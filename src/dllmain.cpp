@@ -1,7 +1,7 @@
 #include <windows.h>
 
 #include "logger.h"
-#include "netplay_menu_hooks.h"
+#include "netplay/hooks/menu_hooks.h"
 
 namespace
 {
@@ -56,3 +56,5 @@ extern "C" __declspec(dllexport) void EFZNetplayShowStubMessageBox(HWND owner)
 {
     netplay::ShowInProgressMessage(owner);
 }
+
+

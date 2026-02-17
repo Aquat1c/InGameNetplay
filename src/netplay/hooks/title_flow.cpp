@@ -1,0 +1,436 @@
+#include "netplay/hooks/internal/shared.h"
+
+#include "logger.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace netplay::hooks::internal
+{
+using namespace netplay::constants;
+using NetplayMenuId = netplay::menu::NetplayMenuId;
+using NetplayMenuAction = netplay::menu::NetplayMenuAction;
+using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
+using netplay::menu::GetDefaultSelectionForMenu;
+using netplay::menu::GetMenuEntries;
+using netplay::menu::MenuActionToString;
+using netplay::menu::MenuIdToString;
+using netplay::menu::RowIndexToString;
+using InlineEditInputResult = netplay::inline_edit::InputResult;
+
+void EnterNetplayMenu(uint32_t screenContext)
+{
+    mod::Log("EnterNetplayMenu: request active=%d", g_netplayMenuState.active);
+    if (g_netplayMenuState.active)
+    {
+        mod::Log("EnterNetplayMenu: already active, ignoring duplicate entry");
+        return;
+    }
+
+    RunTransitionFadeOut(screenContext, 0, 0);
+
+    if (!LoadNetplayAssets(screenContext))
+    {
+        mod::Log("EnterNetplayMenu: assets load failed, keeping title menu active");
+        (void)LoadTitleAssets(screenContext);
+        RunTransitionFadeIn(screenContext);
+        return;
+    }
+
+    ResetTitleMenuState(screenContext, 0);
+
+    g_netplayMenuState.active = true;
+    g_netplayMenuState.bgmActive = true;
+    g_netplayMenuState.menuId = NetplayMenuId::Main;
+    g_netplayMenuState.mainSelection = 0;
+    ResetMenuSlideTransition();
+    ResetInlineEditState();
+    g_lastNetplayFrameLogTick = 0;
+    g_hasLoggedInputSnapshot = false;
+    g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
+    InstallNetplayWindowHook(screenContext);
+
+    auto const playBackgroundMusic = reinterpret_cast<PlayBackgroundMusicFn>(RuntimeAddress(kVaPlayBackgroundMusic));
+    playBackgroundMusic(GetGameSystem(screenContext), kNetplayBgmTrack);
+    RunTransitionFadeIn(screenContext);
+    mod::Log(
+        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d",
+        MenuIdToString(g_netplayMenuState.menuId),
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+        kNetplayBgmTrack,
+        g_netplayMenuState.useConfigStyleRender,
+        g_netplayMenuState.optionCount,
+        g_netplayMenuState.backIndex);
+}
+
+void LeaveNetplayMenu(uint32_t screenContext)
+{
+    mod::Log("LeaveNetplayMenu: request active=%d bgmActive=%d", g_netplayMenuState.active, g_netplayMenuState.bgmActive);
+    if (!g_netplayMenuState.active)
+    {
+        mod::Log("LeaveNetplayMenu: already inactive");
+        return;
+    }
+
+    RunTransitionFadeOut(screenContext, 0, 0);
+
+    if (g_netplayMenuState.bgmActive)
+    {
+        StopCurrentBgm(screenContext, "leave_netplay");
+    }
+
+    g_netplayMenuState.active = false;
+    g_netplayMenuState.bgmActive = false;
+    g_netplayMenuState.useConfigStyleRender = false;
+    g_netplayMenuState.menuId = NetplayMenuId::Main;
+    g_netplayMenuState.mainSelection = 0;
+    g_netplayMenuState.optionCount = kNetplayDefaultOptionCount;
+    g_netplayMenuState.backIndex = kNetplayDefaultBackIndex;
+    g_netplayMenuState.renderLayout = {};
+    ResetMenuSlideTransition();
+    ResetInlineEditState();
+    g_hasLoggedInputSnapshot = false;
+    g_netplayEscapeDown = false;
+    RemoveNetplayWindowHook();
+
+    (void)LoadTitleAssets(screenContext);
+    ResetTitleMenuState(screenContext, 4);
+    RunTransitionFadeIn(screenContext);
+    mod::Log(
+        "LeaveNetplayMenu: returned to title assets, titleSelection=%d",
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+}
+
+void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
+{
+    if (g_inlineEditState.active)
+    {
+        CancelInlineEdit();
+    }
+    g_netplayMenuState.menuId = menuId;
+    int requestedSelection = selection;
+    if (requestedSelection < 0)
+    {
+        requestedSelection = GetDefaultSelectionForMenu(menuId);
+    }
+    const int clamped = ClampSelectionToCurrentMenu(requestedSelection);
+    g_netplayMenuState.optionCount = GetCurrentMenuEntryCount();
+    g_netplayMenuState.backIndex = g_netplayMenuState.optionCount > 0 ? g_netplayMenuState.optionCount - 1 : 0;
+
+    *reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection) = static_cast<int8_t>(clamped);
+    *reinterpret_cast<uint16_t*>(screenContext + kOffsetMenuAnimCounter) = 0;
+    *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+    *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+    *reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter) = 0;
+    g_lastLoggedSelection = static_cast<int8_t>(clamped);
+
+    const NetplayMenuEntry* entry = GetCurrentMenuEntry(clamped);
+    const int rowIndex = GetRenderRowForSelection(clamped);
+    mod::Log(
+        "NetplayMenuSwitch: menu=%s selection=%d count=%d row=%d(%s) entry=%s",
+        MenuIdToString(menuId),
+        clamped,
+        g_netplayMenuState.optionCount,
+        rowIndex,
+        RowIndexToString(rowIndex),
+        entry != nullptr ? entry->debugLabel : "none");
+}
+
+void ShowStubActionMessage(HWND owner, const std::string& message)
+{
+    MessageBoxA(owner, message.c_str(), "Netplay", MB_OK | MB_ICONINFORMATION);
+}
+
+void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int logicalSelection)
+{
+    const HWND owner = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+    const int selectedRow = GetRenderRowForSelection(logicalSelection);
+    mod::Log(
+        "NetplayAction: menu=%s selection=%d row=%d(%s) action=%s",
+        MenuIdToString(g_netplayMenuState.menuId),
+        logicalSelection,
+        selectedRow,
+        RowIndexToString(selectedRow),
+        MenuActionToString(action));
+
+    switch (action)
+    {
+    case NetplayMenuAction::OpenHost:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Host, -1, +1);
+        break;
+    case NetplayMenuAction::OpenJoin:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Join, -1, +1);
+        break;
+    case NetplayMenuAction::OpenNickname:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Nickname, -1, +1);
+        break;
+    case NetplayMenuAction::BackToMain:
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+        break;
+    case NetplayMenuAction::LeaveNetplay:
+        LeaveNetplayMenu(screenContext);
+        break;
+    case NetplayMenuAction::HostEditPort:
+        BeginInlineEdit(NetplayMenuAction::HostEditPort);
+        break;
+    case NetplayMenuAction::JoinEditAddress:
+        BeginInlineEdit(NetplayMenuAction::JoinEditAddress);
+        break;
+    case NetplayMenuAction::JoinEditPort:
+        BeginInlineEdit(NetplayMenuAction::JoinEditPort);
+        break;
+    case NetplayMenuAction::NicknameEdit:
+        BeginInlineEdit(NetplayMenuAction::NicknameEdit);
+        break;
+    case NetplayMenuAction::HostStart:
+    {
+        char text[256] = {};
+        snprintf(
+            text,
+            sizeof(text),
+            "Host flow is still in progress.\n\nNickname: %s\nPort: %u",
+            g_netplayMenuState.nickname.c_str(),
+            static_cast<unsigned>(g_netplayMenuState.hostPort));
+        ShowStubActionMessage(owner, text);
+        break;
+    }
+    case NetplayMenuAction::JoinConnect:
+    {
+        char text[320] = {};
+        snprintf(
+            text,
+            sizeof(text),
+            "Join flow is still in progress.\n\nNickname: %s\nAddress: %s\nPort: %u",
+            g_netplayMenuState.nickname.c_str(),
+            g_netplayMenuState.joinAddress.c_str(),
+            static_cast<unsigned>(g_netplayMenuState.joinPort));
+        ShowStubActionMessage(owner, text);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+char UpdateNetplayMenu(uint32_t screenContext)
+{
+    ++g_netplayUpdateCallCount;
+    auto const render = GetOriginalTitleRender();
+    auto const processInput = reinterpret_cast<ProcessPlayerInputFn>(RuntimeAddress(kVaProcessPlayerInput));
+
+    AdvanceMenuSlideTransition(screenContext);
+    if (g_useRuntimeTextOverlay)
+    {
+        (void)RenderNetplayMenuRuntimeText(screenContext);
+    }
+    else if (g_netplayMenuState.useConfigStyleRender)
+    {
+        (void)RenderNetplayMenuConfigStyle(screenContext);
+    }
+    else
+    {
+        (void)render(screenContext);
+    }
+
+    const int gameSystem = GetGameSystem(screenContext);
+    processInput(reinterpret_cast<int*>(gameSystem));
+    auto* const inputBytes = reinterpret_cast<uint8_t*>(gameSystem);
+    InputSnapshot currentSnapshot = {
+        static_cast<int8_t>(inputBytes[12]),
+        static_cast<int8_t>(inputBytes[14]),
+        inputBytes[16],
+        inputBytes[18],
+        static_cast<int8_t>(inputBytes[13]),
+        static_cast<int8_t>(inputBytes[15]),
+        inputBytes[17],
+        inputBytes[19],
+    };
+
+    auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection);
+    auto* const inactivityCounter = reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter);
+
+    if (!g_hasLoggedInputSnapshot
+        || std::memcmp(&currentSnapshot, &g_lastInputSnapshot, sizeof(InputSnapshot)) != 0)
+    {
+        mod::Log(
+            "NetplayInput: P1(h=%d v=%d c=%u b=%u) P2(h=%d v=%d c=%u b=%u)",
+            static_cast<int>(currentSnapshot.p1Horizontal),
+            static_cast<int>(currentSnapshot.p1Vertical),
+            static_cast<unsigned>(currentSnapshot.p1Confirm),
+            static_cast<unsigned>(currentSnapshot.p1Cancel),
+            static_cast<int>(currentSnapshot.p2Horizontal),
+            static_cast<int>(currentSnapshot.p2Vertical),
+            static_cast<unsigned>(currentSnapshot.p2Confirm),
+            static_cast<unsigned>(currentSnapshot.p2Cancel));
+        g_lastInputSnapshot = currentSnapshot;
+        g_hasLoggedInputSnapshot = true;
+    }
+
+    const DWORD nowTick = GetTickCount();
+    if (g_lastNetplayFrameLogTick == 0 || nowTick - g_lastNetplayFrameLogTick >= kNetplayFrameLogIntervalMs)
+    {
+        const int currentRow = GetRenderRowForSelection(static_cast<int>(*selectionPtr));
+        const int nativeSlideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
+        mod::Log(
+            "NetplayFrame: updates=%llu menu=%s selection=%d row=%d(%s) inactivity=%u slide=%d nativeSlideY=%d",
+            static_cast<unsigned long long>(g_netplayUpdateCallCount),
+            MenuIdToString(g_netplayMenuState.menuId),
+            static_cast<int>(*selectionPtr),
+            currentRow,
+            RowIndexToString(currentRow),
+            *inactivityCounter,
+            IsMenuSlideTransitionActive() ? 1 : 0,
+            nativeSlideY);
+        g_lastNetplayFrameLogTick = nowTick;
+    }
+
+    if (IsMenuSlideTransitionActive())
+    {
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
+    const int entryCount = GetCurrentMenuEntryCount();
+    if (entryCount <= 0)
+    {
+        SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
+        return 0;
+    }
+
+    if (HandleInlineEditInput(screenContext, inputBytes))
+    {
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        *inactivityCounter = 0;
+        return 0;
+    }
+
+    if (ConsumeNetplayEscapeEdge())
+    {
+        PlayUiSound(screenContext, kSfxConfirm);
+        mod::Log(
+            "NetplayCancel: keyboard=ESC menu=%s selection=%d",
+            MenuIdToString(g_netplayMenuState.menuId),
+            static_cast<int>(*selectionPtr));
+
+        if (g_netplayMenuState.menuId == NetplayMenuId::Main)
+        {
+            LeaveNetplayMenu(screenContext);
+        }
+        else
+        {
+            StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+        }
+        return 0;
+    }
+
+    bool hadDirectionalInput = false;
+
+    for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+    {
+        auto* const inputLatch = reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1 + playerIndex);
+        const int8_t vertical = static_cast<int8_t>(inputBytes[playerIndex + 14]);
+
+        if (vertical != 0)
+        {
+            hadDirectionalInput = true;
+            *inactivityCounter = 0;
+            if (*inputLatch == 0)
+            {
+                PlayUiSound(screenContext, kSfxMove);
+                const int current = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
+                const int delta = vertical > 0 ? 1 : -1;
+                int next = (current + delta + entryCount) % entryCount;
+
+                const NetplayMenuEntry* nextEntry = GetCurrentMenuEntry(next);
+                mod::Log(
+                    "NetplaySelection: player=%d menu=%s from=%d to=%d row=%d(%s) label=%s inputV=%d",
+                    playerIndex,
+                    MenuIdToString(g_netplayMenuState.menuId),
+                    current,
+                    next,
+                    nextEntry != nullptr ? nextEntry->renderRow : -1,
+                    nextEntry != nullptr ? RowIndexToString(nextEntry->renderRow) : "ROW_UNKNOWN",
+                    nextEntry != nullptr ? nextEntry->debugLabel : "none",
+                    static_cast<int>(vertical));
+                *selectionPtr = static_cast<int8_t>(next);
+                *reinterpret_cast<uint16_t*>(screenContext + kOffsetMenuAnimCounter) = 0;
+                *inputLatch = 1;
+                g_lastLoggedSelection = *selectionPtr;
+            }
+        }
+        else
+        {
+            *inputLatch = 0;
+        }
+
+        if (inputBytes[playerIndex + 16] == 1)
+        {
+            const int logicalSelection = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
+            const NetplayMenuEntry* selectedEntry = GetCurrentMenuEntry(logicalSelection);
+            if (selectedEntry == nullptr)
+            {
+                return 0;
+            }
+
+            PlayUiSound(screenContext, kSfxConfirm);
+            mod::Log(
+                "NetplayConfirm: player=%d menu=%s selection=%d row=%d(%s) label=%s action=%s",
+                playerIndex,
+                MenuIdToString(g_netplayMenuState.menuId),
+                logicalSelection,
+                selectedEntry->renderRow,
+                RowIndexToString(selectedEntry->renderRow),
+                selectedEntry->debugLabel,
+                MenuActionToString(selectedEntry->action));
+            ExecuteNetplayAction(screenContext, selectedEntry->action, logicalSelection);
+            return 0;
+        }
+
+        if (inputBytes[playerIndex + 18] == 1)
+        {
+            PlayUiSound(screenContext, kSfxConfirm);
+            mod::Log(
+                "NetplayCancel: player=%d menu=%s selection=%d",
+                playerIndex,
+                MenuIdToString(g_netplayMenuState.menuId),
+                static_cast<int>(*selectionPtr));
+
+            if (g_netplayMenuState.menuId == NetplayMenuId::Main)
+            {
+                LeaveNetplayMenu(screenContext);
+            }
+            else
+            {
+                StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+            }
+            return 0;
+        }
+    }
+
+    if (!hadDirectionalInput)
+    {
+        ++(*inactivityCounter);
+    }
+
+    return 0;
+}
+
+void TriggerNetplayMenuEntry(uint32_t screenContext)
+{
+    mod::Log(
+        "TriggerNetplayMenuEntry: titleSelection=%d screenContext=0x%08X",
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+        screenContext);
+    PlayUiSound(screenContext, kSfxConfirm);
+    EnterNetplayMenu(screenContext);
+}
+} // namespace netplay::hooks::internal
+
