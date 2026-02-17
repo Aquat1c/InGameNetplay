@@ -6,8 +6,11 @@ Add a new `NETPLAY` option to EFZ title menu and open an in-engine netplay subme
 Current wiring status:
 - Confirm on `NETPLAY` enters a custom netplay submenu loop in title state.
 - Netplay submenu assets are loaded from DLL-relative `assets`.
-- Unimplemented submenu actions currently show:
-  - `MessageBoxA(hwnd, "In progress", "Netplay", MB_OK | MB_ICONINFORMATION);`
+- Currently stubbed actions still showing `In progress`:
+  - `HOST -> START HOST`
+  - `JOIN -> CONNECT`
+- Editable actions are now inline in-menu (no modal edit dialog):
+  - host port, join address, join port, nickname
 
 This project is a DLL runtime mod (not rebuilding `efz.exe` from `efz.c`).
 
@@ -25,7 +28,8 @@ Planned assets for the netplay flow:
     - `EFZ\\mods\\efz_netplay_mod\\assets`
   - Expected lookup model:
     - `<dll_dir>\\assets\\netplay_bg.dat`
-    - optional object candidates:
+    - object candidates:
+      - `<dll_dir>\\assets\\netplay_ob.dat`
       - `<dll_dir>\\assets\\netplay_ui_ob.dat`
       - `<dll_dir>\\assets\\config_ob.dat`
       - fallback `system\\title_ob.dat`
@@ -43,7 +47,7 @@ Notes:
 
 ### Canonical `netplay_ob` Row Map (Now Wired)
 
-The netplay menu now uses a canonical 8-row slot map in code (`src/netplay_menu_hooks.cpp`) so renderer, navigation, and action dispatch all reference the same row slots.
+The netplay menu uses a canonical 8-row slot map in code (`include/netplay/core/menu_model.h`, `src/netplay/core/menu_model.cpp`) so renderer, navigation, and action dispatch all reference the same row slots.
 
 Row slots (config-style lanes):
 
@@ -212,7 +216,7 @@ Adding a true 8th case requires code hook/cave logic, not just changing one imme
 
 ### Current DLL implementation mapping
 
-Implemented in `src/netplay_menu_hooks.cpp` using a custom 8-entry dispatch table:
+Implemented in `src/netplay/hooks/title_patch_install.cpp` using a custom 8-entry dispatch table:
 
 - `[0] Arcade` -> original case `0x007761E9`
 - `[1] VS CPU` -> original case `0x00776268`
@@ -273,7 +277,8 @@ Menu sheets are strict `14px` row-grid assets; non-grid heights cause selected-r
 - Press confirm on `NETPLAY` -> enter netplay submenu (no state transition).
 - Netplay submenu supports up/down + confirm/cancel.
 - `Back` in netplay submenu returns to title assets/menu.
-- Non-back submenu actions currently show `In progress`.
+- Stub actions (`START HOST`, `CONNECT`) currently show `In progress`.
+- Editable fields are handled inline with `Enter`/`Esc`.
 
 ## Minimum code changes needed (runtime patch/hook)
 1. **Selection range**
@@ -342,15 +347,29 @@ If a full render hook is too heavy for phase 1:
 
 ---
 
-## Next Implementation Deliverables
+## Current Implementation Layout
 
-1. `netplay_menu_hooks.cpp`:
-   - title update hook through title vtable (`off_789980[1]`)
-   - netplay submenu loop + asset enter/exit path
-   - custom netplay title-case thunk in title dispatch
-2. `menu_constants.h`:
-   - centralized menu row count/height/source-dest rect constants
-3. Optional debug log (`OutputDebugStringA`) around menu index and transitions.
+Hook and state logic has been split out of the old monolithic file:
+
+1. Hook entrypoints and shared hook state:
+   - `src/netplay/hooks/menu_hooks.cpp`
+   - `include/netplay/hooks/internal/shared.h`
+2. Hook patch install/remove:
+   - `src/netplay/hooks/title_patch_install.cpp`
+   - `src/netplay/hooks/title_patch_helpers.cpp`
+3. Netplay flow and input state machine:
+   - `src/netplay/hooks/title_flow.cpp`
+   - `src/netplay/hooks/title_core.cpp`
+4. Rendering pipeline:
+   - `src/netplay/hooks/title_draw_layers.cpp`
+   - `src/netplay/hooks/title_overlay_text.cpp`
+   - `src/netplay/render/*`
+5. Asset/path/dat handling:
+   - `src/netplay/hooks/title_assets.cpp`
+   - `src/netplay/assets/assets.cpp`
+6. Menu model/constants/validation/inline edit:
+   - `src/netplay/core/*`
+   - `include/netplay/core/*`
 
 ---
 

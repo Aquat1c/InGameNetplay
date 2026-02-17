@@ -1,67 +1,84 @@
 # EFZ In-Game Netplay Mod (DLL)
 
-Runtime DLL mod scaffold for integrating a `NETPLAY` option into EFZ's title menu.
+Runtime DLL mod that injects a `NETPLAY` entry into EFZ title menu and runs a custom in-engine netplay submenu loop.
 
 ## Current Status
-- Project initialized and buildable as a Windows DLL.
-- Logger opens a dedicated console window and writes logs to:
+- Buildable Win32 DLL with runtime hook install/remove.
+- Logger opens a console and writes to:
   - `<dll_folder>\\efz_netplay_mod.log`
-- Title menu runtime patches are implemented in `netplay::InstallHooks()`:
-  - Selection range expanded from 7 to 8 entries
-  - Menu renderer geometry adjusted for 8 rows
-  - Title action switch redirected to an 8-entry custom dispatch table
-  - `NETPLAY` case enters an in-engine netplay submenu loop
-  - Title update vtable entry is hooked so netplay submenu navigation runs each frame
-- Netplay submenu asset loading:
-  - `<dll_folder>\\assets\\netplay_bg.dat`
-  - menu rows are wired to a canonical 8-slot `netplay_ob` lane map (`0..7`)
-  - static row text in `netplay_ob.dat` is optional; runtime sprite text can populate labels/values
-  - optional object lookup:
-    - `<dll_folder>\\assets\\netplay_ui_ob.dat`
-    - `<dll_folder>\\assets\\config_ob.dat`
-    - fallback: `system\\title_ob.dat`
-  - runtime styled text uses sprite-font mapping file:
-    - `<dll_folder>\\assets\\netplay_font_map.txt`
-    - example template: `assets\\netplay_font_map.example.txt`
-  - netplay labels/values are rendered from runtime state with sprite glyph blits (no static `netplay_ob.dat` text required)
-  - BGM uses vanilla pathing (`wave\\bgm\\bgm08.wav`)
-- Netplay menu flow now uses a structured submenu model:
+- Title menu hook/patch stack is active (`netplay::InstallHooks()`):
+  - Selection range expanded `0..6 -> 0..7`
+  - Title dispatch switched to custom 8-entry table
+  - Title render and update vtable entries are hooked
+  - 8-row panel/highlight geometry patches applied
+- Netplay menu entry/exit flow includes:
+  - Fade-out/fade-in transition calls
+  - Netplay BGM track `8` start on enter
+  - BGM stop + title assets restore on leave
+  - State reset for menu selection/latches/counters
+- Netplay submenu model:
   - Main: `HOST`, `JOIN`, `CHANGE NICKNAME`, `RETURN TO TITLE`
-  - Host submenu: start-host action + editable host port
-  - Join submenu: connect action + editable address + editable port
-  - Nickname submenu: editable nickname
-  - Canonical row slots: `HOST=0`, `JOIN=1`, `NICKNAME=2`, `ADDRESS=3`, `PORT=4`, `RETURN/BACK=7` (`5/6` reserved)
-  - Submenu transitions use the game's native slide helper (`performSlideAnimation`, `0x0075DA30`) with compact rows (no empty placeholders)
-  - Cancel in submenus returns to Main; cancel in Main returns to title
-- Editable fields use native modal dialogs with input validation:
-  - Port range: `1..65535`
-  - Join address: alnum plus `.`, `-`, `_`, `:`
-  - Nickname: 1-20 visible ASCII chars
-- Runtime text mirrors current values each frame:
-  - current nickname
-  - host port
-  - join address/port
-- In object-sheet-only mode (no sprite font map), field values are still drawn manually via overlay text on top of menu rows.
-- If sprite map is missing, code can optionally fall back to plain GDI overlay (disabled by default).
-- Message box helper available:
-  - `EFZNetplayShowStubMessageBox(HWND owner)`
-  - shows `In progress`.
+  - Host: `START HOST`, editable `PORT`, `BACK`
+  - Join: `CONNECT`, editable `ADDRESS`, editable `PORT`, `BACK`
+  - Nickname: editable `NAME`, `BACK`
+  - Canonical row slots: `0,1,2,3,4,7` (`5/6` reserved)
+- Inline editing is embedded in-menu (no extra modal input window):
+  - `Enter` commits
+  - `Esc` cancels edit only
+  - Outside edit mode, cancel/ESC follows menu back behavior
+  - Validation:
+    - Port: `1..65535`
+    - Address: alnum + `.:-_`
+    - Nickname: printable ASCII, max 20 chars
+- Rendering:
+  - Preferred: sprite-glyph runtime text from object sheet + `netplay_font_map.txt`
+  - Object-sheet-only mode: dynamic field values are drawn directly on menu rows
+  - Optional GDI fallback overlay exists (disabled by default)
 
-See `NETPLAY_MENU_INTEGRATION.md` for reverse-engineering notes and hook targets.
+## Asset Lookup
+- DLL-relative assets:
+  - `<dll_folder>\\assets\\netplay_bg.dat`
+  - `<dll_folder>\\assets\\netplay_ob.dat` (or fallback object candidates)
+  - `<dll_folder>\\assets\\netplay_font_map.txt` (optional, template in `assets\\netplay_font_map.example.txt`)
+- Object fallback order:
+  - `<dll_folder>\\assets\\netplay_ob.dat`
+  - `<dll_folder>\\assets\\netplay_ui_ob.dat`
+  - `<dll_folder>\\assets\\config_ob.dat`
+  - `system\\title_ob.dat`
+- BGM path remains vanilla:
+  - `wave\\bgm\\bgm08.wav`
 
-## Build (Visual Studio / CMake)
+## Source Layout
+- Hooks:
+  - `src/netplay/hooks/menu_hooks.cpp` (shared state + hook entrypoints/thunks)
+  - `src/netplay/hooks/title_patch_install.cpp`
+  - `src/netplay/hooks/title_flow.cpp`
+  - `src/netplay/hooks/title_draw_layers.cpp`
+  - `src/netplay/hooks/title_core.cpp`
+  - `src/netplay/hooks/title_assets.cpp`
+  - `src/netplay/hooks/title_overlay_text.cpp`
+  - `src/netplay/hooks/title_patch_helpers.cpp`
+- Shared hook internals:
+  - `include/netplay/hooks/internal/shared.h`
+- Core helpers:
+  - `src/netplay/core/*`
+- Rendering helpers:
+  - `src/netplay/render/*`
+- Asset parsing/pathing:
+  - `src/netplay/assets/assets.cpp`
 
-Build from this folder:
-
+## Build (CMake / Visual Studio)
 ```powershell
 cmake -S . -B build -A Win32
 cmake --build build --config Release
 ```
 
-Output DLL:
+Output:
 - `build/bin/Release/efz_netplay_mod.dll`
 
 Notes:
-- EFZ is 32-bit, so use `-A Win32`.
-- Patches are validated against expected original bytes before applying.
-- If your `efz.exe` build differs, hook install will fail safely and log mismatch details.
+- EFZ is 32-bit; always use `-A Win32`.
+- Patches validate expected original bytes before writing.
+- Unsupported `efz.exe` builds fail hook install safely with logs.
+
+See `NETPLAY_MENU_INTEGRATION.md` for detailed reverse-engineering notes, addresses, and menu flow documentation.
