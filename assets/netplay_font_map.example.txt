@@ -1,0 +1,59 @@
+# Netplay sprite font map template.
+# Coordinate space is the loaded objects surface (e.g. netplay_ui_ob.dat).
+# Format:
+#   line_height=<pixels>
+#   letter_spacing=<pixels>
+#   uppercase_input=<0|1>
+#   <char>=<srcX>,<srcY>,<width>,<height>[,<advance>]
+#
+# Notes:
+# - One printable ASCII character per key (example: A, B, 0, :, .)
+# - <advance> is optional; if omitted, width is used.
+# - Lines starting with # are ignored.
+
+line_height=14
+letter_spacing=1
+uppercase_input=1
+
+# Minimal set for menu labels. Replace coordinates with your atlas positions.
+A=0,0,8,14
+B=8,0,8,14
+C=16,0,8,14
+D=24,0,8,14
+E=32,0,8,14
+F=40,0,8,14
+G=48,0,8,14
+H=56,0,8,14
+I=64,0,8,14
+J=72,0,8,14
+K=80,0,8,14
+L=88,0,8,14
+M=96,0,8,14
+N=104,0,8,14
+O=112,0,8,14
+P=120,0,8,14
+Q=128,0,8,14
+R=136,0,8,14
+S=144,0,8,14
+T=152,0,8,14
+U=160,0,8,14
+V=168,0,8,14
+W=176,0,8,14
+X=184,0,8,14
+Y=192,0,8,14
+Z=200,0,8,14
+0=208,0,8,14
+1=216,0,8,14
+2=224,0,8,14
+3=232,0,8,14
+4=240,0,8,14
+5=248,0,8,14
+6=256,0,8,14
+7=264,0,8,14
+8=272,0,8,14
+9=280,0,8,14
+:=288,0,4,14
+.=292,0,4,14
+-=296,0,6,14
+_=302,0,8,14
+/=310,0,6,14
