@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <windows.h>
 
@@ -20,6 +21,8 @@ struct OverlayCallbacks
     std::function<bool(netplay::menu::NetplayMenuAction)> isInlineEditableAction;
     std::function<bool(netplay::menu::NetplayMenuAction, std::string*, bool)> getInlineEditDisplayValue;
     std::function<int(uint32_t)> getScaledNativeSlideY;
+    // Optional: override text color per row. Return nullopt to use defaults.
+    std::function<std::optional<COLORREF>(const netplay::menu::NetplayMenuEntry&, bool isSelected)> getRowTextColor;
 };
 
 struct RuntimeOverlayState

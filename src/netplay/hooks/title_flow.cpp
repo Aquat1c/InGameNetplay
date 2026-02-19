@@ -16,6 +16,7 @@ using netplay::menu::GetDefaultSelectionForMenu;
 using netplay::menu::GetMenuEntries;
 using netplay::menu::MenuActionToString;
 using netplay::menu::MenuIdToString;
+using netplay::menu::RebuildLobbyMenuEntries;
 using netplay::menu::RowIndexToString;
 using InlineEditInputResult = netplay::inline_edit::InputResult;
 
@@ -89,6 +90,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_netplayMenuState.optionCount = kNetplayDefaultOptionCount;
     g_netplayMenuState.backIndex = kNetplayDefaultBackIndex;
     g_netplayMenuState.renderLayout = {};
+    g_netplayMenuState.lobbyScrollOffset = 0;
     ResetMenuSlideTransition();
     ResetInlineEditState();
     g_hasLoggedInputSnapshot = false;
@@ -96,7 +98,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
-    ResetTitleMenuState(screenContext, 4);
+    ResetTitleMenuState(screenContext, 5);
     RunTransitionFadeIn(screenContext);
     mod::Log(
         "LeaveNetplayMenu: returned to title assets, titleSelection=%d",
@@ -109,7 +111,30 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         CancelInlineEdit();
     }
+    // Lobby session lifecycle: destroy when navigating away, create when entering.
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
+    {
+        if (g_lobbySession)
+        {
+            mod::Log("SwitchToMenu: leaving Lobby, resetting lobby session");
+            g_lobbySession.reset();
+        }
+        g_netplayMenuState.lobbyScrollOffset = 0;
+    }
     g_netplayMenuState.menuId = menuId;
+    if (menuId == NetplayMenuId::Lobby && !g_lobbySession)
+    {
+        // Seed the dynamic entry list with 0 idle players before any spec
+        // queries so that GetCurrentMenuEntryCount() returns a valid count.
+        RebuildLobbyMenuEntries(0, 0);
+        g_netplayMenuState.lobbyScrollOffset = 0;
+        mod::Log("SwitchToMenu: entering Lobby, creating session for '%s' port=%u",
+            g_netplayMenuState.nickname.c_str(),
+            static_cast<unsigned>(g_netplayMenuState.hostPort));
+        g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
+            g_netplayMenuState.nickname,
+            g_netplayMenuState.hostPort);
+    }
     int requestedSelection = selection;
     if (requestedSelection < 0)
     {
@@ -169,6 +194,10 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::Nickname, -1, +1);
         break;
+    case NetplayMenuAction::OpenLobby:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
+        break;
     case NetplayMenuAction::BackToMain:
         StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
         break;
@@ -210,6 +239,37 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_netplayMenuState.joinAddress.c_str(),
             static_cast<unsigned>(g_netplayMenuState.joinPort));
         ShowStubActionMessage(owner, text);
+        break;
+    }
+    case NetplayMenuAction::LobbyPlaying0:
+    {
+        // Playing pair row -- stub until spectating is implemented.
+        ShowStubActionMessage(owner, "Spectating is not yet implemented.\n\nThis row shows the current active match.");
+        break;
+    }
+    case NetplayMenuAction::LobbySlot0:
+    case NetplayMenuAction::LobbySlot1:
+    case NetplayMenuAction::LobbySlot2:
+    case NetplayMenuAction::LobbySlot3:
+    case NetplayMenuAction::LobbySlot4:
+    case NetplayMenuAction::LobbySlot5:
+    {
+        const int visSlot   = static_cast<int>(action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
+        const int realSlot  = visSlot + g_netplayMenuState.lobbyScrollOffset;
+        if (g_lobbySession)
+        {
+            const auto status = g_lobbySession->GetStatus();
+            if (realSlot < static_cast<int>(status.idlePlayers.size()))
+            {
+                char text[256] = {};
+                snprintf(
+                    text,
+                    sizeof(text),
+                    "Challenge '%s' (stub)\n\nP2P connect is not yet implemented.\nWill trigger EfzRevival network flow in a future update.",
+                    status.idlePlayers[realSlot].name.c_str());
+                ShowStubActionMessage(owner, text);
+            }
+        }
         break;
     }
     default:
@@ -297,6 +357,51 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    // Lobby: rebuild dynamic entries each frame so that the visible row count
+    // tracks the actual number of idle players.  Also clamp the scroll offset
+    // and sync optionCount / backIndex.
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby)
+    {
+        int idleCount = 0;
+        int playingCount = 0;
+        if (g_lobbySession)
+        {
+            const auto lobSt = g_lobbySession->GetStatus();
+            if (lobSt.pollState == netplay::lobby::PollState::Polling)
+            {
+                idleCount    = static_cast<int>(lobSt.idlePlayers.size());
+                playingCount = static_cast<int>(lobSt.playing.size());
+            }
+        }
+        RebuildLobbyMenuEntries(idleCount, playingCount);
+
+        // Clamp scroll so we never point past the end of the player list.
+        const int visSlots = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
+        const int maxScroll = std::max(0, idleCount - visSlots);
+        if (g_netplayMenuState.lobbyScrollOffset > maxScroll)
+        {
+            g_netplayMenuState.lobbyScrollOffset = maxScroll;
+        }
+
+        // Sync optionCount / backIndex from the freshly rebuilt spec.
+        const int newCount = GetCurrentMenuEntryCount();
+        if (newCount != g_netplayMenuState.optionCount && newCount > 0)
+        {
+            g_netplayMenuState.optionCount = newCount;
+            g_netplayMenuState.backIndex   = newCount - 1;
+            const int clampedSel = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
+            *selectionPtr = static_cast<int8_t>(clampedSel);
+        }
+    }
+
+    // Lobby: allow R key to trigger an immediate poll refresh.
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
+        && g_lobbySession
+        && (GetAsyncKeyState('R') & 0x0001) != 0)
+    {
+        g_lobbySession->RequestRefresh();
+    }
+
     const int entryCount = GetCurrentMenuEntryCount();
     if (entryCount <= 0)
     {
@@ -348,6 +453,37 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 const int current = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
                 const int delta = vertical > 0 ? 1 : -1;
                 int next = (current + delta + entryCount) % entryCount;
+
+                // Lobby: intercept boundary movement to scroll the player list
+                // instead of wrapping when more entries exist off-screen.
+                if (g_netplayMenuState.menuId == NetplayMenuId::Lobby && g_lobbySession)
+                {
+                    const auto lobSt = g_lobbySession->GetStatus();
+                    const int idleCount = static_cast<int>(lobSt.idlePlayers.size());
+                    const int visSlots  = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
+
+                    if (delta > 0 && current == visSlots - 1 && next == visSlots)
+                    {
+                        // Moving down from the last visible slot: scroll if more
+                        // players are below, otherwise fall through to LobbyPlaying0.
+                        const int maxScroll = std::max(0, idleCount - visSlots);
+                        if (g_netplayMenuState.lobbyScrollOffset < maxScroll)
+                        {
+                            g_netplayMenuState.lobbyScrollOffset++;
+                            next = current; // stay at last visible slot
+                        }
+                    }
+                    else if (delta < 0 && current == 0 && next == entryCount - 1)
+                    {
+                        // Moving up from the first slot: scroll back if possible,
+                        // otherwise fall through to BackToMain (wrap).
+                        if (g_netplayMenuState.lobbyScrollOffset > 0)
+                        {
+                            g_netplayMenuState.lobbyScrollOffset--;
+                            next = current; // stay at first slot
+                        }
+                    }
+                }
 
                 const NetplayMenuEntry* nextEntry = GetCurrentMenuEntry(next);
                 mod::Log(

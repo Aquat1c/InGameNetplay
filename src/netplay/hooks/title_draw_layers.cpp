@@ -112,6 +112,17 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
                 continue;
             }
 
+            // Lobby player/playing slots display arbitrary network strings that may
+            // not exist in the sprite sheet -- skip here and let GDI handle them.
+            const bool isLobbyNicknameRow =
+                g_netplayMenuState.menuId == NetplayMenuId::Lobby
+                && entries[i].action >= NetplayMenuAction::LobbySlot0
+                && entries[i].action <= NetplayMenuAction::LobbyPlaying0;
+            if (isLobbyNicknameRow)
+            {
+                continue;
+            }
+
             const int y = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)] + rowTextOffsetY;
             DrawSpriteText(screenContext, panelLeft, y, BuildRowLabel(entries[i]), panelRight - panelLeft, false);
         }
@@ -299,9 +310,12 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
     (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
     (void)blit(graphicsContext, 0, 0, 320, 240, objectsSurface, 0, 0, 320, 240, transparentColor, 0);
 
-    if (g_netplayMenuState.useConfigStyleRender && !g_useRuntimeTextOverlay)
     {
-        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Reserved5);
+        // Always stamp unused sprite-sheet rows with a blank black bar so
+        // labels from other menus (ADDRESS, PORT, etc.) don't bleed through.
+        // Reserved6 (row 6) is intentionally blank in the sheet; never use
+        // Reserved5 here because that row carries the "LOBBY" label.
+        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Reserved6);
         if (kBlankRowIndex >= 0 && kBlankRowIndex < kNetplayConfigOptionCount)
         {
             const int blankSrcY = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(kBlankRowIndex)];
@@ -369,13 +383,17 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
+    // Lobby nicknames are arbitrary server-supplied strings; always use GDI for
+    // the lobby so that every character is renderable regardless of the sprite
+    // font sheet coverage.
+    const bool forceGdi = (g_netplayMenuState.menuId == NetplayMenuId::Lobby);
     bool drewGdiOverlay = false;
-    if (!g_spriteFont.loaded)
+    if (!g_spriteFont.loaded || forceGdi)
     {
         drewGdiOverlay = DrawRuntimeTextOverlayGdi(screenContext, false);
     }
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
-    if (!g_spriteFont.loaded && !drewGdiOverlay)
+    if ((!g_spriteFont.loaded || forceGdi) && !drewGdiOverlay)
     {
         (void)DrawRuntimeTextOverlayGdi(screenContext, true);
     }

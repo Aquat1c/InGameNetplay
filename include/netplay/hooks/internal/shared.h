@@ -2,6 +2,7 @@
 
 #include "netplay/core/constants.h"
 #include "netplay/core/inline_edit.h"
+#include "netplay/core/lobby_client.h"
 #include "netplay/core/menu_model.h"
 #include "netplay/core/patch_utils.h"
 #include "netplay/render/menu_overlay.h"
@@ -32,6 +33,10 @@ struct NetplayMenuState
     uint8_t paletteStart = 193;
     uint8_t paletteCount = 48;
     netplay::constants::NetplayRenderLayout renderLayout = {};
+    // Lobby browser: index of the first idle player shown in the visible window.
+    // Incremented/decremented at the scroll boundary rows to pan through a list
+    // longer than kLobbyMaxDisplayPlayers.
+    int lobbyScrollOffset = 0;
 };
 
 struct MenuSlideTransition
@@ -92,6 +97,7 @@ extern std::atomic<bool> g_hooksInstalled;
 extern uintptr_t g_exeBase;
 extern std::vector<netplay::patch::PatchRecord> g_appliedPatches;
 extern uint32_t g_customDispatchTable[8];
+extern uint32_t g_replayCaseDispatchAddress;
 extern "C" uint32_t g_titleCaseReturnAddress;
 extern std::string g_moduleDirectory;
 extern NetplayMenuState g_netplayMenuState;
@@ -109,7 +115,11 @@ extern HFONT g_menuOverlayFont;
 extern HWND g_hookedWindow;
 extern WNDPROC g_originalWindowProc;
 extern bool g_netplayEscapeDown;
+extern bool g_restoreReplaySelectionOnNextTitleUpdate;
+extern uint32_t g_replaySelectionGuardFramesRemaining;
+extern int8_t g_replaySelectionRestoreTarget;
 extern InputSnapshot g_lastInputSnapshot;
+extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 HMODULE ResolveCurrentModule();
 uintptr_t RuntimeAddress(uintptr_t va);
@@ -176,6 +186,8 @@ extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext);
 #if defined(_M_IX86)
 extern "C" void __cdecl NetplayCaseImpl(uint32_t screenContext);
 extern "C" void NetplayCaseThunk();
+extern "C" void __cdecl ReplayCaseCompatImpl(uint32_t screenContext);
+extern "C" void ReplayCaseCompatThunk();
 extern "C" void HookedTitleUpdateThunk();
 extern "C" void HookedTitleRenderThunk();
 #endif

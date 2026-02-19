@@ -29,6 +29,7 @@ enum class NetplayMenuId : uint8_t
     Host = 1,
     Join = 2,
     Nickname = 3,
+    Lobby = 4,
 };
 
 enum class NetplayMenuAction : uint8_t
@@ -44,7 +45,25 @@ enum class NetplayMenuAction : uint8_t
     JoinEditAddress = 8,
     JoinEditPort = 9,
     NicknameEdit = 10,
+    // Lobby browser
+    OpenLobby = 11,
+    LobbySlot0 = 12,
+    LobbySlot1 = 13,
+    LobbySlot2 = 14,
+    LobbySlot3 = 15,
+    LobbySlot4 = 16,
+    LobbySlot5 = 17,
+    LobbyPlaying0 = 18, // playing-pair display row (non-interactive)
 };
+
+// Returns the LobbySlotN action for a given zero-based slot index [0, kLobbyMaxDisplayPlayers).
+constexpr NetplayMenuAction LobbySlotAction(int slot)
+{
+    return static_cast<NetplayMenuAction>(static_cast<int>(NetplayMenuAction::LobbySlot0) + slot);
+}
+
+constexpr int kLobbyMaxDisplayPlayers = 6;
+constexpr int kLobbyMaxPlayingPairs   = 1;
 
 struct NetplayMenuEntry
 {
@@ -69,5 +88,15 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId);
 const NetplayMenuEntry* GetMenuEntries(NetplayMenuId menuId, int* outCount);
 int GetDefaultSelectionForMenu(NetplayMenuId menuId);
 bool ValidateMenuSpecs();
+
+// Rebuilds the dynamic lobby entry list based on the current number of idle
+// players visible on screen (after applying scroll offset).  This must be
+// called once when entering the lobby menu and then once per update frame so
+// that unused rows are hidden correctly.
+// |idleCount| is the total number of idle players presently in the lobby
+// (NOT the number visible in the window – the function clamps internally).
+// |playingCount| is the number of active playing pairs; LobbyPlaying0 is
+// only included in the entry list when this is greater than zero.
+void RebuildLobbyMenuEntries(int idleCount, int playingCount);
 }
 

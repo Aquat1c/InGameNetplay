@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace netplay::hooks::internal
@@ -63,6 +64,58 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
             return "NAME: " + value;
         }
         return "NAME";
+    case NetplayMenuAction::OpenLobby:
+        return "LOBBY";
+    case NetplayMenuAction::LobbyPlaying0:
+    {
+        // Show the playing pair at index 0 in a compact VS format.
+        // This entry only exists in the menu when there is at least one pair.
+        if (g_lobbySession)
+        {
+            const auto status = g_lobbySession->GetStatus();
+            if (!status.playing.empty())
+            {
+                return status.playing[0].p1Name + " vs " + status.playing[0].p2Name;
+            }
+        }
+        return "";
+    }
+    case NetplayMenuAction::LobbySlot0:
+    case NetplayMenuAction::LobbySlot1:
+    case NetplayMenuAction::LobbySlot2:
+    case NetplayMenuAction::LobbySlot3:
+    case NetplayMenuAction::LobbySlot4:
+    case NetplayMenuAction::LobbySlot5:
+    {
+        // The visible slot index in the dynamic entry list.  Add the scroll
+        // offset to get the real index into idlePlayers[].
+        const int visSlot  = static_cast<int>(entry.action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
+        const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
+        if (g_lobbySession)
+        {
+            const auto status = g_lobbySession->GetStatus();
+            if (realSlot < static_cast<int>(status.idlePlayers.size()))
+            {
+                // Show a scroll indicator on the first/last visible row so the
+                // user knows there are more players above/below.
+                const int idleCount = static_cast<int>(status.idlePlayers.size());
+                const int visSlots  = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
+                std::string name    = status.idlePlayers[realSlot].name;
+                const bool canScrollUp   = (g_netplayMenuState.lobbyScrollOffset > 0);
+                const bool canScrollDown = (g_netplayMenuState.lobbyScrollOffset < std::max(0, idleCount - visSlots));
+                if (visSlot == 0 && canScrollUp)
+                {
+                    return "^ " + name;
+                }
+                if (visSlot == visSlots - 1 && canScrollDown)
+                {
+                    return name + " v";
+                }
+                return name;
+            }
+        }
+        return "  --";
+    }
     default:
         return entry.debugLabel;
     }
@@ -93,6 +146,34 @@ std::string BuildFooterText()
     }
 
     char buffer[256] = {};
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby)
+    {
+        if (!g_lobbySession)
+        {
+            return "Not connected";
+        }
+        const auto status = g_lobbySession->GetStatus();
+        switch (status.pollState)
+        {
+        case netplay::lobby::PollState::Joining:
+            return "Connecting to lobby...";
+        case netplay::lobby::PollState::Polling:
+        {
+            const DWORD elapsed = (GetTickCount() - status.lastPollTick) / 1000u;
+            snprintf(buffer, sizeof(buffer),
+                "%d idle  %d match  R=REFRESH  CONFIRM=Challenge  ESC=BACK",
+                static_cast<int>(status.idlePlayers.size()),
+                static_cast<int>(status.playing.size()));
+            (void)elapsed; // used only for debug; keep footer short
+            return buffer;
+        }
+        case netplay::lobby::PollState::Error:
+            snprintf(buffer, sizeof(buffer), "Lobby error: %s", status.statusMessage.c_str());
+            return buffer;
+        default:
+            return "Idle";
+        }
+    }
     snprintf(
         buffer,
         sizeof(buffer),
@@ -169,16 +250,29 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks()
             return GetInlineEditDisplayValue(action, outValue, includeCaret);
         },
         [](uint32_t screenContext) -> int { return GetScaledNativeSlideY(screenContext); },
+        // Playing-pair rows render in gold; idle slot rows render in default colors.
+        [](const NetplayMenuEntry& entry, bool isSelected) -> std::optional<COLORREF>
+        {
+            if (entry.action == NetplayMenuAction::LobbyPlaying0)
+            {
+                // Selected: bright gold on dark highlight. Unselected: muted gold.
+                return isSelected ? RGB(255, 215, 0) : RGB(160, 130, 0);
+            }
+            return std::nullopt;
+        },
     };
     return callbacks;
 }
 
 bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc)
 {
+    // The lobby always forces GDI rendering regardless of whether the sprite
+    // font is loaded or the global runtime-text / GDI-fallback flags are set.
+    const bool lobbyForced = (g_netplayMenuState.menuId == netplay::menu::NetplayMenuId::Lobby);
     const netplay::render::RuntimeOverlayState state = {
-        g_useRuntimeTextOverlay,
+        g_useRuntimeTextOverlay || lobbyForced, // lobby treated as always enabled
         g_netplayMenuState.active,
-        g_enableGdiFallbackOverlay,
+        g_enableGdiFallbackOverlay || lobbyForced,
         g_netplayMenuState.menuId,
     };
     return netplay::render::DrawRuntimeTextOverlayGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);

@@ -50,8 +50,9 @@ bool InstallHooks()
     g_customDispatchTable[1] = static_cast<uint32_t>(RuntimeAddress(kVaCaseVsCpu));
     g_customDispatchTable[2] = static_cast<uint32_t>(RuntimeAddress(kVaCaseVsHuman));
     g_customDispatchTable[3] = static_cast<uint32_t>(RuntimeAddress(kVaCasePractice));
-    g_customDispatchTable[4] = reinterpret_cast<uint32_t>(&NetplayCaseThunk);
-    g_customDispatchTable[5] = static_cast<uint32_t>(RuntimeAddress(kVaCaseReplay));
+    g_replayCaseDispatchAddress = static_cast<uint32_t>(RuntimeAddress(kVaCaseReplay));
+    g_customDispatchTable[4] = g_replayCaseDispatchAddress;
+    g_customDispatchTable[5] = reinterpret_cast<uint32_t>(&NetplayCaseThunk);
     g_customDispatchTable[6] = static_cast<uint32_t>(RuntimeAddress(kVaCaseOptions));
     g_customDispatchTable[7] = static_cast<uint32_t>(RuntimeAddress(kVaCaseExit));
 
@@ -161,10 +162,13 @@ void RemoveHooks()
     g_spriteFont = {};
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
+    g_restoreReplaySelectionOnNextTitleUpdate = false;
+    g_replaySelectionGuardFramesRemaining = 0;
+    g_replaySelectionRestoreTarget = -1;
+    g_replayCaseDispatchAddress = 0;
     RemoveNetplayWindowHook();
     RestorePatches();
     g_hooksInstalled.store(false);
     mod::Log("RemoveHooks: restored original bytes");
 }
 } // namespace netplay
-

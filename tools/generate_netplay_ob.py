@@ -145,14 +145,19 @@ def encode_dat(image: Image.Image) -> bytes:
 
 def parse_labels(raw: str | None) -> list[str]:
     default_labels = [
-        "HOST",
-        "JOIN",
-        "CHANGE NICKNAME",
-        "ADDRESS",
-        "PORT",
-        "",
-        "",
-        "RETURN TO TITLE",
+        "HOST",           # row 0 – Main→HOST, Lobby→idle slot 0
+        "JOIN",           # row 1 – Main→JOIN, Lobby→idle slot 1
+        "CHANGE NICKNAME",# row 2 – Main→NICKNAME, Lobby→idle slot 2
+        "ADDRESS",        # row 3 – Join→ADDRESS, Lobby→idle slot 3
+        "PORT",           # row 4 – Host/Join→PORT, Lobby→idle slot 4
+        "LOBBY",          # row 5 – Main→LOBBY (Reserved5).  Text visible in
+                          #          config-style mode; GDI overlays in runtime
+                          #          text mode.
+        "",               # row 6 – Reserved6: intentionally blank black bar.
+                          #          Used as the empty-row blit template to hide
+                          #          unused lobby slots.  Actual content (playing
+                          #          pair etc.) is rendered by GDI above this.
+        "RETURN TO TITLE",# row 7 – all menus→BACK / RETURN
     ]
     if not raw:
         return default_labels

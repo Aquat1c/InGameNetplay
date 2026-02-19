@@ -178,6 +178,49 @@ void DrawTextRight5x7(
         x += glyphW + gap;
     }
 }
+
+void DrawTextLeft5x7(
+    const IndexedSurfaceView& surface,
+    const std::string& text,
+    int leftX,
+    int rightX,
+    int y,
+    int scaleX,
+    int scaleY,
+    uint8_t color)
+{
+    const int maxWidth = rightX - leftX;
+    if (maxWidth <= 0)
+    {
+        return;
+    }
+
+    std::string clipped;
+    clipped.reserve(text.size());
+    for (char c : text)
+    {
+        std::string trial = clipped;
+        trial.push_back(c);
+        if (MeasureText5x7(trial, scaleX) > maxWidth)
+        {
+            break;
+        }
+        clipped.push_back(c);
+    }
+    if (clipped.empty())
+    {
+        return;
+    }
+
+    const int glyphW = 5 * scaleX;
+    const int gap = scaleX;
+    int x = leftX;
+    for (char c : clipped)
+    {
+        DrawGlyph5x7(surface, x, y, c, scaleX, scaleY, color);
+        x += glyphW + gap;
+    }
+}
 }
 
 

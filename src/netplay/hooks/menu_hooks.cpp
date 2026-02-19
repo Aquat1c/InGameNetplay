@@ -15,6 +15,7 @@ std::atomic<bool> g_hooksInstalled{false};
 uintptr_t g_exeBase = 0;
 std::vector<netplay::patch::PatchRecord> g_appliedPatches;
 uint32_t g_customDispatchTable[8] = {};
+uint32_t g_replayCaseDispatchAddress = 0;
 extern "C" uint32_t g_titleCaseReturnAddress = 0;
 std::string g_moduleDirectory;
 
@@ -33,7 +34,11 @@ HFONT g_menuOverlayFont = nullptr;
 HWND g_hookedWindow = nullptr;
 WNDPROC g_originalWindowProc = nullptr;
 bool g_netplayEscapeDown = false;
+bool g_restoreReplaySelectionOnNextTitleUpdate = false;
+uint32_t g_replaySelectionGuardFramesRemaining = 0;
+int8_t g_replaySelectionRestoreTarget = -1;
 InputSnapshot g_lastInputSnapshot = {};
+std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 {
@@ -48,7 +53,32 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 
     if (!g_netplayMenuState.active)
     {
-        return GetOriginalTitleUpdate()(screenContext);
+        const char result = GetOriginalTitleUpdate()(screenContext);
+
+        if (g_restoreReplaySelectionOnNextTitleUpdate)
+        {
+            auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection);
+            if (g_replaySelectionRestoreTarget >= 0 && *selectionPtr == 4)
+            {
+                *selectionPtr = g_replaySelectionRestoreTarget;
+                mod::Log(
+                    "HookedTitleUpdateImpl: guarded replay title selection 4 -> %d (guardFrames=%u)",
+                    static_cast<int>(g_replaySelectionRestoreTarget),
+                    static_cast<unsigned>(g_replaySelectionGuardFramesRemaining));
+            }
+
+            if (g_replaySelectionGuardFramesRemaining > 0)
+            {
+                --g_replaySelectionGuardFramesRemaining;
+                if (g_replaySelectionGuardFramesRemaining == 0)
+                {
+                    g_restoreReplaySelectionOnNextTitleUpdate = false;
+                    g_replaySelectionRestoreTarget = -1;
+                    mod::Log("HookedTitleUpdateImpl: replay selection guard window ended");
+                }
+            }
+        }
+        return result;
     }
     return UpdateNetplayMenu(screenContext);
 }
@@ -83,6 +113,39 @@ extern "C" __declspec(naked) void NetplayCaseThunk()
         add esp, 4
         mov al, 0
         mov edx, dword ptr [g_titleCaseReturnAddress]
+        jmp edx
+    }
+}
+
+extern "C" void __cdecl ReplayCaseCompatImpl(uint32_t screenContext)
+{
+    auto* const selectionPtr =
+        reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection);
+    const int oldSelection = static_cast<int>(*selectionPtr);
+    if (oldSelection != 4)
+    {
+        // Revival checks mode0+1084 == 4 to recognize replay context.
+        g_replaySelectionRestoreTarget = static_cast<int8_t>(oldSelection);
+        *selectionPtr = 4;
+        g_restoreReplaySelectionOnNextTitleUpdate = true;
+        g_replaySelectionGuardFramesRemaining = 300;
+        mod::Log(
+            "ReplayCaseCompatImpl: remapped title selection %d -> 4 for replay compatibility (restoreTarget=%d guardFrames=%u)",
+            oldSelection,
+            static_cast<int>(g_replaySelectionRestoreTarget),
+            static_cast<unsigned>(g_replaySelectionGuardFramesRemaining));
+    }
+}
+
+extern "C" __declspec(naked) void ReplayCaseCompatThunk()
+{
+    __asm
+    {
+        mov eax, dword ptr [ebp-8]
+        push eax
+        call ReplayCaseCompatImpl
+        add esp, 4
+        mov edx, dword ptr [g_replayCaseDispatchAddress]
         jmp edx
     }
 }
@@ -124,4 +187,3 @@ void ShowInProgressMessage(HWND owner)
     MessageBoxA(owner, "In progress", "Netplay", MB_OK | MB_ICONINFORMATION);
 }
 } // namespace netplay
-

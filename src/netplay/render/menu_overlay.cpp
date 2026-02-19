@@ -94,7 +94,16 @@ bool DrawRuntimeTextOverlayGdi(
             }
 
             const std::string label = callbacks.buildRowLabel(entries[i]);
-            SetTextColor(dc, isSelected ? RGB(8, 8, 8) : RGB(108, 108, 108));
+            COLORREF textColor = isSelected ? RGB(8, 8, 8) : RGB(108, 108, 108);
+            if (callbacks.getRowTextColor)
+            {
+                const auto overrideColor = callbacks.getRowTextColor(entries[i], isSelected);
+                if (overrideColor.has_value())
+                {
+                    textColor = overrideColor.value();
+                }
+            }
+            SetTextColor(dc, textColor);
             DrawTextA(dc, label.c_str(), -1, &rowRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
     }
@@ -145,7 +154,9 @@ bool DrawDynamicFieldValuesGdi(
             }
         }
     }
-    if (!hasDynamicField)
+    // Lobby rows all carry dynamic GDI labels (player names, playing pair, Back).
+    const bool isLobby = (state.menuId == netplay::menu::NetplayMenuId::Lobby);
+    if (!hasDynamicField && !isLobby)
     {
         return true;
     }
@@ -172,15 +183,28 @@ bool DrawDynamicFieldValuesGdi(
             for (int i = 0; i < count; ++i)
             {
                 std::string value;
-                if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+                if (isLobby)
                 {
-                    continue;
+                    // For the lobby, every row gets a centered GDI label from
+                    // buildRowLabel (player name, "--", "vs", "BACK", etc.).
+                    if (!callbacks.buildRowLabel)
+                    {
+                        continue;
+                    }
+                    value = callbacks.buildRowLabel(entries[i]);
+                }
+                else
+                {
+                    if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+                    {
+                        continue;
+                    }
                 }
 
                 const int slideY = callbacks.getScaledNativeSlideY(screenContext);
                 const int rowTop = netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY;
                 const int rowBottom = rowTop + state.highlightHeight;
-                const int leftX = highResSurface ? 182 : MulDiv(182, lockedSurface.width, 320);
+                const int leftX = highResSurface ? (isLobby ? 8 : 182) : MulDiv(isLobby ? 8 : 182, lockedSurface.width, 320);
                 const int rightX = highResSurface ? 314 : MulDiv(314, lockedSurface.width, 320);
                 const int topY = highResSurface ? rowTop : MulDiv(rowTop, lockedSurface.height, 240);
                 const int bottomY = highResSurface ? rowBottom : MulDiv(rowBottom, lockedSurface.height, 240);
@@ -194,15 +218,30 @@ bool DrawDynamicFieldValuesGdi(
                     lockedSurface.pitch,
                 };
 
-                netplay::font::DrawTextRight5x7(
-                    surfaceView,
-                    value,
-                    leftX,
-                    rightX - fontScaleX,
-                    textY,
-                    fontScaleX,
-                    fontScaleY,
-                    color);
+                if (isLobby)
+                {
+                    netplay::font::DrawTextLeft5x7(
+                        surfaceView,
+                        value,
+                        leftX,
+                        rightX - fontScaleX,
+                        textY,
+                        fontScaleX,
+                        fontScaleY,
+                        color);
+                }
+                else
+                {
+                    netplay::font::DrawTextRight5x7(
+                        surfaceView,
+                        value,
+                        leftX,
+                        rightX - fontScaleX,
+                        textY,
+                        fontScaleX,
+                        fontScaleY,
+                        color);
+                }
                 drewText = true;
             }
         }
@@ -260,20 +299,47 @@ bool DrawDynamicFieldValuesGdi(
         for (int i = 0; i < count; ++i)
         {
             std::string value;
-            if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+            DWORD textFlags = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+            if (isLobby)
             {
-                continue;
+                if (!callbacks.buildRowLabel)
+                {
+                    continue;
+                }
+                value = callbacks.buildRowLabel(entries[i]);
+                textFlags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+            }
+            else
+            {
+                if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+                {
+                    continue;
+                }
             }
 
             const int slideY = callbacks.getScaledNativeSlideY(screenContext);
             RECT rowRect = {
-                scaleX(182),
+                scaleX(isLobby ? 8 : 182),
                 scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY),
                 scaleX(314),
                 scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + state.highlightHeight + slideY),
             };
-            SetTextColor(dc, (i == selected) ? RGB(255, 255, 255) : RGB(186, 186, 186));
-            DrawTextA(dc, value.c_str(), -1, &rowRect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+            COLORREF textColor = (i == selected) ? RGB(8, 8, 8) : RGB(186, 186, 186);
+            if (!isLobby)
+            {
+                textColor = (i == selected) ? RGB(255, 255, 255) : RGB(186, 186, 186);
+            }
+            else if (callbacks.getRowTextColor)
+            {
+                const auto overrideColor = callbacks.getRowTextColor(entries[i], i == selected);
+                if (overrideColor.has_value())
+                {
+                    textColor = overrideColor.value();
+                }
+            }
+            SetTextColor(dc, textColor);
+            DrawTextA(dc, value.c_str(), -1, &rowRect, textFlags);
         }
     }
 

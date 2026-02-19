@@ -2,15 +2,17 @@
 
 #include "logger.h"
 
+#include <algorithm>
 #include <array>
 
 namespace netplay::menu
 {
-constexpr std::array<NetplayMenuEntry, 4> kMainMenuEntries = {{
-    {NetplayMenuAction::OpenHost, RowToIndex(NetplayObRow::Host), "HOST"},
-    {NetplayMenuAction::OpenJoin, RowToIndex(NetplayObRow::Join), "JOIN"},
-    {NetplayMenuAction::OpenNickname, RowToIndex(NetplayObRow::Nickname), "CHANGE_NICKNAME"},
-    {NetplayMenuAction::LeaveNetplay, RowToIndex(NetplayObRow::ReturnToTitle), "RETURN_TO_TITLE"},
+constexpr std::array<NetplayMenuEntry, 5> kMainMenuEntries = {{
+    {NetplayMenuAction::OpenHost,     RowToIndex(NetplayObRow::Host),         "HOST"},
+    {NetplayMenuAction::OpenJoin,     RowToIndex(NetplayObRow::Join),         "JOIN"},
+    {NetplayMenuAction::OpenLobby,    RowToIndex(NetplayObRow::Reserved5),    "LOBBY"},
+    {NetplayMenuAction::OpenNickname, RowToIndex(NetplayObRow::Nickname),     "CHANGE_NICKNAME"},
+    {NetplayMenuAction::LeaveNetplay, RowToIndex(NetplayObRow::ReturnToTitle),"RETURN_TO_TITLE"},
 }};
 
 constexpr std::array<NetplayMenuEntry, 3> kHostMenuEntries = {{
@@ -31,6 +33,35 @@ constexpr std::array<NetplayMenuEntry, 2> kNicknameMenuEntries = {{
     {NetplayMenuAction::BackToMain, RowToIndex(NetplayObRow::ReturnToTitle), "BACK"},
 }};
 
+// Lobby browser: dynamic entry list rebuilt per-frame by RebuildLobbyMenuEntries.
+// Maximum size is kLobbyMaxDisplayPlayers slots + LobbyPlaying0 + BackToMain.
+static NetplayMenuEntry s_lobbyDynEntries[kLobbyMaxDisplayPlayers + 2] = {};
+static NetplayMenuSpec  s_lobbyDynSpec = {
+    NetplayMenuId::Lobby, "LOBBY BROWSER", s_lobbyDynEntries, 0, 0
+};
+
+void RebuildLobbyMenuEntries(int idleCount, int playingCount)
+{
+    const int visSlots = std::min(idleCount, kLobbyMaxDisplayPlayers);
+    // All player/playing rows use Reserved6 (blank bar from the sprite sheet).
+    // The actual label text is drawn on top by DrawDynamicFieldValuesGdi.
+    // BackToMain uses ReturnToTitle so the "RETURN TO TITLE" bar is shown.
+    constexpr int kBlankRow  = RowToIndex(NetplayObRow::Reserved6);
+    constexpr int kBackRow   = RowToIndex(NetplayObRow::ReturnToTitle);
+    int idx = 0;
+    for (int s = 0; s < visSlots; ++s)
+    {
+        s_lobbyDynEntries[idx++] = {LobbySlotAction(s), kBlankRow, "LOBBY_SLOT"};
+    }
+    // LobbyPlaying0 only added when there is at least one active match.
+    if (playingCount > 0)
+    {
+        s_lobbyDynEntries[idx++] = {NetplayMenuAction::LobbyPlaying0, kBlankRow, "LOBBY_PLAYING_0"};
+    }
+    s_lobbyDynEntries[idx++] = {NetplayMenuAction::BackToMain, kBackRow, "BACK"};
+    s_lobbyDynSpec.entryCount = idx;
+}
+
 const char* MenuIdToString(NetplayMenuId menuId)
 {
     switch (menuId)
@@ -43,6 +74,8 @@ const char* MenuIdToString(NetplayMenuId menuId)
         return "Join";
     case NetplayMenuId::Nickname:
         return "Nickname";
+    case NetplayMenuId::Lobby:
+        return "Lobby";
     default:
         return "Unknown";
     }
@@ -75,11 +108,18 @@ const char* RowIndexToString(int rowIndex)
 
 const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
 {
+    // Lobby uses a dynamically rebuilt spec (entry count changes with player
+    // count) so it lives in mutable storage rather than in a const static array.
+    if (menuId == NetplayMenuId::Lobby)
+    {
+        return &s_lobbyDynSpec;
+    }
+
     static const std::array<NetplayMenuSpec, 4> specs = {{
-        {NetplayMenuId::Main, "NETPLAY SETTINGS", kMainMenuEntries.data(), static_cast<int>(kMainMenuEntries.size()), 0},
-        {NetplayMenuId::Host, "HOST SETTINGS", kHostMenuEntries.data(), static_cast<int>(kHostMenuEntries.size()), 0},
-        {NetplayMenuId::Join, "JOIN SETTINGS", kJoinMenuEntries.data(), static_cast<int>(kJoinMenuEntries.size()), 0},
-        {NetplayMenuId::Nickname, "NICKNAME", kNicknameMenuEntries.data(), static_cast<int>(kNicknameMenuEntries.size()), 0},
+        {NetplayMenuId::Main,     "NETPLAY SETTINGS", kMainMenuEntries.data(),     static_cast<int>(kMainMenuEntries.size()),     0},
+        {NetplayMenuId::Host,     "HOST SETTINGS",    kHostMenuEntries.data(),     static_cast<int>(kHostMenuEntries.size()),     0},
+        {NetplayMenuId::Join,     "JOIN SETTINGS",    kJoinMenuEntries.data(),     static_cast<int>(kJoinMenuEntries.size()),     0},
+        {NetplayMenuId::Nickname, "NICKNAME",         kNicknameMenuEntries.data(), static_cast<int>(kNicknameMenuEntries.size()), 0},
     }};
 
     for (const NetplayMenuSpec& spec : specs)
@@ -118,6 +158,22 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "JoinEditPort";
     case NetplayMenuAction::NicknameEdit:
         return "NicknameEdit";
+    case NetplayMenuAction::OpenLobby:
+        return "OpenLobby";
+    case NetplayMenuAction::LobbySlot0:
+        return "LobbySlot0";
+    case NetplayMenuAction::LobbySlot1:
+        return "LobbySlot1";
+    case NetplayMenuAction::LobbySlot2:
+        return "LobbySlot2";
+    case NetplayMenuAction::LobbySlot3:
+        return "LobbySlot3";
+    case NetplayMenuAction::LobbySlot4:
+        return "LobbySlot4";
+    case NetplayMenuAction::LobbySlot5:
+        return "LobbySlot5";
+    case NetplayMenuAction::LobbyPlaying0:
+        return "LobbyPlaying0";
     default:
         return "Unknown";
     }
@@ -154,15 +210,23 @@ int GetDefaultSelectionForMenu(NetplayMenuId menuId)
 
 bool ValidateMenuSpecs()
 {
-    constexpr std::array<NetplayMenuId, 4> kMenus = {
+    constexpr std::array<NetplayMenuId, 5> kMenus = {
         NetplayMenuId::Main,
         NetplayMenuId::Host,
         NetplayMenuId::Join,
         NetplayMenuId::Nickname,
+        NetplayMenuId::Lobby,
     };
 
     for (NetplayMenuId menuId : kMenus)
     {
+        // The lobby spec is rebuilt dynamically at runtime; seed it so
+        // validation can inspect a minimal valid layout.
+        if (menuId == NetplayMenuId::Lobby)
+        {
+            RebuildLobbyMenuEntries(0, 0);
+        }
+
         const NetplayMenuSpec* spec = GetMenuSpec(menuId);
         if (spec == nullptr || spec->entries == nullptr || spec->entryCount <= 0)
         {

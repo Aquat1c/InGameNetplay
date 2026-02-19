@@ -12,3 +12,5 @@ build/
 *.dll
 *.exe
 *.c
+shared_documentation/
+decompilations/

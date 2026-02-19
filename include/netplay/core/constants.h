@@ -80,8 +80,8 @@ inline constexpr unsigned short kNetplayBgmTrack = 8;
 inline constexpr uint32_t kNetplayFrameLogIntervalMs = 500;
 inline constexpr uint16_t kDefaultNetplayPort = 7500;
 
-inline constexpr int kNetplayDefaultOptionCount = 4;
-inline constexpr int kNetplayDefaultBackIndex = 3;
+inline constexpr int kNetplayDefaultOptionCount = 5; // main menu now has 5 entries
+inline constexpr int kNetplayDefaultBackIndex = 4;
 inline constexpr int kNetplayConfigOptionCount = netplay::menu::kConfigOptionCount;
 inline constexpr int kNetplayConfigBackIndex = 7;
 inline constexpr int kNetplayDefaultHighlightHeight = 14;
