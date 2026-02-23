@@ -95,15 +95,34 @@ bool IsRenderRowUsedByMenu(NetplayMenuId menuId, int rowIndex)
 
 int GetScaledNativeSlideY(uint32_t screenContext)
 {
-    int slideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
-    slideY /= kNetplayNativeSlideDivisor;
-    if (slideY < -400)
+    if (!g_menuSlideTransition.active)
     {
-        slideY = -400;
+        return 0;
     }
-    if (slideY > 400)
+
+    const int rawSlideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
+    if (rawSlideY < -8192 || rawSlideY > 8192)
     {
-        slideY = 400;
+        static bool loggedInvalidSlideY = false;
+        if (!loggedInvalidSlideY)
+        {
+            mod::Log(
+                "GetScaledNativeSlideY: ignoring out-of-range raw value=%d at 0x%08X",
+                rawSlideY,
+                screenContext + kOffsetSlideAnimationY);
+            loggedInvalidSlideY = true;
+        }
+        return 0;
+    }
+
+    int slideY = rawSlideY / kNetplayNativeSlideDivisor;
+    if (slideY < -120)
+    {
+        slideY = -120;
+    }
+    if (slideY > 120)
+    {
+        slideY = 120;
     }
     return slideY;
 }
@@ -355,4 +374,3 @@ uintptr_t RuntimeAddress(uintptr_t va)
     return g_exeBase + (va - kEfzImageBase);
 }
 } // namespace netplay::hooks::internal
-

@@ -22,6 +22,11 @@ Runtime DLL mod that injects a `NETPLAY` entry into EFZ title menu and runs a cu
   - Join: `CONNECT`, editable `ADDRESS`, editable `PORT`, `BACK`
   - Nickname: editable `NAME`, `BACK`
   - Canonical row slots: `0,1,2,3,4,7` (`5/6` reserved)
+- Integrated Revival takeover bridge (no separate `netbridge.dll`):
+  - `HostStart` / `JoinConnect` / spectate actions call bridge session start
+  - Bridge spawns `EfzRevival.exe` suspended, injects this same DLL, patches IAT stubs, resumes, handshakes init, and reuses local `EfzRevival.dll`
+  - Export compatibility is preserved from this DLL: `netbridge_StartNetplaySession`, `netbridge_GetStatus`, `netbridge_CancelSession`
+  - Connecting state supports in-menu cancel (`ESC` / controller cancel)
 - Inline editing is embedded in-menu (no extra modal input window):
   - `Enter` commits
   - `Esc` cancels edit only
@@ -69,16 +74,64 @@ Runtime DLL mod that injects a `NETPLAY` entry into EFZ title menu and runs a cu
 
 ## Build (CMake / Visual Studio)
 ```powershell
-cmake -S . -B build -A Win32
-cmake --build build --config Release
+cmake --preset release
+cmake --build --preset build-release
 ```
 
 Output:
-- `build/bin/Release/efz_netplay_mod.dll`
+- `build_release_win32/bin/Release/efz_netplay_mod.dll`
 
 Notes:
 - EFZ is 32-bit; always use `-A Win32`.
 - Patches validate expected original bytes before writing.
 - Unsupported `efz.exe` builds fail hook install safely with logs.
+
+## XP Compatibility
+- The DLL now avoids hard links against `winhttp.dll` and `dbghelp.dll`:
+  - Lobby HTTP API loads dynamically at runtime (`WinHTTP`, then `WinINet` fallback).
+  - Crash dump API (`MiniDumpWriteDump`) loads dynamically at runtime.
+- HTTPS lobby can also use embedded TLS (mbedTLS linked statically into this DLL), so it does not depend on OS TLS support.
+- This removes loader failures from those optional components on older systems, but full XP compatibility still depends on the compiler toolset runtime imports.
+- Lobby note:
+  - Concerto requires modern TLS (1.2+). Legacy XP Schannel cannot negotiate this reliably.
+  - On XP-family systems (major version 5), the mod now auto-enables embedded TLS if no explicit backend override is configured.
+  - You can still override manually with INI/env keys below.
+- Embedded TLS settings:
+  - Add to `EfzRevival.ini`:
+```ini
+[Lobby]
+ForceEmbeddedTls=1
+TlsVerify=0
+```
+  - Runtime env overrides:
+    - `EFZ_LOBBY_FORCE_EMBEDDED_TLS`
+    - `EFZ_LOBBY_TLS_VERIFY`
+- Optional fallback proxy endpoint (automatic retry, no force flags required):
+  - If the primary lobby endpoint fails, the mod retries once against `ProxyBaseUrl`.
+  - Works with both `https://` and `http://` proxy endpoints.
+  - Add to `EfzRevival.ini`:
+```ini
+[Lobby]
+ProxyBaseUrl=https://your-lobby-proxy.example
+```
+  - Runtime env override:
+    - `EFZ_LOBBY_PROXY_BASE_URL`
+- Optional local proxy/bridge endpoint (XP-friendly plain HTTP):
+  - Add to `EfzRevival.ini`:
+```ini
+[Lobby]
+ProxyBaseUrl=http://127.0.0.1:17777
+ForceWinInet=1
+```
+  - Runtime env overrides (useful for quick testing without editing INI):
+    - `EFZ_LOBBY_BASE_URL`
+    - `EFZ_LOBBY_FORCE_WININET`
+- Use the XP preset with the XP toolset installed:
+```powershell
+cmake --preset xp-release
+cmake --build --preset build-xp-release
+```
+- If `v141_xp` is missing, configure fails with `MSB8020` and XP builds cannot be produced yet.
+- Current modern-toolset builds (v143/v180) still import Vista+ kernel APIs and will not load on Windows XP.
 
 See `NETPLAY_MENU_INTEGRATION.md` for detailed reverse-engineering notes, addresses, and menu flow documentation.

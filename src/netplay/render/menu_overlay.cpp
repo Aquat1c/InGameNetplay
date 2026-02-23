@@ -147,7 +147,8 @@ bool DrawDynamicFieldValuesGdi(
     {
         for (int i = 0; i < count; ++i)
         {
-            if (callbacks.isInlineEditableAction(entries[i].action))
+            if (callbacks.isInlineEditableAction(entries[i].action)
+                || entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
             {
                 hasDynamicField = true;
                 break;
@@ -183,6 +184,7 @@ bool DrawDynamicFieldValuesGdi(
             for (int i = 0; i < count; ++i)
             {
                 std::string value;
+                bool drawAsLabel = false;
                 if (isLobby)
                 {
                     // For the lobby, every row gets a centered GDI label from
@@ -195,7 +197,12 @@ bool DrawDynamicFieldValuesGdi(
                 }
                 else
                 {
-                    if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+                    if (entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
+                    {
+                        value = callbacks.buildRowLabel(entries[i]);
+                        drawAsLabel = true;
+                    }
+                    else if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
                     {
                         continue;
                     }
@@ -204,7 +211,9 @@ bool DrawDynamicFieldValuesGdi(
                 const int slideY = callbacks.getScaledNativeSlideY(screenContext);
                 const int rowTop = netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY;
                 const int rowBottom = rowTop + state.highlightHeight;
-                const int leftX = highResSurface ? (isLobby ? 8 : 182) : MulDiv(isLobby ? 8 : 182, lockedSurface.width, 320);
+                const int leftX = highResSurface
+                    ? (isLobby ? 8 : (drawAsLabel ? 152 : 182))
+                    : MulDiv(isLobby ? 8 : (drawAsLabel ? 152 : 182), lockedSurface.width, 320);
                 const int rightX = highResSurface ? 314 : MulDiv(314, lockedSurface.width, 320);
                 const int topY = highResSurface ? rowTop : MulDiv(rowTop, lockedSurface.height, 240);
                 const int bottomY = highResSurface ? rowBottom : MulDiv(rowBottom, lockedSurface.height, 240);
@@ -218,7 +227,7 @@ bool DrawDynamicFieldValuesGdi(
                     lockedSurface.pitch,
                 };
 
-                if (isLobby)
+                if (isLobby || drawAsLabel)
                 {
                     netplay::font::DrawTextLeft5x7(
                         surfaceView,
@@ -300,6 +309,7 @@ bool DrawDynamicFieldValuesGdi(
         {
             std::string value;
             DWORD textFlags = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+            bool drawAsLabel = false;
             if (isLobby)
             {
                 if (!callbacks.buildRowLabel)
@@ -311,7 +321,13 @@ bool DrawDynamicFieldValuesGdi(
             }
             else
             {
-                if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
+                if (entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
+                {
+                    value = callbacks.buildRowLabel(entries[i]);
+                    textFlags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+                    drawAsLabel = true;
+                }
+                else if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
                 {
                     continue;
                 }
@@ -319,7 +335,7 @@ bool DrawDynamicFieldValuesGdi(
 
             const int slideY = callbacks.getScaledNativeSlideY(screenContext);
             RECT rowRect = {
-                scaleX(isLobby ? 8 : 182),
+                scaleX(isLobby ? 8 : (drawAsLabel ? 152 : 182)),
                 scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY),
                 scaleX(314),
                 scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + state.highlightHeight + slideY),
@@ -351,5 +367,4 @@ bool DrawDynamicFieldValuesGdi(
     return true;
 }
 }
-
 

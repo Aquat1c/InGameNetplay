@@ -4,7 +4,7 @@
 
 namespace mod
 {
-bool InitializeLogger(HMODULE moduleHandle);
+bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole = true);
 void ShutdownLogger();
 void Log(const char* fmt, ...);
 }

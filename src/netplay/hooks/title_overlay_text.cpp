@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/session_bridge.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -146,6 +147,14 @@ std::string BuildFooterText()
     }
 
     char buffer[256] = {};
+    const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+    const auto bridgePhase = static_cast<netplay::bridge::NetbridgePhase>(bridgeStatus.phase);
+    if (bridgePhase != netplay::bridge::NetbridgePhase::Idle)
+    {
+        netplay::bridge::BuildStatusLine(bridgeStatus, buffer, sizeof(buffer));
+        return buffer;
+    }
+
     if (g_netplayMenuState.menuId == NetplayMenuId::Lobby)
     {
         if (!g_lobbySession)

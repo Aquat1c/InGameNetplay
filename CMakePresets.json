@@ -1,0 +1,50 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "architecture": {
+        "value": "Win32",
+        "strategy": "set"
+      },
+      "cacheVariables": {
+        "EFZ_STATIC_RUNTIME": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build_release_win32",
+      "cacheVariables": {
+        "EFZ_XP_COMPAT": "OFF"
+      }
+    },
+    {
+      "name": "xp-release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build_xp_win32",
+      "toolset": "v141_xp",
+      "cacheVariables": {
+        "EFZ_XP_COMPAT": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-release",
+      "configurePreset": "release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-xp-release",
+      "configurePreset": "xp-release",
+      "configuration": "Release"
+    }
+  ]
+}

@@ -28,6 +28,7 @@ inline constexpr uintptr_t kVaUpdateTitleScreenLogic = 0x00775FB0;
 inline constexpr uintptr_t kVaTitleVtableRender = 0x00789980;
 inline constexpr uintptr_t kVaTitleVtableUpdate = 0x00789984;
 inline constexpr uintptr_t kVaTitleCaseEpilogue = 0x00776483;
+inline constexpr uintptr_t kVaCurrentScreenIndex = 0x00790148;
 
 inline constexpr uintptr_t kVaWrapCmpMax = 0x0077612E;
 inline constexpr uintptr_t kVaWrapClampNegative = 0x0077614B;
@@ -108,6 +109,5 @@ struct NetplayRenderLayout
     int highlightHeight = kNetplayDefaultHighlightHeight;
 };
 }
-
 
 

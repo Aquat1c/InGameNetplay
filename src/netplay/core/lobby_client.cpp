@@ -1,26 +1,977 @@
 #include "netplay/core/lobby_client.h"
+#include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <type_traits>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winhttp.h>
-#pragma comment(lib, "winhttp.lib")
+#include <wininet.h>
 
 namespace netplay::lobby
 {
 namespace
 {
+constexpr const char* kConcertoHostUtf8 = "concerto-mbaacc.shib.live";
 constexpr const wchar_t* kConcertoHost = L"concerto-mbaacc.shib.live";
 constexpr INTERNET_PORT kConcertoPort = INTERNET_DEFAULT_HTTPS_PORT;
 constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kReceiveTimeoutMs = 12000;
 constexpr DWORD kPollIntervalMs = 3000;
+std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
+
+struct LobbyEndpointConfig
+{
+    bool forceWinInet = false;
+    bool forceEmbeddedTls = false;
+    bool tlsVerify = false;
+    bool hasBaseUrlOverride = false;
+    std::string baseUrl;
+    bool hasProxyBaseUrl = false;
+    std::string proxyBaseUrl;
+};
+
+std::string TrimAscii(std::string value)
+{
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0)
+    {
+        ++begin;
+    }
+
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0)
+    {
+        --end;
+    }
+
+    return value.substr(begin, end - begin);
+}
+
+std::string ResolveRevivalIniPath()
+{
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exePath, static_cast<DWORD>(std::size(exePath))) == 0)
+    {
+        return "EfzRevival.ini";
+    }
+
+    std::string iniPath = exePath;
+    const size_t sep = iniPath.find_last_of("\\/");
+    if (sep == std::string::npos)
+    {
+        return "EfzRevival.ini";
+    }
+
+    iniPath.resize(sep + 1);
+    iniPath += "EfzRevival.ini";
+    return iniPath;
+}
+
+bool ParseBoolValue(const std::string& text, bool* out)
+{
+    if (out == nullptr)
+    {
+        return false;
+    }
+
+    std::string normalized = TrimAscii(text);
+    for (char& c : normalized)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on")
+    {
+        *out = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off")
+    {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+std::string ReadEnvironmentString(const char* name)
+{
+    if (name == nullptr || name[0] == '\0')
+    {
+        return std::string();
+    }
+
+    char buffer[1024] = {};
+    const DWORD size = GetEnvironmentVariableA(name, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (size == 0 || size >= static_cast<DWORD>(std::size(buffer)))
+    {
+        return std::string();
+    }
+    return std::string(buffer, buffer + size);
+}
+
+bool HasHttpScheme(const std::string& value)
+{
+    if (value.size() < 8)
+    {
+        return false;
+    }
+
+    auto startsWithIgnoreCase = [&](const char* prefix) -> bool
+    {
+        const size_t n = std::strlen(prefix);
+        if (value.size() < n)
+        {
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i)
+        {
+            const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+            const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[i])));
+            if (a != b)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    return startsWithIgnoreCase("http://") || startsWithIgnoreCase("https://");
+}
+
+bool HasHttpsScheme(const std::string& value)
+{
+    if (value.size() < 8)
+    {
+        return false;
+    }
+    const char* prefix = "https://";
+    for (size_t i = 0; i < 8; ++i)
+    {
+        const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+        if (a != prefix[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string NormalizeBaseUrl(std::string value)
+{
+    value = TrimAscii(std::move(value));
+    while (!value.empty() && value.back() == '/')
+    {
+        value.pop_back();
+    }
+    return value;
+}
+
+struct WindowsVersionInfo
+{
+    DWORD major = 0;
+    DWORD minor = 0;
+    DWORD build = 0;
+    bool valid = false;
+};
+
+WindowsVersionInfo QueryWindowsVersion()
+{
+    WindowsVersionInfo info = {};
+
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOEXW*);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (ntdll != nullptr)
+    {
+        auto rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
+        if (rtlGetVersion != nullptr)
+        {
+            OSVERSIONINFOEXW version = {};
+            version.dwOSVersionInfoSize = sizeof(version);
+            if (rtlGetVersion(&version) == 0)
+            {
+                info.major = version.dwMajorVersion;
+                info.minor = version.dwMinorVersion;
+                info.build = version.dwBuildNumber;
+                info.valid = true;
+                return info;
+            }
+        }
+    }
+    return info;
+}
+
+bool IsWindowsXpFamily(const WindowsVersionInfo& info)
+{
+    if (!info.valid)
+    {
+        return false;
+    }
+
+    // Windows 2000/XP/Server 2003 all report major version 5.
+    return info.major <= 5;
+}
+
+const LobbyEndpointConfig& GetLobbyEndpointConfig()
+{
+    static LobbyEndpointConfig config;
+    static bool initialized = false;
+    if (initialized)
+    {
+        return config;
+    }
+    initialized = true;
+
+    std::string iniBaseUrl;
+    std::string iniProxyBaseUrl;
+    bool iniForceWinInet = false;
+    bool hasIniForceWinInet = false;
+    bool iniForceEmbeddedTls = false;
+    bool hasIniForceEmbeddedTls = false;
+    bool iniTlsVerify = false;
+    bool hasIniTlsVerify = false;
+
+    const std::string iniPath = ResolveRevivalIniPath();
+    if (GetFileAttributesA(iniPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        char baseUrlBuf[512] = {};
+        (void)GetPrivateProfileStringA(
+            "Lobby",
+            "BaseUrl",
+            "",
+            baseUrlBuf,
+            static_cast<DWORD>(std::size(baseUrlBuf)),
+            iniPath.c_str());
+        iniBaseUrl = TrimAscii(baseUrlBuf);
+
+        char proxyBaseUrlBuf[512] = {};
+        (void)GetPrivateProfileStringA(
+            "Lobby",
+            "ProxyBaseUrl",
+            "",
+            proxyBaseUrlBuf,
+            static_cast<DWORD>(std::size(proxyBaseUrlBuf)),
+            iniPath.c_str());
+        iniProxyBaseUrl = TrimAscii(proxyBaseUrlBuf);
+
+        char forceBuf[32] = {};
+        (void)GetPrivateProfileStringA(
+            "Lobby",
+            "ForceWinInet",
+            "",
+            forceBuf,
+            static_cast<DWORD>(std::size(forceBuf)),
+            iniPath.c_str());
+        if (forceBuf[0] != '\0')
+        {
+            hasIniForceWinInet = ParseBoolValue(forceBuf, &iniForceWinInet);
+            if (!hasIniForceWinInet)
+            {
+                mod::Log(
+                    "LobbySession: invalid Lobby.ForceWinInet='%s' in '%s' (expected 0/1/true/false)",
+                    forceBuf,
+                    iniPath.c_str());
+            }
+        }
+
+        char forceEmbeddedBuf[32] = {};
+        (void)GetPrivateProfileStringA(
+            "Lobby",
+            "ForceEmbeddedTls",
+            "",
+            forceEmbeddedBuf,
+            static_cast<DWORD>(std::size(forceEmbeddedBuf)),
+            iniPath.c_str());
+        if (forceEmbeddedBuf[0] != '\0')
+        {
+            hasIniForceEmbeddedTls = ParseBoolValue(forceEmbeddedBuf, &iniForceEmbeddedTls);
+            if (!hasIniForceEmbeddedTls)
+            {
+                mod::Log(
+                    "LobbySession: invalid Lobby.ForceEmbeddedTls='%s' in '%s' (expected 0/1/true/false)",
+                    forceEmbeddedBuf,
+                    iniPath.c_str());
+            }
+        }
+
+        char tlsVerifyBuf[32] = {};
+        (void)GetPrivateProfileStringA(
+            "Lobby",
+            "TlsVerify",
+            "",
+            tlsVerifyBuf,
+            static_cast<DWORD>(std::size(tlsVerifyBuf)),
+            iniPath.c_str());
+        if (tlsVerifyBuf[0] != '\0')
+        {
+            hasIniTlsVerify = ParseBoolValue(tlsVerifyBuf, &iniTlsVerify);
+            if (!hasIniTlsVerify)
+            {
+                mod::Log(
+                    "LobbySession: invalid Lobby.TlsVerify='%s' in '%s' (expected 0/1/true/false)",
+                    tlsVerifyBuf,
+                    iniPath.c_str());
+            }
+        }
+    }
+
+    const std::string envBaseUrl = TrimAscii(ReadEnvironmentString("EFZ_LOBBY_BASE_URL"));
+    const std::string envProxyBaseUrl = TrimAscii(ReadEnvironmentString("EFZ_LOBBY_PROXY_BASE_URL"));
+    const std::string envForceWinInetText = TrimAscii(ReadEnvironmentString("EFZ_LOBBY_FORCE_WININET"));
+    const std::string envForceEmbeddedTlsText = TrimAscii(ReadEnvironmentString("EFZ_LOBBY_FORCE_EMBEDDED_TLS"));
+    const std::string envTlsVerifyText = TrimAscii(ReadEnvironmentString("EFZ_LOBBY_TLS_VERIFY"));
+    bool envForceWinInet = false;
+    bool hasEnvForceWinInet = false;
+    bool envForceEmbeddedTls = false;
+    bool hasEnvForceEmbeddedTls = false;
+    bool envTlsVerify = false;
+    bool hasEnvTlsVerify = false;
+    if (!envForceWinInetText.empty())
+    {
+        hasEnvForceWinInet = ParseBoolValue(envForceWinInetText, &envForceWinInet);
+        if (!hasEnvForceWinInet)
+        {
+            mod::Log(
+                "LobbySession: invalid EFZ_LOBBY_FORCE_WININET='%s' (expected 0/1/true/false)",
+                envForceWinInetText.c_str());
+        }
+    }
+    if (!envForceEmbeddedTlsText.empty())
+    {
+        hasEnvForceEmbeddedTls = ParseBoolValue(envForceEmbeddedTlsText, &envForceEmbeddedTls);
+        if (!hasEnvForceEmbeddedTls)
+        {
+            mod::Log(
+                "LobbySession: invalid EFZ_LOBBY_FORCE_EMBEDDED_TLS='%s' (expected 0/1/true/false)",
+                envForceEmbeddedTlsText.c_str());
+        }
+    }
+    if (!envTlsVerifyText.empty())
+    {
+        hasEnvTlsVerify = ParseBoolValue(envTlsVerifyText, &envTlsVerify);
+        if (!hasEnvTlsVerify)
+        {
+            mod::Log(
+                "LobbySession: invalid EFZ_LOBBY_TLS_VERIFY='%s' (expected 0/1/true/false)",
+                envTlsVerifyText.c_str());
+        }
+    }
+
+    const std::string selectedBaseUrl = !envBaseUrl.empty() ? envBaseUrl : iniBaseUrl;
+    if (!selectedBaseUrl.empty())
+    {
+        config.baseUrl = NormalizeBaseUrl(selectedBaseUrl);
+        if (HasHttpScheme(config.baseUrl))
+        {
+            config.hasBaseUrlOverride = true;
+        }
+        else
+        {
+            mod::Log(
+                "LobbySession: ignoring lobby base URL without http/https scheme: '%s'",
+                config.baseUrl.c_str());
+            config.baseUrl.clear();
+        }
+    }
+
+    const std::string selectedProxyBaseUrl = !envProxyBaseUrl.empty() ? envProxyBaseUrl : iniProxyBaseUrl;
+    if (!selectedProxyBaseUrl.empty())
+    {
+        config.proxyBaseUrl = NormalizeBaseUrl(selectedProxyBaseUrl);
+        if (HasHttpScheme(config.proxyBaseUrl))
+        {
+            config.hasProxyBaseUrl = true;
+        }
+        else
+        {
+            mod::Log(
+                "LobbySession: ignoring proxy base URL without http/https scheme: '%s'",
+                config.proxyBaseUrl.c_str());
+            config.proxyBaseUrl.clear();
+        }
+    }
+
+    if (hasEnvForceWinInet)
+    {
+        config.forceWinInet = envForceWinInet;
+    }
+    else if (hasIniForceWinInet)
+    {
+        config.forceWinInet = iniForceWinInet;
+    }
+
+    if (hasEnvForceEmbeddedTls)
+    {
+        config.forceEmbeddedTls = envForceEmbeddedTls;
+    }
+    else if (hasIniForceEmbeddedTls)
+    {
+        config.forceEmbeddedTls = iniForceEmbeddedTls;
+    }
+
+    if (hasEnvTlsVerify)
+    {
+        config.tlsVerify = envTlsVerify;
+    }
+    else if (hasIniTlsVerify)
+    {
+        config.tlsVerify = iniTlsVerify;
+    }
+
+    const bool hasExplicitBackendOverride =
+        hasEnvForceWinInet || hasIniForceWinInet || hasEnvForceEmbeddedTls || hasIniForceEmbeddedTls;
+    if (!hasExplicitBackendOverride)
+    {
+        const WindowsVersionInfo windowsVersion = QueryWindowsVersion();
+        if (IsWindowsXpFamily(windowsVersion))
+        {
+            config.forceEmbeddedTls = true;
+            mod::Log(
+                "LobbySession: detected legacy Windows %lu.%lu build=%lu; auto enabling ForceEmbeddedTls=1",
+                static_cast<unsigned long>(windowsVersion.major),
+                static_cast<unsigned long>(windowsVersion.minor),
+                static_cast<unsigned long>(windowsVersion.build));
+        }
+    }
+
+    if (config.forceEmbeddedTls && config.forceWinInet)
+    {
+        mod::Log("LobbySession: both force flags set; ForceEmbeddedTls takes priority for HTTPS URLs");
+    }
+
+    mod::Log(
+        "LobbySession: endpoint config override=%d baseUrl='%s' proxyOverride=%d proxyBaseUrl='%s' forceWinInet=%d forceEmbeddedTls=%d tlsVerify=%d embeddedAvailable=%d",
+        config.hasBaseUrlOverride ? 1 : 0,
+        config.hasBaseUrlOverride ? config.baseUrl.c_str() : "",
+        config.hasProxyBaseUrl ? 1 : 0,
+        config.hasProxyBaseUrl ? config.proxyBaseUrl.c_str() : "",
+        config.forceWinInet ? 1 : 0,
+        config.forceEmbeddedTls ? 1 : 0,
+        config.tlsVerify ? 1 : 0,
+        netplay::tls::IsAvailable() ? 1 : 0);
+
+    return config;
+}
+
+std::string BuildLobbyRequestUrl(const std::string& path)
+{
+    const LobbyEndpointConfig& config = GetLobbyEndpointConfig();
+    if (config.hasBaseUrlOverride)
+    {
+        return config.baseUrl + path;
+    }
+    return std::string("https://") + kConcertoHostUtf8 + path;
+}
+
+std::string BuildLobbyProxyRequestUrl(const std::string& path)
+{
+    const LobbyEndpointConfig& config = GetLobbyEndpointConfig();
+    if (!config.hasProxyBaseUrl)
+    {
+        return std::string();
+    }
+    return config.proxyBaseUrl + path;
+}
+
+struct WinHttpApi
+{
+    HMODULE module = nullptr;
+    bool initialized = false;
+    bool available = false;
+
+    decltype(&WinHttpOpen) Open = nullptr;
+    decltype(&WinHttpSetTimeouts) SetTimeouts = nullptr;
+    decltype(&WinHttpConnect) Connect = nullptr;
+    decltype(&WinHttpOpenRequest) OpenRequest = nullptr;
+    decltype(&WinHttpSendRequest) SendRequest = nullptr;
+    decltype(&WinHttpReceiveResponse) ReceiveResponse = nullptr;
+    decltype(&WinHttpQueryDataAvailable) QueryDataAvailable = nullptr;
+    decltype(&WinHttpReadData) ReadData = nullptr;
+    decltype(&WinHttpCloseHandle) CloseHandle = nullptr;
+};
+
+WinHttpApi& GetWinHttpApi()
+{
+    static WinHttpApi api;
+    if (api.initialized)
+    {
+        return api;
+    }
+    api.initialized = true;
+
+    api.module = LoadLibraryA("winhttp.dll");
+    if (api.module == nullptr)
+    {
+        mod::Log("LobbySession: winhttp.dll unavailable (%lu); will try WinINet fallback", GetLastError());
+        return api;
+    }
+
+    auto resolve = [&](auto* fn, const char* name) -> bool
+    {
+        *fn = reinterpret_cast<std::remove_reference_t<decltype(*fn)>>(GetProcAddress(api.module, name));
+        if (*fn == nullptr)
+        {
+            mod::Log("LobbySession: missing WinHTTP symbol '%s' (%lu)", name, GetLastError());
+            return false;
+        }
+        return true;
+    };
+
+    if (!resolve(&api.Open, "WinHttpOpen")
+        || !resolve(&api.SetTimeouts, "WinHttpSetTimeouts")
+        || !resolve(&api.Connect, "WinHttpConnect")
+        || !resolve(&api.OpenRequest, "WinHttpOpenRequest")
+        || !resolve(&api.SendRequest, "WinHttpSendRequest")
+        || !resolve(&api.ReceiveResponse, "WinHttpReceiveResponse")
+        || !resolve(&api.QueryDataAvailable, "WinHttpQueryDataAvailable")
+        || !resolve(&api.ReadData, "WinHttpReadData")
+        || !resolve(&api.CloseHandle, "WinHttpCloseHandle"))
+    {
+        FreeLibrary(api.module);
+        api.module = nullptr;
+        return api;
+    }
+
+    api.available = true;
+    mod::Log("LobbySession: WinHTTP runtime API loaded");
+    return api;
+}
+
+struct WinInetApi
+{
+    HMODULE module = nullptr;
+    bool initialized = false;
+    bool available = false;
+
+    decltype(&InternetOpenW) Open = nullptr;
+    decltype(&InternetSetOptionW) SetOption = nullptr;
+    decltype(&InternetOpenUrlW) OpenUrl = nullptr;
+    decltype(&InternetReadFile) ReadFile = nullptr;
+    decltype(&InternetCloseHandle) CloseHandle = nullptr;
+    decltype(&InternetGetLastResponseInfoA) GetLastResponseInfo = nullptr;
+};
+
+WinInetApi& GetWinInetApi()
+{
+    static WinInetApi api;
+    if (api.initialized)
+    {
+        return api;
+    }
+    api.initialized = true;
+
+    api.module = LoadLibraryA("wininet.dll");
+    if (api.module == nullptr)
+    {
+        mod::Log("LobbySession: wininet.dll unavailable (%lu); fallback disabled", GetLastError());
+        return api;
+    }
+
+    auto resolve = [&](auto* fn, const char* name) -> bool
+    {
+        *fn = reinterpret_cast<std::remove_reference_t<decltype(*fn)>>(GetProcAddress(api.module, name));
+        if (*fn == nullptr)
+        {
+            mod::Log("LobbySession: missing WinINet symbol '%s' (%lu)", name, GetLastError());
+            return false;
+        }
+        return true;
+    };
+
+    if (!resolve(&api.Open, "InternetOpenW")
+        || !resolve(&api.SetOption, "InternetSetOptionW")
+        || !resolve(&api.OpenUrl, "InternetOpenUrlW")
+        || !resolve(&api.ReadFile, "InternetReadFile")
+        || !resolve(&api.CloseHandle, "InternetCloseHandle"))
+    {
+        FreeLibrary(api.module);
+        api.module = nullptr;
+        return api;
+    }
+
+    api.GetLastResponseInfo = reinterpret_cast<decltype(api.GetLastResponseInfo)>(
+        GetProcAddress(api.module, "InternetGetLastResponseInfoA"));
+
+    api.available = true;
+    mod::Log("LobbySession: WinINet runtime API loaded");
+    return api;
+}
+
+const char* WinInetErrorName(DWORD code)
+{
+    switch (code)
+    {
+    case ERROR_INTERNET_TIMEOUT:
+        return "ERROR_INTERNET_TIMEOUT";
+    case ERROR_INTERNET_NAME_NOT_RESOLVED:
+        return "ERROR_INTERNET_NAME_NOT_RESOLVED";
+    case ERROR_INTERNET_CANNOT_CONNECT:
+        return "ERROR_INTERNET_CANNOT_CONNECT";
+    case ERROR_INTERNET_CONNECTION_ABORTED:
+        return "ERROR_INTERNET_CONNECTION_ABORTED";
+    case ERROR_INTERNET_CONNECTION_RESET:
+        return "ERROR_INTERNET_CONNECTION_RESET";
+    case ERROR_INTERNET_INVALID_CA:
+        return "ERROR_INTERNET_INVALID_CA";
+    case ERROR_INTERNET_SEC_CERT_CN_INVALID:
+        return "ERROR_INTERNET_SEC_CERT_CN_INVALID";
+    case ERROR_INTERNET_SEC_CERT_DATE_INVALID:
+        return "ERROR_INTERNET_SEC_CERT_DATE_INVALID";
+    case ERROR_INTERNET_SEC_CERT_ERRORS:
+        return "ERROR_INTERNET_SEC_CERT_ERRORS";
+    case ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED:
+        return "ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED";
+    case ERROR_INTERNET_HTTP_TO_HTTPS_ON_REDIR:
+        return "ERROR_INTERNET_HTTP_TO_HTTPS_ON_REDIR";
+    case ERROR_INTERNET_HTTPS_TO_HTTP_ON_REDIR:
+        return "ERROR_INTERNET_HTTPS_TO_HTTP_ON_REDIR";
+    case ERROR_INTERNET_DECODING_FAILED:
+        return "ERROR_INTERNET_DECODING_FAILED";
+    default:
+        return "ERROR_INTERNET_UNKNOWN";
+    }
+}
+
+std::string ReadWinInetResponseInfo(WinInetApi& api)
+{
+    if (api.GetLastResponseInfo == nullptr)
+    {
+        return std::string();
+    }
+
+    char buffer[512] = {};
+    DWORD responseError = 0;
+    DWORD size = static_cast<DWORD>(std::size(buffer) - 1);
+    if (api.GetLastResponseInfo(&responseError, buffer, &size) == FALSE || size == 0)
+    {
+        return std::string();
+    }
+
+    buffer[size] = '\0';
+    std::string info = TrimAscii(buffer);
+    if (info.empty())
+    {
+        return std::string();
+    }
+
+    char prefixed[640] = {};
+    std::snprintf(prefixed, sizeof(prefixed), "respErr=%lu msg=%s", static_cast<unsigned long>(responseError), info.c_str());
+    return std::string(prefixed);
+}
+
+void LogWinInetFailure(const char* stage, WinInetApi& api)
+{
+    const DWORD error = GetLastError();
+    const std::string responseInfo = ReadWinInetResponseInfo(api);
+    if (!responseInfo.empty())
+    {
+        mod::Log(
+            "LobbySession::DoHttpGet: %s failed (%lu %s) %s",
+            stage,
+            static_cast<unsigned long>(error),
+            WinInetErrorName(error),
+            responseInfo.c_str());
+    }
+    else
+    {
+        mod::Log(
+            "LobbySession::DoHttpGet: %s failed (%lu %s)",
+            stage,
+            static_cast<unsigned long>(error),
+            WinInetErrorName(error));
+    }
+}
+
+std::wstring Utf8ToWideNullTerminated(const std::string& utf8)
+{
+    const int wLen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (wLen <= 1)
+    {
+        return std::wstring();
+    }
+
+    std::wstring wide(static_cast<size_t>(wLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], wLen);
+    return wide;
+}
+
+std::string DoHttpGetViaWinHttp(const std::string& path)
+{
+    std::string result;
+    WinHttpApi& api = GetWinHttpApi();
+    if (!api.available)
+    {
+        return result;
+    }
+
+    HINTERNET hSession = api.Open(
+        L"EFZNetplayMod/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (hSession == nullptr)
+    {
+        mod::Log("LobbySession::DoHttpGet: WinHttpOpen failed (%lu)", GetLastError());
+        return result;
+    }
+
+    api.SetTimeouts(hSession,
+        static_cast<int>(kConnectTimeoutMs),
+        static_cast<int>(kConnectTimeoutMs),
+        static_cast<int>(kReceiveTimeoutMs),
+        static_cast<int>(kReceiveTimeoutMs));
+
+    HINTERNET hConnect = api.Connect(hSession, kConcertoHost, kConcertoPort, 0);
+    if (hConnect == nullptr)
+    {
+        mod::Log("LobbySession::DoHttpGet: WinHttpConnect failed (%lu)", GetLastError());
+        api.CloseHandle(hSession);
+        return result;
+    }
+
+    const std::wstring wPath = Utf8ToWideNullTerminated(path);
+    if (wPath.empty())
+    {
+        api.CloseHandle(hConnect);
+        api.CloseHandle(hSession);
+        return result;
+    }
+
+    HINTERNET hRequest = api.OpenRequest(
+        hConnect,
+        L"GET",
+        wPath.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (hRequest == nullptr)
+    {
+        mod::Log("LobbySession::DoHttpGet: WinHttpOpenRequest failed (%lu)", GetLastError());
+        api.CloseHandle(hConnect);
+        api.CloseHandle(hSession);
+        return result;
+    }
+
+    const BOOL sent = api.SendRequest(
+        hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0);
+    if (!sent || !api.ReceiveResponse(hRequest, nullptr))
+    {
+        mod::Log("LobbySession::DoHttpGet: WinHttp send/receive failed (%lu)", GetLastError());
+        api.CloseHandle(hRequest);
+        api.CloseHandle(hConnect);
+        api.CloseHandle(hSession);
+        return result;
+    }
+
+    DWORD available = 0;
+    while (api.QueryDataAvailable(hRequest, &available) && available > 0)
+    {
+        const size_t oldSize = result.size();
+        result.resize(oldSize + available);
+        DWORD bytesRead = 0;
+        if (!api.ReadData(hRequest, &result[oldSize], available, &bytesRead))
+        {
+            break;
+        }
+        result.resize(oldSize + bytesRead);
+    }
+
+    api.CloseHandle(hRequest);
+    api.CloseHandle(hConnect);
+    api.CloseHandle(hSession);
+    return result;
+}
+
+std::string DoHttpGetViaWinInet(const std::string& fullUrl)
+{
+    std::string result;
+    WinInetApi& api = GetWinInetApi();
+    if (!api.available)
+    {
+        return result;
+    }
+
+    HINTERNET hInternet = api.Open(
+        L"EFZNetplayMod/1.0",
+        INTERNET_OPEN_TYPE_PRECONFIG,
+        nullptr,
+        nullptr,
+        0);
+    if (hInternet == nullptr)
+    {
+        LogWinInetFailure("InternetOpenW", api);
+        return result;
+    }
+
+    const DWORD connectTimeout = kConnectTimeoutMs;
+    const DWORD receiveTimeout = kReceiveTimeoutMs;
+    if (api.SetOption(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, (LPVOID)&connectTimeout, sizeof(connectTimeout)) == FALSE)
+    {
+        LogWinInetFailure("InternetSetOption(CONNECT_TIMEOUT)", api);
+    }
+    if (api.SetOption(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, (LPVOID)&receiveTimeout, sizeof(receiveTimeout)) == FALSE)
+    {
+        LogWinInetFailure("InternetSetOption(RECEIVE_TIMEOUT)", api);
+    }
+    if (api.SetOption(hInternet, INTERNET_OPTION_SEND_TIMEOUT, (LPVOID)&receiveTimeout, sizeof(receiveTimeout)) == FALSE)
+    {
+        LogWinInetFailure("InternetSetOption(SEND_TIMEOUT)", api);
+    }
+
+    const std::wstring wUrl = Utf8ToWideNullTerminated(fullUrl);
+    if (wUrl.empty())
+    {
+        api.CloseHandle(hInternet);
+        return result;
+    }
+
+    DWORD flags = INTERNET_FLAG_RELOAD
+        | INTERNET_FLAG_NO_CACHE_WRITE
+        | INTERNET_FLAG_PRAGMA_NOCACHE;
+    if (HasHttpsScheme(fullUrl))
+    {
+        flags |= INTERNET_FLAG_SECURE;
+    }
+
+    HINTERNET hUrl = api.OpenUrl(hInternet, wUrl.c_str(), nullptr, 0, flags, 0);
+    if (hUrl == nullptr)
+    {
+        LogWinInetFailure("InternetOpenUrlW", api);
+        api.CloseHandle(hInternet);
+        return result;
+    }
+
+    char buffer[4096] = {};
+    for (;;)
+    {
+        DWORD bytesRead = 0;
+        if (!api.ReadFile(hUrl, buffer, sizeof(buffer), &bytesRead))
+        {
+            LogWinInetFailure("InternetReadFile", api);
+            break;
+        }
+        if (bytesRead == 0)
+        {
+            break;
+        }
+        result.append(buffer, buffer + bytesRead);
+    }
+
+    api.CloseHandle(hUrl);
+    api.CloseHandle(hInternet);
+    return result;
+}
+
+std::string TryHttpGetForEndpoint(
+    const LobbyEndpointConfig& endpointConfig,
+    const std::string& endpointTag,
+    const std::string& requestUrl,
+    const std::string& defaultPathForWinHttp,
+    bool allowWinHttpForThisUrl,
+    int* outBackend)
+{
+    if (outBackend != nullptr)
+    {
+        *outBackend = 0;
+    }
+
+    const bool isHttps = HasHttpsScheme(requestUrl);
+    const bool tryEmbeddedTls = isHttps && (!endpointConfig.forceWinInet || endpointConfig.forceEmbeddedTls);
+
+    if (tryEmbeddedTls)
+    {
+        std::string body;
+        std::string error;
+        if (netplay::tls::HttpGet(requestUrl, endpointConfig.tlsVerify, kReceiveTimeoutMs, &body, &error))
+        {
+            if (outBackend != nullptr)
+            {
+                *outBackend = 3;
+            }
+            return body;
+        }
+
+        mod::Log(
+            "LobbySession::DoHttpGet: %s endpoint EmbeddedTLS failed url='%s' error='%s'",
+            endpointTag.c_str(),
+            requestUrl.c_str(),
+            error.c_str());
+
+        // Explicit force means skip non-embedded backends for this endpoint only.
+        if (endpointConfig.forceEmbeddedTls)
+        {
+            return std::string();
+        }
+    }
+
+    if (allowWinHttpForThisUrl && !endpointConfig.forceWinInet && !endpointConfig.forceEmbeddedTls)
+    {
+        const std::string result = DoHttpGetViaWinHttp(defaultPathForWinHttp);
+        if (!result.empty())
+        {
+            if (outBackend != nullptr)
+            {
+                *outBackend = 1;
+            }
+            return result;
+        }
+    }
+
+    const std::string winInetResult = DoHttpGetViaWinInet(requestUrl);
+    if (!winInetResult.empty())
+    {
+        if (outBackend != nullptr)
+        {
+            *outBackend = 2;
+        }
+        return winInetResult;
+    }
+
+    return std::string();
+}
+
+void LogBackendTransition(const LobbyEndpointConfig& endpointConfig, int backend, const char* endpointTag)
+{
+    const int previous = g_lobbyHttpBackend.exchange(backend);
+    if (previous == backend)
+    {
+        return;
+    }
+
+    switch (backend)
+    {
+    case 1:
+        mod::Log("LobbySession::DoHttpGet: backend=WinHTTP endpoint=%s", endpointTag);
+        break;
+    case 2:
+        mod::Log("LobbySession::DoHttpGet: backend=WinINet endpoint=%s", endpointTag);
+        break;
+    case 3:
+        mod::Log(
+            "LobbySession::DoHttpGet: backend=EmbeddedTLS endpoint=%s verify=%d",
+            endpointTag,
+            endpointConfig.tlsVerify ? 1 : 0);
+        break;
+    default:
+        break;
+    }
+}
 
 // Minimal percent-encoding for a query-string value.
 std::string UrlEncode(const std::string& s)
@@ -290,94 +1241,61 @@ void LobbySession::DoLeave()
 }
 
 // ---------------------------------------------------------------------------
-// WinHTTP helper
+// HTTP backend helper
 // ---------------------------------------------------------------------------
 
 std::string LobbySession::DoHttpGet(const std::string& path)
 {
-    std::string result;
-
-    HINTERNET hSession = WinHttpOpen(
-        L"EFZNetplayMod/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0);
-    if (hSession == nullptr)
+    const LobbyEndpointConfig& endpointConfig = GetLobbyEndpointConfig();
+    const std::string primaryUrl = BuildLobbyRequestUrl(path);
+    std::string proxyUrl = BuildLobbyProxyRequestUrl(path);
+    if (!proxyUrl.empty() && proxyUrl == primaryUrl)
     {
-        mod::Log("LobbySession::DoHttpGet: WinHttpOpen failed (%lu)", GetLastError());
-        return result;
+        proxyUrl.clear();
     }
 
-    WinHttpSetTimeouts(hSession,
-        static_cast<int>(kConnectTimeoutMs),
-        static_cast<int>(kConnectTimeoutMs),
-        static_cast<int>(kReceiveTimeoutMs),
-        static_cast<int>(kReceiveTimeoutMs));
-
-    HINTERNET hConnect = WinHttpConnect(hSession, kConcertoHost, kConcertoPort, 0);
-    if (hConnect == nullptr)
+    int backend = 0;
+    const bool allowPrimaryWinHttp = !endpointConfig.hasBaseUrlOverride;
+    std::string body = TryHttpGetForEndpoint(
+        endpointConfig,
+        "primary",
+        primaryUrl,
+        path,
+        allowPrimaryWinHttp,
+        &backend);
+    if (!body.empty())
     {
-        mod::Log("LobbySession::DoHttpGet: WinHttpConnect failed (%lu)", GetLastError());
-        WinHttpCloseHandle(hSession);
-        return result;
+        LogBackendTransition(endpointConfig, backend, "primary");
+        return body;
     }
 
-    // Convert the narrow path to wide.
-    int wLen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::wstring wPath(static_cast<size_t>(wLen), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wPath[0], wLen);
-
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
-        L"GET",
-        wPath.c_str(),
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
-    if (hRequest == nullptr)
+    if (!proxyUrl.empty())
     {
-        mod::Log("LobbySession::DoHttpGet: WinHttpOpenRequest failed (%lu)", GetLastError());
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
+        mod::Log(
+            "LobbySession::DoHttpGet: primary endpoint failed; retrying proxy endpoint url='%s'",
+            proxyUrl.c_str());
 
-    const BOOL sent = WinHttpSendRequest(
-        hRequest,
-        WINHTTP_NO_ADDITIONAL_HEADERS,
-        0,
-        WINHTTP_NO_REQUEST_DATA,
-        0,
-        0,
-        0);
-    if (!sent || !WinHttpReceiveResponse(hRequest, nullptr))
-    {
-        mod::Log("LobbySession::DoHttpGet: send/receive failed (%lu)", GetLastError());
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
-
-    DWORD available = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &available) && available > 0)
-    {
-        const size_t oldSize = result.size();
-        result.resize(oldSize + available);
-        DWORD bytesRead = 0;
-        if (!WinHttpReadData(hRequest, &result[oldSize], available, &bytesRead))
+        body = TryHttpGetForEndpoint(
+            endpointConfig,
+            "proxy",
+            proxyUrl,
+            path,
+            false,
+            &backend);
+        if (!body.empty())
         {
-            break;
+            LogBackendTransition(endpointConfig, backend, "proxy");
+            return body;
         }
-        result.resize(oldSize + bytesRead);
     }
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return result;
+    const int previous = g_lobbyHttpBackend.exchange(0);
+    if (previous != 0)
+    {
+        mod::Log("LobbySession::DoHttpGet: no available HTTP backend");
+    }
+
+    return std::string();
 }
 
 // ---------------------------------------------------------------------------

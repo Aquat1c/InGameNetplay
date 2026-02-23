@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/session_bridge.h"
 
 #include "logger.h"
 
@@ -19,6 +20,8 @@ using netplay::menu::MenuIdToString;
 using netplay::menu::RebuildLobbyMenuEntries;
 using netplay::menu::RowIndexToString;
 using InlineEditInputResult = netplay::inline_edit::InputResult;
+using NetbridgeRole = netplay::bridge::NetbridgeRole;
+using NetbridgePhase = netplay::bridge::NetbridgePhase;
 
 void EnterNetplayMenu(uint32_t screenContext)
 {
@@ -39,6 +42,7 @@ void EnterNetplayMenu(uint32_t screenContext)
         return;
     }
 
+    LoadNetplayMenuSettingsFromIni();
     ResetTitleMenuState(screenContext, 0);
 
     g_netplayMenuState.active = true;
@@ -50,6 +54,7 @@ void EnterNetplayMenu(uint32_t screenContext)
     g_lastNetplayFrameLogTick = 0;
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    g_pendingVsHumanAutoConfirm = false;
     SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
     InstallNetplayWindowHook(screenContext);
 
@@ -82,6 +87,43 @@ void LeaveNetplayMenu(uint32_t screenContext)
         StopCurrentBgm(screenContext, "leave_netplay");
     }
 
+    netplay::bridge::CancelSession("leave_menu");
+
+    g_netplayMenuState.active = false;
+    g_netplayMenuState.bgmActive = false;
+    g_netplayMenuState.useConfigStyleRender = false;
+    g_netplayMenuState.menuId = NetplayMenuId::Main;
+    g_netplayMenuState.mainSelection = 0;
+    g_netplayMenuState.optionCount = kNetplayDefaultOptionCount;
+    g_netplayMenuState.backIndex = kNetplayDefaultBackIndex;
+    g_netplayMenuState.renderLayout = {};
+    g_netplayMenuState.lobbyScrollOffset = 0;
+    ResetMenuSlideTransition();
+    ResetInlineEditState();
+    g_hasLoggedInputSnapshot = false;
+    g_netplayEscapeDown = false;
+    g_pendingVsHumanAutoConfirm = false;
+    RemoveNetplayWindowHook();
+
+    (void)LoadTitleAssets(screenContext);
+    ResetTitleMenuState(screenContext, 5);
+    RunTransitionFadeIn(screenContext);
+    mod::Log(
+        "LeaveNetplayMenu: returned to title assets, titleSelection=%d",
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+}
+
+void HandoffConnectedSessionToTitle(uint32_t screenContext)
+{
+    mod::Log("HandoffConnectedSessionToTitle: begin");
+
+    RunTransitionFadeOut(screenContext, 0, 0);
+
+    if (g_netplayMenuState.bgmActive)
+    {
+        StopCurrentBgm(screenContext, "handoff_connected_session");
+    }
+
     g_netplayMenuState.active = false;
     g_netplayMenuState.bgmActive = false;
     g_netplayMenuState.useConfigStyleRender = false;
@@ -98,11 +140,16 @@ void LeaveNetplayMenu(uint32_t screenContext)
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
-    ResetTitleMenuState(screenContext, 5);
+    ResetTitleMenuState(screenContext, 2);
+    g_pendingVsHumanAutoConfirm = true;
+
     RunTransitionFadeIn(screenContext);
+
+    const uint8_t currentState = *reinterpret_cast<uint8_t*>(RuntimeAddress(kVaCurrentScreenIndex));
     mod::Log(
-        "LeaveNetplayMenu: returned to title assets, titleSelection=%d",
-        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+        "HandoffConnectedSessionToTitle: armed auto-confirm selection=%d state=%u",
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+        static_cast<unsigned>(currentState));
 }
 
 void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
@@ -218,33 +265,75 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         break;
     case NetplayMenuAction::HostStart:
     {
-        char text[256] = {};
-        snprintf(
-            text,
-            sizeof(text),
-            "Host flow is still in progress.\n\nNickname: %s\nPort: %u",
-            g_netplayMenuState.nickname.c_str(),
-            static_cast<unsigned>(g_netplayMenuState.hostPort));
-        ShowStubActionMessage(owner, text);
+        const bool started = netplay::bridge::StartSession(
+            NetbridgeRole::Host,
+            g_netplayMenuState.hostPort,
+            "",
+            g_netplayMenuState.nickname.c_str());
+        if (!started)
+        {
+            const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+            char text[320] = {};
+            snprintf(
+                text,
+                sizeof(text),
+                "Host start failed.\n\n%s",
+                status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+            ShowStubActionMessage(owner, text);
+        }
         break;
     }
     case NetplayMenuAction::JoinConnect:
     {
-        char text[320] = {};
-        snprintf(
-            text,
-            sizeof(text),
-            "Join flow is still in progress.\n\nNickname: %s\nAddress: %s\nPort: %u",
-            g_netplayMenuState.nickname.c_str(),
+        const bool started = netplay::bridge::StartSession(
+            NetbridgeRole::Join,
+            g_netplayMenuState.joinPort,
             g_netplayMenuState.joinAddress.c_str(),
-            static_cast<unsigned>(g_netplayMenuState.joinPort));
-        ShowStubActionMessage(owner, text);
+            g_netplayMenuState.nickname.c_str());
+        if (!started)
+        {
+            const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+            char text[320] = {};
+            snprintf(
+                text,
+                sizeof(text),
+                "Join start failed.\n\n%s",
+                status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+            ShowStubActionMessage(owner, text);
+        }
         break;
     }
     case NetplayMenuAction::LobbyPlaying0:
     {
-        // Playing pair row -- stub until spectating is implemented.
-        ShowStubActionMessage(owner, "Spectating is not yet implemented.\n\nThis row shows the current active match.");
+        if (!g_lobbySession)
+        {
+            ShowStubActionMessage(owner, "Lobby status unavailable.");
+            break;
+        }
+
+        const auto status = g_lobbySession->GetStatus();
+        if (status.playing.empty() || status.playing[0].hostIp.empty())
+        {
+            ShowStubActionMessage(owner, "No active match host information is available for spectating yet.");
+            break;
+        }
+
+        const bool started = netplay::bridge::StartSession(
+            NetbridgeRole::Spectate,
+            g_netplayMenuState.joinPort,
+            status.playing[0].hostIp.c_str(),
+            "");
+        if (!started)
+        {
+            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+            char text[320] = {};
+            snprintf(
+                text,
+                sizeof(text),
+                "Spectate start failed.\n\n%s",
+                bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+            ShowStubActionMessage(owner, text);
+        }
         break;
     }
     case NetplayMenuAction::LobbySlot0:
@@ -254,21 +343,45 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     case NetplayMenuAction::LobbySlot4:
     case NetplayMenuAction::LobbySlot5:
     {
-        const int visSlot   = static_cast<int>(action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
-        const int realSlot  = visSlot + g_netplayMenuState.lobbyScrollOffset;
+        const int visSlot = static_cast<int>(action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
+        const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
+        std::string targetName;
         if (g_lobbySession)
         {
             const auto status = g_lobbySession->GetStatus();
             if (realSlot < static_cast<int>(status.idlePlayers.size()))
             {
-                char text[256] = {};
+                targetName = status.idlePlayers[realSlot].name;
+            }
+        }
+
+        const bool started = netplay::bridge::StartSession(
+            NetbridgeRole::Join,
+            g_netplayMenuState.joinPort,
+            g_netplayMenuState.joinAddress.c_str(),
+            g_netplayMenuState.nickname.c_str());
+        if (!started)
+        {
+            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+            char text[320] = {};
+            if (targetName.empty())
+            {
                 snprintf(
                     text,
                     sizeof(text),
-                    "Challenge '%s' (stub)\n\nP2P connect is not yet implemented.\nWill trigger EfzRevival network flow in a future update.",
-                    status.idlePlayers[realSlot].name.c_str());
-                ShowStubActionMessage(owner, text);
+                    "Challenge start failed.\n\n%s",
+                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
             }
+            else
+            {
+                snprintf(
+                    text,
+                    sizeof(text),
+                    "Challenge start failed for '%s'.\n\n%s",
+                    targetName.c_str(),
+                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+            }
+            ShowStubActionMessage(owner, text);
         }
         break;
     }
@@ -299,6 +412,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
     const int gameSystem = GetGameSystem(screenContext);
     processInput(reinterpret_cast<int*>(gameSystem));
+    netplay::bridge::Tick();
     auto* const inputBytes = reinterpret_cast<uint8_t*>(gameSystem);
     InputSnapshot currentSnapshot = {
         static_cast<int8_t>(inputBytes[12]),
@@ -335,9 +449,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if (g_lastNetplayFrameLogTick == 0 || nowTick - g_lastNetplayFrameLogTick >= kNetplayFrameLogIntervalMs)
     {
         const int currentRow = GetRenderRowForSelection(static_cast<int>(*selectionPtr));
-        const int nativeSlideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
+        const int nativeSlideYRaw = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
+        const int nativeSlideYScaled = GetScaledNativeSlideY(screenContext);
         mod::Log(
-            "NetplayFrame: updates=%llu menu=%s selection=%d row=%d(%s) inactivity=%u slide=%d nativeSlideY=%d",
+            "NetplayFrame: updates=%llu menu=%s selection=%d row=%d(%s) inactivity=%u slide=%d nativeSlideRaw=%d nativeSlideScaled=%d",
             static_cast<unsigned long long>(g_netplayUpdateCallCount),
             MenuIdToString(g_netplayMenuState.menuId),
             static_cast<int>(*selectionPtr),
@@ -345,7 +460,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
             RowIndexToString(currentRow),
             *inactivityCounter,
             IsMenuSlideTransitionActive() ? 1 : 0,
-            nativeSlideY);
+            nativeSlideYRaw,
+            nativeSlideYScaled);
         g_lastNetplayFrameLogTick = nowTick;
     }
 
@@ -414,6 +530,40 @@ char UpdateNetplayMenu(uint32_t screenContext)
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         *inactivityCounter = 0;
+        return 0;
+    }
+
+    const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+    const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
+    if (bridgePhase == NetbridgePhase::Connected)
+    {
+        mod::Log("NetplayBridge: connected; handing off to title for character select transition");
+        HandoffConnectedSessionToTitle(screenContext);
+        return 0;
+    }
+
+    if (bridgePhase == NetbridgePhase::Connecting)
+    {
+        bool cancelRequested = ConsumeNetplayEscapeEdge();
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 18] == 1)
+            {
+                cancelRequested = true;
+                break;
+            }
+        }
+
+        if (cancelRequested)
+        {
+            PlayUiSound(screenContext, kSfxConfirm);
+            netplay::bridge::CancelSession("user_cancel");
+            mod::Log("NetplayBridge: cancel requested during connecting");
+        }
+
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
         return 0;
     }
 
@@ -569,4 +719,3 @@ void TriggerNetplayMenuEntry(uint32_t screenContext)
     EnterNetplayMenu(screenContext);
 }
 } // namespace netplay::hooks::internal
-

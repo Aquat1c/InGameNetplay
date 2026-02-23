@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <share.h>
 #include <string>
 
 namespace
@@ -54,11 +55,11 @@ void WriteLineUnlocked(const char* line)
 
 namespace mod
 {
-bool InitializeLogger(HMODULE moduleHandle)
+bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
 
-    if (!g_consoleReady)
+    if (!g_consoleReady && spawnConsole)
     {
         if (AllocConsole() != FALSE)
         {
@@ -78,8 +79,8 @@ bool InitializeLogger(HMODULE moduleHandle)
     if (g_logFile == nullptr)
     {
         const std::string logPath = BuildLogPathFromModule(moduleHandle);
-        FILE* file = nullptr;
-        if (fopen_s(&file, logPath.c_str(), "a") == 0 && file != nullptr)
+        FILE* file = _fsopen(logPath.c_str(), "a", _SH_DENYNO);
+        if (file != nullptr)
         {
             g_logFile = file;
         }
@@ -128,3 +129,4 @@ void Log(const char* fmt, ...)
     WriteLineUnlocked(line);
 }
 }
+

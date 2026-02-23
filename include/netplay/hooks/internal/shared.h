@@ -118,6 +118,7 @@ extern bool g_netplayEscapeDown;
 extern bool g_restoreReplaySelectionOnNextTitleUpdate;
 extern uint32_t g_replaySelectionGuardFramesRemaining;
 extern int8_t g_replaySelectionRestoreTarget;
+extern bool g_pendingVsHumanAutoConfirm;
 extern InputSnapshot g_lastInputSnapshot;
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
@@ -161,6 +162,7 @@ void RunTransitionFadeOut(uint32_t screenContext, int baseVolume, int volumeAdju
 void RunTransitionFadeIn(uint32_t screenContext);
 bool LoadTitleAssets(uint32_t screenContext);
 bool LoadNetplayAssets(uint32_t screenContext);
+void LoadNetplayMenuSettingsFromIni();
 
 std::string BuildMenuHeaderText();
 std::string BuildRowLabel(const netplay::menu::NetplayMenuEntry& entry);

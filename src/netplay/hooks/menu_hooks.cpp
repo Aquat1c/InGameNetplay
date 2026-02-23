@@ -1,5 +1,6 @@
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/session_bridge.h"
 
 #include "logger.h"
 
@@ -37,8 +38,29 @@ bool g_netplayEscapeDown = false;
 bool g_restoreReplaySelectionOnNextTitleUpdate = false;
 uint32_t g_replaySelectionGuardFramesRemaining = 0;
 int8_t g_replaySelectionRestoreTarget = -1;
+bool g_pendingVsHumanAutoConfirm = false;
 InputSnapshot g_lastInputSnapshot = {};
 std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
+bool g_titleConfirmDown = false;
+
+void ObserveOfflineSelectionConfirm(uint32_t screenContext)
+{
+    const int gameSystem = GetGameSystem(screenContext);
+    const auto* const inputBytes = reinterpret_cast<const uint8_t*>(gameSystem);
+    const bool confirmDown = (inputBytes[16] == 1) || (inputBytes[17] == 1);
+    const bool confirmEdge = confirmDown && !g_titleConfirmDown;
+    g_titleConfirmDown = confirmDown;
+
+    if (!confirmEdge)
+    {
+        return;
+    }
+
+    const auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection);
+    const int selection = static_cast<int>(*selectionPtr);
+    mod::Log("HookedTitleUpdateImpl: title confirm edge selection=%d", selection);
+    netplay::bridge::OnTitleSelectionConfirmed(selection);
+}
 
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 {
@@ -53,7 +75,25 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 
     if (!g_netplayMenuState.active)
     {
+        if (g_pendingVsHumanAutoConfirm)
+        {
+            const int gameSystem = GetGameSystem(screenContext);
+            auto* const inputBytes = reinterpret_cast<uint8_t*>(gameSystem);
+            inputBytes[12] = 0;
+            inputBytes[13] = 0;
+            inputBytes[14] = 0;
+            inputBytes[15] = 0;
+            inputBytes[16] = 1;
+            inputBytes[17] = 0;
+            inputBytes[18] = 0;
+            inputBytes[19] = 0;
+            mod::Log("HookedTitleUpdateImpl: injecting one-shot VS Human confirm");
+            g_pendingVsHumanAutoConfirm = false;
+        }
+
         const char result = GetOriginalTitleUpdate()(screenContext);
+
+        ObserveOfflineSelectionConfirm(screenContext);
 
         if (g_restoreReplaySelectionOnNextTitleUpdate)
         {
@@ -80,6 +120,8 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
         }
         return result;
     }
+
+    g_titleConfirmDown = false;
     return UpdateNetplayMenu(screenContext);
 }
 
