@@ -1,9 +1,5 @@
 build/
-build_release/
-build_xp/
-build_xp_probe/
-build_release_win32/
-build_xp_win32/
+build_*/
 .vs/
 *.user
 *.VC.db

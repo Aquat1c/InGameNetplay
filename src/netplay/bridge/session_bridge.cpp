@@ -120,6 +120,32 @@ void Shutdown()
     mod::Log("SessionBridge: shutdown (role=host)");
 }
 
+void EmergencyShutdown()
+{
+    // Best-effort teardown for DLL detach during process termination.
+    // Avoid blocking joins under loader-lock constraints.
+    if (!g_mutex.try_lock())
+    {
+        takeover::RequestAbortStart();
+        takeover::EmergencyShutdownHost();
+        return;
+    }
+
+    if (g_startWorker.joinable())
+    {
+        g_startWorker.detach();
+    }
+    g_startWorkerRunning = false;
+    ++g_startRequestSerial;
+    takeover::RequestAbortStart();
+    takeover::EmergencyShutdownHost();
+    g_status = {};
+    SetPhase(NetbridgePhase::Idle, nullptr);
+    g_connectStartTick = 0;
+    g_initialized = false;
+    g_mutex.unlock();
+}
+
 void InitializeInjectedProcess()
 {
     takeover::InitializeInjected();
@@ -246,6 +272,81 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     return true;
 }
 
+bool ApplyInputDelay(int delayFrames)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    JoinFinishedWorkerUnlocked();
+    if (g_startWorkerRunning)
+    {
+        mod::Log("SessionBridge: ApplyInputDelay rejected (start worker running)");
+        return false;
+    }
+
+    const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
+    if (phase != NetbridgePhase::Connecting
+        && phase != NetbridgePhase::DelaySetup
+        && phase != NetbridgePhase::Connected)
+    {
+        mod::Log(
+            "SessionBridge: ApplyInputDelay ignored (phase=%s value=%d)",
+            PhaseToString(phase),
+            delayFrames);
+        return false;
+    }
+
+    const bool applied = takeover::ApplyInputDelay(delayFrames, &g_status);
+    mod::Log(
+        "SessionBridge: ApplyInputDelay value=%d result=%d phase=%s",
+        delayFrames,
+        applied ? 1 : 0,
+        PhaseToString(static_cast<NetbridgePhase>(g_status.phase)));
+    return applied;
+}
+
+bool PrepareVsHumanHandoff()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    JoinFinishedWorkerUnlocked();
+    if (g_startWorkerRunning)
+    {
+        mod::Log("SessionBridge: PrepareVsHumanHandoff rejected (start worker running)");
+        return false;
+    }
+
+    const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
+    const bool allowDuringConnectingDelayStage =
+        (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
+        && g_status.delaySetupReady != 0;
+    if (phase != NetbridgePhase::Connected && !allowDuringConnectingDelayStage)
+    {
+        mod::Log(
+            "SessionBridge: PrepareVsHumanHandoff ignored (phase=%s)",
+            PhaseToString(phase));
+        return false;
+    }
+
+    const bool prepared = takeover::PrepareVsHumanHandoff(&g_status);
+    mod::Log(
+        "SessionBridge: PrepareVsHumanHandoff result=%d sync(mode=%d flag1084=%d session=%d flags=%d/%d)",
+        prepared ? 1 : 0,
+        g_status.syncGameMode,
+        g_status.syncMode0Flag1084,
+        g_status.syncSessionByte,
+        g_status.syncGlobalFlag4964,
+        g_status.syncGlobalFlag4965);
+    return prepared;
+}
+
 void CancelSession(const char* reason)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -287,7 +388,9 @@ void OnTitleSelectionConfirmed(int selection)
     }
 
     const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
-    if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::Connected)
+    if (phase == NetbridgePhase::Connecting
+        || phase == NetbridgePhase::DelaySetup
+        || phase == NetbridgePhase::Connected)
     {
         return;
     }
@@ -301,6 +404,12 @@ NetbridgeStatus GetStatus()
     return g_status;
 }
 
+DelayPromptMetrics GetDelayPromptMetrics()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return takeover::GetDelayPromptMetrics();
+}
+
 const char* PhaseToString(NetbridgePhase phase)
 {
     switch (phase)
@@ -309,6 +418,8 @@ const char* PhaseToString(NetbridgePhase phase)
         return "Idle";
     case NetbridgePhase::Connecting:
         return "Connecting";
+    case NetbridgePhase::DelaySetup:
+        return "DelaySetup";
     case NetbridgePhase::Connected:
         return "Connected";
     case NetbridgePhase::Failed:
@@ -345,8 +456,25 @@ void BuildStatusLine(const NetbridgeStatus& status, char* buffer, size_t bufferS
         std::snprintf(
             buffer,
             bufferSize,
-            "Connecting... pid=%lu ESC/BACK=Cancel",
-            static_cast<unsigned long>(status.processId));
+            "Connecting... pid=%lu Sync:%d/%d/%d DelayReady:%d Prompt:%d Init:%d ESC/BACK=Cancel",
+            static_cast<unsigned long>(status.processId),
+            status.syncGameMode,
+            status.syncMode0Flag1084,
+            status.syncSessionByte,
+            status.delaySetupReady,
+            status.delayPromptSerial > 0 ? 1 : 0,
+            status.localInitApplied);
+        break;
+    case NetbridgePhase::DelaySetup:
+        std::snprintf(
+            buffer,
+            bufferSize,
+            "Delay setup pid=%lu Ping:%dms Current:%df Prompt:%d Init:%d CONFIRM=Apply ESC/BACK=Cancel",
+            static_cast<unsigned long>(status.processId),
+            status.pingMs,
+            status.rollbackFrames,
+            status.delayPromptSerial > 0 ? 1 : 0,
+            status.localInitApplied);
         break;
     case NetbridgePhase::Connected:
     {
@@ -361,18 +489,21 @@ void BuildStatusLine(const NetbridgeStatus& status, char* buffer, size_t bufferS
         {
             std::snprintf(delayText, sizeof(delayText), "%df", status.rollbackFrames);
         }
-        if (status.p1Name[0] != '\0' || status.p2Name[0] != '\0')
+        if (status.p1Name[0] != '\0' && status.p2Name[0] != '\0')
         {
             std::snprintf(namesText, sizeof(namesText), " %s vs %s", status.p1Name, status.p2Name);
         }
         std::snprintf(
             buffer,
             bufferSize,
-            "Connected pid=%lu Ping:%s Delay:%s Role:%d%s",
+            "Connected pid=%lu Ping:%s Delay:%s Role:%d Sync:%d/%d/%d%s",
             static_cast<unsigned long>(status.processId),
             pingText,
             delayText,
             status.roleFlag,
+            status.syncGameMode,
+            status.syncMode0Flag1084,
+            status.syncSessionByte,
             namesText);
         break;
     }

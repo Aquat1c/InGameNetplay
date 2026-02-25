@@ -62,6 +62,23 @@ struct InputSnapshot
     uint8_t p2Cancel = 0;
 };
 
+struct DelaySetupOverlayState
+{
+    bool active = false;
+    bool waitingForRuntimeReady = false;
+    bool vsHumanSyncArmed = false;
+    DWORD nextHandoffRetryTick = 0;
+    int selectedDelay = 0;
+    int recommendedDelay = 0;
+    int minDelay = 0;
+    int maxDelay = 20;
+    int pingMs = -1;
+    int currentDelay = 0;
+    char p1Name[64] = {};
+    char p2Name[64] = {};
+    char errorMessage[96] = {};
+};
+
 using PlaySoundEffectFn = int(__thiscall*)(void* gameSystem, unsigned short soundIndex);
 using PlayBackgroundMusicFn = void(__thiscall*)(int gameSystem, unsigned short trackNumber);
 using StopBackgroundMusicFn = int(__thiscall*)(int gameSystem);
@@ -119,7 +136,11 @@ extern bool g_restoreReplaySelectionOnNextTitleUpdate;
 extern uint32_t g_replaySelectionGuardFramesRemaining;
 extern int8_t g_replaySelectionRestoreTarget;
 extern bool g_pendingVsHumanAutoConfirm;
+extern DWORD g_pendingVsHumanAutoConfirmTick;
+extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
+extern bool g_returnToNetplayAfterMatch;
 extern InputSnapshot g_lastInputSnapshot;
+extern DelaySetupOverlayState g_delaySetupOverlay;
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 HMODULE ResolveCurrentModule();
@@ -171,6 +192,7 @@ HFONT GetMenuOverlayFont();
 const netplay::render::OverlayCallbacks& GetOverlayCallbacks();
 bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext);
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext);
 void DrawAnimatedCompactMenuLayer(uint32_t screenContext);

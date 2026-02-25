@@ -392,10 +392,15 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     {
         drewGdiOverlay = DrawRuntimeTextOverlayGdi(screenContext, false);
     }
+    const bool drewDelayOverlay = DrawDelaySetupOverlayGdi(screenContext, false);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     if ((!g_spriteFont.loaded || forceGdi) && !drewGdiOverlay)
     {
         (void)DrawRuntimeTextOverlayGdi(screenContext, true);
+    }
+    if (!drewDelayOverlay)
+    {
+        (void)DrawDelaySetupOverlayGdi(screenContext, true);
     }
     return presentResult;
 }
@@ -405,12 +410,16 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
     DrawAnimatedCompactMenuLayer(screenContext);
     const bool drewGdiOverlay = DrawDynamicFieldValuesGdi(screenContext, false);
+    const bool drewDelayOverlay = DrawDelaySetupOverlayGdi(screenContext, false);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     if (!drewGdiOverlay)
     {
         (void)DrawDynamicFieldValuesGdi(screenContext, true);
     }
+    if (!drewDelayOverlay)
+    {
+        (void)DrawDelaySetupOverlayGdi(screenContext, true);
+    }
     return presentResult;
 }
 } // namespace netplay::hooks::internal
-

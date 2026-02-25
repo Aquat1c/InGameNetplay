@@ -78,7 +78,7 @@ inline constexpr uint32_t kVtableOffsetSurfaceUnlock = 128;
 inline constexpr unsigned short kSfxConfirm = 6;
 inline constexpr unsigned short kSfxMove = 8;
 inline constexpr unsigned short kNetplayBgmTrack = 8;
-inline constexpr uint32_t kNetplayFrameLogIntervalMs = 500;
+inline constexpr uint32_t kNetplayFrameLogIntervalMs = 2000;
 inline constexpr uint16_t kDefaultNetplayPort = 7500;
 
 inline constexpr int kNetplayDefaultOptionCount = 5; // main menu now has 5 entries
@@ -109,5 +109,4 @@ struct NetplayRenderLayout
     int highlightHeight = kNetplayDefaultHighlightHeight;
 };
 }
-
 

@@ -3,6 +3,8 @@
 
 #include "logger.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -22,6 +24,406 @@ using netplay::menu::RowIndexToString;
 using InlineEditInputResult = netplay::inline_edit::InputResult;
 using NetbridgeRole = netplay::bridge::NetbridgeRole;
 using NetbridgePhase = netplay::bridge::NetbridgePhase;
+
+void HandoffConnectedSessionToVsHumanState(uint32_t screenContext);
+
+namespace
+{
+constexpr int kDelaySelectionMin = 0;
+constexpr int kDelaySelectionMax = 20;
+int g_pendingGlobalStateTransition = -1;
+constexpr uint32_t kGameSystemOffsetCpuFlagP1 = 4931;
+constexpr uint32_t kGameSystemOffsetCpuFlagP2 = 4932;
+constexpr uint32_t kGameSystemOffsetRoundsCurrent = 4942;
+constexpr uint32_t kGameSystemOffsetRoundsSetting = 4943;
+constexpr uint32_t kGameSystemOffsetMode = 4964;
+constexpr uint32_t kGameSystemOffsetSecondaryModeFlag = 4965;
+constexpr uint32_t kGameSystemOffsetReplaySessionFlag = 82563;
+constexpr uint8_t kGameModeVsHuman = 4;
+constexpr uint8_t kSecondaryModeFlagVsHuman = 4;
+constexpr uint8_t kReplaySessionFlagCleared = 0;
+
+void CopyBoundedText(char* dst, size_t dstSize, const char* src)
+{
+    if (dst == nullptr || dstSize == 0)
+    {
+        return;
+    }
+    if (src == nullptr)
+    {
+        dst[0] = '\0';
+        return;
+    }
+#if defined(_MSC_VER)
+    strncpy_s(dst, dstSize, src, _TRUNCATE);
+#else
+    std::snprintf(dst, dstSize, "%s", src);
+#endif
+}
+
+void ResetDelaySetupOverlayState()
+{
+    g_delaySetupOverlay = {};
+}
+
+int ClampDelaySelection(int value)
+{
+    if (value < kDelaySelectionMin)
+    {
+        return kDelaySelectionMin;
+    }
+    if (value > kDelaySelectionMax)
+    {
+        return kDelaySelectionMax;
+    }
+    return value;
+}
+
+// Mirrors Revival's CalculateDelayDelta.
+int CalculateDelayDeltaLikeRevival(float rttMs, float currentDelayFrames)
+{
+    if (rttMs < 0.0f)
+    {
+        rttMs = 0.0f;
+    }
+
+    const double frameTimeMs = 1000.0 / 64.0;
+    const double roundTripInFrames = static_cast<double>(rttMs) / (frameTimeMs * 2.0);
+    const double framesNeeded = std::ceil(roundTripInFrames);
+    const double delta = framesNeeded - static_cast<double>(currentDelayFrames);
+    const double clamped = (delta > 0.0) ? delta : 0.0;
+    return static_cast<int>(clamped);
+}
+
+// Mirrors Revival's CalculateRecommendedDelay.
+int CalculateRecommendedDelayLikeRevival(int delayFloor, float rttMs, float currentDelayFrames)
+{
+    if (rttMs < 0.0f)
+    {
+        rttMs = 0.0f;
+    }
+
+    const float minDelay = (std::min)(3.0f, currentDelayFrames);
+    const double roundTripMs = (1000.0 / 64.0) * 2.0;
+    const double rttInFrames = static_cast<double>(rttMs) / roundTripMs;
+    const double framesNeeded = std::ceil(rttInFrames);
+    const double rawDelta = std::ceil(framesNeeded - static_cast<double>(minDelay));
+    const int delta = static_cast<int>(rawDelta);
+    int best = (std::max)(delayFloor, delta);
+    if (currentDelayFrames == minDelay)
+    {
+        ++best;
+    }
+    return best;
+}
+
+void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeStatus)
+{
+    ResetDelaySetupOverlayState();
+    g_delaySetupOverlay.active = true;
+    g_delaySetupOverlay.waitingForRuntimeReady = false;
+    g_delaySetupOverlay.maxDelay = kDelaySelectionMax;
+    g_delaySetupOverlay.pingMs = bridgeStatus.pingMs;
+
+    const int currentDelay = ClampDelaySelection((bridgeStatus.rollbackFrames >= 0) ? bridgeStatus.rollbackFrames : 0);
+    g_delaySetupOverlay.currentDelay = currentDelay;
+
+    const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
+    int minDelay = 0;
+    int recommendedDelay = currentDelay;
+    int maxDelay = kDelaySelectionMax;
+    if (promptMetrics.serial > 0)
+    {
+        if (promptMetrics.averagePingMs >= 0)
+        {
+            g_delaySetupOverlay.pingMs = promptMetrics.averagePingMs;
+        }
+        if (promptMetrics.minDelay >= kDelaySelectionMin && promptMetrics.minDelay <= kDelaySelectionMax)
+        {
+            minDelay = promptMetrics.minDelay;
+        }
+        if (promptMetrics.maxDelay >= kDelaySelectionMin && promptMetrics.maxDelay <= kDelaySelectionMax)
+        {
+            maxDelay = promptMetrics.maxDelay;
+        }
+        if (promptMetrics.recommendedDelay >= kDelaySelectionMin && promptMetrics.recommendedDelay <= kDelaySelectionMax)
+        {
+            recommendedDelay = promptMetrics.recommendedDelay;
+        }
+    }
+    if (bridgeStatus.pingMs >= 0)
+    {
+        const int fallbackMin = CalculateDelayDeltaLikeRevival(static_cast<float>(bridgeStatus.pingMs), static_cast<float>(currentDelay));
+        const int fallbackRecommended =
+            CalculateRecommendedDelayLikeRevival(fallbackMin, static_cast<float>(bridgeStatus.pingMs), static_cast<float>(currentDelay));
+        if (promptMetrics.serial <= 0)
+        {
+            minDelay = fallbackMin;
+            recommendedDelay = fallbackRecommended;
+        }
+    }
+
+    if (maxDelay < minDelay)
+    {
+        maxDelay = minDelay;
+    }
+
+    g_delaySetupOverlay.minDelay = ClampDelaySelection(minDelay);
+    g_delaySetupOverlay.maxDelay = ClampDelaySelection(maxDelay);
+    g_delaySetupOverlay.recommendedDelay =
+        (std::min)(g_delaySetupOverlay.maxDelay, ClampDelaySelection((std::max)(recommendedDelay, g_delaySetupOverlay.minDelay)));
+    g_delaySetupOverlay.selectedDelay = g_delaySetupOverlay.recommendedDelay;
+    if (bridgeStatus.p1Name[0] != '\0' && bridgeStatus.p2Name[0] != '\0')
+    {
+        CopyBoundedText(g_delaySetupOverlay.p1Name, sizeof(g_delaySetupOverlay.p1Name), bridgeStatus.p1Name);
+        CopyBoundedText(g_delaySetupOverlay.p2Name, sizeof(g_delaySetupOverlay.p2Name), bridgeStatus.p2Name);
+    }
+    else
+    {
+        g_delaySetupOverlay.p1Name[0] = '\0';
+        g_delaySetupOverlay.p2Name[0] = '\0';
+    }
+
+    mod::Log(
+        "DelayOverlay: activated promptSerial=%d ping=%d current=%d min=%d max=%d recommended=%d names='%s' vs '%s'",
+        promptMetrics.serial,
+        g_delaySetupOverlay.pingMs,
+        g_delaySetupOverlay.currentDelay,
+        g_delaySetupOverlay.minDelay,
+        g_delaySetupOverlay.maxDelay,
+        g_delaySetupOverlay.recommendedDelay,
+        g_delaySetupOverlay.p1Name,
+        g_delaySetupOverlay.p2Name);
+}
+
+bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
+{
+    if (!g_delaySetupOverlay.active || inputBytes == nullptr || inactivityCounter == nullptr)
+    {
+        return false;
+    }
+
+    if (g_delaySetupOverlay.waitingForRuntimeReady)
+    {
+        const auto statusWhileWaiting = netplay::bridge::GetStatus();
+        const DWORD nowTick = GetTickCount();
+        if (statusWhileWaiting.localInitApplied != 0
+            && nowTick >= g_delaySetupOverlay.nextHandoffRetryTick
+            && (!g_delaySetupOverlay.vsHumanSyncArmed || statusWhileWaiting.roleFlag != 2))
+        {
+            const bool wasArmed = g_delaySetupOverlay.vsHumanSyncArmed;
+            const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
+            if (prepared)
+            {
+                g_delaySetupOverlay.vsHumanSyncArmed = true;
+                if (!wasArmed)
+                {
+                    mod::Log(
+                        "DelayOverlay: handoff armed localInit=%d role=%d phase=%s",
+                        statusWhileWaiting.localInitApplied,
+                        statusWhileWaiting.roleFlag,
+                        netplay::bridge::PhaseToString(static_cast<NetbridgePhase>(statusWhileWaiting.phase)));
+                }
+            }
+            g_delaySetupOverlay.nextHandoffRetryTick = nowTick + 1000;
+        }
+
+        bool cancelRequested = ConsumeNetplayEscapeEdge();
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 18] == 1)
+            {
+                cancelRequested = true;
+                break;
+            }
+        }
+        if (cancelRequested)
+        {
+            PlayUiSound(screenContext, kSfxConfirm);
+            ResetDelaySetupOverlayState();
+            netplay::bridge::CancelSession("user_cancel");
+            mod::Log("DelayOverlay: canceled while waiting for runtime sync");
+            return true;
+        }
+
+        ++(*inactivityCounter);
+        return true;
+    }
+
+    bool cancelRequested = ConsumeNetplayEscapeEdge();
+    bool confirmRequested = false;
+    int confirmPlayer = -1;
+    bool moved = false;
+
+    for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+    {
+        auto* const inputLatch = reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1 + playerIndex);
+        const int8_t horizontal = static_cast<int8_t>(inputBytes[playerIndex + 12]);
+        const int8_t vertical = static_cast<int8_t>(inputBytes[playerIndex + 14]);
+
+        int step = 0;
+        if (horizontal > 0 || vertical > 0)
+        {
+            step = 1;
+        }
+        else if (horizontal < 0 || vertical < 0)
+        {
+            step = -1;
+        }
+
+        if (step != 0)
+        {
+            *inactivityCounter = 0;
+            if (*inputLatch == 0)
+            {
+                const int oldValue = g_delaySetupOverlay.selectedDelay;
+                const int nextValue = oldValue + step;
+                g_delaySetupOverlay.selectedDelay =
+                    (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, nextValue));
+                if (g_delaySetupOverlay.selectedDelay != oldValue)
+                {
+                    g_delaySetupOverlay.errorMessage[0] = '\0';
+                    PlayUiSound(screenContext, kSfxMove);
+                    moved = true;
+                    mod::Log(
+                        "DelayOverlay: selection player=%d from=%d to=%d step=%d",
+                        playerIndex,
+                        oldValue,
+                        g_delaySetupOverlay.selectedDelay,
+                        step);
+                }
+                *inputLatch = 1;
+            }
+        }
+        else
+        {
+            *inputLatch = 0;
+        }
+
+        if (inputBytes[playerIndex + 16] == 1)
+        {
+            confirmRequested = true;
+            confirmPlayer = playerIndex;
+        }
+        if (inputBytes[playerIndex + 18] == 1)
+        {
+            cancelRequested = true;
+        }
+    }
+
+    if (!moved)
+    {
+        ++(*inactivityCounter);
+    }
+
+    if (cancelRequested)
+    {
+        PlayUiSound(screenContext, kSfxConfirm);
+        ResetDelaySetupOverlayState();
+        netplay::bridge::CancelSession("user_cancel");
+        mod::Log("DelayOverlay: canceled");
+        return true;
+    }
+
+    if (confirmRequested)
+    {
+        const int selectedDelay = g_delaySetupOverlay.selectedDelay;
+        const bool applied = netplay::bridge::ApplyInputDelay(selectedDelay);
+        if (!applied)
+        {
+            PlayUiSound(screenContext, kSfxMove);
+            const auto status = netplay::bridge::GetStatus();
+            if (status.errorMsg[0] != '\0')
+            {
+                std::snprintf(
+                    g_delaySetupOverlay.errorMessage,
+                    sizeof(g_delaySetupOverlay.errorMessage),
+                    "Delay apply failed: %s",
+                    status.errorMsg);
+            }
+            else
+            {
+                std::snprintf(
+                    g_delaySetupOverlay.errorMessage,
+                    sizeof(g_delaySetupOverlay.errorMessage),
+                    "Delay apply failed");
+            }
+            mod::Log("DelayOverlay: confirm failed selected=%d", selectedDelay);
+            return true;
+        }
+
+        PlayUiSound(screenContext, kSfxConfirm);
+        const auto statusAfterApply = netplay::bridge::GetStatus();
+        const auto phaseAfterApply = static_cast<NetbridgePhase>(statusAfterApply.phase);
+        mod::Log(
+            "DelayOverlay: confirmed player=%d selected=%d recommended=%d min=%d max=%d ping=%d phase=%s syncReady=%d",
+            confirmPlayer,
+            selectedDelay,
+            g_delaySetupOverlay.recommendedDelay,
+            g_delaySetupOverlay.minDelay,
+            g_delaySetupOverlay.maxDelay,
+            g_delaySetupOverlay.pingMs,
+            netplay::bridge::PhaseToString(phaseAfterApply),
+            statusAfterApply.vsHumanSyncReady);
+
+        const bool readyForHandoff =
+            phaseAfterApply == NetbridgePhase::Connected || statusAfterApply.vsHumanSyncReady != 0;
+        if (!readyForHandoff)
+        {
+            g_delaySetupOverlay.waitingForRuntimeReady = true;
+            g_delaySetupOverlay.vsHumanSyncArmed = false;
+            g_delaySetupOverlay.nextHandoffRetryTick = 0;
+            g_delaySetupOverlay.errorMessage[0] = '\0';
+            mod::Log(
+                "DelayOverlay: waiting for runtime sync after delay selection phase=%s prompt=%d/%d",
+                netplay::bridge::PhaseToString(phaseAfterApply),
+                statusAfterApply.delayPromptSerial,
+                statusAfterApply.delayPromptServedSerial);
+            return true;
+        }
+
+        ResetDelaySetupOverlayState();
+        HandoffConnectedSessionToVsHumanState(screenContext);
+        return true;
+    }
+
+    return true;
+}
+
+void PrepareVsHumanGameState(uint32_t screenContext)
+{
+    const int gameSystem = GetGameSystem(screenContext);
+    if (gameSystem == 0)
+    {
+        mod::Log("PrepareVsHumanGameState: skipped (gameSystem=null)");
+        return;
+    }
+
+    auto* const state = reinterpret_cast<uint8_t*>(gameSystem);
+    const uint8_t roundsSetting = state[kGameSystemOffsetRoundsSetting];
+
+    // Mirror the native title "VS Human" branch:
+    // 4931/4932 = human-vs-human, 4964 = mode 4, 4942 = configured round count.
+    // Also set 4965 and 82563 which ConfigureModeFlags(0) would set via the
+    // nav hooks at 0x763F04/0x763E50.  We bypass those hooks by forcing
+    // g_pendingGlobalStateTransition=1, so the flags must be set here.
+    state[kGameSystemOffsetCpuFlagP1] = 0;
+    state[kGameSystemOffsetCpuFlagP2] = 0;
+    state[kGameSystemOffsetMode] = kGameModeVsHuman;
+    state[kGameSystemOffsetSecondaryModeFlag] = kSecondaryModeFlagVsHuman;
+    state[kGameSystemOffsetRoundsCurrent] = roundsSetting;
+    state[kGameSystemOffsetReplaySessionFlag] = kReplaySessionFlagCleared;
+
+    mod::Log(
+        "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u",
+        static_cast<unsigned>(state[kGameSystemOffsetMode]),
+        static_cast<unsigned>(state[kGameSystemOffsetSecondaryModeFlag]),
+        static_cast<unsigned>(state[kGameSystemOffsetReplaySessionFlag]),
+        static_cast<unsigned>(state[kGameSystemOffsetRoundsCurrent]),
+        static_cast<unsigned>(state[kGameSystemOffsetCpuFlagP1]),
+        static_cast<unsigned>(state[kGameSystemOffsetCpuFlagP2]));
+}
+} // namespace
 
 void EnterNetplayMenu(uint32_t screenContext)
 {
@@ -55,6 +457,11 @@ void EnterNetplayMenu(uint32_t screenContext)
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+    g_pendingGlobalStateTransition = -1;
+    g_returnToNetplayAfterMatch = false;
+    ResetDelaySetupOverlayState();
     SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
     InstallNetplayWindowHook(screenContext);
 
@@ -103,6 +510,11 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
     g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+    g_pendingGlobalStateTransition = -1;
+    g_returnToNetplayAfterMatch = false;
+    ResetDelaySetupOverlayState();
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -113,11 +525,21 @@ void LeaveNetplayMenu(uint32_t screenContext)
         static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
 }
 
-void HandoffConnectedSessionToTitle(uint32_t screenContext)
+void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
 {
-    mod::Log("HandoffConnectedSessionToTitle: begin");
+    const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
+    const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+    mod::Log(
+        "HandoffConnectedSessionToVsHumanState: begin prepared=%d sync(mode=%d flag1084=%d session=%d flags=%d/%d)",
+        prepared ? 1 : 0,
+        status.syncGameMode,
+        status.syncMode0Flag1084,
+        status.syncSessionByte,
+        status.syncGlobalFlag4964,
+        status.syncGlobalFlag4965);
 
     RunTransitionFadeOut(screenContext, 0, 0);
+    PrepareVsHumanGameState(screenContext);
 
     if (g_netplayMenuState.bgmActive)
     {
@@ -137,19 +559,17 @@ void HandoffConnectedSessionToTitle(uint32_t screenContext)
     ResetInlineEditState();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
+    g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+    ResetDelaySetupOverlayState();
     RemoveNetplayWindowHook();
-
-    (void)LoadTitleAssets(screenContext);
-    ResetTitleMenuState(screenContext, 2);
-    g_pendingVsHumanAutoConfirm = true;
-
-    RunTransitionFadeIn(screenContext);
-
-    const uint8_t currentState = *reinterpret_cast<uint8_t*>(RuntimeAddress(kVaCurrentScreenIndex));
+    g_returnToNetplayAfterMatch = true;
+    g_pendingGlobalStateTransition = 1;
     mod::Log(
-        "HandoffConnectedSessionToTitle: armed auto-confirm selection=%d state=%u",
-        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
-        static_cast<unsigned>(currentState));
+        "HandoffConnectedSessionToVsHumanState: queued global transition nextState=%d returnToNetplay=%d",
+        g_pendingGlobalStateTransition,
+        g_returnToNetplayAfterMatch ? 1 : 0);
 }
 
 void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
@@ -535,14 +955,126 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
-    if (bridgePhase == NetbridgePhase::Connected)
+    const bool bridgeDelaySetupReady = bridgeStatus.delaySetupReady != 0;
+    if ((bridgePhase == NetbridgePhase::DelaySetup
+            || bridgePhase == NetbridgePhase::Connected
+            || bridgePhase == NetbridgePhase::Connecting)
+        && bridgeDelaySetupReady)
     {
-        mod::Log("NetplayBridge: connected; handing off to title for character select transition");
-        HandoffConnectedSessionToTitle(screenContext);
+        const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
+        if (!g_delaySetupOverlay.active)
+        {
+            ActivateDelaySetupOverlay(bridgeStatus);
+        }
+        else
+        {
+            if (bridgeStatus.pingMs >= 0)
+            {
+                g_delaySetupOverlay.pingMs = bridgeStatus.pingMs;
+            }
+            if (bridgeStatus.p1Name[0] != '\0' && bridgeStatus.p2Name[0] != '\0')
+            {
+                CopyBoundedText(g_delaySetupOverlay.p1Name, sizeof(g_delaySetupOverlay.p1Name), bridgeStatus.p1Name);
+                CopyBoundedText(g_delaySetupOverlay.p2Name, sizeof(g_delaySetupOverlay.p2Name), bridgeStatus.p2Name);
+            }
+            else
+            {
+                g_delaySetupOverlay.p1Name[0] = '\0';
+                g_delaySetupOverlay.p2Name[0] = '\0';
+            }
+            if (promptMetrics.serial > 0)
+            {
+                if (promptMetrics.averagePingMs >= 0)
+                {
+                    g_delaySetupOverlay.pingMs = promptMetrics.averagePingMs;
+                }
+                if (promptMetrics.minDelay >= kDelaySelectionMin && promptMetrics.minDelay <= kDelaySelectionMax)
+                {
+                    g_delaySetupOverlay.minDelay = promptMetrics.minDelay;
+                }
+                if (promptMetrics.maxDelay >= kDelaySelectionMin && promptMetrics.maxDelay <= kDelaySelectionMax)
+                {
+                    g_delaySetupOverlay.maxDelay = promptMetrics.maxDelay;
+                }
+                if (g_delaySetupOverlay.maxDelay < g_delaySetupOverlay.minDelay)
+                {
+                    g_delaySetupOverlay.maxDelay = g_delaySetupOverlay.minDelay;
+                }
+                if (promptMetrics.recommendedDelay >= kDelaySelectionMin && promptMetrics.recommendedDelay <= kDelaySelectionMax)
+                {
+                    const int clampedRecommended =
+                        (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, promptMetrics.recommendedDelay));
+                    g_delaySetupOverlay.recommendedDelay = clampedRecommended;
+                    if (!g_delaySetupOverlay.waitingForRuntimeReady)
+                    {
+                        g_delaySetupOverlay.selectedDelay =
+                            (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, g_delaySetupOverlay.selectedDelay));
+                    }
+                }
+            }
+            g_delaySetupOverlay.selectedDelay =
+                (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, g_delaySetupOverlay.selectedDelay));
+        }
+
+        if (g_delaySetupOverlay.waitingForRuntimeReady
+            && (bridgePhase == NetbridgePhase::Connected || bridgeStatus.vsHumanSyncReady != 0))
+        {
+            mod::Log(
+                "DelayOverlay: runtime sync ready after delay selection phase=%s sync(mode=%d flag1084=%d session=%d)",
+                netplay::bridge::PhaseToString(bridgePhase),
+                bridgeStatus.syncGameMode,
+                bridgeStatus.syncMode0Flag1084,
+                bridgeStatus.syncSessionByte);
+            ResetDelaySetupOverlayState();
+            HandoffConnectedSessionToVsHumanState(screenContext);
+            if (g_pendingGlobalStateTransition >= 0)
+            {
+                const int nextState = g_pendingGlobalStateTransition;
+                g_pendingGlobalStateTransition = -1;
+                mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
+                return static_cast<char>(nextState);
+            }
+            return 0;
+        }
+
+        (void)HandleDelaySetupOverlayInput(screenContext, inputBytes, inactivityCounter);
+        if (g_pendingGlobalStateTransition >= 0)
+        {
+            const int nextState = g_pendingGlobalStateTransition;
+            g_pendingGlobalStateTransition = -1;
+            mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
+            return static_cast<char>(nextState);
+        }
+        return 0;
+    }
+    else
+    {
+        ResetDelaySetupOverlayState();
+    }
+
+    // Some sessions can complete delay negotiation inside Revival without
+    // presenting a prompt we can mirror. In that case, go straight to VS Human.
+    if (bridgePhase == NetbridgePhase::Connected
+        && !bridgeDelaySetupReady
+        && bridgeStatus.vsHumanSyncReady != 0)
+    {
+        mod::Log(
+            "NetplayTransition: connected without delay prompt; auto handoff sync(mode=%d flag1084=%d session=%d)",
+            bridgeStatus.syncGameMode,
+            bridgeStatus.syncMode0Flag1084,
+            bridgeStatus.syncSessionByte);
+        HandoffConnectedSessionToVsHumanState(screenContext);
+        if (g_pendingGlobalStateTransition >= 0)
+        {
+            const int nextState = g_pendingGlobalStateTransition;
+            g_pendingGlobalStateTransition = -1;
+            mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
+            return static_cast<char>(nextState);
+        }
         return 0;
     }
 
-    if (bridgePhase == NetbridgePhase::Connecting)
+    if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
     {
         bool cancelRequested = ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)

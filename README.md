@@ -80,6 +80,7 @@ cmake --build --preset build-release
 
 Output:
 - `build_release_win32/bin/Release/efz_netplay_mod.dll`
+- Canonical build trees used by presets: `build_release_win32/`, `build_xp_win32/`
 
 Notes:
 - EFZ is 32-bit; always use `-A Win32`.

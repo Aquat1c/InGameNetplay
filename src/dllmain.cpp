@@ -92,6 +92,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
             netplay::RemoveHooks();
             netplay::bridge::Shutdown();
         }
+        else
+        {
+            netplay::bridge::EmergencyShutdown();
+        }
         mod::UninstallCrashHandlers();
         mod::ShutdownLogger();
         break;

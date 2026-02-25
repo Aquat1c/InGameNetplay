@@ -124,8 +124,13 @@ void Log(const char* fmt, ...)
         return;
     }
 
-    char line[1200];
-    snprintf(line, sizeof(line), "[efz_netplay_mod] %s\n", message);
+    char line[1248];
+    snprintf(
+        line,
+        sizeof(line),
+        "[efz_netplay_mod][pid=%lu] %s\n",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        message);
     WriteLineUnlocked(line);
 }
 }

@@ -1,5 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/render/draw_surface.h"
+#include "logger.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -286,5 +288,138 @@ bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc)
     };
     return netplay::render::DrawRuntimeTextOverlayGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);
 }
-} // namespace netplay::hooks::internal
 
+bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool allowWindowDc)
+{
+    static bool s_loggedForCurrentOverlay = false;
+    if (!g_netplayMenuState.active || !g_delaySetupOverlay.active)
+    {
+        s_loggedForCurrentOverlay = false;
+        return false;
+    }
+
+    HDC dc = nullptr;
+    void* surface = nullptr;
+    HWND window = nullptr;
+    if (!netplay::draw::AcquireMenuDrawDc(screenContext, &dc, &surface, &window, allowWindowDc))
+    {
+        return false;
+    }
+
+    const bool useWindowDc = (window != nullptr);
+    if (!s_loggedForCurrentOverlay)
+    {
+        mod::Log(
+            "DelayOverlay: draw path=%s allowWindowDc=%d",
+            useWindowDc ? "window_dc" : "surface_dc",
+            allowWindowDc ? 1 : 0);
+        s_loggedForCurrentOverlay = true;
+    }
+    auto scaleX = [useWindowDc, window](int x)
+    {
+        if (!useWindowDc)
+        {
+            return x;
+        }
+        RECT clientRect = {};
+        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
+        {
+            return x;
+        }
+        const int clientW = clientRect.right - clientRect.left;
+        return (clientW > 0) ? MulDiv(x, clientW, 320) : x;
+    };
+    auto scaleY = [useWindowDc, window](int y)
+    {
+        if (!useWindowDc)
+        {
+            return y;
+        }
+        RECT clientRect = {};
+        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
+        {
+            return y;
+        }
+        const int clientH = clientRect.bottom - clientRect.top;
+        return (clientH > 0) ? MulDiv(y, clientH, 240) : y;
+    };
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, GetMenuOverlayFont());
+
+    RECT panelRect = {scaleX(82), scaleY(10), scaleX(318), scaleY(94)};
+    HBRUSH panelBrush = CreateSolidBrush(RGB(8, 16, 28));
+    FillRect(dc, &panelRect, panelBrush);
+    DeleteObject(panelBrush);
+    HBRUSH frameBrush = CreateSolidBrush(RGB(96, 210, 200));
+    FrameRect(dc, &panelRect, frameBrush);
+    DeleteObject(frameBrush);
+
+    RECT textRect = {scaleX(88), scaleY(14), scaleX(314), scaleY(30)};
+    SetTextColor(dc, RGB(220, 245, 245));
+    DrawTextA(dc, "MATCH DELAY", -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    char line[192] = {};
+    RECT lineRect = {scaleX(88), scaleY(30), scaleX(314), scaleY(44)};
+    if (g_delaySetupOverlay.pingMs >= 0)
+    {
+        std::snprintf(line, sizeof(line), "Ping: %d ms", g_delaySetupOverlay.pingMs);
+    }
+    else
+    {
+        std::snprintf(line, sizeof(line), "Ping: measuring...");
+    }
+    SetTextColor(dc, RGB(180, 208, 208));
+    DrawTextA(dc, line, -1, &lineRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT lineRect2 = {scaleX(88), scaleY(44), scaleX(314), scaleY(58)};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "Selected: %df  Recommended: %df",
+        g_delaySetupOverlay.selectedDelay,
+        g_delaySetupOverlay.recommendedDelay);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextA(dc, line, -1, &lineRect2, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT lineRect3 = {scaleX(88), scaleY(58), scaleX(314), scaleY(72)};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "Allowed range: %d to %d",
+        g_delaySetupOverlay.minDelay,
+        g_delaySetupOverlay.maxDelay);
+    SetTextColor(dc, RGB(176, 198, 198));
+    DrawTextA(dc, line, -1, &lineRect3, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT lineRect4 = {scaleX(88), scaleY(72), scaleX(314), scaleY(86)};
+    if (g_delaySetupOverlay.waitingForRuntimeReady)
+    {
+        SetTextColor(dc, RGB(184, 208, 208));
+        DrawTextA(dc, "Delay submitted. Waiting for game sync...", -1, &lineRect4, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    else if (g_delaySetupOverlay.errorMessage[0] != '\0')
+    {
+        SetTextColor(dc, RGB(255, 130, 130));
+        DrawTextA(dc, g_delaySetupOverlay.errorMessage, -1, &lineRect4, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    else if (g_delaySetupOverlay.p1Name[0] != '\0' && g_delaySetupOverlay.p2Name[0] != '\0')
+    {
+        std::snprintf(line, sizeof(line), "%s vs %s", g_delaySetupOverlay.p1Name, g_delaySetupOverlay.p2Name);
+        SetTextColor(dc, RGB(184, 208, 208));
+        DrawTextA(dc, line, -1, &lineRect4, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    else
+    {
+        SetTextColor(dc, RGB(184, 208, 208));
+        DrawTextA(dc, "LEFT/RIGHT adjust  CONFIRM accept  BACK cancel", -1, &lineRect4, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+
+    if (oldFont != nullptr)
+    {
+        SelectObject(dc, oldFont);
+    }
+    netplay::draw::ReleaseMenuDrawDc(dc, surface, window);
+    return true;
+}
+} // namespace netplay::hooks::internal
