@@ -432,6 +432,18 @@ bool ConsumeRevivalExitInterception(int* outMode)
     return takeover::ConsumeRevivalExitInterception(outMode, &g_status);
 }
 
+bool NotifyTitleScreenActive()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    JoinFinishedWorkerUnlocked();
+    return takeover::NotifyTitleScreenActive(&g_status);
+}
+
 void OnTitleSelectionConfirmed(int selection)
 {
     std::lock_guard<std::mutex> lock(g_mutex);

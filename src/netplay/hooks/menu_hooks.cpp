@@ -198,6 +198,17 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 
     if (!g_netplayMenuState.active)
     {
+        // When the tournament match ends and the game returns to mode 0 (title
+        // screen), ExitProcess is blocked by Jcc patches so NeutralizeExitProcess
+        // and ConsumeRevivalExitInterception never fire on the normal path.
+        // Detect this proactively: if we're still flagged as tournament but the
+        // game mode is 0, clean up immediately and schedule text clearing.
+        if (netplay::bridge::NotifyTitleScreenActive())
+        {
+            g_postExitTextClearFrames = 5;
+            mod::Log("HookedTitleUpdateImpl: tournament return to title detected, clearing text");
+        }
+
         // Check for Revival DLL ExitProcess interception BEFORE ticking.
         // If ExitProcess was intercepted, the session vtable has been
         // neutralized and we need to clean up and route the user to the

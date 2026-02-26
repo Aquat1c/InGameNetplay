@@ -1250,6 +1250,40 @@ DelayPromptMetrics GetDelayPromptMetrics()
     return metrics;
 }
 
+bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (g_localRoleFlag != kLocalRoleTournament)
+    {
+        return false;
+    }
+
+    // The Jcc patches prevent ExitProcess from firing, so NeutralizeExitProcess
+    // (and ConsumeRevivalExitInterception) never triggers on the normal path when
+    // the tournament match ends and the game returns to mode 0 (title screen).
+    // Poll the game mode directly: if we're still flagged as tournament but the
+    // game is back on the title screen, run the same cleanup chain proactively.
+    int gameMode = -1;
+    if (!SafeReadInt(reinterpret_cast<const void*>(g_activeRevival->addrGameModeCurrentIndex), &gameMode)
+        || gameMode != 0)
+    {
+        return false;
+    }
+
+    mod::Log("Takeover: tournament returned to title screen (mode 0) — cleaning up proactively");
+
+    RestoreDllExitProcessPatches();
+    RestoreTournamentExePatches();
+    ForceLocalPlayInit();
+    ClearRevivalText();
+    DisableRevivalTextRendering();
+    g_localRoleFlag = kLocalRoleLocalPlay;
+
+    RefreshRuntimeStatus(ioStatus);
+    return true;
+}
+
 } // namespace netplay::bridge::takeover
 
 

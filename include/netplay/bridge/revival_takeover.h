@@ -19,5 +19,6 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
 void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick);
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus);
 bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus);
+bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus);
 DelayPromptMetrics GetDelayPromptMetrics();
 }

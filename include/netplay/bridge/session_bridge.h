@@ -78,6 +78,7 @@ bool AnswerSpectateConfirm(bool acceptSpectate);
 bool PrepareVsHumanHandoff();
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
+bool NotifyTitleScreenActive();
 void OnTitleSelectionConfirmed(int selection);
 NetbridgeStatus GetStatus();
 DelayPromptMetrics GetDelayPromptMetrics();
