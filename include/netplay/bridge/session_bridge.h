@@ -10,6 +10,7 @@ enum class NetbridgeRole : int
     Host = 0,
     Join = 1,
     Spectate = 2,
+    JoinSpectate = 3,   // Join (choice 3) with auto-accept spectate redirect
 };
 
 enum class NetbridgePhase : int
@@ -36,6 +37,8 @@ struct NetbridgeStatus
     int rollbackFrames = -1;
     int delayPromptSerial = 0;
     int delayPromptServedSerial = 0;
+    int spectateConfirmPromptSerial = 0;
+    int spectateConfirmPromptServedSerial = 0;
     int localInitApplied = 0;
     int delaySetupReady = 0;
     int vsHumanSyncReady = 0;
@@ -71,8 +74,10 @@ void ShutdownInjectedProcess();
 void Tick();
 bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname);
 bool ApplyInputDelay(int delayFrames);
+bool AnswerSpectateConfirm(bool acceptSpectate);
 bool PrepareVsHumanHandoff();
 void CancelSession(const char* reason);
+bool ConsumeRevivalExitInterception(int* outMode);
 void OnTitleSelectionConfirmed(int selection);
 NetbridgeStatus GetStatus();
 DelayPromptMetrics GetDelayPromptMetrics();

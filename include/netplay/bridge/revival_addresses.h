@@ -1,0 +1,205 @@
+#pragma once
+// Version-specific addresses and offsets for EfzRevival.dll and EFZ.exe.
+// Each supported Revival build gets its own constexpr profile instance.
+// The active profile is selected at runtime via g_activeRevival.
+//
+// NOTE: This header deliberately uses C++11-compatible constructs
+// (nested namespace declarations, aggregate constexpr) so that it
+// compiles cleanly under the v141_xp (Windows XP) toolset as well.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace netplay { namespace bridge { namespace takeover {
+
+// Compile-time upper bound for error-code null-guard patch buffers.
+// Individual profiles store their actual patch size in errorCodeIsZeroPatchSize.
+constexpr size_t kMaxErrorCodePatchBytes = 8;
+
+// Maximum number of role-flag / session-pointer offset slots per profile.
+constexpr size_t kMaxRoleFlagOffsets    = 4;
+constexpr size_t kMaxSessionPtrOffsets  = 4;
+
+// Tournament EXE patch save/restore limits.
+constexpr size_t kMaxTournamentExePatches    = 4;
+constexpr size_t kMaxTournamentExePatchBytes  = 20;
+
+struct RevivalAddressProfile
+{
+    // Human-readable version tag for logging (e.g. "1.02e").
+    const char* versionTag;
+
+    // -----------------------------------------------------------------------
+    // EFZ executable identifiers
+    // -----------------------------------------------------------------------
+
+    // 4-byte fingerprint read from EFZ.exe at address 0x7871F4.
+    uint32_t efzFingerprint;
+
+    // Default preferred image base for EfzRevival.dll.
+    uint32_t defaultImageBase;
+
+    // -----------------------------------------------------------------------
+    // EFZ.exe addresses (absolute virtual addresses)
+    // -----------------------------------------------------------------------
+
+    uintptr_t addrGameModeStructTable;
+    uintptr_t addrGameModeCurrentIndex;
+
+    // -----------------------------------------------------------------------
+    // Revival DLL RVA offsets
+    // -----------------------------------------------------------------------
+
+    // Role-flag global variable locations (up to kMaxRoleFlagOffsets).
+    uintptr_t roleFlagOffsets[kMaxRoleFlagOffsets];
+    size_t    roleFlagOffsetCount;
+
+    // Session-pointer global variable locations (up to kMaxSessionPtrOffsets).
+    uintptr_t sessionPtrOffsets[kMaxSessionPtrOffsets];
+    size_t    sessionPtrOffsetCount;
+
+    // Global state pointer RVA.
+    uintptr_t globalStatePtrOffset;
+
+    // Error-code-is-zero function patch target.
+    uintptr_t errorCodeIsZeroRva;
+    size_t    errorCodeIsZeroPatchSize;
+
+    // "Start init player" function RVA (sub_10072880 in 1.02e).
+    uintptr_t startInitPlayerRva;
+
+    // -----------------------------------------------------------------------
+    // Session object field offsets (byte offsets from session pointer)
+    // -----------------------------------------------------------------------
+
+    uintptr_t sessionOffsetInitComplete;
+    uintptr_t sessionOffsetInputDelay;
+    uintptr_t sessionOffsetPingMs;
+    uintptr_t sessionOffsetHelperHandle;
+    uintptr_t sessionOffsetHelperPid;
+    uintptr_t sessionOffsetActivePlayer;
+    uintptr_t sessionOffsetQueuePlayer;
+    uintptr_t sessionOffsetHistoryPrimaryPtr;
+    uintptr_t sessionOffsetHistorySecondaryPtr;
+    uintptr_t sessionOffsetHistoryPrimaryVec;
+    uintptr_t sessionOffsetHistorySecondaryVec;
+
+    // -----------------------------------------------------------------------
+    // Global state offsets (byte offsets from global-state pointer)
+    // -----------------------------------------------------------------------
+
+    uintptr_t globalStateOffsetFlag4964;
+    uintptr_t globalStateOffsetFlag4965;
+    uintptr_t globalStateOffsetSessionByte;
+
+    // -----------------------------------------------------------------------
+    // Tournament session layout (byte offsets from session pointer)
+    // -----------------------------------------------------------------------
+
+    // Byte offset from the tournament session pointer to the auto-nav input
+    // deque (MSVC std::deque of 2-byte elements, 8 per block).  The
+    // tournament constructor populates this queue with 22 byte-pair entries
+    // that simulate controller presses to auto-navigate menus.
+    uintptr_t tournamentInputQueueOffset;
+
+    // RVA of EFZ_Render_ClearText (sub_1006C070 in 1.02e).  A void(void)
+    // function that clears the Revival text overlay buffer.  Called after
+    // switching away from tournament mode to remove stale nickname / win-
+    // count text.
+    uintptr_t clearTextRva;
+
+    // RVA of EFZ_Render_SetTextEnabled (sub_1006C030 in 1.02e).  A
+    // __thiscall(void* contextBase, bool enable) function that enables or
+    // disables the EFZ.exe text overlay.  contextBase is &dword_100A0760
+    // (i.e. base + renderContextGlobalOffset - 0x18).  The character-select
+    // mode transition calls this with enable=false to hide tournament
+    // nicknames / win counts.
+    uintptr_t setTextEnabledRva;
+
+    // Offset of dword_100A0778 (the EfzRender* global) in the Revival DLL's
+    // .data section.  This global is used by EFZ_Render_ClearText and
+    // EFZ_Render_AddTextAndClear.  Tournament cleanup corrupts it before
+    // calling ExitProcess, so we save/restore it around tournament mode.
+    uintptr_t renderContextGlobalOffset;
+
+    // Absolute EXE addresses and sizes of the code patches applied by the
+    // tournament session constructor.  Saved before init(3,102) and
+    // restored after intercepting the tournament ExitProcess.
+    uintptr_t tournamentExePatchAddr[kMaxTournamentExePatches];
+    uint8_t   tournamentExePatchSize[kMaxTournamentExePatches];
+    size_t    tournamentExePatchCount;
+
+    // Revival DLL ExitProcess call-site patches.
+    //
+    // The tournament session's per-frame tick calls ExitProcess when it
+    // detects game mode 0 (title screen).  Since ExitProcess is __noreturn,
+    // the compiler emits no valid code after the call — we cannot return
+    // from our IAT stub.  Instead, we patch the conditional-jump bytes
+    // that guard each ExitProcess call to unconditional jumps (74/75→EB),
+    // making the calls unreachable.  The IAT hook remains as a safety net.
+    //
+    // Each entry is an RVA relative to the Revival DLL's default image
+    // base (0x10000000).  The original byte at that RVA is a Jcc opcode
+    // (0x74 = jz, 0x75 = jnz) which is replaced with 0xEB (jmp short).
+    static constexpr size_t kMaxExitProcessPatches = 4;
+    uintptr_t exitProcessPatchRva[kMaxExitProcessPatches];
+    uint8_t   exitProcessPatchOriginal[kMaxExitProcessPatches];
+    size_t    exitProcessPatchCount;
+};
+
+// ---------------------------------------------------------------------------
+// Known profiles
+// ---------------------------------------------------------------------------
+
+// EfzRevival.dll v1.02e (current default).
+constexpr RevivalAddressProfile kRevival_1_02e = {
+    "1.02e",                                            // versionTag
+    0x4386998Fu,                                        // efzFingerprint
+    0x10000000u,                                        // defaultImageBase
+    0x00790110u,                                        // addrGameModeStructTable
+    0x00790148u,                                        // addrGameModeCurrentIndex
+    {0x00A05D0u, 0x00A05F0u, 0x00A15FCu, 0u},          // roleFlagOffsets
+    3,                                                  // roleFlagOffsetCount
+    {0x00A02CCu, 0x00A02ECu, 0u, 0u},                  // sessionPtrOffsets
+    2,                                                  // sessionPtrOffsetCount
+    0x000A07B8u,                                        // globalStatePtrOffset
+    0x000021E0u,                                        // errorCodeIsZeroRva
+    8u,                                                 // errorCodeIsZeroPatchSize
+    0x00072880u,                                        // startInitPlayerRva
+    1220u,                                              // sessionOffsetInitComplete
+    688u,                                               // sessionOffsetInputDelay
+    936u,                                               // sessionOffsetPingMs
+    700u,                                               // sessionOffsetHelperHandle
+    1216u,                                              // sessionOffsetHelperPid
+    680u,                                               // sessionOffsetActivePlayer
+    684u,                                               // sessionOffsetQueuePlayer
+    824u,                                               // sessionOffsetHistoryPrimaryPtr
+    828u,                                               // sessionOffsetHistorySecondaryPtr
+    788u,                                               // sessionOffsetHistoryPrimaryVec
+    800u,                                               // sessionOffsetHistorySecondaryVec
+    4964u,                                              // globalStateOffsetFlag4964
+    4965u,                                              // globalStateOffsetFlag4965
+    82563u,                                             // globalStateOffsetSessionByte
+    740u,                                               // tournamentInputQueueOffset
+    0x0006C070u,                                        // clearTextRva
+    0x0006C030u,                                        // setTextEnabledRva
+    0x000A0778u,                                        // renderContextGlobalOffset
+    {0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu},       // tournamentExePatchAddr
+    {7, 7, 1, 20},                                      // tournamentExePatchSize
+    4,                                                  // tournamentExePatchCount
+
+    // DLL ExitProcess call-site patches (conditional jump → unconditional).
+    //
+    // Site 6: sub_10079090 (tournament mode-0 handler)
+    //   0x7909D: jz +8 (0x74) → jmp +8 (0xEB) — skips ExitProcess when
+    //   sub_1002B150 says results container has data.
+    //
+    // Site 2: tournament results handler (in sub_100718D0)
+    //   0x7215D: jnz +0x2F (0x75) → jmp +0x2F (0xEB) — skips ExitProcess
+    //   when EFZ_GameMode_GetCurrentIndex() == 0 && v47 == 1.
+    {0x0007909Du, 0x0007215Du, 0u, 0u},                  // exitProcessPatchRva
+    {0x74u, 0x75u, 0u, 0u},                              // exitProcessPatchOriginal
+    2,                                                   // exitProcessPatchCount
+};
+
+}}} // namespace netplay::bridge::takeover

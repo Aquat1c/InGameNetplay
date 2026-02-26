@@ -112,6 +112,13 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
                 continue;
             }
 
+            // Main menu entries already have correct labels baked into the
+            // sprite sheet; drawing sprite-font text on top would double-render.
+            if (g_netplayMenuState.menuId == NetplayMenuId::Main)
+            {
+                continue;
+            }
+
             // Lobby player/playing slots display arbitrary network strings that may
             // not exist in the sprite sheet -- skip here and let GDI handle them.
             const bool isLobbyNicknameRow =
@@ -383,43 +390,27 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
-    // Lobby nicknames are arbitrary server-supplied strings; always use GDI for
-    // the lobby so that every character is renderable regardless of the sprite
-    // font sheet coverage.
+    // All overlays now draw via surface lock + pixel writes before present,
+    // so there is no post-present window DC fallback needed.
     const bool forceGdi = (g_netplayMenuState.menuId == NetplayMenuId::Lobby);
-    bool drewGdiOverlay = false;
     if (!g_spriteFont.loaded || forceGdi)
     {
-        drewGdiOverlay = DrawRuntimeTextOverlayGdi(screenContext, false);
+        (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }
-    const bool drewDelayOverlay = DrawDelaySetupOverlayGdi(screenContext, false);
-    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
-    if ((!g_spriteFont.loaded || forceGdi) && !drewGdiOverlay)
-    {
-        (void)DrawRuntimeTextOverlayGdi(screenContext, true);
-    }
-    if (!drewDelayOverlay)
-    {
-        (void)DrawDelaySetupOverlayGdi(screenContext, true);
-    }
-    return presentResult;
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawDebugOverlay(screenContext);
+    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
 }
 
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
     DrawAnimatedCompactMenuLayer(screenContext);
-    const bool drewGdiOverlay = DrawDynamicFieldValuesGdi(screenContext, false);
-    const bool drewDelayOverlay = DrawDelaySetupOverlayGdi(screenContext, false);
-    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
-    if (!drewGdiOverlay)
-    {
-        (void)DrawDynamicFieldValuesGdi(screenContext, true);
-    }
-    if (!drewDelayOverlay)
-    {
-        (void)DrawDelaySetupOverlayGdi(screenContext, true);
-    }
-    return presentResult;
+    (void)DrawDynamicFieldValuesGdi(screenContext, false);
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawDebugOverlay(screenContext);
+    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
 }
 } // namespace netplay::hooks::internal

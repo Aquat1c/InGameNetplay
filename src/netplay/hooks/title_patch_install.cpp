@@ -78,6 +78,7 @@ bool InstallHooks()
     const uintptr_t addrTitleVtableRender = RuntimeAddress(kVaTitleVtableRender);
     const uintptr_t addrTitleVtableUpdate = RuntimeAddress(kVaTitleVtableUpdate);
 
+
     bool ok = true;
     ok = ok && ApplyPatch(addrWrapCmpMax, {0x83, 0xF8, 0x06}, {0x83, 0xF8, 0x07}, "wrap compare 6->7");
     ok = ok && ApplyPatch(
@@ -128,6 +129,7 @@ bool InstallHooks()
         dwordToBytes(static_cast<uint32_t>(RuntimeAddress(kVaUpdateTitleScreenLogic))),
         dwordToBytes(reinterpret_cast<uint32_t>(&HookedTitleUpdateThunk)),
         "title vtable update -> hook");
+
 
     if (!ok)
     {

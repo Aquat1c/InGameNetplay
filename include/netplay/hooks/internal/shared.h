@@ -67,7 +67,9 @@ struct DelaySetupOverlayState
     bool active = false;
     bool waitingForRuntimeReady = false;
     bool vsHumanSyncArmed = false;
+    bool connectedHandoffDelayActive = false;
     DWORD nextHandoffRetryTick = 0;
+    int connectedHandoffDelayFramesRemaining = 0;
     int selectedDelay = 0;
     int recommendedDelay = 0;
     int minDelay = 0;
@@ -77,6 +79,22 @@ struct DelaySetupOverlayState
     char p1Name[64] = {};
     char p2Name[64] = {};
     char errorMessage[96] = {};
+};
+
+struct SpectateConfirmOverlayState
+{
+    bool active = false;
+    int selectedOption = 0; // 0 = Yes, 1 = No
+    char errorMessage[96] = {};
+};
+
+struct DebugOverlayState
+{
+    bool open = false;
+    int selectedIndex = 0;
+    bool forceDelayOverlay = false;
+    bool forceSpectateOverlay = false;
+    bool forceRuntimeTextOverlay = false;
 };
 
 using PlaySoundEffectFn = int(__thiscall*)(void* gameSystem, unsigned short soundIndex);
@@ -139,8 +157,11 @@ extern bool g_pendingVsHumanAutoConfirm;
 extern DWORD g_pendingVsHumanAutoConfirmTick;
 extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
 extern bool g_returnToNetplayAfterMatch;
+extern bool g_charSelectEntryHoldArmed;
 extern InputSnapshot g_lastInputSnapshot;
 extern DelaySetupOverlayState g_delaySetupOverlay;
+extern SpectateConfirmOverlayState g_spectateConfirmOverlay;
+extern DebugOverlayState g_debugOverlay;
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 HMODULE ResolveCurrentModule();
@@ -157,6 +178,8 @@ void PlayUiSound(uint32_t screenContext, unsigned short soundIndex);
 void InstallNetplayWindowHook(uint32_t screenContext);
 void RemoveNetplayWindowHook();
 bool ConsumeNetplayEscapeEdge();
+bool EnsureCharSelectEntryHoldHook();
+void ArmCharSelectEntryHold();
 
 int GetCurrentMenuEntryCount();
 int ClampSelectionToCurrentMenu(int selection);
@@ -177,6 +200,7 @@ void*** GetGraphicsManager(uint32_t screenContext);
 void** GetGraphicsContext(uint32_t screenContext);
 TitleUpdateFn GetOriginalTitleUpdate();
 TitleRenderFn GetOriginalTitleRender();
+
 void StopCurrentBgm(uint32_t screenContext, const char* reason);
 void ResetTitleMenuState(uint32_t screenContext, int8_t selection);
 void RunTransitionFadeOut(uint32_t screenContext, int baseVolume, int volumeAdjustment);
@@ -193,6 +217,9 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks();
 bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawDebugOverlay(uint32_t screenContext);
+bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter);
 BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext);
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext);
 void DrawAnimatedCompactMenuLayer(uint32_t screenContext);
@@ -206,6 +233,7 @@ void TriggerNetplayMenuEntry(uint32_t screenContext);
 
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext);
 extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext);
+
 
 #if defined(_M_IX86)
 extern "C" void __cdecl NetplayCaseImpl(uint32_t screenContext);

@@ -28,5 +28,11 @@ void ResolveOverlayTextPaletteColors(
     uint8_t paletteCount,
     uint8_t* outSelected,
     uint8_t* outNormal);
+
+uint8_t ResolveBestPaletteColor(
+    uint32_t screenContext,
+    int targetR,
+    int targetG,
+    int targetB);
 }
 

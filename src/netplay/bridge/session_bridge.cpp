@@ -308,6 +308,42 @@ bool ApplyInputDelay(int delayFrames)
     return applied;
 }
 
+bool AnswerSpectateConfirm(bool acceptSpectate)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    JoinFinishedWorkerUnlocked();
+    if (g_startWorkerRunning)
+    {
+        mod::Log("SessionBridge: AnswerSpectateConfirm rejected (start worker running)");
+        return false;
+    }
+
+    const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
+    if (phase != NetbridgePhase::Connecting
+        && phase != NetbridgePhase::DelaySetup
+        && phase != NetbridgePhase::Connected)
+    {
+        mod::Log(
+            "SessionBridge: AnswerSpectateConfirm ignored (phase=%s accept=%d)",
+            PhaseToString(phase),
+            acceptSpectate ? 1 : 0);
+        return false;
+    }
+
+    const bool answered = takeover::AnswerSpectateConfirm(acceptSpectate, &g_status);
+    mod::Log(
+        "SessionBridge: AnswerSpectateConfirm accept=%d result=%d phase=%s",
+        acceptSpectate ? 1 : 0,
+        answered ? 1 : 0,
+        PhaseToString(static_cast<NetbridgePhase>(g_status.phase)));
+    return answered;
+}
+
 bool PrepareVsHumanHandoff()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -377,6 +413,23 @@ void CancelSession(const char* reason)
 
     JoinFinishedWorkerUnlocked();
     takeover::CancelSession(reason, &g_status);
+}
+
+bool ConsumeRevivalExitInterception(int* outMode)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    // Invalidate any in-flight start worker result so it won't overwrite the
+    // cleaned-up status when it eventually completes.
+    ++g_startRequestSerial;
+    g_connectStartTick = 0;
+
+    JoinFinishedWorkerUnlocked();
+    return takeover::ConsumeRevivalExitInterception(outMode, &g_status);
 }
 
 void OnTitleSelectionConfirmed(int selection)

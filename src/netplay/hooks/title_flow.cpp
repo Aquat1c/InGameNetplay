@@ -31,6 +31,7 @@ namespace
 {
 constexpr int kDelaySelectionMin = 0;
 constexpr int kDelaySelectionMax = 20;
+constexpr int kConnectedPreHandoffDelayFrames = 18;
 int g_pendingGlobalStateTransition = -1;
 constexpr uint32_t kGameSystemOffsetCpuFlagP1 = 4931;
 constexpr uint32_t kGameSystemOffsetCpuFlagP2 = 4932;
@@ -64,6 +65,131 @@ void CopyBoundedText(char* dst, size_t dstSize, const char* src)
 void ResetDelaySetupOverlayState()
 {
     g_delaySetupOverlay = {};
+}
+
+void ResetSpectateConfirmOverlayState()
+{
+    g_spectateConfirmOverlay = {};
+}
+
+void ActivateSpectateConfirmOverlay()
+{
+    ResetSpectateConfirmOverlayState();
+    g_spectateConfirmOverlay.active = true;
+    g_spectateConfirmOverlay.selectedOption = 0; // default to Yes
+    mod::Log("SpectateConfirmOverlay: activated");
+}
+
+bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
+{
+    if (!g_spectateConfirmOverlay.active || inputBytes == nullptr || inactivityCounter == nullptr)
+    {
+        return false;
+    }
+
+    bool cancelRequested = ConsumeNetplayEscapeEdge();
+    bool confirmRequested = false;
+
+    for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+    {
+        auto* const inputLatch = reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1 + playerIndex);
+        const int8_t vertical = static_cast<int8_t>(inputBytes[playerIndex + 14]);
+
+        int step = 0;
+        if (vertical > 0)
+        {
+            step = 1;
+        }
+        else if (vertical < 0)
+        {
+            step = -1;
+        }
+
+        if (step != 0)
+        {
+            *inactivityCounter = 0;
+            if (*inputLatch == 0)
+            {
+                const int oldOption = g_spectateConfirmOverlay.selectedOption;
+                int newOption = oldOption + step;
+                if (newOption < 0) newOption = 1;
+                if (newOption > 1) newOption = 0;
+                if (newOption != oldOption)
+                {
+                    g_spectateConfirmOverlay.selectedOption = newOption;
+                    PlayUiSound(screenContext, kSfxMove);
+                }
+                *inputLatch = 1;
+            }
+        }
+        else
+        {
+            *inputLatch = 0;
+        }
+
+        if (inputBytes[playerIndex + 16] == 1)
+        {
+            confirmRequested = true;
+        }
+        if (inputBytes[playerIndex + 18] == 1)
+        {
+            cancelRequested = true;
+        }
+    }
+
+    ++(*inactivityCounter);
+
+    if (cancelRequested)
+    {
+        PlayUiSound(screenContext, kSfxConfirm);
+        ResetSpectateConfirmOverlayState();
+        netplay::bridge::AnswerSpectateConfirm(false);
+        netplay::bridge::CancelSession("spectate_declined");
+        mod::Log("SpectateConfirmOverlay: canceled (escape)");
+        return true;
+    }
+
+    if (confirmRequested)
+    {
+        const bool accepted = (g_spectateConfirmOverlay.selectedOption == 0); // 0 = Yes
+        PlayUiSound(screenContext, kSfxConfirm);
+
+        const bool answered = netplay::bridge::AnswerSpectateConfirm(accepted);
+        if (!answered)
+        {
+            const auto status = netplay::bridge::GetStatus();
+            if (status.errorMsg[0] != '\0')
+            {
+                std::snprintf(
+                    g_spectateConfirmOverlay.errorMessage,
+                    sizeof(g_spectateConfirmOverlay.errorMessage),
+                    "%s",
+                    status.errorMsg);
+            }
+            else
+            {
+                std::snprintf(
+                    g_spectateConfirmOverlay.errorMessage,
+                    sizeof(g_spectateConfirmOverlay.errorMessage),
+                    "Failed to send answer");
+            }
+            mod::Log("SpectateConfirmOverlay: answer failed accepted=%d", accepted ? 1 : 0);
+            return true;
+        }
+
+        mod::Log("SpectateConfirmOverlay: answered accepted=%d", accepted ? 1 : 0);
+        ResetSpectateConfirmOverlayState();
+
+        if (!accepted)
+        {
+            netplay::bridge::CancelSession("spectate_declined");
+        }
+        // If accepted, the session continues — Revival will proceed to delay
+        // setup or straight to game. The normal delay/connected flow handles it.
+        return true;
+    }
+
+    return true;
 }
 
 int ClampDelaySelection(int value)
@@ -241,6 +367,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         {
             PlayUiSound(screenContext, kSfxConfirm);
             ResetDelaySetupOverlayState();
+            ResetSpectateConfirmOverlayState();
             netplay::bridge::CancelSession("user_cancel");
             mod::Log("DelayOverlay: canceled while waiting for runtime sync");
             return true;
@@ -320,6 +447,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
     {
         PlayUiSound(screenContext, kSfxConfirm);
         ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
         netplay::bridge::CancelSession("user_cancel");
         mod::Log("DelayOverlay: canceled");
         return true;
@@ -383,6 +511,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         }
 
         ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
         HandoffConnectedSessionToVsHumanState(screenContext);
         return true;
     }
@@ -462,6 +591,7 @@ void EnterNetplayMenu(uint32_t screenContext)
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
     ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
     SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
     InstallNetplayWindowHook(screenContext);
 
@@ -515,6 +645,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
     ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -563,9 +694,11 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     g_pendingVsHumanAutoConfirmTick = 0;
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = 1;
+
     mod::Log(
         "HandoffConnectedSessionToVsHumanState: queued global transition nextState=%d returnToNetplay=%d",
         g_pendingGlobalStateTransition,
@@ -739,7 +872,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         }
 
         const bool started = netplay::bridge::StartSession(
-            NetbridgeRole::Spectate,
+            NetbridgeRole::JoinSpectate,
             g_netplayMenuState.joinPort,
             status.playing[0].hostIp.c_str(),
             "");
@@ -953,9 +1086,65 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    // --- Debug overlay (D key) ---
+    // Always poll the D key toggle; if the overlay is open, consume input.
+    if (HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
+    {
+        // Don't clear input latches — the debug overlay manages them internally
+        // to prevent axis repeat.
+        return 0;
+    }
+
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
     const bool bridgeDelaySetupReady = bridgeStatus.delaySetupReady != 0;
+
+    // --- Fast handoff ---
+    // If the Revival rollback engine is already in sync state (vsHumanSyncReady)
+    // and the delay overlay has been submitted (waitingForRuntimeReady) or delay
+    // setup was never shown, transition immediately.  This prevents a multi-frame
+    // window where the remote side is at State 1 (charselect) while we're still
+    // at State 0 (title), which causes a non-rollback desync freeze.
+    if (bridgeStatus.vsHumanSyncReady != 0
+        && (bridgePhase == NetbridgePhase::Connected
+            || bridgePhase == NetbridgePhase::DelaySetup)
+        && (!g_delaySetupOverlay.active || g_delaySetupOverlay.waitingForRuntimeReady))
+    {
+        mod::Log(
+            "FastHandoff: vsHumanSyncReady detected, immediate transition phase=%s sync(mode=%d flag1084=%d session=%d)",
+            netplay::bridge::PhaseToString(bridgePhase),
+            bridgeStatus.syncGameMode,
+            bridgeStatus.syncMode0Flag1084,
+            bridgeStatus.syncSessionByte);
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        HandoffConnectedSessionToVsHumanState(screenContext);
+        if (g_pendingGlobalStateTransition >= 0)
+        {
+            const int nextState = g_pendingGlobalStateTransition;
+            g_pendingGlobalStateTransition = -1;
+            return static_cast<char>(nextState);
+        }
+        return 0;
+    }
+
+    // --- Spectate confirm overlay ---
+    // The spectate confirm prompt fires during Connecting when the host is
+    // already mid-match.  We must handle it BEFORE the delay-setup check so
+    // that the user can accept/decline before Revival continues.
+    const bool spectateConfirmPending =
+        bridgeStatus.spectateConfirmPromptSerial > 0
+        && bridgeStatus.spectateConfirmPromptServedSerial < bridgeStatus.spectateConfirmPromptSerial;
+    if (spectateConfirmPending && !g_spectateConfirmOverlay.active)
+    {
+        ActivateSpectateConfirmOverlay();
+    }
+    if (g_spectateConfirmOverlay.active)
+    {
+        (void)HandleSpectateConfirmOverlayInput(screenContext, inputBytes, inactivityCounter);
+        return 0;
+    }
+
     if ((bridgePhase == NetbridgePhase::DelaySetup
             || bridgePhase == NetbridgePhase::Connected
             || bridgePhase == NetbridgePhase::Connecting)
@@ -1019,6 +1208,27 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (g_delaySetupOverlay.waitingForRuntimeReady
             && (bridgePhase == NetbridgePhase::Connected || bridgeStatus.vsHumanSyncReady != 0))
         {
+            if (bridgeStatus.vsHumanSyncReady == 0 && bridgePhase == NetbridgePhase::Connected)
+            {
+                if (!g_delaySetupOverlay.connectedHandoffDelayActive)
+                {
+                    g_delaySetupOverlay.connectedHandoffDelayActive = true;
+                    g_delaySetupOverlay.connectedHandoffDelayFramesRemaining = kConnectedPreHandoffDelayFrames;
+                    mod::Log(
+                        "DelayOverlay: connected pre-handoff delay started frames=%d sync(mode=%d flag1084=%d session=%d)",
+                        g_delaySetupOverlay.connectedHandoffDelayFramesRemaining,
+                        bridgeStatus.syncGameMode,
+                        bridgeStatus.syncMode0Flag1084,
+                        bridgeStatus.syncSessionByte);
+                }
+
+                if (g_delaySetupOverlay.connectedHandoffDelayFramesRemaining > 0)
+                {
+                    --g_delaySetupOverlay.connectedHandoffDelayFramesRemaining;
+                    return 0;
+                }
+            }
+
             mod::Log(
                 "DelayOverlay: runtime sync ready after delay selection phase=%s sync(mode=%d flag1084=%d session=%d)",
                 netplay::bridge::PhaseToString(bridgePhase),
@@ -1026,6 +1236,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 bridgeStatus.syncMode0Flag1084,
                 bridgeStatus.syncSessionByte);
             ResetDelaySetupOverlayState();
+            ResetSpectateConfirmOverlayState();
             HandoffConnectedSessionToVsHumanState(screenContext);
             if (g_pendingGlobalStateTransition >= 0)
             {
@@ -1050,6 +1261,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     else
     {
         ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
     }
 
     // Some sessions can complete delay negotiation inside Revival without

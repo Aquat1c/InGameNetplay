@@ -34,6 +34,11 @@ add_library(efz_netplay_mod SHARED
     src/netplay/assets/assets.cpp
     src/netplay/bridge/session_bridge.cpp
     src/netplay/bridge/revival_takeover.cpp
+    src/netplay/bridge/console_capture.cpp
+    src/netplay/bridge/revival_memory.cpp
+    src/netplay/bridge/ipc_shared.cpp
+    src/netplay/bridge/process_inject.cpp
+    src/netplay/bridge/iat_stubs.cpp
     src/netplay/core/inline_edit.cpp
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
@@ -66,18 +71,24 @@ if(EFZ_EMBEDDED_TLS)
 endif()
 
 if(MSVC)
-    target_compile_options(efz_netplay_mod PRIVATE /W4 /permissive- /EHsc)
-    if(EFZ_STATIC_RUNTIME)
-        set_property(TARGET efz_netplay_mod PROPERTY
-            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    endif()
-
     if(EFZ_XP_COMPAT)
-        target_compile_definitions(efz_netplay_mod PRIVATE WINVER=0x0501 _WIN32_WINNT=0x0501)
+        # The Windows 7.1A SDK shipped with the v141_xp toolset has headers
+        # that do not compile under /permissive-.  Use relaxed conformance
+        # mode so the old SDK headers are accepted.
+        target_compile_options(efz_netplay_mod PRIVATE /W4 /EHsc)
+        target_compile_definitions(efz_netplay_mod PRIVATE
+            WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
         target_compile_options(efz_netplay_mod PRIVATE /Zc:threadSafeInit-)
         if(NOT CMAKE_GENERATOR_TOOLSET MATCHES "v141_xp")
             message(WARNING "EFZ_XP_COMPAT is enabled but generator toolset is not v141_xp; the binary may still import Vista+ APIs.")
         endif()
+    else()
+        target_compile_options(efz_netplay_mod PRIVATE /W4 /permissive- /EHsc)
+    endif()
+
+    if(EFZ_STATIC_RUNTIME)
+        set_property(TARGET efz_netplay_mod PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endif()
 

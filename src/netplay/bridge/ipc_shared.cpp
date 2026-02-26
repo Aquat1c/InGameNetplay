@@ -1,0 +1,1077 @@
+// IPC shared memory, config loading, module resolution, and session status helpers.
+
+#include "netplay/bridge/takeover_internal.h"
+
+#include <array>
+#include <cstdio>
+#include <cstring>
+
+#include <windows.h>
+
+namespace netplay::bridge::takeover
+{
+
+void* EnsureRevivalErrorCodeNullGuardStub()
+{
+    if (g_revivalErrorCodeNullGuardStub != nullptr)
+    {
+        return g_revivalErrorCodeNullGuardStub;
+    }
+
+    void* stub = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (stub == nullptr)
+    {
+        mod::Log(
+            "Takeover: failed to allocate null-guard stub err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return nullptr;
+    }
+
+    // if ((ecx & 0xFFFF0000) == 0) return true; else return (*ecx == 0);
+    constexpr std::array<uint8_t, 17> kStubBytes = {
+        0xB0, 0x01,                         // mov al, 1
+        0xF7, 0xC1, 0x00, 0x00, 0xFF, 0xFF, // test ecx, 0xFFFF0000
+        0x74, 0x06,                         // jz +6
+        0x83, 0x39, 0x00,                   // cmp dword ptr [ecx], 0
+        0x0F, 0x94, 0xC0,                   // sete al
+        0xC3,                               // ret
+    };
+
+    std::memcpy(stub, kStubBytes.data(), kStubBytes.size());
+    (void)FlushInstructionCache(GetCurrentProcess(), stub, kStubBytes.size());
+    g_revivalErrorCodeNullGuardStub = stub;
+    return stub;
+}
+
+bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsoleEvent)
+{
+    if (ctx == nullptr)
+    {
+        return false;
+    }
+
+    ctx->mapHandle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, kSharedBlockName);
+    if (ctx->mapHandle == nullptr)
+    {
+        return false;
+    }
+
+    ctx->block = static_cast<SharedBlock*>(MapViewOfFile(ctx->mapHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock)));
+    if (ctx->block == nullptr)
+    {
+        CloseHandle(ctx->mapHandle);
+        ctx->mapHandle = nullptr;
+        return false;
+    }
+
+    if (needInitEvent)
+    {
+        ctx->initEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kInitReadyEventName);
+    }
+    if (needConsoleEvent)
+    {
+        ctx->consoleEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kConsoleReadyEventName);
+    }
+
+    return true;
+}
+
+void CloseTempIpcContext(TempIpcContext* ctx)
+{
+    if (ctx == nullptr)
+    {
+        return;
+    }
+
+    if (ctx->block != nullptr)
+    {
+        UnmapViewOfFile(ctx->block);
+        ctx->block = nullptr;
+    }
+    if (ctx->mapHandle != nullptr)
+    {
+        CloseHandle(ctx->mapHandle);
+        ctx->mapHandle = nullptr;
+    }
+    if (ctx->initEvent != nullptr)
+    {
+        CloseHandle(ctx->initEvent);
+        ctx->initEvent = nullptr;
+    }
+    if (ctx->consoleEvent != nullptr)
+    {
+        CloseHandle(ctx->consoleEvent);
+        ctx->consoleEvent = nullptr;
+    }
+}
+
+void PublishDelayPromptSerial(LONG serial)
+{
+    if (serial <= 0)
+    {
+        return;
+    }
+
+    if (g_injectedBlock != nullptr)
+    {
+        const LONG current = InterlockedCompareExchange(&g_injectedBlock->delayPromptSerial, 0, 0);
+        if (serial > current)
+        {
+            InterlockedExchange(&g_injectedBlock->delayPromptSerial, serial);
+        }
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        const LONG current = InterlockedCompareExchange(&temp.block->delayPromptSerial, 0, 0);
+        if (serial > current)
+        {
+            InterlockedExchange(&temp.block->delayPromptSerial, serial);
+        }
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void PublishSpectateConfirmPromptSerial(LONG serial)
+{
+    if (serial <= 0)
+    {
+        return;
+    }
+
+    if (g_injectedBlock != nullptr)
+    {
+        const LONG current = InterlockedCompareExchange(&g_injectedBlock->spectateConfirmPromptSerial, 0, 0);
+        if (serial > current)
+        {
+            InterlockedExchange(&g_injectedBlock->spectateConfirmPromptSerial, serial);
+        }
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        const LONG current = InterlockedCompareExchange(&temp.block->spectateConfirmPromptSerial, 0, 0);
+        if (serial > current)
+        {
+            InterlockedExchange(&temp.block->spectateConfirmPromptSerial, serial);
+        }
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial)
+{
+    LONG promptSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
+    LONG promptServedSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
+
+    if (g_hostBlock != nullptr)
+    {
+        const LONG sharedPromptSerial = InterlockedCompareExchange(&g_hostBlock->spectateConfirmPromptSerial, 0, 0);
+        const LONG sharedPromptServedSerial = InterlockedCompareExchange(&g_hostBlock->spectateConfirmPromptServedSerial, 0, 0);
+        if (sharedPromptSerial > promptSerial)
+        {
+            promptSerial = sharedPromptSerial;
+        }
+        if (sharedPromptServedSerial > promptServedSerial)
+        {
+            promptServedSerial = sharedPromptServedSerial;
+        }
+    }
+
+    if (outPromptSerial != nullptr)
+    {
+        *outPromptSerial = promptSerial;
+    }
+    if (outPromptServedSerial != nullptr)
+    {
+        *outPromptServedSerial = promptServedSerial;
+    }
+}
+
+HMODULE SelfModule()
+{
+    HMODULE module = nullptr;
+    (void)GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&SelfModule),
+        &module);
+    return module;
+}
+
+std::string ModulePath(HMODULE module)
+{
+    char path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+    {
+        return std::string();
+    }
+    return std::string(path);
+}
+
+bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag)
+{
+    if (outEnabled == nullptr)
+    {
+        return false;
+    }
+
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0)
+    {
+        return false;
+    }
+    char* slash = std::strrchr(exePath, '\\');
+    if (slash == nullptr)
+    {
+        slash = std::strrchr(exePath, '/');
+    }
+    if (slash == nullptr)
+    {
+        return false;
+    }
+    slash[1] = '\0';
+    std::string iniPath = std::string(exePath) + "EfzRevival.ini";
+
+    const UINT debugValue = GetPrivateProfileIntA("Global", "Debug", 2, iniPath.c_str());
+    if (debugValue > 1)
+    {
+        return false;
+    }
+
+    *outEnabled = (debugValue != 0);
+    if (outSourceTag != nullptr)
+    {
+        *outSourceTag = std::string("ini:") + iniPath;
+    }
+    return true;
+}
+
+bool CaptureRevivalNativeLogsEnabled()
+{
+    if (g_captureRevivalNativeLogsConfigured)
+    {
+        return g_captureRevivalNativeLogs;
+    }
+
+    bool enabled = false;
+    std::string sourceTag = "default_off";
+    if (TryReadCaptureRevivalNativeLogsConfig(&enabled, &sourceTag))
+    {
+        g_captureRevivalNativeLogs = enabled;
+    }
+    else
+    {
+        g_captureRevivalNativeLogs = enabled;
+    }
+    g_captureRevivalNativeLogsConfigured = true;
+
+    mod::Log(
+        "Takeover: capture revival native logs=%d source=%s",
+        g_captureRevivalNativeLogs ? 1 : 0,
+        sourceTag.c_str());
+
+    return g_captureRevivalNativeLogs;
+}
+
+std::string GameDirectory()
+{
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, path, MAX_PATH) == 0)
+    {
+        return std::string();
+    }
+    char* slash = std::strrchr(path, '\\');
+    if (slash == nullptr)
+    {
+        return std::string();
+    }
+    *slash = '\0';
+    return std::string(path);
+}
+
+bool TryWriteClipboardAscii(const char* text)
+{
+    if (text == nullptr || text[0] == '\0')
+    {
+        return false;
+    }
+
+    const size_t bytes = std::strlen(text) + 1;
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        if (OpenClipboard(nullptr) == FALSE)
+        {
+            Sleep(10);
+            continue;
+        }
+
+        bool success = false;
+        if (EmptyClipboard() != FALSE)
+        {
+            HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if (memory != nullptr)
+            {
+                void* const locked = GlobalLock(memory);
+                if (locked != nullptr)
+                {
+                    std::memcpy(locked, text, bytes);
+                    GlobalUnlock(memory);
+                    if (SetClipboardData(CF_TEXT, memory) != nullptr)
+                    {
+                        // Clipboard owns the handle after success.
+                        memory = nullptr;
+                        success = true;
+                    }
+                }
+                if (memory != nullptr)
+                {
+                    GlobalFree(memory);
+                }
+            }
+        }
+
+        CloseClipboard();
+        if (success)
+        {
+            return true;
+        }
+
+        Sleep(10);
+    }
+
+    return false;
+}
+
+void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error)
+{
+    if (status == nullptr)
+    {
+        return;
+    }
+
+    const NetbridgePhase oldPhase = static_cast<NetbridgePhase>(status->phase);
+    char oldError[sizeof(status->errorMsg)] = {};
+    std::memcpy(oldError, status->errorMsg, sizeof(status->errorMsg));
+
+    status->phase = static_cast<int>(phase);
+    status->phaseTick = GetTickCount();
+    if (error != nullptr)
+    {
+        CopyString(status->errorMsg, sizeof(status->errorMsg), error);
+    }
+    else if (phase != NetbridgePhase::Failed)
+    {
+        status->errorMsg[0] = '\0';
+    }
+
+    if (oldPhase != phase || std::strncmp(oldError, status->errorMsg, sizeof(status->errorMsg)) != 0)
+    {
+        mod::Log(
+            "Takeover: phase %s -> %s reason='%s'",
+            netplay::bridge::PhaseToString(oldPhase),
+            netplay::bridge::PhaseToString(phase),
+            status->errorMsg[0] != '\0' ? status->errorMsg : "");
+    }
+}
+
+void CloseProcessHandle(NetbridgeStatus* status)
+{
+    if (g_revivalProcess != nullptr)
+    {
+        CloseHandle(g_revivalProcess);
+        g_revivalProcess = nullptr;
+    }
+    g_revivalProcessId = 0;
+    g_remoteInjectedSelfBase = 0;
+    g_lastLatePatchRetryTick = 0;
+    g_lastLatePatchRetryLogTick = 0;
+    g_latePatchRetryAttempts = 0;
+    g_latePatchRetrySuccesses = 0;
+    g_lastLatePatchRetryResultValid = false;
+    g_lastLatePatchRetryResult = false;
+    g_observedTakeoverCreatePath = false;
+    g_lastRuntimeReadyProbeLogTick = 0;
+    g_lastRuntimeReadyProbeMask = 0;
+    g_lastRuntimeReadyProbeMaskValid = false;
+    if (status != nullptr)
+    {
+        status->processId = 0;
+    }
+}
+
+bool ProcessAlive(NetbridgeStatus* status)
+{
+    if (g_revivalProcess == nullptr)
+    {
+        return false;
+    }
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(g_revivalProcess, &exitCode) == FALSE || exitCode != STILL_ACTIVE)
+    {
+        CloseProcessHandle(status);
+        return false;
+    }
+    return true;
+}
+
+bool IsSyncReadyForVsHuman(const NetbridgeStatus* status)
+{
+    if (status == nullptr)
+    {
+        return false;
+    }
+
+    // Player sync ready: EFZ game mode 3 (online play), connection flag 4,
+    // rollback session byte in a known-good state.
+    if (status->syncGameMode == 3
+        && status->syncMode0Flag1084 == 4
+        && (status->syncSessionByte == 0 || status->syncSessionByte == 1 || status->syncSessionByte == 2))
+    {
+        return true;
+    }
+
+    // Spectator sync ready: EFZ game mode 8 (spectate), connection flag 4.
+    // Spectators don't use the same session object layout so we don't check
+    // sessionByte here — the lightweight spectator wrapper has different
+    // offsets and a smaller object (160 bytes vs 688 for players).
+    if (status->syncGameMode == 8 && status->syncMode0Flag1084 == 4)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial)
+{
+    LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
+    LONG promptServedSerial = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
+
+    if (g_hostBlock != nullptr)
+    {
+        const LONG sharedPromptSerial = InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0);
+        const LONG sharedPromptServedSerial = InterlockedCompareExchange(&g_hostBlock->delayPromptServedSerial, 0, 0);
+        if (sharedPromptSerial > promptSerial)
+        {
+            promptSerial = sharedPromptSerial;
+        }
+        if (sharedPromptServedSerial > promptServedSerial)
+        {
+            promptServedSerial = sharedPromptServedSerial;
+        }
+    }
+
+    if (outPromptSerial != nullptr)
+    {
+        *outPromptSerial = promptSerial;
+    }
+    if (outPromptServedSerial != nullptr)
+    {
+        *outPromptServedSerial = promptServedSerial;
+    }
+}
+
+RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status)
+{
+    RuntimeReadyProbe probe = {};
+    probe.nativeSyncReady = IsSyncReadyForVsHuman(status);
+    if (probe.nativeSyncReady)
+    {
+        probe.ready = true;
+        probe.source = "native_sync";
+        return probe;
+    }
+
+    probe.localInitApplied = g_localInitAppliedForSession;
+    if (!probe.localInitApplied)
+    {
+        return probe;
+    }
+
+    LONG promptSerial = 0;
+    LONG promptServedSerial = 0;
+    ReadDelayPromptSignal(&promptSerial, &promptServedSerial);
+    probe.delayPromptSeen = promptSerial > 0;
+    if (!probe.delayPromptSeen)
+    {
+        return probe;
+    }
+
+    LONG inputSerial = 0;
+    LONG inputServedSerial = 0;
+    if (g_hostBlock != nullptr)
+    {
+        inputSerial = InterlockedCompareExchange(&g_hostBlock->delayInputSerial, 0, 0);
+        inputServedSerial = InterlockedCompareExchange(&g_hostBlock->delayInputServedSerial, 0, 0);
+    }
+
+    probe.delayInputApplied =
+        (inputSerial > 0 && inputServedSerial >= inputSerial)
+        || (inputSerial <= 0 && promptServedSerial >= promptSerial);
+    if (!probe.delayInputApplied)
+    {
+        return probe;
+    }
+
+    if (g_revivalProcessId == 0)
+    {
+        return probe;
+    }
+
+    const uintptr_t sessionPtr = ReadSessionPointerFromRevival();
+    probe.sessionPointerValid = sessionPtr != 0;
+    if (!probe.sessionPointerValid)
+    {
+        return probe;
+    }
+
+    int helperPidField = -1;
+    uintptr_t helperHandleFieldRaw = 0;
+    (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetHelperPid), &helperPidField);
+    (void)SafeReadPtr(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetHelperHandle), &helperHandleFieldRaw);
+
+    probe.helperPidMatches = helperPidField == static_cast<int>(g_revivalProcessId);
+    const HANDLE helperHandle = reinterpret_cast<HANDLE>(helperHandleFieldRaw);
+    if (helperHandle != nullptr && helperHandle != INVALID_HANDLE_VALUE)
+    {
+        probe.helperHandleMatches = GetProcessId(helperHandle) == g_revivalProcessId;
+    }
+
+    probe.helperBindingReady = probe.helperPidMatches || probe.helperHandleMatches;
+    if (probe.helperBindingReady)
+    {
+        probe.ready = true;
+        probe.source = "post_delay_binding";
+    }
+
+    return probe;
+}
+
+bool HasRuntimeReadySignal(const NetbridgeStatus* status)
+{
+    return EvaluateRuntimeReadyProbe(status).ready;
+}
+
+uint32_t BuildRuntimeReadyProbeMask(const RuntimeReadyProbe& probe)
+{
+    uint32_t mask = 0;
+    if (probe.nativeSyncReady)
+    {
+        mask |= (1u << 0);
+    }
+    if (probe.localInitApplied)
+    {
+        mask |= (1u << 1);
+    }
+    if (probe.delayPromptSeen)
+    {
+        mask |= (1u << 2);
+    }
+    if (probe.delayInputApplied)
+    {
+        mask |= (1u << 3);
+    }
+    if (probe.sessionPointerValid)
+    {
+        mask |= (1u << 4);
+    }
+    if (probe.helperPidMatches)
+    {
+        mask |= (1u << 5);
+    }
+    if (probe.helperHandleMatches)
+    {
+        mask |= (1u << 6);
+    }
+    if (probe.ready)
+    {
+        mask |= (1u << 7);
+    }
+    return mask;
+}
+
+bool EnsureHostIpc()
+{
+    if (g_hostBlock != nullptr && g_hostInitEvent != nullptr && g_hostConsoleEvent != nullptr)
+    {
+        return true;
+    }
+
+    if (g_hostMapHandle == nullptr)
+    {
+        g_hostMapHandle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedBlock), kSharedBlockName);
+        if (g_hostMapHandle == nullptr)
+        {
+            mod::Log("Takeover: CreateFileMapping failed: %s", ErrorString(GetLastError()).c_str());
+            return false;
+        }
+    }
+    if (g_hostBlock == nullptr)
+    {
+        g_hostBlock = static_cast<SharedBlock*>(MapViewOfFile(g_hostMapHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock)));
+        if (g_hostBlock == nullptr)
+        {
+            mod::Log("Takeover: MapViewOfFile failed: %s", ErrorString(GetLastError()).c_str());
+            return false;
+        }
+    }
+
+    if (g_hostInitEvent == nullptr)
+    {
+        g_hostInitEvent = CreateEventA(nullptr, FALSE, FALSE, kInitReadyEventName);
+        if (g_hostInitEvent == nullptr)
+        {
+            return false;
+        }
+    }
+    if (g_hostConsoleEvent == nullptr)
+    {
+        g_hostConsoleEvent = CreateEventA(nullptr, FALSE, FALSE, kConsoleReadyEventName);
+        if (g_hostConsoleEvent == nullptr)
+        {
+            return false;
+        }
+    }
+
+    g_hostBlock->magic = kIpcMagic;
+    g_hostBlock->version = kIpcVersion;
+    g_hostBlock->hostPid = GetCurrentProcessId();
+    g_hostBlock->hostRevivalBase = static_cast<uint32_t>(g_hostRevivalBase);
+    return true;
+}
+
+void CloseHostIpc()
+{
+    if (g_hostBlock != nullptr)
+    {
+        UnmapViewOfFile(g_hostBlock);
+        g_hostBlock = nullptr;
+    }
+    if (g_hostMapHandle != nullptr)
+    {
+        CloseHandle(g_hostMapHandle);
+        g_hostMapHandle = nullptr;
+    }
+    if (g_hostInitEvent != nullptr)
+    {
+        CloseHandle(g_hostInitEvent);
+        g_hostInitEvent = nullptr;
+    }
+    if (g_hostConsoleEvent != nullptr)
+    {
+        CloseHandle(g_hostConsoleEvent);
+        g_hostConsoleEvent = nullptr;
+    }
+    g_hostRevivalBase = 0;
+}
+
+bool EnsureLocalRevivalLoaded()
+{
+    if (g_localInitFn != nullptr)
+    {
+        PublishHostRevivalBase();
+        if (!PatchRevivalErrorCodeNullGuard())
+        {
+            mod::Log("Takeover: warning failed to verify EfzRevival null-guard");
+        }
+        if (g_localRoleFlag < 0)
+        {
+            g_localRoleFlag = kLocalRoleLocalPlay;
+        }
+        return true;
+    }
+
+    if (g_localRevivalModule == nullptr)
+    {
+        g_localRevivalModule = GetModuleHandleA("EfzRevival.dll");
+        if (g_localRevivalModule == nullptr)
+        {
+            g_localRevivalModule = LoadLibraryA("EfzRevival.dll");
+        }
+    }
+    if (g_localRevivalModule == nullptr)
+    {
+        mod::Log("Takeover: LoadLibrary(EfzRevival.dll) failed");
+        return false;
+    }
+
+    PublishHostRevivalBase();
+    if (!PatchRevivalErrorCodeNullGuard())
+    {
+        mod::Log("Takeover: warning failed to patch EfzRevival null-guard");
+    }
+
+    g_localInitFn = reinterpret_cast<RevivalInitFn>(GetProcAddress(g_localRevivalModule, "init"));
+    if (g_localInitFn == nullptr)
+    {
+        mod::Log("Takeover: GetProcAddress(init) failed");
+        return false;
+    }
+
+    int localParams[2] = {2, 102};
+    const int initResult = g_localInitFn(localParams);
+    g_localRoleFlag = kLocalRoleLocalPlay;
+    mod::Log("Takeover: local init(2,102) result=%d", initResult);
+
+    if (!PatchRevivalDllExitProcess())
+    {
+        mod::Log("Takeover: warning — failed to patch EfzRevival ExitProcess IAT");
+    }
+
+    return true;
+}
+
+void ReinitLocalPlay()
+{
+    if (g_localRoleFlag == kLocalRoleLocalPlay)
+    {
+        mod::Log("Takeover: local re-init skipped (already local play)");
+        return;
+    }
+
+    // Calling Revival init() during teardown/timeout paths can race with
+    // in-flight audio/network cleanup and crash. Keep local role state in
+    // local play mode without forcing another immediate init() call.
+    // Also restore the DLL flag globals so other mods see local play.
+    mod::Log(
+        "Takeover: local re-init deferred (from role=%d -> local play, no init call)",
+        g_localRoleFlag);
+    SetRoleFlagDirect(kLocalRoleLocalPlay, "reinit_local_play");
+}
+
+uintptr_t ResolveHostRevivalBase()
+{
+    if (g_localRevivalModule != nullptr)
+    {
+        return reinterpret_cast<uintptr_t>(g_localRevivalModule);
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival != nullptr)
+    {
+        return reinterpret_cast<uintptr_t>(revival);
+    }
+
+    return 0;
+}
+
+bool PatchRevivalErrorCodeNullGuard()
+{
+    const uintptr_t base = ResolveHostRevivalBase();
+    if (base == 0)
+    {
+        return false;
+    }
+
+    void* const stub = EnsureRevivalErrorCodeNullGuardStub();
+    if (stub == nullptr)
+    {
+        return false;
+    }
+
+    uint8_t* const target = reinterpret_cast<uint8_t*>(base + g_activeRevival->errorCodeIsZeroRva);
+    std::array<uint8_t, kMaxErrorCodePatchBytes> patchBytes = {};
+    patchBytes[0] = 0xE9;
+    const intptr_t delta = reinterpret_cast<uint8_t*>(stub) - (target + 5);
+    const int32_t rel = static_cast<int32_t>(delta);
+    std::memcpy(&patchBytes[1], &rel, sizeof(rel));
+    patchBytes[5] = 0x90;
+    patchBytes[6] = 0x90;
+    patchBytes[7] = 0x90;
+
+    if (g_revivalErrorCodeNullGuardPatched && g_revivalErrorCodeNullGuardPatchedBase == base)
+    {
+        uint8_t verify[kMaxErrorCodePatchBytes] = {};
+        std::memcpy(verify, target, sizeof(verify));
+        if (std::memcmp(verify, patchBytes.data(), sizeof(verify)) == 0)
+        {
+            return true;
+        }
+        mod::Log("Takeover: null-guard bytes changed, reapplying");
+        g_revivalErrorCodeNullGuardPatched = false;
+    }
+
+    constexpr std::array<uint8_t, 8> kExpectedPrefix = {
+        0x33, 0xC0, 0x39, 0x01, 0x0F, 0x94, 0xC0, 0xC3,
+    };
+    constexpr std::array<uint8_t, 8> kLegacyPatchedPrefix = {
+        0x85, 0xC9, 0x74, 0x06, 0x83, 0x39, 0x00, 0x0F,
+    };
+
+    uint8_t current[kMaxErrorCodePatchBytes] = {};
+    std::memcpy(current, target, sizeof(current));
+    if (std::memcmp(current, patchBytes.data(), sizeof(current)) == 0)
+    {
+        g_revivalErrorCodeNullGuardPatched = true;
+        g_revivalErrorCodeNullGuardPatchedBase = base;
+        return true;
+    }
+
+    if (std::memcmp(current, kExpectedPrefix.data(), kExpectedPrefix.size()) != 0
+        && std::memcmp(current, kLegacyPatchedPrefix.data(), kLegacyPatchedPrefix.size()) != 0)
+    {
+        mod::Log(
+            "Takeover: skip null-guard patch at +0x%04lX (unexpected bytes %02X %02X %02X %02X)",
+            static_cast<unsigned long>(g_activeRevival->errorCodeIsZeroRva),
+            static_cast<unsigned>(current[0]),
+            static_cast<unsigned>(current[1]),
+            static_cast<unsigned>(current[2]),
+            static_cast<unsigned>(current[3]));
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(target, sizeof(patchBytes), PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        mod::Log(
+            "Takeover: failed null-guard patch protect at +0x%04lX err=%s",
+            static_cast<unsigned long>(g_activeRevival->errorCodeIsZeroRva),
+            ErrorString(GetLastError()).c_str());
+        return false;
+    }
+
+    std::memcpy(target, patchBytes.data(), sizeof(patchBytes));
+    (void)FlushInstructionCache(GetCurrentProcess(), target, sizeof(patchBytes));
+
+    DWORD restoredProtect = 0;
+    if (!VirtualProtect(target, sizeof(patchBytes), oldProtect, &restoredProtect))
+    {
+        mod::Log(
+            "Takeover: null-guard patch restore protect failed at +0x%04lX err=%s",
+            static_cast<unsigned long>(g_activeRevival->errorCodeIsZeroRva),
+            ErrorString(GetLastError()).c_str());
+    }
+
+    g_revivalErrorCodeNullGuardPatched = true;
+    g_revivalErrorCodeNullGuardPatchedBase = base;
+    mod::Log(
+        "Takeover: patched EfzRevival.dll null-guard at +0x%04lX",
+        static_cast<unsigned long>(g_activeRevival->errorCodeIsZeroRva));
+    return true;
+}
+
+void PublishHostRevivalBase()
+{
+    const uintptr_t base = ResolveHostRevivalBase();
+    g_hostRevivalBase = base;
+    if (g_hostBlock != nullptr)
+    {
+        g_hostBlock->hostRevivalBase = static_cast<uint32_t>(base);
+    }
+    if (base != 0)
+    {
+        mod::Log("Takeover: host revival base=0x%08lX", static_cast<unsigned long>(base));
+    }
+}
+
+uintptr_t ResolveInjectedExpectedRevivalBase()
+{
+    if (g_injectedBlock != nullptr && g_injectedBlock->hostRevivalBase != 0)
+    {
+        return static_cast<uintptr_t>(g_injectedBlock->hostRevivalBase);
+    }
+
+    TempIpcContext temp = {};
+    uintptr_t base = 0;
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        base = static_cast<uintptr_t>(temp.block->hostRevivalBase);
+    }
+    CloseTempIpcContext(&temp);
+    return base;
+}
+
+bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* address, const char* nickname)
+{
+    std::string iniPath = gameDir;
+    if (!iniPath.empty())
+    {
+        iniPath += "\\";
+    }
+    iniPath += "EfzRevival.ini";
+
+    const DWORD existingAttrs = GetFileAttributesA(iniPath.c_str());
+    const bool existed = (existingAttrs != INVALID_FILE_ATTRIBUTES);
+    const char* safeAddress = (address != nullptr) ? address : "";
+    const char* safeNickname = (nickname != nullptr && nickname[0] != '\0') ? nickname : "Player";
+    char portText[16] = {};
+    std::snprintf(portText, sizeof(portText), "%u", static_cast<unsigned>(port));
+
+    auto writeIniKey = [&iniPath](const char* section, const char* key, const char* value) -> bool {
+        if (WritePrivateProfileStringA(section, key, value, iniPath.c_str()) == FALSE)
+        {
+            mod::Log(
+                "Takeover: WriteIni key failed section='%s' key='%s' value='%s' err=%s",
+                section != nullptr ? section : "",
+                key != nullptr ? key : "",
+                value != nullptr ? value : "",
+                ErrorString(GetLastError()).c_str());
+            return false;
+        }
+        return true;
+    };
+    bool ok = true;
+
+    // Keep user INI intact. Update only the settings currently supported by
+    // InGameNetplay menu integration.
+    ok = writeIniKey("Network", "Name", safeNickname) && ok;
+    ok = writeIniKey("Network", "Port", portText) && ok;
+
+    mod::Log(
+        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d (updated keys: Network.Name, Network.Port)",
+        iniPath.c_str(),
+        existed ? 1 : 0,
+        role,
+        static_cast<unsigned>(port),
+        safeNickname,
+        safeAddress,
+        ok ? 1 : 0);
+    return ok;
+}
+
+bool IsCurrentProcessRevival()
+{
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, path, MAX_PATH) == 0)
+    {
+        return false;
+    }
+    return BaseLower(path) == "efzrevival.exe";
+}
+
+void InitializeInjected()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (int attempt = 0; attempt < 200; ++attempt)
+    {
+        if (g_injectedMapHandle == nullptr)
+        {
+            g_injectedMapHandle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, kSharedBlockName);
+        }
+        if (g_injectedMapHandle != nullptr && g_injectedBlock == nullptr)
+        {
+            g_injectedBlock = static_cast<SharedBlock*>(MapViewOfFile(g_injectedMapHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock)));
+        }
+        if (g_injectedInitEvent == nullptr)
+        {
+            g_injectedInitEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kInitReadyEventName);
+        }
+        if (g_injectedConsoleEvent == nullptr)
+        {
+            g_injectedConsoleEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kConsoleReadyEventName);
+        }
+
+        if (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr)
+        {
+            break;
+        }
+        Sleep(10);
+    }
+
+    g_remoteThreadCallIndex = 0;
+    g_startAbortRequested = 0;
+    g_injectedLastConsoleSerialServed = 0;
+    g_injectedLastConsoleAuxSerialServed = 0;
+    g_injectedActiveConsoleAuxSerial = 0;
+    g_injectedConsoleAuxScriptOffset = 0;
+    g_injectedAutoConsoleFallbackCount = 0;
+    g_injectedConsoleOutputHits = 0;
+    g_injectedDelayPromptWaitStartTick = 0;
+    g_injectedSpectateConfirmPromptWaitStartTick = 0;
+    g_fakeProcessThreadHandle = nullptr;
+    g_initCapturedFromWrite = false;
+    g_delayPromptMetrics = {};
+    ResetNativeWorkflowFlags();
+    g_injectedInitAddress = 0;
+    g_injectedLazyBound = false;
+    g_lastConnectingDiagnosticTick = 0;
+    g_lastSessionPtrOffset = 0;
+    g_lastValidatedSessionPtr = 0;
+    g_lastSessionPointerMismatchTick = 0;
+    g_lastRuntimeReadyProbeLogTick = 0;
+    g_lastRuntimeReadyProbeMask = 0;
+    g_lastRuntimeReadyProbeMaskValid = false;
+    ClearFakeThreads();
+    ClearRedirectAllocations();
+    g_redirectWriteBlockedHits = 0;
+    g_injectedReady = (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr);
+    if (g_injectedReady)
+    {
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival != nullptr)
+        {
+            const FARPROC initProc = GetProcAddress(revival, "init");
+            g_injectedInitAddress = reinterpret_cast<uintptr_t>(initProc);
+        }
+    }
+    mod::Log(
+        "Takeover: injected initialized ready=%d block=0x%p init=0x%p console=0x%p initAddr=0x%p hostRevivalBase=0x%08lX",
+        g_injectedReady ? 1 : 0,
+        g_injectedBlock,
+        g_injectedInitEvent,
+        g_injectedConsoleEvent,
+        reinterpret_cast<void*>(g_injectedInitAddress),
+        static_cast<unsigned long>(g_injectedBlock != nullptr ? g_injectedBlock->hostRevivalBase : 0));
+    InterlockedExchange(&g_injectedLazyBootstrapState, g_injectedReady ? 2 : 0);
+}
+
+void ShutdownInjected()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ClearFakeThreads();
+    ClearRedirectAllocations();
+
+    if (g_injectedBlock != nullptr)
+    {
+        UnmapViewOfFile(g_injectedBlock);
+        g_injectedBlock = nullptr;
+    }
+    if (g_injectedMapHandle != nullptr)
+    {
+        CloseHandle(g_injectedMapHandle);
+        g_injectedMapHandle = nullptr;
+    }
+    if (g_injectedInitEvent != nullptr)
+    {
+        CloseHandle(g_injectedInitEvent);
+        g_injectedInitEvent = nullptr;
+    }
+    if (g_injectedConsoleEvent != nullptr)
+    {
+        CloseHandle(g_injectedConsoleEvent);
+        g_injectedConsoleEvent = nullptr;
+    }
+    g_injectedReady = false;
+    g_injectedInitAddress = 0;
+    g_injectedLazyBound = false;
+    g_startAbortRequested = 0;
+    g_injectedLastConsoleSerialServed = 0;
+    g_injectedLastConsoleAuxSerialServed = 0;
+    g_injectedActiveConsoleAuxSerial = 0;
+    g_injectedConsoleAuxScriptOffset = 0;
+    g_injectedAutoConsoleFallbackCount = 0;
+    g_injectedConsoleOutputHits = 0;
+    g_injectedDelayPromptWaitStartTick = 0;
+    g_injectedSpectateConfirmPromptWaitStartTick = 0;
+    g_fakeProcessThreadHandle = nullptr;
+    g_initCapturedFromWrite = false;
+    g_delayPromptMetrics = {};
+    ResetNativeWorkflowFlags();
+    g_localRoleFlag = -1;
+    g_lastConnectingDiagnosticTick = 0;
+    g_lastSessionPtrOffset = 0;
+    g_lastValidatedSessionPtr = 0;
+    g_lastSessionPointerMismatchTick = 0;
+    g_lastRuntimeReadyProbeLogTick = 0;
+    g_lastRuntimeReadyProbeMask = 0;
+    g_lastRuntimeReadyProbeMaskValid = false;
+    InterlockedExchange(&g_injectedLazyBootstrapState, 0);
+    mod::Log("Takeover: injected shutdown");
+}
+
+} // namespace netplay::bridge::takeover

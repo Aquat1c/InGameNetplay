@@ -13,7 +13,7 @@ bool DrawRuntimeTextOverlayGdi(
     const OverlayCallbacks& callbacks,
     const RuntimeOverlayState& state,
     uint32_t screenContext,
-    bool allowWindowDc)
+    bool /*allowWindowDc*/)
 {
     if (!state.useRuntimeTextOverlay || !state.netplayActive || !state.enableGdiFallbackOverlay)
     {
@@ -25,99 +25,64 @@ bool DrawRuntimeTextOverlayGdi(
         return false;
     }
 
-    HDC dc = nullptr;
-    void* surface = nullptr;
-    HWND window = nullptr;
-    if (!netplay::draw::AcquireMenuDrawDc(screenContext, &dc, &surface, &window, allowWindowDc))
+    netplay::draw::LockedMenuSurface lockedSurface;
+    if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
     {
         return false;
     }
 
-    const bool useWindowDc = (window != nullptr);
-    SetBkMode(dc, TRANSPARENT);
-    HGDIOBJ oldFont = SelectObject(dc, callbacks.getMenuOverlayFont());
-    auto scaleX = [useWindowDc, window](int x)
-    {
-        if (!useWindowDc)
-        {
-            return x;
-        }
-        RECT clientRect = {};
-        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
-        {
-            return x;
-        }
-        const int clientW = clientRect.right - clientRect.left;
-        return (clientW > 0) ? MulDiv(x, clientW, 320) : x;
-    };
-    auto scaleY = [useWindowDc, window](int y)
-    {
-        if (!useWindowDc)
-        {
-            return y;
-        }
-        RECT clientRect = {};
-        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
-        {
-            return y;
-        }
-        const int clientH = clientRect.bottom - clientRect.top;
-        return (clientH > 0) ? MulDiv(y, clientH, 240) : y;
+    const netplay::font::IndexedSurfaceView sv = {
+        lockedSurface.pixels,
+        lockedSurface.width,
+        lockedSurface.height,
+        lockedSurface.pitch,
     };
 
-    const int panelLeft = scaleX(150);
-    const int panelTop = scaleY(78);
-    const int panelRight = scaleX(314);
-    const int rowHeight = (std::max)(16, scaleY(16));
-    const int rowStep = (std::max)(rowHeight + 2, scaleY(21));
+    // Resolve palette colors
+    const uint8_t headerColor = netplay::draw::ResolveBestPaletteColor(screenContext, 32, 32, 32);
+    const uint8_t selectedTextColor = netplay::draw::ResolveBestPaletteColor(screenContext, 8, 8, 8);
+    const uint8_t normalTextColor = netplay::draw::ResolveBestPaletteColor(screenContext, 108, 108, 108);
+    const uint8_t highlightColor = netplay::draw::ResolveBestPaletteColor(screenContext, 110, 225, 214);
+    const uint8_t footerColor = netplay::draw::ResolveBestPaletteColor(screenContext, 90, 90, 90);
 
-    RECT headerRect = {panelLeft, scaleY(56), panelRight, scaleY(74)};
-    SetTextColor(dc, RGB(32, 32, 32));
+    constexpr int panelLeft = 150;
+    constexpr int panelRight = 314;
+    constexpr int rowHeight = 16;
+    constexpr int rowStep = 18;
+
+    // Header
     const std::string header = callbacks.buildMenuHeaderText();
-    DrawTextA(dc, header.c_str(), -1, &headerRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    netplay::font::DrawTextLeft5x7(sv, header, panelLeft, panelRight, 60, 1, 1, headerColor);
 
+    // Rows
     const int selection =
         callbacks.clampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection)));
     int count = 0;
     const netplay::menu::NetplayMenuEntry* entries = callbacks.getMenuEntries(state.menuId, &count);
     if (entries != nullptr && count > 0)
     {
+        constexpr int panelTop = 78;
         for (int i = 0; i < count; ++i)
         {
-            RECT rowRect = {panelLeft, panelTop + i * rowStep, panelRight, panelTop + i * rowStep + rowHeight};
+            const int rowY = panelTop + i * rowStep;
             const bool isSelected = (i == selection);
             if (isSelected)
             {
-                HBRUSH highlightBrush = CreateSolidBrush(RGB(110, 225, 214));
-                FillRect(dc, &rowRect, highlightBrush);
-                DeleteObject(highlightBrush);
+                netplay::font::FillIndexedSurfaceRect(sv, panelLeft, rowY, panelRight - panelLeft, rowHeight, highlightColor);
             }
 
             const std::string label = callbacks.buildRowLabel(entries[i]);
-            COLORREF textColor = isSelected ? RGB(8, 8, 8) : RGB(108, 108, 108);
-            if (callbacks.getRowTextColor)
-            {
-                const auto overrideColor = callbacks.getRowTextColor(entries[i], isSelected);
-                if (overrideColor.has_value())
-                {
-                    textColor = overrideColor.value();
-                }
-            }
-            SetTextColor(dc, textColor);
-            DrawTextA(dc, label.c_str(), -1, &rowRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            const int textY = rowY + (rowHeight - 7) / 2; // center 5x7 glyph in row
+            const uint8_t color = isSelected ? selectedTextColor : normalTextColor;
+            netplay::font::DrawTextLeft5x7(sv, label, panelLeft + 2, panelRight - 2, textY, 1, 1, color);
         }
     }
 
-    RECT footerRect = {panelLeft, scaleY(224), panelRight, scaleY(238)};
-    SetTextColor(dc, RGB(90, 90, 90));
+    // Footer
     const std::string footer = callbacks.buildFooterText();
-    DrawTextA(dc, footer.c_str(), -1, &footerRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    netplay::font::DrawTextLeft5x7(sv, footer, panelLeft, panelRight, 226, 1, 1, footerColor);
 
-    if (oldFont != nullptr)
-    {
-        SelectObject(dc, oldFont);
-    }
-    netplay::draw::ReleaseMenuDrawDc(dc, surface, window);
+    netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;
 }
 
@@ -125,7 +90,7 @@ bool DrawDynamicFieldValuesGdi(
     const OverlayCallbacks& callbacks,
     const DynamicFieldOverlayState& state,
     uint32_t screenContext,
-    bool allowWindowDc)
+    bool /*allowWindowDc*/)
 {
     if (!state.netplayActive || state.useRuntimeTextOverlay || state.menuSlideActive)
     {
@@ -154,6 +119,12 @@ bool DrawDynamicFieldValuesGdi(
                 break;
             }
         }
+    }
+    // Main menu labels (HOST, JOIN, LOBBY, etc.) are baked into the sprite sheet,
+    // so no dynamic text is needed there.
+    if (state.menuId == netplay::menu::NetplayMenuId::Main)
+    {
+        return true;
     }
     // Lobby rows all carry dynamic GDI labels (player names, playing pair, Back).
     const bool isLobby = (state.menuId == netplay::menu::NetplayMenuId::Lobby);
@@ -187,8 +158,14 @@ bool DrawDynamicFieldValuesGdi(
                 bool drawAsLabel = false;
                 if (isLobby)
                 {
-                    // For the lobby, every row gets a centered GDI label from
-                    // buildRowLabel (player name, "--", "vs", "BACK", etc.).
+                    // BackToMain uses the ReturnToTitle sprite row which already
+                    // has "RETURN TO TITLE" baked into the sprite sheet — skip it.
+                    if (entries[i].action == netplay::menu::NetplayMenuAction::BackToMain)
+                    {
+                        continue;
+                    }
+                    // For the lobby, every other row gets a centered label from
+                    // buildRowLabel (player name, "vs", etc.).
                     if (!callbacks.buildRowLabel)
                     {
                         continue;
@@ -262,109 +239,8 @@ bool DrawDynamicFieldValuesGdi(
         }
     }
 
-    HDC dc = nullptr;
-    void* surface = nullptr;
-    HWND window = nullptr;
-    if (!netplay::draw::AcquireMenuDrawDc(screenContext, &dc, &surface, &window, allowWindowDc))
-    {
-        return false;
-    }
-
-    const bool useWindowDc = (window != nullptr);
-    auto scaleX = [useWindowDc, window](int x)
-    {
-        if (!useWindowDc)
-        {
-            return x;
-        }
-        RECT clientRect = {};
-        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
-        {
-            return x;
-        }
-        const int clientW = clientRect.right - clientRect.left;
-        return (clientW > 0) ? MulDiv(x, clientW, 320) : x;
-    };
-    auto scaleY = [useWindowDc, window](int y)
-    {
-        if (!useWindowDc)
-        {
-            return y;
-        }
-        RECT clientRect = {};
-        if (window == nullptr || GetClientRect(window, &clientRect) == FALSE)
-        {
-            return y;
-        }
-        const int clientH = clientRect.bottom - clientRect.top;
-        return (clientH > 0) ? MulDiv(y, clientH, 240) : y;
-    };
-
-    SetBkMode(dc, TRANSPARENT);
-    HGDIOBJ oldFont = SelectObject(dc, callbacks.getMenuOverlayFont());
-
-    if (entries != nullptr && count > 0)
-    {
-        for (int i = 0; i < count; ++i)
-        {
-            std::string value;
-            DWORD textFlags = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
-            bool drawAsLabel = false;
-            if (isLobby)
-            {
-                if (!callbacks.buildRowLabel)
-                {
-                    continue;
-                }
-                value = callbacks.buildRowLabel(entries[i]);
-                textFlags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
-            }
-            else
-            {
-                if (entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
-                {
-                    value = callbacks.buildRowLabel(entries[i]);
-                    textFlags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
-                    drawAsLabel = true;
-                }
-                else if (!callbacks.getInlineEditDisplayValue(entries[i].action, &value, true))
-                {
-                    continue;
-                }
-            }
-
-            const int slideY = callbacks.getScaledNativeSlideY(screenContext);
-            RECT rowRect = {
-                scaleX(isLobby ? 8 : (drawAsLabel ? 152 : 182)),
-                scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY),
-                scaleX(314),
-                scaleY(netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + state.highlightHeight + slideY),
-            };
-
-            COLORREF textColor = (i == selected) ? RGB(8, 8, 8) : RGB(186, 186, 186);
-            if (!isLobby)
-            {
-                textColor = (i == selected) ? RGB(255, 255, 255) : RGB(186, 186, 186);
-            }
-            else if (callbacks.getRowTextColor)
-            {
-                const auto overrideColor = callbacks.getRowTextColor(entries[i], i == selected);
-                if (overrideColor.has_value())
-                {
-                    textColor = overrideColor.value();
-                }
-            }
-            SetTextColor(dc, textColor);
-            DrawTextA(dc, value.c_str(), -1, &rowRect, textFlags);
-        }
-    }
-
-    if (oldFont != nullptr)
-    {
-        SelectObject(dc, oldFont);
-    }
-    netplay::draw::ReleaseMenuDrawDc(dc, surface, window);
-    return true;
+    // Surface lock failed — nothing we can do without flickering.
+    return false;
 }
 }
 

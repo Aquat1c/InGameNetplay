@@ -97,6 +97,16 @@ int MeasureText5x7(const std::string& text, int scaleX)
     return static_cast<int>(text.size()) * (glyphW + gap) - gap;
 }
 
+} // anonymous namespace
+
+int MeasureText5x7Width(const std::string& text, int scaleX)
+{
+    return MeasureText5x7(text, scaleX);
+}
+
+namespace
+{
+
 void PutSurfacePixel(const IndexedSurfaceView& surface, int x, int y, uint8_t color)
 {
     if (surface.pixels == nullptr || x < 0 || y < 0 || x >= surface.width || y >= surface.height)
@@ -220,6 +230,106 @@ void DrawTextLeft5x7(
         DrawGlyph5x7(surface, x, y, c, scaleX, scaleY, color);
         x += glyphW + gap;
     }
+}
+
+void DrawTextCentered5x7(
+    const IndexedSurfaceView& surface,
+    const std::string& text,
+    int leftX,
+    int rightX,
+    int y,
+    int scaleX,
+    int scaleY,
+    uint8_t color)
+{
+    const int rangeWidth = rightX - leftX;
+    if (rangeWidth <= 0)
+    {
+        return;
+    }
+
+    std::string clipped;
+    clipped.reserve(text.size());
+    for (char c : text)
+    {
+        std::string trial = clipped;
+        trial.push_back(c);
+        if (MeasureText5x7(trial, scaleX) > rangeWidth)
+        {
+            break;
+        }
+        clipped.push_back(c);
+    }
+    if (clipped.empty())
+    {
+        return;
+    }
+
+    const int textW = MeasureText5x7(clipped, scaleX);
+    const int startX = leftX + (rangeWidth - textW) / 2;
+    const int glyphW = 5 * scaleX;
+    const int gap = scaleX;
+    int x = startX;
+    for (char c : clipped)
+    {
+        DrawGlyph5x7(surface, x, y, c, scaleX, scaleY, color);
+        x += glyphW + gap;
+    }
+}
+
+void FillIndexedSurfaceRect(
+    const IndexedSurfaceView& surface,
+    int x,
+    int y,
+    int w,
+    int h,
+    uint8_t color)
+{
+    if (surface.pixels == nullptr || w <= 0 || h <= 0)
+    {
+        return;
+    }
+
+    // Clip to surface bounds
+    int x0 = (x < 0) ? 0 : x;
+    int y0 = (y < 0) ? 0 : y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x1 > surface.width) x1 = surface.width;
+    if (y1 > surface.height) y1 = surface.height;
+    if (x0 >= x1 || y0 >= y1)
+    {
+        return;
+    }
+
+    const int fillW = x1 - x0;
+    for (int row = y0; row < y1; ++row)
+    {
+        std::memset(&surface.pixels[row * surface.pitch + x0], color, fillW);
+    }
+}
+
+void DrawIndexedSurfaceFrame(
+    const IndexedSurfaceView& surface,
+    int x,
+    int y,
+    int w,
+    int h,
+    uint8_t color)
+{
+    if (surface.pixels == nullptr || w <= 0 || h <= 0)
+    {
+        return;
+    }
+
+    // Top edge
+    FillIndexedSurfaceRect(surface, x, y, w, 1, color);
+    // Bottom edge
+    FillIndexedSurfaceRect(surface, x, y + h - 1, w, 1, color);
+    // Left edge
+    FillIndexedSurfaceRect(surface, x, y, 1, h, color);
+    // Right edge
+    FillIndexedSurfaceRect(surface, x + w - 1, y, 1, h, color);
 }
 }
 

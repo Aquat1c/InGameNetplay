@@ -140,6 +140,16 @@ std::string BuildArtifactPath(const char* extension)
     return path;
 }
 
+// Read a DWORD safely using SEH — returns 0xDEADBEEF on fault.
+// Isolated in its own function to avoid __try / C++ object unwinding conflict.
+static uintptr_t SafeReadDword(uintptr_t addr)
+{
+    uintptr_t val = 0xDEADBEEFu;
+    __try { val = *reinterpret_cast<const uintptr_t*>(addr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { val = 0xDEADBEEFu; }
+    return val;
+}
+
 void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reason, const char* dumpPath)
 {
     const std::string txtPath = BuildArtifactPath("txt");
@@ -168,6 +178,67 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
     std::fprintf(file, "exception_code=0x%08lX\n", static_cast<unsigned long>(exceptionCode));
     std::fprintf(file, "exception_address=0x%p\n", reinterpret_cast<void*>(exceptionAddress));
     std::fprintf(file, "minidump=%s\n", dumpPath != nullptr ? dumpPath : "");
+
+    // Module context: identify which module the crash address belongs to.
+    {
+        HMODULE crashModule = nullptr;
+        char crashModuleName[MAX_PATH] = {};
+        if (exceptionAddress != 0
+            && GetModuleHandleExA(
+                   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                   reinterpret_cast<LPCSTR>(exceptionAddress),
+                   &crashModule))
+        {
+            GetModuleFileNameA(crashModule, crashModuleName, MAX_PATH);
+            const uintptr_t modBase = reinterpret_cast<uintptr_t>(crashModule);
+            const uintptr_t rva = exceptionAddress - modBase;
+            std::fprintf(file, "crash_module=%s\n", crashModuleName);
+            std::fprintf(file, "crash_module_base=0x%08lX\n", static_cast<unsigned long>(modBase));
+            std::fprintf(file, "crash_rva=0x%08lX\n", static_cast<unsigned long>(rva));
+        }
+
+        // Revival DLL state.
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival != nullptr)
+        {
+            const uintptr_t revBase = reinterpret_cast<uintptr_t>(revival);
+            std::fprintf(file, "revival_base=0x%08lX\n", static_cast<unsigned long>(revBase));
+
+            // Dump dword_100A0778 (renderContextGlobalOffset = 0xA0778).
+            const uintptr_t renderCtxAddr = revBase + 0x000A0778u;
+            const uintptr_t renderCtxVal = SafeReadDword(renderCtxAddr);
+            std::fprintf(file, "revival_renderCtx_addr=0x%08lX\n", static_cast<unsigned long>(renderCtxAddr));
+            std::fprintf(file, "revival_renderCtx_value=0x%08lX\n", static_cast<unsigned long>(renderCtxVal));
+
+            // Dump dword_100A02CC (session pointer).
+            const uintptr_t sessionAddr = revBase + 0x000A02CCu;
+            const uintptr_t sessionVal = SafeReadDword(sessionAddr);
+            std::fprintf(file, "revival_session_addr=0x%08lX\n", static_cast<unsigned long>(sessionAddr));
+            std::fprintf(file, "revival_session_value=0x%08lX\n", static_cast<unsigned long>(sessionVal));
+
+            // If session pointer is readable, dump its vtable.
+            if (sessionVal != 0 && sessionVal != 0xDEADBEEFu)
+            {
+                const uintptr_t vtableVal = SafeReadDword(sessionVal);
+                std::fprintf(file, "revival_session_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
+            }
+
+            // If renderCtx pointer is readable, dump its vtable.
+            if (renderCtxVal != 0 && renderCtxVal != 0xDEADBEEFu)
+            {
+                const uintptr_t vtableVal = SafeReadDword(renderCtxVal);
+                std::fprintf(file, "revival_renderCtx_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
+            }
+        }
+
+        // Our mod DLL.
+        HMODULE ourMod = GetModuleHandleA("efz_netplay_mod.dll");
+        if (ourMod != nullptr)
+        {
+            std::fprintf(file, "mod_base=0x%08lX\n",
+                         static_cast<unsigned long>(reinterpret_cast<uintptr_t>(ourMod)));
+        }
+    }
 
     if (exceptionPointers != nullptr && exceptionPointers->ContextRecord != nullptr)
     {

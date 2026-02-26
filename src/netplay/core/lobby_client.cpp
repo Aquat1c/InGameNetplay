@@ -14,7 +14,66 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winhttp.h>
+
+#ifdef EFZ_XP_COMPAT
+// The Windows 7.1A SDK (v141_xp) has type-name conflicts when both
+// winhttp.h and wininet.h are included in the same translation unit.
+// Since all WinINet APIs are resolved at runtime via GetProcAddress we
+// only need the function declarations and a handful of constants.
+
+extern "C" {
+    HINTERNET WINAPI InternetOpenW(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+    BOOL      WINAPI InternetSetOptionW(HINTERNET, DWORD, LPVOID, DWORD);
+    HINTERNET WINAPI InternetOpenUrlW(HINTERNET, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+    BOOL      WINAPI InternetReadFile(HINTERNET, LPVOID, DWORD, LPDWORD);
+    BOOL      WINAPI InternetCloseHandle(HINTERNET);
+    BOOL      WINAPI InternetGetLastResponseInfoA(LPDWORD, LPSTR, LPDWORD);
+}
+
+#ifndef INTERNET_OPEN_TYPE_PRECONFIG
+#define INTERNET_OPEN_TYPE_PRECONFIG        0
+#endif
+#ifndef INTERNET_OPTION_CONNECT_TIMEOUT
+#define INTERNET_OPTION_CONNECT_TIMEOUT     2
+#endif
+#ifndef INTERNET_OPTION_SEND_TIMEOUT
+#define INTERNET_OPTION_SEND_TIMEOUT        5
+#endif
+#ifndef INTERNET_OPTION_RECEIVE_TIMEOUT
+#define INTERNET_OPTION_RECEIVE_TIMEOUT     6
+#endif
+#ifndef INTERNET_FLAG_RELOAD
+#define INTERNET_FLAG_RELOAD                0x80000000
+#endif
+#ifndef INTERNET_FLAG_NO_CACHE_WRITE
+#define INTERNET_FLAG_NO_CACHE_WRITE        0x04000000
+#endif
+#ifndef INTERNET_FLAG_PRAGMA_NOCACHE
+#define INTERNET_FLAG_PRAGMA_NOCACHE        0x00000010
+#endif
+#ifndef INTERNET_FLAG_SECURE
+#define INTERNET_FLAG_SECURE                0x00800000
+#endif
+
+#ifndef ERROR_INTERNET_TIMEOUT
+#define ERROR_INTERNET_TIMEOUT              12002
+#define ERROR_INTERNET_NAME_NOT_RESOLVED    12007
+#define ERROR_INTERNET_DECODING_FAILED      12019
+#define ERROR_INTERNET_CANNOT_CONNECT       12029
+#define ERROR_INTERNET_CONNECTION_ABORTED   12030
+#define ERROR_INTERNET_CONNECTION_RESET     12031
+#define ERROR_INTERNET_SEC_CERT_DATE_INVALID 12037
+#define ERROR_INTERNET_SEC_CERT_CN_INVALID  12038
+#define ERROR_INTERNET_HTTP_TO_HTTPS_ON_REDIR 12039
+#define ERROR_INTERNET_HTTPS_TO_HTTP_ON_REDIR 12040
+#define ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED 12044
+#define ERROR_INTERNET_INVALID_CA           12045
+#define ERROR_INTERNET_SEC_CERT_ERRORS      12055
+#endif
+
+#else // !EFZ_XP_COMPAT
 #include <wininet.h>
+#endif
 
 namespace netplay::lobby
 {
