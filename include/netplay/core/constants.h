@@ -67,6 +67,27 @@ inline constexpr uint32_t kOffsetInactivityCounter = 0x444;
 inline constexpr uint32_t kOffsetSlideAnimationY = 1876;
 inline constexpr uint32_t kOffsetScreenInitState = 44;
 inline constexpr uint32_t kOffsetScreenExitState = 45;
+
+// Character-select screen object offsets (relative to the screen object).
+// Grid col/row are only set by the constructor (Ex), NOT by the per-entry
+// reinit at 0x7597D0, so they must be explicitly zeroed for a clean start.
+inline constexpr uint32_t kOffsetCharSelectP1GridCol   = 1336;
+inline constexpr uint32_t kOffsetCharSelectP2GridCol   = 1337;
+inline constexpr uint32_t kOffsetCharSelectP1GridRow   = 1338;
+inline constexpr uint32_t kOffsetCharSelectP2GridRow   = 1339;
+inline constexpr uint32_t kOffsetCharSelectP1CharId    = 1340;
+inline constexpr uint32_t kOffsetCharSelectP2CharId    = 1341;
+inline constexpr uint32_t kOffsetCharSelectP1Color    = 1342;
+inline constexpr uint32_t kOffsetCharSelectP2Color    = 1343;
+inline constexpr uint32_t kOffsetCharSelectP1Timer    = 1344;
+inline constexpr uint32_t kOffsetCharSelectP2Timer    = 1346;
+// Default values matching the constructor (initializeCharacterSelectScreenEx):
+inline constexpr uint8_t  kCharSelectDefaultP1Col = 0;  // leftmost column
+inline constexpr uint8_t  kCharSelectDefaultP1Row = 0;  // top row
+inline constexpr uint8_t  kCharSelectDefaultP2Col = 2;  // third column
+inline constexpr uint8_t  kCharSelectDefaultP2Row = 0;  // top row
+// Grid map starts at screen object + 1209; charId = gridMap[row*3 + col].
+inline constexpr uint32_t kOffsetCharSelectGridMap = 1209;
 inline constexpr uint32_t kOffsetGraphicsPrimarySurface = 33283u * sizeof(uint32_t);
 inline constexpr uint32_t kOffsetGraphicsBackBufferSurface = 33284u * sizeof(uint32_t);
 

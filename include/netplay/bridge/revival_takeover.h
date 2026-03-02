@@ -21,4 +21,8 @@ void CancelSession(const char* reason, NetbridgeStatus* ioStatus);
 bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus);
 bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus);
 DelayPromptMetrics GetDelayPromptMetrics();
+bool IsPeerProcessAlive();
+bool IsNetplayExitInterceptionPending();
+bool ForceLocalPlayInit();
+bool ForceGameModeToTitle();
 }

@@ -1,10 +1,12 @@
 // IAT stub implementations and extern "C" nb_stub_* wrappers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "crash_handler.h"
 
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <intrin.h>
 
 #include <windows.h>
 
@@ -142,6 +144,31 @@ static ExitProcessFn g_realExitProcess = nullptr;
 
 static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 {
+    // Capture caller context for diagnostics before any side-effects.
+    const void* callerAddr = _ReturnAddress();
+    uintptr_t callerRva = 0;
+    const char* callerModule = "unknown";
+    {
+        HMODULE revival = g_localRevivalModule;
+        if (revival != nullptr)
+        {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+            const uintptr_t caller = reinterpret_cast<uintptr_t>(callerAddr);
+            if (caller >= base && caller < base + 0x200000u)
+            {
+                callerRva = caller - base;
+                callerModule = "EfzRevival.dll";
+            }
+        }
+    }
+    int currentScreenIndex = -1;
+    if (g_activeRevival != nullptr && g_activeRevival->addrGameModeCurrentIndex != 0)
+    {
+        SafeReadInt(
+            reinterpret_cast<const void*>(g_activeRevival->addrGameModeCurrentIndex),
+            &currentScreenIndex);
+    }
+
     // First interception: neutralize the session vtable and capture the role.
     if (InterlockedExchange(&g_revivalExitIntercepted, 1) == 0)
     {
@@ -149,8 +176,12 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(role));
 
         mod::Log(
-            "NeutralizeExitProcess: entry code=%u role=%d",
-            uExitCode, role);
+            "NeutralizeExitProcess: intercepted code=%u role=%d screen=%d "
+            "caller=%s+0x%lX (%p) frameJmpActive=%d uiJmpActive=%d",
+            uExitCode, role, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr,
+            g_netplayFrameJmpActive ? 1 : 0,
+            g_netplayUiJmpActive ? 1 : 0);
 
         if (role == kLocalRoleTournament)
         {
@@ -159,15 +190,126 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 
         NeutralizeRevivalSessionVtable();
         mod::Log(
-            "NeutralizeExitProcess: done code=%u role=%d vtable neutralized",
+            "NeutralizeExitProcess: vtable neutralised code=%u role=%d",
             uExitCode, role);
     }
 
-    // ExitProcess is __noreturn — the compiler emits no valid code past the
-    // call instruction.  We cannot return from this stub.  The DLL call-site
-    // patches should prevent reaching this point during tournament mode.
-    // Suspend the thread as a last resort to avoid garbage execution.
-    mod::Log("NeutralizeExitProcess: suspending thread (safety fallback)");
+    // For netplay (online/spectate) sessions, ExitProcess is called on the
+    // EFZ.exe main game thread when the peer process terminates.  Unlike
+    // tournament (where Jcc patches make ExitProcess unreachable), netplay has
+    // no such patches.  If OurFrameDispatch (which wraps sub_1006E590) has
+    // set a setjmp recovery point, use longjmp to escape without freezing the
+    // main thread.  The title-screen hook will then consume the interception
+    // flag and re-enter the netplay menu on the next mode-0 frame.
+    if (g_netplayFrameJmpActive)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: longjmp — returning control to game "
+            "thread (role=%d)",
+            g_localRoleFlag);
+        g_netplayFrameJmpActive = false;
+        longjmp(g_netplayFrameJmpBuf, 1);
+        // longjmp does not return.
+    }
+
+    // Fallback: during title/menu/charselect update flow the frame hook's
+    // setjmp is not active. If ExitProcess fires there (common in spectate/join
+    // error paths, or early desync during charselect), use the UI-update
+    // recovery context instead of returning into unknown compiler-generated
+    // post-call code.
+    if (g_netplayUiJmpActive)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: ui longjmp — escaping title/menu path "
+            "(role=%d)",
+            g_localRoleFlag);
+        g_netplayUiJmpActive = false;
+        longjmp(g_netplayUiJmpBuf, 1);
+        // longjmp does not return.
+    }
+
+    // For online/spectate: if neither longjmp context is active, ExitProcess
+    // was called from a DLL code path that isn't covered by any setjmp
+    // (e.g. a direct vtable call from the EXE game loop during a state
+    // transition, BEFORE HookedCharSelectUpdateImpl runs for the first time).
+    //
+    // All ExitProcess call sites in the DLL should be made unreachable by
+    // SaveAndApplyDllExitProcessPatches.  If we reach here, there is an
+    // unpatched site.  Do full cleanup to keep the game alive, then force
+    // the game mode back to title screen and suspend this thread forever
+    // (ExitProcess is __noreturn; the compiler emits no valid code after the
+    // call site, so we MUST NOT return).
+    const int currentRole = g_localRoleFlag;
+    if (currentRole == kLocalRoleOnline || currentRole == kLocalRoleSpectate)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: no jmp recovery for online role=%d screen=%d "
+            "caller=%s+0x%lX (%p) — performing inline cleanup (TOCTOU last resort)",
+            currentRole, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        // Step 1: Reinstate a live local-play session so the game loop has
+        // a valid vtable for subsequent frame dispatches.
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 1 ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        // Step 2: Terminate the dead helper process and close its handle.
+        if (g_revivalProcess != nullptr)
+        {
+            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+            CloseHandle(g_revivalProcess);
+            g_revivalProcess = nullptr;
+            g_revivalProcessId = 0;
+            mod::Log(
+                "NeutralizeExitProcess: TOCTOU step 2 helper terminated=%d",
+                termOk ? 1 : 0);
+        }
+
+        // Step 3: Restore DLL Jcc patches.
+        const bool patchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 3 RestoreDllExitProcessPatches=%d",
+            patchOk ? 1 : 0);
+
+        // Step 4: Disable stale text overlays.
+        DisableRevivalTextRendering();
+
+        // Step 5: Reset VEH one-shot guard.
+        mod::ResetCrashRecoveryState();
+
+        // Step 6: Force game mode to title screen.
+        const bool modeOk = ForceGameModeToTitle();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 6 ForceGameModeToTitle=%d",
+            modeOk ? 1 : 0);
+
+        // ExitProcess is __noreturn.  The DLL code after `call ExitProcess`
+        // is a compiler-emitted unreachable marker (HLT / privileged insn).
+        // We MUST NOT return.  Suspend this thread forever; the VEH handler
+        // will catch the resulting StillActive when ForceGameModeToTitle
+        // transitions back to the title screen on the next game-loop tick.
+        //
+        // NOTE: If the ExitProcess call happened on the main game thread,
+        // suspending it here will freeze the game.  The VEH handler should
+        // detect this and TOCTOU-recover normally since we've already done
+        // full cleanup.
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU cleanup complete, suspending thread "
+            "(role=%d)",
+            currentRole);
+        SuspendThread(GetCurrentThread());
+        // If resumed, just sleep forever.
+        while (true) { Sleep(INFINITE); }
+    }
+    // No recovery point active (tournament fallback or unguarded path).
+    // Jcc patches normally prevent reaching here during tournament mode.
+    mod::Log(
+        "NeutralizeExitProcess: no longjmp recovery point active — "
+        "suspending thread (role=%d screen=%d caller=%s+0x%lX, safety fallback)",
+        currentRole, currentScreenIndex,
+        callerModule, static_cast<unsigned long>(callerRva));
     while (true) { Sleep(INFINITE); }
 }
 

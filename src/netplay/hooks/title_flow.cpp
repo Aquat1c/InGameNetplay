@@ -26,6 +26,7 @@ using NetbridgeRole = netplay::bridge::NetbridgeRole;
 using NetbridgePhase = netplay::bridge::NetbridgePhase;
 
 void HandoffConnectedSessionToVsHumanState(uint32_t screenContext);
+void HandoffSpectateSession(uint32_t screenContext);
 
 namespace
 {
@@ -33,16 +34,27 @@ constexpr int kDelaySelectionMin = 0;
 constexpr int kDelaySelectionMax = 20;
 constexpr int kConnectedPreHandoffDelayFrames = 18;
 int g_pendingGlobalStateTransition = -1;
+bool g_charSelectResetPending = false;
+constexpr uint32_t kGameSystemOffsetP1WinState = 4920;
+constexpr uint32_t kGameSystemOffsetP2WinState = 4924;
 constexpr uint32_t kGameSystemOffsetCpuFlagP1 = 4931;
 constexpr uint32_t kGameSystemOffsetCpuFlagP2 = 4932;
 constexpr uint32_t kGameSystemOffsetRoundsCurrent = 4942;
 constexpr uint32_t kGameSystemOffsetRoundsSetting = 4943;
+constexpr uint32_t kGameSystemOffsetMatchCounter = 4952;
 constexpr uint32_t kGameSystemOffsetMode = 4964;
 constexpr uint32_t kGameSystemOffsetSecondaryModeFlag = 4965;
+constexpr uint32_t kGameSystemOffsetContinueFlag = 4984;
+constexpr uint32_t kGameSystemOffsetStageSelection = 4985;
 constexpr uint32_t kGameSystemOffsetReplaySessionFlag = 82563;
+constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
 constexpr uint8_t kGameModeVsHuman = 4;
 constexpr uint8_t kSecondaryModeFlagVsHuman = 4;
 constexpr uint8_t kReplaySessionFlagCleared = 0;
+constexpr int kRoleFlagSpectate = 1;            // matches kLocalRoleSpectate in takeover_internal.h
+constexpr int kScreenIndexCharSelect = 1;       // EFZ screen table index for character select
+constexpr int kScreenIndexReplay = 8;           // EFZ screen table index for replay (used by spectate)
+constexpr int8_t kMenuSelectionReplay = 4;      // title menu "Replay" entry index
 
 void CopyBoundedText(char* dst, size_t dstSize, const char* src)
 {
@@ -543,16 +555,206 @@ void PrepareVsHumanGameState(uint32_t screenContext)
     state[kGameSystemOffsetRoundsCurrent] = roundsSetting;
     state[kGameSystemOffsetReplaySessionFlag] = kReplaySessionFlagCleared;
 
+    // Reset match state so the next match starts fresh.  These fields are
+    // normally cleared by initializeCharacterSelectScreen (0x7597D0) but
+    // persist if a previous online match left them dirty.
+    *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP1WinState) = 0;
+    *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState) = 0;
+    state[kGameSystemOffsetMatchCounter] = 0;
+    state[kGameSystemOffsetContinueFlag] = 0;
+    state[kGameSystemOffsetStageSelection] = 0;
+
+    // Force the charselect screen object to re-initialise next time it
+    // runs (reset cursor positions, cameras, selection state, unlock
+    // flags, etc.).  The screen table at 0x790110 holds pointers to
+    // each screen object; index 1 is charselect.  Setting byte +44
+    // (init required flag) to 1 causes updateCharacterSelectScreen to
+    // call initializeCharacterSelectScreen on the next frame it runs.
+    //
+    // The full grid/palette/timer reset is guarded by g_charSelectResetPending
+    // so it only fires on the initial menu→charselect transition and NOT on
+    // subsequent handoffs within the same netplay session (e.g. rematches).
+    __try
+    {
+        const uintptr_t tableAddr = RuntimeAddress(kVaScreenObjectTable);
+        auto* const screenTable = reinterpret_cast<uint32_t*>(tableAddr);
+        const uint32_t charSelectObj = screenTable[1];
+        if (charSelectObj != 0)
+        {
+            // Trigger the per-entry reinit (resets cursor pixels, camera,
+            // colors, timers, grid states, input latches).
+            *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetScreenInitState) = 1;
+
+            if (g_charSelectResetPending)
+            {
+                g_charSelectResetPending = false;
+
+                // The reinit does NOT reset grid col/row — those are only set
+                // by the constructor.  Explicitly reset them to the constructor
+                // defaults so both players start at a known position every time.
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1GridCol) = kCharSelectDefaultP1Col;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2GridCol) = kCharSelectDefaultP2Col;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1GridRow) = kCharSelectDefaultP1Row;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2GridRow) = kCharSelectDefaultP2Row;
+
+                // Derive character IDs from the grid map so they match the
+                // reset col/row positions (avoids one frame of stale charId).
+                const auto* gridMap = reinterpret_cast<const uint8_t*>(
+                    charSelectObj + kOffsetCharSelectGridMap);
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1CharId) =
+                    gridMap[kCharSelectDefaultP1Row * 3 + kCharSelectDefaultP1Col];
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2CharId) =
+                    gridMap[kCharSelectDefaultP2Row * 3 + kCharSelectDefaultP2Col];
+
+                // Reset palette/color selection and selection timers to 0.
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1Color) = 0;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2Color) = 0;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP1Timer) = 0;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP2Timer) = 0;
+
+                mod::Log("PrepareVsHumanGameState: charselect full reset "
+                    "grid p1(%u,%u) p2(%u,%u) color=0/0 (obj=0x%08lX)",
+                    kCharSelectDefaultP1Col, kCharSelectDefaultP1Row,
+                    kCharSelectDefaultP2Col, kCharSelectDefaultP2Row,
+                    static_cast<unsigned long>(charSelectObj));
+            }
+            else
+            {
+                mod::Log("PrepareVsHumanGameState: charselect initFlag=1, "
+                    "grid/palette reset skipped (mid-session) obj=0x%08lX",
+                    static_cast<unsigned long>(charSelectObj));
+            }
+        }
+        else
+        {
+            mod::Log("PrepareVsHumanGameState: charselect screen object is null");
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log("PrepareVsHumanGameState: SEH exception reading charselect screen object");
+    }
+
     mod::Log(
-        "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u",
+        "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u "
+        "wins=%u/%u match=%u continue=%u stage=%u",
         static_cast<unsigned>(state[kGameSystemOffsetMode]),
         static_cast<unsigned>(state[kGameSystemOffsetSecondaryModeFlag]),
         static_cast<unsigned>(state[kGameSystemOffsetReplaySessionFlag]),
         static_cast<unsigned>(state[kGameSystemOffsetRoundsCurrent]),
         static_cast<unsigned>(state[kGameSystemOffsetCpuFlagP1]),
-        static_cast<unsigned>(state[kGameSystemOffsetCpuFlagP2]));
+        static_cast<unsigned>(state[kGameSystemOffsetCpuFlagP2]),
+        *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP1WinState),
+        *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState),
+        static_cast<unsigned>(state[kGameSystemOffsetMatchCounter]),
+        static_cast<unsigned>(state[kGameSystemOffsetContinueFlag]),
+        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]));
+}
+
+// ---------------------------------------------------------------------------
+// PrepareSpectateReplayState — set the title screen's menu selection to
+// "Replay" (4) so the Revival DLL's mode-transition detector recognises the
+// spectate context.  The DLL checks EFZ_Mode0_ReadFlag1084() == 4 which is
+// byte 1084 (0x43C) of the mode-0 screen object — the menu selection field.
+// ---------------------------------------------------------------------------
+void PrepareSpectateReplayState(uint32_t screenContext)
+{
+    auto* const menuSelection = reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection);
+    const int oldSelection = static_cast<int>(*menuSelection);
+    *menuSelection = kMenuSelectionReplay;
+    const int newSelection = static_cast<int>(*menuSelection);
+
+    // Cross-check: read the current screen index from the EXE game mode table
+    // to confirm we're on the title screen (mode 0) where this write matters.
+    int currentScreenIdx = -1;
+    {
+        auto* const screenIdxPtr = reinterpret_cast<const int*>(kVaCurrentScreenIndex);
+        currentScreenIdx = *screenIdxPtr;
+    }
+
+    mod::Log(
+        "PrepareSpectateReplayState: screenContext=0x%08lX offset=0x%03X "
+        "menuSelection %d -> %d (Replay) screen=%d",
+        static_cast<unsigned long>(screenContext),
+        static_cast<unsigned>(kOffsetMenuSelection),
+        oldSelection, newSelection, currentScreenIdx);
 }
 } // namespace
+
+// ---------------------------------------------------------------------------
+// HandoffSpectateSession — transition directly to the Replay Screen (mode 8)
+// for spectating.  Unlike the VS Human handoff which goes to Character Select
+// (mode 1), spectators skip charselect entirely; the DLL's frame-hook
+// (sub_1006D810) detects the 0→8 transition, verifies role==2 and menu
+// selection==4, then creates a lightweight spectator-watcher session.
+// ---------------------------------------------------------------------------
+void HandoffSpectateSession(uint32_t screenContext)
+{
+    const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
+    const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+    mod::Log(
+        "HandoffSpectateSession: begin prepared=%d sync(mode=%d flag1084=%d session=%d flags=%d/%d role=%d)",
+        prepared ? 1 : 0,
+        status.syncGameMode,
+        status.syncMode0Flag1084,
+        status.syncSessionByte,
+        status.syncGlobalFlag4964,
+        status.syncGlobalFlag4965,
+        status.roleFlag);
+
+    RunTransitionFadeOut(screenContext, 0, 0);
+    PrepareSpectateReplayState(screenContext);
+
+    // Post-preparation verification: confirm the DLL's key conditions will
+    // be met after the screen index transition fires (0 → 8).
+    //   1. role == 2 (spectator)  — set by bridge init
+    //   2. menu selection == 4    — we just wrote it above
+    //   3. previous screen == 0   — DLL caches this each tick; we're on 0 now
+    {
+        const int verifyMenuSel = static_cast<int>(
+            *reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection));
+        const int verifyScreen = *reinterpret_cast<const int*>(kVaCurrentScreenIndex);
+        const netplay::bridge::NetbridgeStatus postStatus = netplay::bridge::GetStatus();
+        mod::Log(
+            "HandoffSpectateSession: verify menuSel=%d (expect 4) screen=%d (expect 0) "
+            "role=%d (expect 1/spectate) syncMode=%d peerAlive=%d",
+            verifyMenuSel, verifyScreen, postStatus.roleFlag,
+            postStatus.syncGameMode,
+            netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+    }
+
+    if (g_netplayMenuState.bgmActive)
+    {
+        StopCurrentBgm(screenContext, "handoff_spectate_session");
+    }
+
+    g_netplayMenuState.active = false;
+    g_netplayMenuState.bgmActive = false;
+    g_netplayMenuState.useConfigStyleRender = false;
+    g_netplayMenuState.menuId = NetplayMenuId::Main;
+    g_netplayMenuState.mainSelection = 0;
+    g_netplayMenuState.optionCount = kNetplayDefaultOptionCount;
+    g_netplayMenuState.backIndex = kNetplayDefaultBackIndex;
+    g_netplayMenuState.renderLayout = {};
+    g_netplayMenuState.lobbyScrollOffset = 0;
+    ResetMenuSlideTransition();
+    ResetInlineEditState();
+    g_hasLoggedInputSnapshot = false;
+    g_netplayEscapeDown = false;
+    g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+    ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
+    RemoveNetplayWindowHook();
+    g_returnToNetplayAfterMatch = true;
+    g_pendingGlobalStateTransition = kScreenIndexReplay;
+
+    mod::Log(
+        "HandoffSpectateSession: queued global transition nextState=%d returnToNetplay=%d",
+        g_pendingGlobalStateTransition,
+        g_returnToNetplayAfterMatch ? 1 : 0);
+}
 
 void EnterNetplayMenu(uint32_t screenContext)
 {
@@ -580,6 +782,7 @@ void EnterNetplayMenu(uint32_t screenContext)
     g_netplayMenuState.bgmActive = true;
     g_netplayMenuState.menuId = NetplayMenuId::Main;
     g_netplayMenuState.mainSelection = 0;
+    g_charSelectResetPending = true;
     ResetMenuSlideTransition();
     ResetInlineEditState();
     g_lastNetplayFrameLogTick = 0;
@@ -661,13 +864,18 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
     const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
     mod::Log(
-        "HandoffConnectedSessionToVsHumanState: begin prepared=%d sync(mode=%d flag1084=%d session=%d flags=%d/%d)",
+        "HandoffConnectedSessionToVsHumanState: begin prepared=%d "
+        "sync(mode=%d flag1084=%d session=%d flags=%d/%d role=%d) "
+        "screen=%d peerAlive=%d",
         prepared ? 1 : 0,
         status.syncGameMode,
         status.syncMode0Flag1084,
         status.syncSessionByte,
         status.syncGlobalFlag4964,
-        status.syncGlobalFlag4965);
+        status.syncGlobalFlag4965,
+        status.roleFlag,
+        *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+        netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
 
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareVsHumanGameState(screenContext);
@@ -697,7 +905,7 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
-    g_pendingGlobalStateTransition = 1;
+    g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
     mod::Log(
         "HandoffConnectedSessionToVsHumanState: queued global transition nextState=%d returnToNetplay=%d",
@@ -1123,6 +1331,21 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
+            // Pre-flight: if the peer exited during the handoff/fade-out, abort
+            // the state transition.  Without this check, EFZ.exe's state-1 init
+            // calls the DLL rollback tick immediately, which fires ExitProcess on
+            // the main game thread where no setjmp recovery point is active.
+            if (!netplay::bridge::IsPeerProcessAlive())
+            {
+                mod::Log(
+                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
+                    "re-entering netplay menu",
+                    nextState);
+                netplay::bridge::CancelSession("peer_died_before_transition");
+                EnterNetplayMenu(screenContext);
+                return 0;
+            }
+            mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
             return static_cast<char>(nextState);
         }
         return 0;
@@ -1142,6 +1365,71 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if (g_spectateConfirmOverlay.active)
     {
         (void)HandleSpectateConfirmOverlayInput(screenContext, inputBytes, inactivityCounter);
+        return 0;
+    }
+
+    // --- Spectate handoff ---
+    // Spectating uses a fundamentally different path from online play:
+    // the DLL expects the game to transition to screen index 8 (Replay
+    // Screen), NOT screen 1 (Character Select).  The DLL's frame-hook
+    // (sub_1006D810) watches for a 0→8 mode transition, verifies role==2
+    // and title menu selection==4, then creates a lightweight spectator
+    // watcher session.
+    //
+    // Unlike online play, we cannot wait for vsHumanSyncReady (which
+    // requires syncGameMode==8) because the game mode will only BECOME 8
+    // after we perform this transition — waiting would deadlock.  Instead,
+    // we trigger the handoff as soon as DLL init is applied and any
+    // spectate-confirm prompt has been resolved.
+    if (bridgeStatus.roleFlag == kRoleFlagSpectate
+        && bridgeStatus.localInitApplied != 0
+        && (bridgePhase == NetbridgePhase::Connecting
+            || bridgePhase == NetbridgePhase::DelaySetup
+            || bridgePhase == NetbridgePhase::Connected)
+        && !spectateConfirmPending)
+    {
+        mod::Log(
+            "SpectateHandoff: triggered — role=%d init=%d phase=%s "
+            "sync(mode=%d flag1084=%d session=%d flags=%d/%d) "
+            "confirmSerial=%d/%d screen=%d menuSel=%d peerAlive=%d",
+            bridgeStatus.roleFlag,
+            bridgeStatus.localInitApplied,
+            netplay::bridge::PhaseToString(bridgePhase),
+            bridgeStatus.syncGameMode,
+            bridgeStatus.syncMode0Flag1084,
+            bridgeStatus.syncSessionByte,
+            bridgeStatus.syncGlobalFlag4964,
+            bridgeStatus.syncGlobalFlag4965,
+            bridgeStatus.spectateConfirmPromptSerial,
+            bridgeStatus.spectateConfirmPromptServedSerial,
+            *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+            netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        HandoffSpectateSession(screenContext);
+        if (g_pendingGlobalStateTransition >= 0)
+        {
+            const int nextState = g_pendingGlobalStateTransition;
+            g_pendingGlobalStateTransition = -1;
+            if (!netplay::bridge::IsPeerProcessAlive())
+            {
+                mod::Log(
+                    "NetplayTransition: ABORT — peer exited before spectate state=%d, "
+                    "re-entering netplay menu",
+                    nextState);
+                netplay::bridge::CancelSession("peer_died_before_spectate_transition");
+                EnterNetplayMenu(screenContext);
+                return 0;
+            }
+            mod::Log(
+                "NetplayTransition: returning spectate state=%d from netplay menu "
+                "menuSel=%d screen=%d",
+                nextState,
+                static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+                *reinterpret_cast<const int*>(kVaCurrentScreenIndex));
+            return static_cast<char>(nextState);
+        }
         return 0;
     }
 
@@ -1242,6 +1530,16 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 const int nextState = g_pendingGlobalStateTransition;
                 g_pendingGlobalStateTransition = -1;
+                if (!netplay::bridge::IsPeerProcessAlive())
+                {
+                    mod::Log(
+                        "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
+                        "re-entering netplay menu",
+                        nextState);
+                    netplay::bridge::CancelSession("peer_died_before_transition");
+                    EnterNetplayMenu(screenContext);
+                    return 0;
+                }
                 mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
                 return static_cast<char>(nextState);
             }
@@ -1253,6 +1551,16 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
+            if (!netplay::bridge::IsPeerProcessAlive())
+            {
+                mod::Log(
+                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
+                    "re-entering netplay menu",
+                    nextState);
+                netplay::bridge::CancelSession("peer_died_before_transition");
+                EnterNetplayMenu(screenContext);
+                return 0;
+            }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
             return static_cast<char>(nextState);
         }

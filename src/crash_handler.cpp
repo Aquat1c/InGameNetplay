@@ -1,4 +1,5 @@
 #include "crash_handler.h"
+#include "netplay/bridge/session_bridge.h"
 
 #include "logger.h"
 
@@ -18,8 +19,10 @@ PVOID g_vectoredHandle = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER g_previousUnhandledFilter = nullptr;
 char g_moduleDirectory[MAX_PATH] = {};
 bool g_injectedMode = false;
-std::atomic<bool> g_dumpWritten{false};
-HMODULE g_dbgHelpModule = nullptr;
+std::atomic<bool> g_dumpWritten{false};// One-shot flag: the TOCTOU netplay recovery may only fire once per session.
+// Without this guard the VEH would fire repeatedly if DLL code at the
+// redirected address also crashes (e.g. partially-unwound DLL frames).
+std::atomic<bool> g_toctouRecoveryFired{false};HMODULE g_dbgHelpModule = nullptr;
 using MiniDumpWriteDumpFn = BOOL(WINAPI*)(
     HANDLE,
     DWORD,
@@ -349,6 +352,157 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // ---------------------------------------------------------------------------
+    // TOCTOU netplay recovery
+    //
+    // Scenario: IsPeerProcessAlive() returned true so we returned global state=1
+    // to EFZ.exe; the peer died between that check and EFZ.exe calling the DLL
+    // rollback tick in state-4 (VS Human in-game).  NeutralizeExitProcess ran on
+    // the main thread (frameJmpActive=0 — game-state-4 dispatches DLL sessions
+    // via a direct vtable call, not through 0x401582/OurFrameDispatch), neutralised
+    // the session vtable, and returned.  The instruction after 'call ExitProcess'
+    // in EFZ_Main_RollbackLoopTick is a privileged instruction placed by the
+    // compiler as unreachable marker code — executing it raises
+    // STATUS_PRIV_INSTRUCTION (0xC0000096).
+    //
+    // Recovery: simulate 'leave; ret' from the crashing function, returning
+    // cleanly to EFZ.exe's game loop.  The session vtable is already neutralised
+    // (all subsequent DLL tick calls are no-ops).  g_revivalExitIntercepted is
+    // set, so ConsumeRevivalExitInterception fires from HookedTitleUpdateImplBody
+    // when EFZ.exe eventually returns to state-0 (e.g. player presses ESC),
+    // which re-enters the netplay menu and completes the teardown sequence.
+    // ---------------------------------------------------------------------------
+#if defined(_M_IX86)
+    if (code == EXCEPTION_PRIV_INSTRUCTION && !g_injectedMode)
+    {
+        // One-shot: only attempt TOCTOU recovery once.  Without this guard
+        // the VEH would fire again if DLL code at the redirected address
+        // also faults (partially-unwound DLL frames executing stale state).
+        if (!g_toctouRecoveryFired.exchange(true)
+            && netplay::bridge::IsNetplayExitInterceptionPending())
+        {
+            const ULONG_PTR crashAddr =
+                reinterpret_cast<ULONG_PTR>(exceptionPointers->ExceptionRecord->ExceptionAddress);
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            if (revival != nullptr)
+            {
+                // Confirm crash is inside EfzRevival.dll.
+                MEMORY_BASIC_INFORMATION mbi = {};
+                const bool inRevivalDll =
+                    (VirtualQuery(reinterpret_cast<LPCVOID>(crashAddr),
+                                  &mbi, sizeof(mbi)) != 0)
+                    && (mbi.AllocationBase == static_cast<PVOID>(revival));
+                if (inRevivalDll)
+                {
+                    const uintptr_t revBase = reinterpret_cast<uintptr_t>(revival);
+                    CONTEXT* ctx = exceptionPointers->ContextRecord;
+
+                    // Walk the EBP chain until we find a return address that
+                    // is NOT inside EfzRevival.dll.  A simple one-frame
+                    // leave;ret lands back in other DLL code which may also
+                    // fault, causing the VEH to loop.  By walking past all
+                    // DLL frames in one step we return directly into
+                    // EFZ.exe's game loop, which can continue cleanly with
+                    // the already-neutralised dummy vtable.
+                    uintptr_t walkEbp = ctx->Ebp;
+                    uintptr_t foundRet = 0;
+                    uintptr_t foundEbp = 0;
+                    uintptr_t foundEsp = 0;
+                    bool foundExeFrame = false;
+                    int depth = 0;
+
+                    for (; depth < 40; ++depth)
+                    {
+                        const uintptr_t curSavedEbp = SafeReadDword(walkEbp);
+                        const uintptr_t curRet      = SafeReadDword(walkEbp + 4);
+
+                        if (curRet == 0xDEADBEEFu || curRet == 0
+                            || curSavedEbp == 0xDEADBEEFu
+                            || curSavedEbp <= walkEbp)
+                        {
+                            break; // unreadable or non-standard frame
+                        }
+
+                        // Check whether curRet is in EfzRevival.dll.
+                        MEMORY_BASIC_INFORMATION retMbi = {};
+                        const bool retInRevival =
+                            (VirtualQuery(reinterpret_cast<LPCVOID>(curRet),
+                                          &retMbi, sizeof(retMbi)) != 0)
+                            && (retMbi.AllocationBase == static_cast<PVOID>(revival));
+
+                        if (!retInRevival)
+                        {
+                            // This frame's return address is outside
+                            // EfzRevival.dll — it's EFZ.exe (or our mod DLL).
+                            foundRet = curRet;
+                            foundEbp = curSavedEbp;
+                            foundEsp = walkEbp + 8; // EBP+4 = retaddr, +4 = size
+                            foundExeFrame = true;
+                            break;
+                        }
+
+                        walkEbp = curSavedEbp;
+                    }
+
+                    if (foundExeFrame)
+                    {
+                        mod::Log(
+                            "CrashHandler: TOCTOU netplay recovery — "
+                            "walked %d DLL frame(s) from RVA 0x%lX, "
+                            "resuming at EXE addr 0x%08lX "
+                            "(EBP 0x%08lX ESP 0x%08lX)",
+                            depth,
+                            static_cast<unsigned long>(crashAddr - revBase),
+                            static_cast<unsigned long>(foundRet),
+                            static_cast<unsigned long>(foundEbp),
+                            static_cast<unsigned long>(foundEsp));
+
+                        // NeutralizeExitProcess already installed the dummy
+                        // vtable on the session object before the hlt fired.
+                        // Do NOT call ForceLocalPlayInit here: creating a fresh
+                        // local-play session at this point means that session
+                        // will also eventually call ExitProcess (outside
+                        // OurFrameDispatch's setjmp scope), producing a second
+                        // hlt that the one-shot VEH can no longer catch.
+                        //
+                        // The dummy vtable returns 0 safely from every method,
+                        // so EFZ.exe's char-select / game loop can continue
+                        // cleanly (all DLL session calls are no-ops).  The
+                        // title-screen hook will call ConsumeRevivalExitInterception
+                        // on the first mode-0 frame, which does the full proper
+                        // tear-down (TerminateProcess / patch restore /
+                        // ForceLocalPlayInit / text disable) in a controlled way.
+                        //
+                        // Force the game mode to title screen (0) so that the
+                        // title-screen hook runs immediately on the next main-
+                        // loop iteration instead of waiting for the match to
+                        // end naturally.
+                        const bool modeForced = netplay::bridge::ForceGameModeToTitle();
+                        mod::Log(
+                            "CrashHandler: TOCTOU recovery — ForceGameModeToTitle "
+                            "result=%d",
+                            modeForced ? 1 : 0);
+
+                        ctx->Eip = static_cast<DWORD>(foundRet);
+                        ctx->Esp = static_cast<DWORD>(foundEsp);
+                        ctx->Ebp = static_cast<DWORD>(foundEbp);
+                        ctx->Eax = 0;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+
+                    mod::Log(
+                        "CrashHandler: TOCTOU netplay recovery — "
+                        "could not find EXE frame after %d steps "
+                        "(crashRVA=0x%lX EBP=0x%08lX), falling through",
+                        depth,
+                        static_cast<unsigned long>(crashAddr - revBase),
+                        static_cast<unsigned long>(ctx->Ebp));
+                }
+            }
+        }
+    }
+#endif
+
     WriteCrashArtifacts(exceptionPointers, "vectored");
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -404,5 +558,11 @@ void UninstallCrashHandlers()
     }
 
     mod::Log("CrashHandler: uninstalled");
+}
+
+void ResetCrashRecoveryState()
+{
+    g_toctouRecoveryFired.store(false);
+    mod::Log("CrashHandler: TOCTOU recovery guard reset");
 }
 } // namespace mod

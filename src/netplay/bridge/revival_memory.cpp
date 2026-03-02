@@ -1,6 +1,7 @@
 // Revival DLL memory introspection and session field manipulation.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "crash_handler.h"
 
 #include <cstring>
 #include <cwchar>
@@ -950,6 +951,7 @@ bool RestoreTournamentExePatches()
 // ---------------------------------------------------------------------------
 
 static uint8_t g_savedDllExitProcessBytes[RevivalAddressProfile::kMaxExitProcessPatches];
+static uint8_t g_savedDllExitNearJccBytes[RevivalAddressProfile::kMaxExitProcessNearJccPatches][6];
 static bool g_dllExitProcessPatchesSaved = false;
 
 bool SaveAndApplyDllExitProcessPatches()
@@ -972,6 +974,7 @@ bool SaveAndApplyDllExitProcessPatches()
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
     int applied = 0;
 
+    // --- Single-byte Jcc patches (0x74/0x75 → 0xEB) ---
     for (size_t i = 0; i < g_activeRevival->exitProcessPatchCount; ++i)
     {
         const uintptr_t rva = g_activeRevival->exitProcessPatchRva[i];
@@ -1003,13 +1006,117 @@ bool SaveAndApplyDllExitProcessPatches()
             *ptr = 0xEB; // jmp short (unconditional)
             VirtualProtect(ptr, 1, oldProtect, &oldProtect);
             ++applied;
+            mod::Log("SaveAndApplyDllExitProcessPatches: site %zu RVA 0x%lX: "
+                     "patched 0x%02X -> 0xEB",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned>(expected));
+        }
+        else
+        {
+            mod::Log("SaveAndApplyDllExitProcessPatches: site %zu RVA 0x%lX: "
+                     "VirtualProtect failed err=%lu",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned long>(GetLastError()));
+        }
+    }
+
+    // --- 6-byte near-Jcc NOP patches (0F 84/85 rel32 → 6× NOP) ---
+    int nearApplied = 0;
+    for (size_t i = 0; i < g_activeRevival->exitProcessNearJccCount; ++i)
+    {
+        const uintptr_t rva = g_activeRevival->exitProcessNearJccRva[i];
+        if (rva == 0)
+        {
+            continue;
+        }
+
+        auto* ptr = reinterpret_cast<uint8_t*>(base + rva);
+
+        // Save original 6 bytes.
+        std::memcpy(g_savedDllExitNearJccBytes[i], ptr, 6);
+
+        // Validate: expect 0F 84 (jz near) or 0F 85 (jnz near).
+        if (ptr[0] != 0x0F || (ptr[1] != 0x84 && ptr[1] != 0x85))
+        {
+            mod::Log("SaveAndApplyDllExitProcessPatches: near-Jcc %zu at RVA 0x%lX: "
+                     "expected 0F 84/85, found %02X %02X — skipping",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned>(ptr[0]),
+                     static_cast<unsigned>(ptr[1]));
+            continue;
+        }
+
+        DWORD oldProtect = 0;
+        if (VirtualProtect(ptr, 6, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            std::memset(ptr, 0x90, 6); // 6× NOP
+            DWORD ignored = 0;
+            VirtualProtect(ptr, 6, oldProtect, &ignored);
+            FlushInstructionCache(GetCurrentProcess(), ptr, 6);
+            ++nearApplied;
+            mod::Log("SaveAndApplyDllExitProcessPatches: near-Jcc %zu RVA 0x%lX: "
+                     "patched %02X %02X -> 6xNOP",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned>(g_savedDllExitNearJccBytes[i][0]),
+                     static_cast<unsigned>(g_savedDllExitNearJccBytes[i][1]));
+        }
+        else
+        {
+            mod::Log("SaveAndApplyDllExitProcessPatches: near-Jcc %zu RVA 0x%lX: "
+                     "VirtualProtect failed err=%lu",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned long>(GetLastError()));
         }
     }
 
     g_dllExitProcessPatchesSaved = true;
-    mod::Log("SaveAndApplyDllExitProcessPatches: applied %d/%zu patches",
-             applied, g_activeRevival->exitProcessPatchCount);
-    return applied > 0;
+    mod::Log("SaveAndApplyDllExitProcessPatches: applied %d/%zu single-byte + "
+             "%d/%zu near-Jcc patches",
+             applied, g_activeRevival->exitProcessPatchCount,
+             nearApplied, g_activeRevival->exitProcessNearJccCount);
+
+    // --- Post-apply verification pass ---
+    int verifyFail = 0;
+    for (size_t i = 0; i < g_activeRevival->exitProcessPatchCount; ++i)
+    {
+        const uintptr_t rva = g_activeRevival->exitProcessPatchRva[i];
+        if (rva == 0) continue;
+        const auto* ptr = reinterpret_cast<const uint8_t*>(base + rva);
+        if (*ptr != 0xEB)
+        {
+            mod::Log("SaveAndApplyDllExitProcessPatches: VERIFY FAIL site %zu RVA 0x%lX: "
+                     "expected 0xEB, found 0x%02X",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned>(*ptr));
+            ++verifyFail;
+        }
+    }
+    for (size_t i = 0; i < g_activeRevival->exitProcessNearJccCount; ++i)
+    {
+        const uintptr_t rva = g_activeRevival->exitProcessNearJccRva[i];
+        if (rva == 0) continue;
+        const auto* ptr = reinterpret_cast<const uint8_t*>(base + rva);
+        if (ptr[0] != 0x90 || ptr[1] != 0x90)
+        {
+            mod::Log("SaveAndApplyDllExitProcessPatches: VERIFY FAIL near-Jcc %zu RVA 0x%lX: "
+                     "expected 90 90, found %02X %02X",
+                     i, static_cast<unsigned long>(rva),
+                     static_cast<unsigned>(ptr[0]),
+                     static_cast<unsigned>(ptr[1]));
+            ++verifyFail;
+        }
+    }
+    if (verifyFail > 0)
+    {
+        mod::Log("SaveAndApplyDllExitProcessPatches: WARNING — %d patches failed verification!",
+                 verifyFail);
+    }
+    else
+    {
+        mod::Log("SaveAndApplyDllExitProcessPatches: all patches verified OK");
+    }
+
+    return (applied + nearApplied) > 0;
 }
 
 bool RestoreDllExitProcessPatches()
@@ -1028,6 +1135,7 @@ bool RestoreDllExitProcessPatches()
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
     int restored = 0;
 
+    // --- Restore single-byte Jcc patches ---
     for (size_t i = 0; i < g_activeRevival->exitProcessPatchCount; ++i)
     {
         const uintptr_t rva = g_activeRevival->exitProcessPatchRva[i];
@@ -1047,10 +1155,35 @@ bool RestoreDllExitProcessPatches()
         }
     }
 
+    // --- Restore 6-byte near-Jcc patches ---
+    int nearRestored = 0;
+    for (size_t i = 0; i < g_activeRevival->exitProcessNearJccCount; ++i)
+    {
+        const uintptr_t rva = g_activeRevival->exitProcessNearJccRva[i];
+        if (rva == 0)
+        {
+            continue;
+        }
+
+        auto* ptr = reinterpret_cast<uint8_t*>(base + rva);
+
+        DWORD oldProtect = 0;
+        if (VirtualProtect(ptr, 6, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            std::memcpy(ptr, g_savedDllExitNearJccBytes[i], 6);
+            DWORD ignored = 0;
+            VirtualProtect(ptr, 6, oldProtect, &ignored);
+            FlushInstructionCache(GetCurrentProcess(), ptr, 6);
+            ++nearRestored;
+        }
+    }
+
     g_dllExitProcessPatchesSaved = false;
-    mod::Log("RestoreDllExitProcessPatches: restored %d/%zu patches",
-             restored, g_activeRevival->exitProcessPatchCount);
-    return restored > 0;
+    mod::Log("RestoreDllExitProcessPatches: restored %d/%zu single-byte + "
+             "%d/%zu near-Jcc patches",
+             restored, g_activeRevival->exitProcessPatchCount,
+             nearRestored, g_activeRevival->exitProcessNearJccCount);
+    return (restored + nearRestored) > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1204,70 @@ bool RestoreDllExitProcessPatches()
 // calling vtable[1] immediately after storing the session pointer.  We do
 // the same here.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// InvokeSessionVtableInit — read the session pointer from dword_100A02CC and
+// call vtable slot 1 (vtable+4 = the init method).  This must be called
+// immediately after init() so that field initialization (BGM manager,
+// audio, etc.) completes before any other JMP-patched hook dispatches to
+// the new session object.  Without this call, the spectator object's BGM
+// manager pointer (offset +1068) stays NULL and the BGM dispatch hook at
+// 0x40DE80 crashes on a double-dereference.
+//
+// Used by ForceLocalPlayInit (mode 2) and the spectator init path (mode 1).
+// ---------------------------------------------------------------------------
+bool InvokeSessionVtableInit(const char* caller)
+{
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr
+        || g_activeRevival == nullptr
+        || g_activeRevival->sessionPtrOffsetCount == 0)
+    {
+        mod::Log("%s: InvokeSessionVtableInit skipped (DLL not loaded)", caller);
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    const uintptr_t sessionGlobalAddr =
+        base + g_activeRevival->sessionPtrOffsets[0];
+    uintptr_t sessionPtr = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(sessionGlobalAddr),
+                     &sessionPtr)
+        || sessionPtr == 0)
+    {
+        mod::Log("%s: InvokeSessionVtableInit skipped (session NULL)", caller);
+        return false;
+    }
+
+    uintptr_t vtablePtr = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtablePtr)
+        || vtablePtr == 0)
+    {
+        mod::Log("%s: InvokeSessionVtableInit skipped (vtable NULL)", caller);
+        return false;
+    }
+
+    uintptr_t vtableSlot1 = 0;
+    if (!SafeReadPtr(
+            reinterpret_cast<const void*>(vtablePtr + sizeof(uintptr_t)),
+            &vtableSlot1)
+        || vtableSlot1 == 0)
+    {
+        mod::Log("%s: InvokeSessionVtableInit skipped (vtable[1] NULL)", caller);
+        return false;
+    }
+
+    // __thiscall: this in ECX, no extra args.
+    typedef void(__thiscall* SessionInitFn)(void*);
+    auto initFn = reinterpret_cast<SessionInitFn>(vtableSlot1);
+    initFn(reinterpret_cast<void*>(sessionPtr));
+    mod::Log(
+        "%s: InvokeSessionVtableInit vtable[1] 0x%08lX called on session 0x%08lX",
+        caller,
+        static_cast<unsigned long>(vtableSlot1),
+        static_cast<unsigned long>(sessionPtr));
+    return true;
+}
+
 bool ForceLocalPlayInit()
 {
     if (g_localInitFn == nullptr)
@@ -1084,46 +1281,9 @@ bool ForceLocalPlayInit()
     g_localRoleFlag = kLocalRoleLocalPlay;
     mod::Log("ForceLocalPlayInit: init(2,102) result=%d", result);
 
-    // --- Immediately call vtable[1] on the new session -----------------------
-    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
-    if (revival != nullptr
-        && g_activeRevival != nullptr
-        && g_activeRevival->sessionPtrOffsetCount > 0)
-    {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
-        const uintptr_t sessionGlobalAddr =
-            base + g_activeRevival->sessionPtrOffsets[0];
-        uintptr_t sessionPtr = 0;
-        if (SafeReadPtr(reinterpret_cast<const void*>(sessionGlobalAddr),
-                        &sessionPtr)
-            && sessionPtr != 0)
-        {
-            uintptr_t vtablePtr = 0;
-            if (SafeReadPtr(reinterpret_cast<const void*>(sessionPtr),
-                            &vtablePtr)
-                && vtablePtr != 0)
-            {
-                uintptr_t vtableSlot1 = 0;
-                if (SafeReadPtr(
-                        reinterpret_cast<const void*>(
-                            vtablePtr + sizeof(uintptr_t)),
-                        &vtableSlot1)
-                    && vtableSlot1 != 0)
-                {
-                    // __thiscall: this in ECX, no extra args.
-                    typedef void(__thiscall* SessionInitFn)(void*);
-                    auto initFn =
-                        reinterpret_cast<SessionInitFn>(vtableSlot1);
-                    initFn(reinterpret_cast<void*>(sessionPtr));
-                    mod::Log(
-                        "ForceLocalPlayInit: vtable[1] 0x%08lX called on "
-                        "session 0x%08lX",
-                        static_cast<unsigned long>(vtableSlot1),
-                        static_cast<unsigned long>(sessionPtr));
-                }
-            }
-        }
-    }
+    // Immediately call vtable[1] on the new session so that BGM and other
+    // fields are initialized before any dispatch hook fires.
+    (void)InvokeSessionVtableInit("ForceLocalPlayInit");
 
     return true;
 }
@@ -1716,6 +1876,322 @@ void RepairRollbackHistoryBindingsIfNeeded()
             static_cast<unsigned long>(expectedSecondary),
             static_cast<long>(hits));
     }
+}
+
+// ---------------------------------------------------------------------------
+// NetplayFrameHook — wraps sub_1006E590 (the DLL per-frame dispatcher,
+// RVA 0x6E590 in EfzRevival.dll 1.02e) with a setjmp recovery point.
+//
+// For tournament sessions, Jcc patches make ExitProcess calls unreachable.
+// For netplay (online/spectate) sessions, no Jcc patches are applied, so
+// ExitProcess CAN fire from EFZ_Main_RollbackLoopTick when the peer process
+// terminates.  Because ExitProcess is called on the EFZ.exe main game loop
+// thread (via the frame hook dispatch chain), NeutralizeExitProcess must NOT
+// hang that thread with Sleep(INFINITE).
+//
+// This hook installs a 6-byte JMP at sub_1006E590's entry so every frame
+// passes through OurFrameDispatch.  OurFrameDispatch sets a jmp_buf before
+// calling the original function.  NeutralizeExitProcess then longjmp()s
+// back here instead of sleeping, allowing the main loop to continue normally.
+// On the next title-screen frame, ConsumeRevivalExitInterception runs the
+// full cleanup and re-enters the netplay menu.
+//
+// sub_1006E590 first 6 bytes (complete instructions, safe trampoline unit):
+//   55        push ebp
+//   8B EC     mov  ebp, esp
+//   83 E4 C0  and  esp, 0xC0   (64-byte stack alignment)
+// ---------------------------------------------------------------------------
+
+static constexpr uintptr_t kFrameHookRva = 0x6E590u;
+
+// The jmp_buf and active-flag are read by NeutralizeExitProcess in
+// iat_stubs.cpp.  They are declared extern in takeover_internal.h.
+jmp_buf         g_netplayFrameJmpBuf    = {};
+volatile bool   g_netplayFrameJmpActive = false;
+
+// Fallback recovery context armed by HookedTitleUpdateImpl while title/menu
+// logic is executing. Used when ExitProcess fires outside OurFrameDispatch.
+jmp_buf         g_netplayUiJmpBuf       = {};
+volatile bool   g_netplayUiJmpActive    = false;
+
+// Trampoline: first 6 original bytes + near JMP back to original+6.
+static uint8_t g_frameHookTrampoline[12] = {};
+static bool    g_frameHookInstalled      = false;
+
+using FrameDispatchFn = void (*)();
+static FrameDispatchFn g_origFrameDispatch = nullptr;
+
+// g_frameRecoveryPending: set by RunFrameDispatch on longjmp, read and cleared
+// by OurFrameDispatch outside the setjmp scope so C++ code (ForceLocalPlayInit)
+// can run safely.
+static volatile bool g_frameRecoveryPending = false;
+
+// RunFrameDispatch — MSVC C4611 guard: no C++ objects with destructors in scope.
+// Only POD types here.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4611)
+#endif
+static void RunFrameDispatch()
+{
+    g_netplayFrameJmpActive = true;
+    if (setjmp(g_netplayFrameJmpBuf) != 0)
+    {
+        // longjmp path: ExitProcess was intercepted during this frame tick.
+        // Signal OurFrameDispatch to execute C++ recovery outside setjmp scope.
+        g_netplayFrameJmpActive = false;
+        g_frameRecoveryPending = true;
+        return;
+    }
+    // Normal path: dispatch through the original sub_1006E590 trampoline.
+    if (g_origFrameDispatch != nullptr)
+    {
+        g_origFrameDispatch();
+    }
+    g_netplayFrameJmpActive = false;
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+// OurFrameDispatch — entry point patched over sub_1006E590's prologue.
+//
+// On the normal path, delegates to RunFrameDispatch (→ trampoline → original).
+//
+// On the ExitProcess interception path (peer process died during rollback tick):
+//   1. RunFrameDispatch returns with g_frameRecoveryPending = true.
+//   2. Full reverse-init cleanup: reinstate local-play session, terminate the
+//      dead helper process, restore DLL patches, disable text overlays, and
+//      reset the VEH crash-recovery guard.
+//   3. Force game mode to 0 (title screen) so HookedTitleUpdateImplBody can
+//      consume the exit-interception flag and re-enter the netplay menu
+//      immediately instead of waiting for the match to end naturally.
+static void OurFrameDispatch()
+{
+    RunFrameDispatch();
+
+    if (g_frameRecoveryPending)
+    {
+        g_frameRecoveryPending = false;
+
+        // ---- Full reverse-init recovery ------------------------------------
+        // The online/spectate session tick fired ExitProcess (peer died).
+        // NeutralizeExitProcess has already:
+        //   - captured g_revivalExitMode = g_localRoleFlag
+        //   - set g_revivalExitIntercepted = 1
+        //   - neutralised the session vtable (all slots → no-op stubs)
+        //   - longjmp'd back here via g_netplayFrameJmpBuf
+        //
+        // Step 1: Reinstate a live local-play session immediately so the
+        // game loop gets a valid vtable for subsequent frame dispatches.
+        // --------------------------------------------------------------------
+        const int recoveredRole = g_localRoleFlag;
+        const DWORD recoveredPid = g_revivalProcessId;
+        mod::Log(
+            "OurFrameDispatch: ExitProcess intercepted during frame tick "
+            "(role=%d pid=%lu) — performing full cleanup",
+            recoveredRole,
+            static_cast<unsigned long>(recoveredPid));
+
+        // Step 1: Reinstate a live local-play session.
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "OurFrameDispatch: step 1 ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        // Step 2: Terminate the dead helper process and close its handle.
+        // The session is already neutralised; terminating ensures OS
+        // resources are released immediately.
+        if (g_revivalProcess != nullptr)
+        {
+            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+            const DWORD termErr = termOk ? 0 : GetLastError();
+            CloseHandle(g_revivalProcess);
+            g_revivalProcess = nullptr;
+            g_revivalProcessId = 0;
+            mod::Log(
+                "OurFrameDispatch: step 2 helper process terminated "
+                "(pid=%lu termOk=%d err=%lu) and handle closed",
+                static_cast<unsigned long>(recoveredPid),
+                termOk ? 1 : 0,
+                static_cast<unsigned long>(termErr));
+        }
+        else
+        {
+            mod::Log("OurFrameDispatch: step 2 skipped (no helper process handle)");
+        }
+
+        // Step 3: Restore DLL Jcc patches that made ExitProcess call-sites
+        // unreachable.  No longer needed now that the session is local-play.
+        const bool patchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "OurFrameDispatch: step 3 RestoreDllExitProcessPatches result=%d",
+            patchOk ? 1 : 0);
+
+        // Step 4: Disable stale text overlays left by the online session
+        // (nicknames, ping, delay).  ClearRevivalText is unsafe here
+        // (ForceLocalPlayInit may have zeroed the render context pointer)
+        // so we only disable the rendering hook.
+        const bool textOk = DisableRevivalTextRendering();
+        mod::Log(
+            "OurFrameDispatch: step 4 DisableRevivalTextRendering result=%d",
+            textOk ? 1 : 0);
+
+        // Step 5: Reset the one-shot VEH TOCTOU recovery guard so a
+        // subsequent session can still be recovered if needed.
+        mod::ResetCrashRecoveryState();
+        mod::Log("OurFrameDispatch: step 5 crash recovery state reset");
+
+        // Step 6: Force game mode to 0 (title screen).  On the next main-
+        // loop iteration, HookedTitleUpdateImplBody runs, detects
+        // g_revivalExitIntercepted, calls ConsumeRevivalExitInterception,
+        // and re-enters the netplay menu — skipping the rest of the match.
+        const bool modeOk = ForceGameModeToTitle();
+        mod::Log(
+            "OurFrameDispatch: step 6 ForceGameModeToTitle result=%d",
+            modeOk ? 1 : 0);
+
+        g_localInitAppliedForSession = false;
+        mod::Log(
+            "OurFrameDispatch: full recovery complete (was role=%d), "
+            "next title-screen frame will consume exit interception",
+            recoveredRole);
+    }
+}
+
+bool InstallNetplayFrameHook()
+{
+    if (g_frameHookInstalled)
+    {
+        return true;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        mod::Log("InstallNetplayFrameHook: EfzRevival.dll not loaded");
+        return false;
+    }
+
+    const uintptr_t base    = reinterpret_cast<uintptr_t>(revival);
+    uint8_t* const  target  = reinterpret_cast<uint8_t*>(base + kFrameHookRva);
+
+    // Sanity-check: expect push ebp (0x55) as the first byte.
+    uint8_t firstByte = 0;
+    if (!SafeReadByte(target, &firstByte) || firstByte != 0x55)
+    {
+        mod::Log(
+            "InstallNetplayFrameHook: unexpected byte 0x%02X at RVA 0x%lX — skipping",
+            static_cast<unsigned>(firstByte),
+            static_cast<unsigned long>(kFrameHookRva));
+        return false;
+    }
+
+    // Build trampoline: 6 original bytes + JMP-near back to original+6.
+    memcpy(g_frameHookTrampoline, target, 6);
+    const uintptr_t origContinue = base + kFrameHookRva + 6;
+    g_frameHookTrampoline[6]     = 0xE9; // JMP near rel32
+    const uintptr_t jmpFrom      = reinterpret_cast<uintptr_t>(&g_frameHookTrampoline[6]) + 5;
+    *reinterpret_cast<int32_t*>(&g_frameHookTrampoline[7]) =
+        static_cast<int32_t>(origContinue - jmpFrom);
+    g_frameHookTrampoline[11] = 0x90; // padding NOP
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            g_frameHookTrampoline,
+            sizeof(g_frameHookTrampoline),
+            PAGE_EXECUTE_READWRITE,
+            &oldProtect))
+    {
+        mod::Log("InstallNetplayFrameHook: VirtualProtect(trampoline) failed");
+        return false;
+    }
+
+    g_origFrameDispatch = reinterpret_cast<FrameDispatchFn>(
+        reinterpret_cast<void*>(g_frameHookTrampoline));
+
+    // Patch the first 6 bytes of sub_1006E590:
+    //   E9 rel32 (5-byte JMP to OurFrameDispatch) + 90 (NOP).
+    uint8_t patch[6];
+    patch[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(&patch[1]) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&OurFrameDispatch)
+            - (reinterpret_cast<uintptr_t>(target) + 5));
+    patch[5] = 0x90;
+
+    if (!VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        mod::Log("InstallNetplayFrameHook: VirtualProtect(target) failed");
+        return false;
+    }
+    memcpy(target, patch, 6);
+    VirtualProtect(target, 6, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), target, 6);
+
+    g_frameHookInstalled = true;
+    mod::Log(
+        "InstallNetplayFrameHook: installed at DLL RVA 0x%lX, trampoline at %p",
+        static_cast<unsigned long>(kFrameHookRva),
+        static_cast<void*>(g_frameHookTrampoline));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ForceGameModeToTitle — write 0 to the EFZ.exe game-mode index so the
+// next main-loop iteration dispatches to the title-screen update, where
+// HookedTitleUpdateImplBody can run ConsumeRevivalExitInterception and
+// re-enter the netplay menu.
+//
+// Deliberately minimal: called from the VEH crash handler where complex
+// operations (allocations, locks, deep call chains) are unsafe.
+// ---------------------------------------------------------------------------
+bool ForceGameModeToTitle()
+{
+    if (g_activeRevival == nullptr || g_activeRevival->addrGameModeCurrentIndex == 0)
+    {
+        mod::Log("ForceGameModeToTitle: no active Revival profile or game mode address");
+        return false;
+    }
+
+    int currentGameMode = -1;
+    if (!SafeReadInt(
+            reinterpret_cast<const void*>(g_activeRevival->addrGameModeCurrentIndex),
+            &currentGameMode))
+    {
+        mod::Log(
+            "ForceGameModeToTitle: failed to read game mode at 0x%08lX",
+            static_cast<unsigned long>(g_activeRevival->addrGameModeCurrentIndex));
+        return false;
+    }
+
+    if (currentGameMode == 0)
+    {
+        mod::Log("ForceGameModeToTitle: already on title screen (mode=0), no-op");
+        return true;
+    }
+
+    auto* const modePtr = reinterpret_cast<int*>(
+        g_activeRevival->addrGameModeCurrentIndex);
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(modePtr, sizeof(int), PAGE_READWRITE, &oldProtect))
+    {
+        mod::Log(
+            "ForceGameModeToTitle: VirtualProtect failed addr=0x%08lX err=%lu",
+            static_cast<unsigned long>(g_activeRevival->addrGameModeCurrentIndex),
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    *modePtr = 0;
+    DWORD ignored = 0;
+    (void)VirtualProtect(modePtr, sizeof(int), oldProtect, &ignored);
+
+    mod::Log(
+        "ForceGameModeToTitle: game mode %d -> 0 (title screen)",
+        currentGameMode);
+    return true;
 }
 
 } // namespace netplay::bridge::takeover

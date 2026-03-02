@@ -576,12 +576,28 @@ void BuildStatusLine(const NetbridgeStatus& status, char* buffer, size_t bufferS
         std::snprintf(buffer, bufferSize, "Connect failed: %s", status.errorMsg);
         break;
     case NetbridgePhase::SessionEnded:
-        std::snprintf(buffer, bufferSize, "Session ended");
+        std::snprintf(buffer, bufferSize, "Disconnected");
         break;
     default:
         std::snprintf(buffer, bufferSize, "Status unknown");
         break;
     }
+}
+bool IsPeerProcessAlive()
+{
+    return takeover::IsPeerProcessAlive();
+}
+bool IsNetplayExitInterceptionPending()
+{
+    return takeover::IsNetplayExitInterceptionPending();
+}
+bool ForceLocalPlayInit()
+{
+    return takeover::ForceLocalPlayInit();
+}
+bool ForceGameModeToTitle()
+{
+    return takeover::ForceGameModeToTitle();
 }
 } // namespace netplay::bridge
 

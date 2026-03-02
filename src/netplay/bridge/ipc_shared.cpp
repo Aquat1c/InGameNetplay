@@ -723,6 +723,14 @@ bool EnsureLocalRevivalLoaded()
         mod::Log("Takeover: warning — failed to patch EfzRevival ExitProcess IAT");
     }
 
+    // Install a setjmp recovery wrapper around sub_1006E590 (the DLL's per-
+    // frame dispatcher) so that NeutralizeExitProcess can longjmp back to
+    // safety instead of freezing the main game thread during netplay exit.
+    if (!InstallNetplayFrameHook())
+    {
+        mod::Log("Takeover: warning — failed to install netplay frame hook");
+    }
+
     return true;
 }
 

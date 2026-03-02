@@ -287,6 +287,7 @@ bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
 bool RestoreDllExitProcessPatches();
 bool ForceLocalPlayInit();
+bool InvokeSessionVtableInit(const char* caller);
 bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
@@ -295,6 +296,24 @@ void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);
 void StabilizeOnlineSessionBindingAfterInit(int initMode);
 void RepairRollbackHistoryBindingsIfNeeded();
+bool InstallNetplayFrameHook();
+// Force the game mode index to 0 (title screen).
+// Safe to call from the crash handler VEH where minimal code should run.
+bool ForceGameModeToTitle();
+// Advisory peer-process liveness check. No lock held; result is TOCTOU.
+bool IsPeerProcessAlive();
+
+// setjmp buffer and active flag used by the netplay frame-hook recovery
+// mechanism.  Defined in revival_memory.cpp; read by iat_stubs.cpp.
+extern jmp_buf       g_netplayFrameJmpBuf;
+extern volatile bool g_netplayFrameJmpActive;
+
+// Secondary setjmp buffer used by title/menu update hooks as a fallback
+// recovery path when ExitProcess fires outside OurFrameDispatch.
+// Defined in revival_memory.cpp; armed in HookedTitleUpdateImpl;
+// read by iat_stubs.cpp.
+extern jmp_buf       g_netplayUiJmpBuf;
+extern volatile bool g_netplayUiJmpActive;
 
 // ---------------------------------------------------------------------------
 // IPC, config, module loading (ipc_shared.cpp)

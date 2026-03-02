@@ -145,6 +145,20 @@ struct RevivalAddressProfile
     uintptr_t exitProcessPatchRva[kMaxExitProcessPatches];
     uint8_t   exitProcessPatchOriginal[kMaxExitProcessPatches];
     size_t    exitProcessPatchCount;
+
+    // Near-Jcc (6-byte) ExitProcess call-site patches.
+    //
+    // Compound-condition ExitProcess guards use 6-byte near-Jcc instructions
+    // (0F 84 rel32 = jz near, 0F 85 rel32 = jnz near) that jump INTO the
+    // ExitProcess block.  These cannot use the single-byte 74/75→EB patch.
+    // Instead each 6-byte instruction is replaced with 6 NOP bytes (0x90),
+    // making the ExitProcess block unreachable from that branch.
+    //
+    // For compound OR conditions (e.g. `if (!A || !B)`) there are multiple
+    // Jcc instructions per call site; ALL must be patched.
+    static constexpr size_t kMaxExitProcessNearJccPatches = 8;
+    uintptr_t exitProcessNearJccRva[kMaxExitProcessNearJccPatches];
+    size_t    exitProcessNearJccCount;
 };
 
 // ---------------------------------------------------------------------------
@@ -190,16 +204,41 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
 
     // DLL ExitProcess call-site patches (conditional jump → unconditional).
     //
-    // Site 6: sub_10079090 (tournament mode-0 handler)
+    // Site 5: sub_10079090 (tournament mode-0 handler)
     //   0x7909D: jz +8 (0x74) → jmp +8 (0xEB) — skips ExitProcess when
     //   sub_1002B150 says results container has data.
     //
-    // Site 2: tournament results handler (in sub_100718D0)
+    // Site 1: tournament results handler (in sub_100718D0)
     //   0x7215D: jnz +0x2F (0x75) → jmp +0x2F (0xEB) — skips ExitProcess
     //   when EFZ_GameMode_GetCurrentIndex() == 0 && v47 == 1.
-    {0x0007909Du, 0x0007215Du, 0u, 0u},                  // exitProcessPatchRva
-    {0x74u, 0x75u, 0u, 0u},                              // exitProcessPatchOriginal
-    2,                                                   // exitProcessPatchCount
+    //
+    // Site 2: EFZ_Rollback_BatchAdvanceSimple (sub_10072310)
+    //   0x7231F: jz +8 (0x74) → jmp +8 (0xEB) — skips ExitProcess
+    //   when self[179] (exit flag) is non-zero.
+    {0x0007909Du, 0x0007215Du, 0x0007231Fu, 0u},          // exitProcessPatchRva
+    {0x74u, 0x75u, 0x74u, 0u},                            // exitProcessPatchOriginal
+    3,                                                    // exitProcessPatchCount
+
+    // Near-Jcc (6-byte) ExitProcess call-site patches.
+    //
+    // Site 3: EFZ_Main_RollbackLoopTick (sub_10072500)
+    //   Two Jcc's guarding the "peer died" ExitProcess block at 0x727D7:
+    //   0x7251B: 0F 84 B6 02 00 00  jz near +0x2B6 → exit block
+    //     (fires when !EFZ_Process_IsActive(handle))
+    //   0x7252E: 0F 84 A3 02 00 00  jz near +0x2A3 → exit block
+    //     (fires when !EFZ_Queue_IsEmpty(queue))
+    //
+    // Site 4: sub_100742A0 (spectator/lobby tick)
+    //   Three Jcc's guarding the "quit" ExitProcess block at 0x74490:
+    //   0x742E1: 0F 84 A9 01 00 00  jz near +0x1A9 → exit block
+    //     (fires when !sub_10073970(handle))
+    //   0x742F4: 0F 84 96 01 00 00  jz near +0x196 → exit block
+    //     (fires when !EFZ_Queue_IsEmpty(queue))
+    //   0x74301: 0F 84 89 01 00 00  jz near +0x189 → exit block
+    //     (fires when EFZ_GlobalStatus_ComputeFlagMask() == 32)
+    {0x0007251Bu, 0x0007252Eu, 0x000742E1u, 0x000742F4u, 0x00074301u, 0u, 0u, 0u},
+                                                          // exitProcessNearJccRva
+    5,                                                    // exitProcessNearJccCount
 };
 
 }}} // namespace netplay::bridge::takeover

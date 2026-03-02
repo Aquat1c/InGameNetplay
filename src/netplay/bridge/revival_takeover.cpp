@@ -4,6 +4,7 @@
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
 
+#include "crash_handler.h"
 #include "logger.h"
 
 #include <algorithm>
@@ -278,6 +279,13 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
         return false;
     }
+
+    // Save the EfzRender* pointer now so that ClearRevivalText /
+    // DisableRevivalTextRendering can restore it during CancelSession.
+    // Tournament mode already does this in OnTitleSelectionConfirmed,
+    // but online sessions (host/join/spectate) skipped it — causing
+    // both clear and disable to silently fail on the cleanup path.
+    (void)SaveRenderContext();
 
     if (ProcessAlive(ioStatus))
     {
@@ -988,11 +996,40 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
 
-            // Apply DLL ExitProcess call-site patches for ALL session modes.
-            // The Revival DLL's tick function calls ExitProcess(0) when the
-            // game mode returns to 0 (title screen).  Without these patches
-            // the main thread would be suspended by the IAT safety fallback.
+            // For spectator mode, init(1,102) creates the spectator object
+            // but does NOT allocate its BGM manager (offset +1068).  The
+            // full init (EFZ_Spectator_Init) only runs when the game hits
+            // address 0x401582 → sub_1006E590 → vtable+4.  However, the
+            // BGM dispatch hook at 0x40DE80 is already installed from a
+            // previous session, and if the game triggers a BGM event before
+            // 0x401582 fires, it dispatches to the uninitialized spectator
+            // and crashes on the NULL BGM manager.  Calling vtable+4 here
+            // ensures the spectator is fully initialized before any hook
+            // can dispatch to it — identical to what ForceLocalPlayInit
+            // does for mode 2.
+            if (initParams[0] == kLocalRoleSpectate)
+            {
+                const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
+                mod::Log(
+                    "Takeover: spectator vtable init result=%d [deferred]",
+                    vtableInitOk ? 1 : 0);
+            }
+
+            // Init-snapshot: record the DLL ExitProcess Jcc call-site bytes
+            // before patching them.  RestoreDllExitProcessPatches() (called in
+            // CancelSessionUnlocked on exit) will undo exactly these changes.
+            // For online/spectate the Jcc sites only cover the tournament tick
+            // path; the online ExitProcess path is handled by the IAT hook +
+            // OurFrameDispatch longjmp.  Logging here lets us correlate the
+            // init snapshot with the corresponding restore in the log file.
+            mod::Log(
+                "Takeover: init snapshot step SaveAndApplyDllExitProcessPatches "
+                "for mode=%d (to be reversed by RestoreDllExitProcessPatches on exit)",
+                initParams[0]);
             (void)SaveAndApplyDllExitProcessPatches();
+            mod::Log(
+                "Takeover: init snapshot complete for mode=%d",
+                initParams[0]);
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
         }
@@ -1102,6 +1139,46 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     CloseProcessHandle(ioStatus);
     RestoreDllExitProcessPatches();
     ReinitLocalPlay();
+
+    // ---- Additional cleanup (Issues 1, 4, 5 in CONNECTION_INTERRUPTION doc) ----
+    // During normal operation (not process shutdown), reinitialise the DLL
+    // session to local-play immediately.  This replaces the dead/neutralised
+    // online session object with a live one so the game loop always has a
+    // valid vtable for frame dispatch.  During DLL_PROCESS_DETACH we skip
+    // this because calling back into EfzRevival.dll under the loader lock
+    // can deadlock or crash.
+    const bool isShutdown = (reason != nullptr &&
+        (std::strcmp(reason, "shutdown") == 0 ||
+         std::strcmp(reason, "emergency") == 0));
+
+    if (!isShutdown)
+    {
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "Takeover: cancel cleanup — ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        const bool clearOk = ClearRevivalText();
+        mod::Log(
+            "Takeover: cancel cleanup — ClearRevivalText result=%d",
+            clearOk ? 1 : 0);
+
+        const bool textOk = DisableRevivalTextRendering();
+        mod::Log(
+            "Takeover: cancel cleanup — DisableRevivalTextRendering result=%d",
+            textOk ? 1 : 0);
+
+        mod::ResetCrashRecoveryState();
+        mod::Log("Takeover: cancel cleanup — crash recovery state reset");
+    }
+    else
+    {
+        mod::Log(
+            "Takeover: cancel cleanup — skipped DLL re-init (shutdown path reason='%s')",
+            reason != nullptr ? reason : "");
+    }
+    // ---- End additional cleanup ------------------------------------------------
+
     g_localInitAppliedForSession = false;
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
@@ -1111,6 +1188,30 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, 0);
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
     g_delayPromptMetrics = {};
+
+    // Clear stale serials in the shared memory block so that
+    // ReadDelayPromptSignal / ReadSpectateConfirmPromptSignal won't
+    // re-read the old session's values after the next RefreshRuntimeStatus.
+    if (g_hostBlock != nullptr)
+    {
+        InterlockedExchange(&g_hostBlock->delayPromptSerial, 0);
+        InterlockedExchange(&g_hostBlock->delayPromptServedSerial, 0);
+        InterlockedExchange(&g_hostBlock->delayMetricsSerial, 0);
+        InterlockedExchange(&g_hostBlock->delayInputSerial, 0);
+        InterlockedExchange(&g_hostBlock->delayInputServedSerial, 0);
+        g_hostBlock->delayInputValue = -1;
+        g_hostBlock->delayAveragePingMs = -1;
+        g_hostBlock->delayMinPingMs = -1;
+        g_hostBlock->delayMaxPingMs = -1;
+        g_hostBlock->delayRecommended = -1;
+        g_hostBlock->delayRangeMin = 0;
+        g_hostBlock->delayRangeMax = 20;
+        InterlockedExchange(&g_hostBlock->spectateConfirmPromptSerial, 0);
+        InterlockedExchange(&g_hostBlock->spectateConfirmPromptServedSerial, 0);
+        InterlockedExchange(&g_hostBlock->spectateConfirmInputSerial, 0);
+        InterlockedExchange(&g_hostBlock->spectateConfirmInputServedSerial, 0);
+        g_hostBlock->spectateConfirmInputValue = 0;
+    }
     ResetNativeWorkflowFlags();
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
@@ -1180,48 +1281,69 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
         *outMode = mode;
     }
 
+    // ---- Reverse-init teardown sequence ------------------------------------
+    // This mirrors the forward init steps in reverse order:
+    //
+    //   FORWARD INIT                        REVERSE EXIT (this function)
+    //   ──────────────────────────────────  ────────────────────────────────────
+    //   a) EfzRevival.exe spawned        →  step 1: TerminateProcess
+    //   b) DLL ExitProcess Jcc patched   →  step 1: RestoreDllExitProcessPatches
+    //   c) EXE patches (tournament only) →  step 2: RestoreTournamentExePatches
+    //   d) Online session object created →  step 3: ForceLocalPlayInit (new local)
+    //   e) Text rendering active         →  step 4: ClearRevivalText / Disable
+    //                                               (tournament: both;
+    //                                                online/spectate: Disable only)
+    // -----------------------------------------------------------------------
+
+    mod::Log(
+        "Takeover: consuming exit interception mode=%d "
+        "(step 1: cancel session / terminate peer / restore DLL patches)",
+        mode);
     CancelSessionUnlocked("exit_intercepted", ioStatus);
 
-    // Revert any EXE patches applied by the tournament constructor (inline
-    // hooks at 0x763F04/0x763E50, byte clear at 0x754C1A, NOPs at 0x7599ED).
-    // These must be restored before the title screen code runs again.
-    // DLL ExitProcess patches are already restored by CancelSessionUnlocked.
+    // step 2: revert EXE patches applied by the session constructor.
+    // Tournament: 4 inline EXE hooks (0x763F04, 0x763E50, 0x754C1A, 0x7599ED).
+    // Online/spectate: no additional EXE patches (sub_1006E590 re-applies its
+    // frame-by-frame patches every tick and they are self-healing after step 3).
     if (mode == kLocalRoleTournament)
     {
+        mod::Log("Takeover: exit interception step 2 — RestoreTournamentExePatches");
         RestoreTournamentExePatches();
     }
-
-    // Create a fresh local play session to replace the old (neutralised)
-    // session object.  Without this, the tournament session's data
-    // (nicknames, win counts) bleeds into the title screen and the dummy
-    // vtable prevents per-frame dispatch from functioning correctly.
-    //
-    // ForceLocalPlayInit calls init(2,102) AND immediately invokes
-    // vtable[1] on the new session so that all fields (particularly the
-    // BGM audio pointer at offset 668) are initialised before any other
-    // EXE hooks dispatch to it in the same frame.
-    ForceLocalPlayInit();
-
-    // Clear stale tournament text overlays (nicknames, win counts).
-    //
-    // Text entries live in the EfzRender object in EFZ.exe memory and
-    // persist across session transitions.  init(2,102) internally calls
-    // the global reset function (sub_1006CC30) which zeroes the Revival
-    // DLL's EfzRender* global (dword_100A0778), making the wrapper
-    // functions unable to reach the text buffer.  We restore the saved
-    // pointer and issue a clearTextRender call AFTER ForceLocalPlayInit
-    // so the clear takes effect on the very next rendered frame.
-    //
-    // NeutralizeExitProcess also calls ClearRevivalText, but that clear
-    // can be undone by init(2,102)'s reset.  This second call ensures
-    // the text is definitively cleared.
-    if (mode == kLocalRoleTournament)
+    else
     {
-        ClearRevivalText();
-        DisableRevivalTextRendering();
+        mod::Log(
+            "Takeover: exit interception step 2 — no EXE patch restore "
+            "needed for mode=%d (online/spectate)",
+            mode);
     }
 
-    mod::Log("Takeover: consumed exit interception mode=%d", mode);
+    // step 3: reinstate a live local-play session.
+    // Both OurFrameDispatch (frame-hook longjmp recovery) and
+    // CancelSessionUnlocked (step 1 above) now call ForceLocalPlayInit
+    // eagerly.  This third call is a defence-in-depth guarantee: even if
+    // the earlier calls were bypassed (e.g. VEH TOCTOU path or a code
+    // path that doesn't go through OurFrameDispatch), the session is
+    // always replaced here.  Repeated calls are harmless.
+    mod::Log("Takeover: exit interception step 3 — ForceLocalPlayInit (defence-in-depth)");
+    ForceLocalPlayInit();
+
+    // step 4: clear any DLL-side text overlay state left by the session.
+    // Tournament writes win counters and nicknames to the EfzRender text
+    // buffer.  init(2,102) zeroes dword_100A0778 so we must RestoreRenderContext
+    // before the clear; ClearRevivalText does this internally.
+    //
+    // Online/spectate do not write to the EfzRender buffer (they use ImGui
+    // overlays), but we call DisableRevivalTextRendering as a defensive
+    // clean-up in case the session left the DLL text-draw hook active.
+    mod::Log("Takeover: exit interception step 4 — clear text / disable renderer");
+    // Both tournament and online/spectate paths share the same cleanup now.
+    // SaveRenderContext() is called in StartSession for all session types,
+    // so RestoreRenderContext inside ClearRevivalText works for all modes.
+    ClearRevivalText();
+    DisableRevivalTextRendering();
+
+    mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
     return true;
 }
 
@@ -1282,6 +1404,28 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
 
     RefreshRuntimeStatus(ioStatus);
     return true;
+}
+
+bool IsPeerProcessAlive()
+{
+    // Advisory: no mutex needed, single-pointer read is atomic on x86.
+    // caller must handle the TOCTOU window between this check and acting on it.
+    const HANDLE h = g_revivalProcess;
+    if (h == nullptr)
+    {
+        return false;
+    }
+    DWORD exitCode = STILL_ACTIVE;
+    if (GetExitCodeProcess(h, &exitCode) == FALSE)
+    {
+        return false;
+    }
+    return exitCode == STILL_ACTIVE;
+}
+
+bool IsNetplayExitInterceptionPending()
+{
+    return InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0;
 }
 
 } // namespace netplay::bridge::takeover

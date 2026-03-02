@@ -79,6 +79,25 @@ bool PrepareVsHumanHandoff();
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
 bool NotifyTitleScreenActive();
+// Returns true if the EfzRevival.exe peer process is still running.
+// Advisory check (TOCTOU): the process may exit immediately after this call.
+// Used to abort the state-1 handoff before returning a global-state-transition
+// value to EFZ.exe — preventing ExitProcess from firing on the main thread
+// in the absence of a setjmp recovery point.
+bool IsPeerProcessAlive();
+// Returns true if NeutralizeExitProcess has fired and the exit interception
+// flag is pending consumption.  Used by the crash handler to detect the TOCTOU
+// window between IsPeerProcessAlive() returning true and the peer actually dying.
+bool IsNetplayExitInterceptionPending();
+// Unconditionally reinitialise the Revival DLL session to local-play mode.
+// Safe to call from the crash handler's VEH after TOCTOU netplay recovery so
+// EFZ.exe gets a valid session tick on the next frame instead of the dead
+// neutralised vtable.
+bool ForceLocalPlayInit();
+// Force the game mode index to 0 (title screen) so that the title-screen
+// hook runs on the next main-loop iteration.  Returns true on success.
+// Safe to call from the VEH crash handler.
+bool ForceGameModeToTitle();
 void OnTitleSelectionConfirmed(int selection);
 NetbridgeStatus GetStatus();
 DelayPromptMetrics GetDelayPromptMetrics();

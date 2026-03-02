@@ -3,6 +3,7 @@
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 
+#include "crash_handler.h"
 #include "logger.h"
 
 #include <atomic>
@@ -194,6 +195,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
     {
         --g_postExitTextClearFrames;
         netplay::bridge::takeover::ClearRevivalText();
+        netplay::bridge::takeover::DisableRevivalTextRendering();
     }
 
     if (!g_netplayMenuState.active)
@@ -217,6 +219,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         int exitMode = -1;
         if (netplay::bridge::ConsumeRevivalExitInterception(&exitMode))
         {
+            mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
             g_pendingVsHumanAutoConfirm = false;
             g_pendingVsHumanAutoConfirmTick = 0;
@@ -225,6 +228,9 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             if (exitMode == 0 || exitMode == 1)
             {
                 // Netplay (host / join) — return to the netplay menu.
+                // Schedule multi-frame text clearing to ensure any DLL-side
+                // text overlays (nicknames, ping, delay) are fully purged.
+                g_postExitTextClearFrames = 5;
                 mod::Log(
                     "HookedTitleUpdateImpl: exit intercepted (netplay mode=%d), re-entering netplay menu",
                     exitMode);
@@ -250,7 +256,18 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         if (g_returnToNetplayAfterMatch)
         {
             g_returnToNetplayAfterMatch = false;
-            mod::Log("HookedTitleUpdateImpl: post-match return, re-entering netplay menu");
+
+            // The match ended and the game naturally returned to title screen.
+            // Cancel the session to terminate the peer process, restore DLL
+            // patches, clear stale delay/nickname state, and reset the bridge
+            // phase to Idle.  Without this, the old session's delayPromptSerial
+            // persists and the delay overlay re-activates immediately.
+            mod::Log("HookedTitleUpdateImpl: post-match return, cancelling session and re-entering netplay menu");
+            netplay::bridge::CancelSession("match_ended");
+            // Keep clearing DLL text rendering for several frames, just as
+            // the tournament-mode exit path does.  init(3,102) or a transient
+            // session tick can re-add text after the first clear.
+            g_postExitTextClearFrames = 5;
             EnterNetplayMenu(screenContext);
             return 0;
         }
@@ -362,7 +379,12 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
     return UpdateNetplayMenu(screenContext);
 }
 
-extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
+// ---------------------------------------------------------------------------
+// HookedCharSelectUpdateImplBody — the real charselect update logic.
+// Called from HookedCharSelectUpdateImpl which wraps it in setjmp/longjmp
+// protection so NeutralizeExitProcess can safely escape.
+// ---------------------------------------------------------------------------
+static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 {
     if (g_originalCharSelectUpdate == nullptr)
     {
@@ -414,6 +436,66 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
+// HookedCharSelectUpdateImpl — dispatches to HookedCharSelectUpdateImplBody.
+//
+// ExitProcess can fire during charselect when the DLL detects a desync (e.g.
+// State mismatch at early rollback frames).  The frame-hook setjmp
+// (g_netplayFrameJmpBuf) only guards sub_1006E590; other DLL vtable methods
+// called during charselect are NOT covered.  Without setjmp protection here,
+// NeutralizeExitProcess falls through to the fragile VEH TOCTOU last-resort
+// recovery which fails silently (game closes, no crash logs).
+//
+// Wrap the body in setjmp on g_netplayUiJmpBuf — the same buffer used by
+// HookedTitleUpdateImpl.  Only one screen update runs at a time (title OR
+// charselect), so reusing the UI jmpbuf is safe.  On longjmp recovery: force
+// game mode to 0 so the title hook can consume the exit interception and
+// re-enter the netplay menu cleanly.
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4611) // setjmp / C++ destruction interaction
+#endif
+extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
+{
+    netplay::bridge::takeover::g_netplayUiJmpActive = true;
+    if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
+    {
+        netplay::bridge::takeover::g_netplayUiJmpActive = false;
+
+        mod::Log(
+            "HookedCharSelectUpdateImpl: recovered from ExitProcess via "
+            "ui longjmp — forcing game mode to title");
+
+        // Reset the one-shot VEH TOCTOU guard so future sessions can still
+        // be recovered if needed.
+        mod::ResetCrashRecoveryState();
+
+        // Force game mode to 0 (title screen).  On the next main-loop
+        // iteration, HookedTitleUpdateImplBody runs, detects
+        // g_revivalExitIntercepted, calls ConsumeRevivalExitInterception
+        // (which does full teardown: terminate helper, restore patches,
+        // ForceLocalPlayInit, disable text), and re-enters the netplay menu.
+        netplay::bridge::ForceGameModeToTitle();
+
+        // Clear charselect hold state so it doesn't carry over.
+        g_charSelectEntryHoldActive = false;
+        g_charSelectEntryHoldArmed = false;
+        g_charSelectEntryHoldFramesRemaining = 0;
+
+        // ExitProcess interception flag is already set; skip this frame and
+        // let the title-screen update consume/cleanup in a clean state.
+        return 0;
+    }
+
+    const char result = HookedCharSelectUpdateImplBody(screenContext);
+    netplay::bridge::takeover::g_netplayUiJmpActive = false;
+    return result;
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+// ---------------------------------------------------------------------------
 // HookedTitleUpdateImpl — dispatches to HookedTitleUpdateImplBody.
 //
 // ExitProcess interception no longer uses longjmp.  The DLL call-site
@@ -422,7 +504,19 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
 // ---------------------------------------------------------------------------
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 {
-    return HookedTitleUpdateImplBody(screenContext);
+    netplay::bridge::takeover::g_netplayUiJmpActive = true;
+    if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
+    {
+        netplay::bridge::takeover::g_netplayUiJmpActive = false;
+        mod::Log("HookedTitleUpdateImpl: recovered from ExitProcess via ui longjmp");
+        // ExitProcess interception flag is already set; skip this frame and let
+        // the next title update consume/cleanup in a clean state.
+        return 0;
+    }
+
+    const char result = HookedTitleUpdateImplBody(screenContext);
+    netplay::bridge::takeover::g_netplayUiJmpActive = false;
+    return result;
 }
 
 extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
