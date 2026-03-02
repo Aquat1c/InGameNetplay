@@ -114,6 +114,60 @@ bool g_nativeWorkflowHolePunchDiedSeen = false;
 bool g_holePunchServerConfigLoaded = false;
 std::string g_configuredHolePunchServer;
 
+// Job object for automatic child-process cleanup.  When the host process
+// terminates (even by crash), the kernel closes all handles to the job,
+// which kills every process assigned to it — ensuring EfzRevival.exe and
+// any grandchildren (cmd.exe / conhost.exe) never linger in the background.
+static HANDLE g_childJobObject = nullptr;
+
+// ---------------------------------------------------------------------------
+// Job object helpers
+// ---------------------------------------------------------------------------
+
+static HANDLE EnsureChildJobObject()
+{
+    if (g_childJobObject != nullptr)
+        return g_childJobObject;
+
+    g_childJobObject = CreateJobObjectA(nullptr, nullptr);
+    if (g_childJobObject == nullptr)
+    {
+        mod::Log("Takeover: CreateJobObject failed err=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        return nullptr;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(g_childJobObject,
+                                 JobObjectExtendedLimitInformation,
+                                 &jeli, sizeof(jeli)))
+    {
+        mod::Log("Takeover: SetInformationJobObject failed err=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        CloseHandle(g_childJobObject);
+        g_childJobObject = nullptr;
+        return nullptr;
+    }
+
+    mod::Log("Takeover: created kill-on-close job object handle=%p",
+             g_childJobObject);
+    return g_childJobObject;
+}
+
+static void CloseChildJobObject()
+{
+    if (g_childJobObject != nullptr)
+    {
+        // Closing the handle triggers JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        // terminating any surviving child processes.
+        mod::Log("Takeover: closing child job object handle=%p",
+                 g_childJobObject);
+        CloseHandle(g_childJobObject);
+        g_childJobObject = nullptr;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle functions (public API from revival_takeover.h).
 // ---------------------------------------------------------------------------
@@ -141,6 +195,7 @@ void ShutdownHost()
         TerminateProcess(g_revivalProcess, 0);
     }
     CloseProcessHandle(nullptr);
+    CloseChildJobObject();
     CloseHostIpc();
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
@@ -170,6 +225,7 @@ void EmergencyShutdownHost()
         TerminateProcess(g_revivalProcess, 0);
     }
     CloseProcessHandle(nullptr);
+    CloseChildJobObject();
     CloseHostIpc();
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
@@ -267,6 +323,26 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
         (address != nullptr) ? address : "",
         (nickname != nullptr) ? nickname : "");
 
+    // --- Session-start diagnostic dump (2nd-session crash investigation) ---
+    ResetForceLocalPlayInitCount();
+    ResetGameModeValidation();
+
+    // Clear stale exit-interception flags from a previous session.
+    // If g_revivalExitIntercepted leaked from session 1 (e.g. ExitProcess
+    // raced with CancelSession), ConsumeRevivalExitInterception would fire
+    // during session 2's setup — running the full reverse-init cleanup and
+    // destroying the new session.
+    if (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0)
+    {
+        mod::Log("StartSession: clearing stale g_revivalExitIntercepted=%ld g_revivalExitMode=%ld",
+                 static_cast<long>(g_revivalExitIntercepted),
+                 static_cast<long>(g_revivalExitMode));
+        InterlockedExchange(&g_revivalExitIntercepted, 0);
+        InterlockedExchange(&g_revivalExitMode, -1);
+    }
+
+    LogSessionDiagnosticState("StartSession_entry");
+
     InterlockedExchange(&g_startAbortRequested, 0);
 
     if (!EnsureHostIpc())
@@ -351,6 +427,25 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     }
 
     mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
+
+    // Assign to kill-on-close job so that if the host process terminates
+    // (crash, Alt+F4, etc.) without explicit cleanup, all child processes
+    // (EfzRevival.exe, cmd.exe, conhost.exe, ...) are killed automatically.
+    HANDLE job = EnsureChildJobObject();
+    if (job != nullptr)
+    {
+        if (!AssignProcessToJobObject(job, pi.hProcess))
+        {
+            mod::Log("Takeover: AssignProcessToJobObject failed pid=%lu err=%lu",
+                     static_cast<unsigned long>(pi.dwProcessId),
+                     static_cast<unsigned long>(GetLastError()));
+        }
+        else
+        {
+            mod::Log("Takeover: assigned pid=%lu to kill-on-close job",
+                     static_cast<unsigned long>(pi.dwProcessId));
+        }
+    }
 
     uintptr_t remoteBase = 0;
     if (!InjectSelf(pi.hProcess, &remoteBase))
@@ -970,6 +1065,9 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         const DWORD initReady = WaitForSingleObject(g_hostInitEvent, 0);
         if (initReady == WAIT_OBJECT_0)
         {
+            // --- Diagnostic dump before init handshake (2nd-session crash investigation) ---
+            LogSessionDiagnosticState("Tick_init_handshake_pre");
+
             int initParams[2] = {g_hostBlock->initParams[0], g_hostBlock->initParams[1]};
             if (initParams[1] == 0)
             {
@@ -982,16 +1080,132 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[1],
                 static_cast<long>(g_hostBlock->initSerial));
 
+            // --- Full init write snapshot BEFORE ---
+            LogInitWriteSnapshot("Tick_init_pre");
+
+            // Destroy the current session to prevent leaking the old object.
+            // This is the root cause fix for the 2nd-session crash (H1).
+            const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+            DestroyCurrentSession("Tick_init_handshake");
+
+            // Prevent init() from chaining another trampoline at 0x401582.
+            mod::Log(
+                "Tick_init_handshake: about to save EXE hook bytes before "
+                "init() mode=%d oldSession=0x%08lX",
+                initParams[0],
+                static_cast<unsigned long>(oldSessionPtr));
+            SaveExeFrameHookBytes();
+            // Restore original (pre-hook) bytes at mode-ctor hook sites
+            // BEFORE init() so the new trampoline copies clean EXE bytes
+            // instead of stale hooks from a previous session's mode.
+            RestoreModeCtorOriginalBytes();
+            ResetModeConstructorTrampolineCache();
+
+            // Dump the 10 bytes at 0x401582 right before init().
+            {
+                uint8_t pre[10] = {};
+                memcpy(pre, reinterpret_cast<const void*>(0x401582), 10);
+                mod::Log(
+                    "Tick_init_handshake: 0x401582 pre-init  "
+                    "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+                    pre[0], pre[1], pre[2], pre[3], pre[4],
+                    pre[5], pre[6], pre[7], pre[8], pre[9]);
+            }
+
+            mod::Log("Tick_init_handshake: calling init(mode=%d, magic=%d)",
+                     initParams[0], initParams[1]);
             const int initResult = g_localInitFn(initParams);
+
+            // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
+            {
+                uint8_t post[10] = {};
+                memcpy(post, reinterpret_cast<const void*>(0x401582), 10);
+                mod::Log(
+                    "Tick_init_handshake: 0x401582 post-init "
+                    "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+                    post[0], post[1], post[2], post[3], post[4],
+                    post[5], post[6], post[7], post[8], post[9]);
+            }
+
+            // Undo the EXE frame-hook chain growth at 0x401582.
+            // Mode-ctor originals were already restored before init();
+            // for non-local modes init() installs fresh hooks that don't
+            // chain through stale trampolines.
+            mod::Log("Tick_init_handshake: restoring saved EXE hook bytes (mode=%d)", initParams[0]);
+            RestoreExeFrameHookBytes();
+
+            // Verify the restore worked.
+            {
+                uint8_t verify[10] = {};
+                memcpy(verify, reinterpret_cast<const void*>(0x401582), 10);
+                mod::Log(
+                    "Tick_init_handshake: 0x401582 restored  "
+                    "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+                    verify[0], verify[1], verify[2], verify[3], verify[4],
+                    verify[5], verify[6], verify[7], verify[8], verify[9]);
+            }
+
+            // Fix up relative instructions in mode-constructor trampolines.
+            FixupModeConstructorTrampolines("Tick_init_handshake");
+
             g_localRoleFlag = initParams[0];
             g_localInitAppliedForSession = true;
+
+            const uintptr_t newSessionPtr = ReadSessionPointerFromRevival();
+
+            // --- Full init write snapshot AFTER init() ---
+            LogInitWriteSnapshot("Tick_init_post");
+
             mod::Log(
-                "Takeover: local init(mode=%d magic=%d) result=%d [deferred]",
+                "Takeover: local init(mode=%d magic=%d) result=%d [deferred] oldSession=0x%08lX newSession=0x%08lX",
                 initParams[0],
                 initParams[1],
-                initResult);
+                initResult,
+                static_cast<unsigned long>(oldSessionPtr),
+                static_cast<unsigned long>(newSessionPtr));
+
+            // Zero out the initComplete field on the new session BEFORE
+            // calling InvokeStartInitPlayer.  When the heap reuses the same
+            // address as a previous session, initComplete may still be 1
+            // (stale), which would cause InvokeStartInitPlayer to skip the
+            // critical sub_10072880 call — leaving the session in an
+            // uninitialized state and freezing the game.
+            if (newSessionPtr != 0 && newSessionPtr >= 0x00100000u)
+            {
+                int prevInitComplete = -1;
+                (void)SafeReadInt(
+                    reinterpret_cast<const void*>(newSessionPtr + g_activeRevival->sessionOffsetInitComplete),
+                    &prevInitComplete);
+                if (prevInitComplete == 1)
+                {
+                    DWORD oldProt = 0;
+                    void* initCompAddr = reinterpret_cast<void*>(
+                        newSessionPtr + g_activeRevival->sessionOffsetInitComplete);
+                    if (VirtualProtect(initCompAddr, sizeof(int), PAGE_READWRITE, &oldProt))
+                    {
+                        int zero = 0;
+                        memcpy(initCompAddr, &zero, sizeof(int));
+                        VirtualProtect(initCompAddr, sizeof(int), oldProt, &oldProt);
+                        mod::Log(
+                            "Takeover: cleared stale initComplete=1 on reused session 0x%08lX before StartInitPlayer",
+                            static_cast<unsigned long>(newSessionPtr));
+                    }
+                    else
+                    {
+                        mod::Log(
+                            "Takeover: FAILED to clear stale initComplete=1 on session 0x%08lX — "
+                            "VirtualProtect err=%lu (StartInitPlayer will likely skip sub_10072880!)",
+                            static_cast<unsigned long>(newSessionPtr),
+                            static_cast<unsigned long>(GetLastError()));
+                    }
+                }
+            }
 
             const bool startInitOk = InvokeStartInitPlayer(initParams[0]);
+
+            // --- Snapshot after StartInitPlayer (writes session fields) ---
+            LogInitWriteSnapshot("Tick_startInitPlayer_post");
+
             mod::Log(
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
@@ -1013,6 +1227,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 mod::Log(
                     "Takeover: spectator vtable init result=%d [deferred]",
                     vtableInitOk ? 1 : 0);
+                LogInitWriteSnapshot("Tick_spectateVtable1_post");
             }
 
             // Init-snapshot: record the DLL ExitProcess Jcc call-site bytes
@@ -1032,6 +1247,10 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[0]);
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
+
+            // --- Final snapshot after all init steps complete ---
+            LogInitWriteSnapshot("Tick_initSequence_complete");
+            LogSessionDiagnosticState("Tick_init_handshake_post");
         }
     }
 
@@ -1128,6 +1347,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
+    LogSessionDiagnosticState("CancelSession_entry");
+    mod::Log(
+        "DIAG[CancelSession]: reason='%s' forceLocalPlayInitCount=%d",
+        (reason != nullptr) ? reason : "",
+        GetForceLocalPlayInitCount());
+
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
 
@@ -1137,6 +1363,10 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         TerminateProcess(g_revivalProcess, 0);
     }
     CloseProcessHandle(ioStatus);
+    // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
+    // spawned by EfzRevival.exe are also terminated.  A fresh job will be
+    // created for the next StartSession call.
+    CloseChildJobObject();
     RestoreDllExitProcessPatches();
     ReinitLocalPlay();
 
@@ -1153,23 +1383,42 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     if (!isShutdown)
     {
-        const bool initOk = ForceLocalPlayInit();
-        mod::Log(
-            "Takeover: cancel cleanup — ForceLocalPlayInit result=%d",
-            initOk ? 1 : 0);
+        // If we're inside the per-frame tick (sub_1006E570 -> vtable[2] ->
+        // RollbackLoopTick), ForceLocalPlayInit MUST NOT run now because it
+        // would destroy the session that RollbackLoopTick is actively using
+        // as 'this' (use-after-free -> crash in SetEvent(this[2])).
+        // Defer the cleanup to OurPerFrameTickHook which will execute it
+        // after the original sub_1006E570 returns safely.
+        if (IsInsideFrameTick())
+        {
+            mod::Log(
+                "Takeover: cancel cleanup — DEFERRED (inside frame tick, "
+                "ForceLocalPlayInit would destroy active session)");
+            RequestDeferredCancelCleanup();
+        }
+        else
+        {
+            const bool initOk = ForceLocalPlayInit();
+            mod::Log(
+                "Takeover: cancel cleanup — ForceLocalPlayInit result=%d",
+                initOk ? 1 : 0);
 
-        const bool clearOk = ClearRevivalText();
-        mod::Log(
-            "Takeover: cancel cleanup — ClearRevivalText result=%d",
-            clearOk ? 1 : 0);
+            const bool clearOk = ClearRevivalText();
+            mod::Log(
+                "Takeover: cancel cleanup — ClearRevivalText result=%d",
+                clearOk ? 1 : 0);
 
-        const bool textOk = DisableRevivalTextRendering();
-        mod::Log(
-            "Takeover: cancel cleanup — DisableRevivalTextRendering result=%d",
-            textOk ? 1 : 0);
+            const bool textOk = DisableRevivalTextRendering();
+            mod::Log(
+                "Takeover: cancel cleanup — DisableRevivalTextRendering result=%d",
+                textOk ? 1 : 0);
 
-        mod::ResetCrashRecoveryState();
-        mod::Log("Takeover: cancel cleanup — crash recovery state reset");
+            mod::ResetCrashRecoveryState();
+            mod::Log("Takeover: cancel cleanup — crash recovery state reset");
+
+            ResetGameModeValidation();
+            mod::Log("Takeover: cancel cleanup — game mode validation reset");
+        }
     }
     else
     {
@@ -1251,6 +1500,9 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     }
 
     mod::Log("Takeover: cancel reason='%s' hadProcess=%d", (reason != nullptr) ? reason : "", hadProcess ? 1 : 0);
+
+    // --- Diagnostic dump after teardown (2nd-session crash investigation) ---
+    LogSessionDiagnosticState("CancelSession_exit");
 }
 
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus)
@@ -1266,6 +1518,8 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     {
         return false;
     }
+
+    LogSessionDiagnosticState("ConsumeExitInterception_entry");
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -1344,6 +1598,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     DisableRevivalTextRendering();
 
     mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
+    LogSessionDiagnosticState("ConsumeExitInterception_exit");
     return true;
 }
 

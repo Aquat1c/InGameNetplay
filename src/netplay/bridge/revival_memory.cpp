@@ -716,10 +716,82 @@ bool SetLocalRoleFlag(int roleFlag, const char* reason)
         return true;
     }
 
+    LogInitWriteSnapshot("SetLocalRoleFlag_pre");
+
+    // Destroy the current session to prevent leaking the old object.
+    const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+    DestroyCurrentSession("SetLocalRoleFlag");
+
+    // Prevent init() from chaining another trampoline at 0x401582.
+    mod::Log(
+        "SetLocalRoleFlag: about to save EXE hook bytes before init() "
+        "roleFlag=%d oldSession=0x%08lX",
+        roleFlag, static_cast<unsigned long>(oldSessionPtr));
+    SaveExeFrameHookBytes();
+    // Restore original (pre-hook) bytes at mode-ctor hook sites BEFORE
+    // init() so the new trampoline copies clean EXE bytes instead of
+    // stale hooks from a previous session's mode (prevents chaining).
+    RestoreModeCtorOriginalBytes();
+    ResetModeConstructorTrampolineCache();
+
+    // Dump the 10 bytes at 0x401582 right before init().
+    {
+        uint8_t pre[10] = {};
+        memcpy(pre, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "SetLocalRoleFlag: 0x401582 pre-init  "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            pre[0], pre[1], pre[2], pre[3], pre[4],
+            pre[5], pre[6], pre[7], pre[8], pre[9]);
+    }
+
     int localParams[2] = {roleFlag, 102};
+    mod::Log("SetLocalRoleFlag: calling init(mode=%d, magic=%d)",
+             localParams[0], localParams[1]);
     const int result = g_localInitFn(localParams);
+
+    // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
+    {
+        uint8_t post[10] = {};
+        memcpy(post, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "SetLocalRoleFlag: 0x401582 post-init "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            post[0], post[1], post[2], post[3], post[4],
+            post[5], post[6], post[7], post[8], post[9]);
+    }
+
+    // Undo the EXE frame-hook chain growth at 0x401582.
+    mod::Log("SetLocalRoleFlag: restoring saved EXE hook bytes (roleFlag=%d)", roleFlag);
+    RestoreExeFrameHookBytes();
+    // Mode-ctor originals were already restored before init().
+    // For non-local modes (online/spectate/tournament), init() installs
+    // fresh hooks at 0x763E50/0x763F04 that intercept mode transitions;
+    // those hooks are correct and don't chain through stale trampolines.
+
+    // Verify the restore worked.
+    {
+        uint8_t verify[10] = {};
+        memcpy(verify, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "SetLocalRoleFlag: 0x401582 restored  "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            verify[0], verify[1], verify[2], verify[3], verify[4],
+            verify[5], verify[6], verify[7], verify[8], verify[9]);
+    }
+
+    // Fix up relative instructions in mode-constructor trampolines.
+    FixupModeConstructorTrampolines("SetLocalRoleFlag");
+
     g_localRoleFlag = roleFlag;
-    mod::Log("Takeover: local role switch mode=%d result=%d reason=%s", roleFlag, result, reason != nullptr ? reason : "");
+
+    const uintptr_t newSessionPtr = ReadSessionPointerFromRevival();
+    LogInitWriteSnapshot("SetLocalRoleFlag_post");
+
+    mod::Log("Takeover: local role switch mode=%d result=%d reason=%s oldSession=0x%08lX newSession=0x%08lX",
+        roleFlag, result, reason != nullptr ? reason : "",
+        static_cast<unsigned long>(oldSessionPtr),
+        static_cast<unsigned long>(newSessionPtr));
     return true;
 }
 
@@ -958,6 +1030,11 @@ bool SaveAndApplyDllExitProcessPatches()
 {
     if (g_dllExitProcessPatchesSaved)
     {
+        // H4 diagnostic: this early-out means the next restore will use
+        // stale saved bytes from the previous session's save.  Log a
+        // warning so we can detect this in the trace.
+        mod::Log("SaveAndApplyDllExitProcessPatches: SKIPPED (flag already true) "
+                 "— H4: next restore will use previously saved bytes!");
         return true; // Already applied — don't overwrite saved originals.
     }
     if (g_activeRevival == nullptr || g_activeRevival->exitProcessPatchCount == 0)
@@ -1123,7 +1200,33 @@ bool RestoreDllExitProcessPatches()
 {
     if (!g_dllExitProcessPatchesSaved || g_activeRevival == nullptr)
     {
+        mod::Log("RestoreDllExitProcessPatches: SKIPPED (saved=%d profile=%p)",
+                 g_dllExitProcessPatchesSaved ? 1 : 0,
+                 static_cast<const void*>(g_activeRevival));
         return false;
+    }
+
+    // Log the saved bytes we're about to restore (H4 diagnostic)
+    for (size_t i = 0; i < g_activeRevival->exitProcessPatchCount; ++i)
+    {
+        mod::Log("RestoreDllExitProcessPatches: will restore site[%zu] RVA=0x%lX "
+                 "savedByte=0x%02X",
+                 i,
+                 static_cast<unsigned long>(g_activeRevival->exitProcessPatchRva[i]),
+                 static_cast<unsigned>(g_savedDllExitProcessBytes[i]));
+    }
+    for (size_t i = 0; i < g_activeRevival->exitProcessNearJccCount; ++i)
+    {
+        mod::Log("RestoreDllExitProcessPatches: will restore nearJcc[%zu] RVA=0x%lX "
+                 "savedBytes=%02X %02X %02X %02X %02X %02X",
+                 i,
+                 static_cast<unsigned long>(g_activeRevival->exitProcessNearJccRva[i]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][0]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][1]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][2]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][3]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][4]),
+                 static_cast<unsigned>(g_savedDllExitNearJccBytes[i][5]));
     }
 
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
@@ -1192,6 +1295,194 @@ bool RestoreDllExitProcessPatches()
 // fully initialize it (audio, BGM, etc.) before any other hooks dispatch
 // to the new session.
 //
+// ---------------------------------------------------------------------------
+// DestroyCurrentSession — tear down the current Revival session object
+// BEFORE calling init() to create a new one.
+//
+// Root cause fix for the 2nd-session crash: init() allocates a new session
+// via operator new, runs the constructor, and writes the pointer to
+// dword_100A02CC — WITHOUT freeing or destructing the old session.  Every
+// init() call therefore leaks the previous session's memory and OS handles.
+// After several init() calls, heap corruption from these leaked objects
+// causes a vtable dispatch crash in EFZ_GameMode_InvokeAdvance.
+//
+// The DLL's own mid-game swap function (sub_1006D810) demonstrates the
+// correct pattern:
+//     void* old = dword_100A02CC;
+//     vtable[0](old, 1);              // scalar deleting destructor + free
+//     dword_100A02CC = operator new(size);
+//     ...
+//
+// We replicate that pattern here.  Additionally, we close the process
+// handle at session offset +700 (helperHandle) for online/spectator
+// sessions because the DLL's destructor does NOT close it — the vanilla
+// DLL relies on ExitProcess for final handle cleanup.
+//
+// Session sizes per mode (from init() at RVA 0x6E830):
+//   Mode 0 (Online):     0x5D0 = 1488 bytes — offset 700 IN BOUNDS
+//   Mode 1 (Spectator):  0x440 = 1088 bytes — offset 700 IN BOUNDS
+//   Mode 2 (Local play): 0x2B0 =  688 bytes — offset 700 OUT OF BOUNDS
+//   Mode 3 (Tournament): 0x310 =  784 bytes — offset 700 in bounds (unused)
+// ---------------------------------------------------------------------------
+bool DestroyCurrentSession(const char* caller)
+{
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr
+        || g_activeRevival == nullptr
+        || g_activeRevival->sessionPtrOffsetCount == 0)
+    {
+        mod::Log("%s: DestroyCurrentSession skipped (DLL not loaded)", caller);
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+
+    // Read current session pointer from dword_100A02CC.
+    const uintptr_t sessionGlobalAddr =
+        base + g_activeRevival->sessionPtrOffsets[0];
+    uintptr_t sessionPtr = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(sessionGlobalAddr),
+                     &sessionPtr)
+        || sessionPtr == 0)
+    {
+        mod::Log("%s: DestroyCurrentSession skipped (session NULL)", caller);
+        return false;
+    }
+
+    const int currentRole = g_localRoleFlag;
+
+    mod::Log(
+        "%s: DestroyCurrentSession starting session=0x%08lX role=%d",
+        caller,
+        static_cast<unsigned long>(sessionPtr),
+        currentRole);
+
+    // Close the helper process handle for online/spectator sessions.
+    // Mode 2 (local play, 688 bytes) has offset 700 out of bounds;
+    // Mode 3 (tournament, 784 bytes) has it in bounds but unused.
+    if (currentRole == kLocalRoleOnline || currentRole == kLocalRoleSpectate)
+    {
+        uintptr_t helperHandle = 0;
+        if (SafeReadPtr(
+                reinterpret_cast<const void*>(
+                    sessionPtr + g_activeRevival->sessionOffsetHelperHandle),
+                &helperHandle)
+            && helperHandle != 0
+            && helperHandle != static_cast<uintptr_t>(~uintptr_t(0)))
+        {
+            const BOOL closed =
+                CloseHandle(reinterpret_cast<HANDLE>(helperHandle));
+            mod::Log(
+                "%s: DestroyCurrentSession closed helperHandle=0x%08lX result=%d",
+                caller,
+                static_cast<unsigned long>(helperHandle),
+                closed);
+        }
+    }
+
+    // Read vtable pointer.
+    uintptr_t vtablePtr = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtablePtr)
+        || vtablePtr == 0)
+    {
+        mod::Log(
+            "%s: DestroyCurrentSession WARN vtable NULL session=0x%08lX, zeroing ptr only",
+            caller,
+            static_cast<unsigned long>(sessionPtr));
+        goto zero_globals;
+    }
+
+    mod::Log(
+        "%s: DestroyCurrentSession vtable=0x%08lX (RVA 0x%08lX)",
+        caller,
+        static_cast<unsigned long>(vtablePtr),
+        static_cast<unsigned long>(vtablePtr - base));
+
+    // Read vtable[0] — the scalar deleting destructor.
+    {
+        uintptr_t vtableSlot0 = 0;
+        if (!SafeReadPtr(reinterpret_cast<const void*>(vtablePtr),
+                         &vtableSlot0)
+            || vtableSlot0 == 0)
+        {
+            mod::Log(
+                "%s: DestroyCurrentSession WARN vtable[0] NULL vtable=0x%08lX, zeroing ptr only",
+                caller,
+                static_cast<unsigned long>(vtablePtr));
+            goto zero_globals;
+        }
+
+        // Validate that vtable[0] points into the Revival DLL image.
+        uintptr_t revBase = 0, revEnd = 0;
+        if (ReadModuleImageRange(revival, &revBase, &revEnd))
+        {
+            if (vtableSlot0 < revBase || vtableSlot0 >= revEnd)
+            {
+                mod::Log(
+                    "%s: DestroyCurrentSession SKIPPED — vtable[0]=0x%08lX "
+                    "outside DLL [0x%08lX..0x%08lX], zeroing ptr only",
+                    caller,
+                    static_cast<unsigned long>(vtableSlot0),
+                    static_cast<unsigned long>(revBase),
+                    static_cast<unsigned long>(revEnd));
+                goto zero_globals;
+            }
+        }
+
+        // Call vtable[0](session, 1) as __thiscall.
+        // Flag 1 = destruct AND free (operator delete).
+        // This is exactly what sub_1006D810 does during mid-game mode swap.
+        typedef void(__thiscall* ScalarDeletingDtorFn)(void*, int);
+        auto dtorFn = reinterpret_cast<ScalarDeletingDtorFn>(vtableSlot0);
+
+        mod::Log(
+            "%s: DestroyCurrentSession calling dtor vtable[0]=0x%08lX "
+            "session=0x%08lX role=%d",
+            caller,
+            static_cast<unsigned long>(vtableSlot0),
+            static_cast<unsigned long>(sessionPtr),
+            currentRole);
+
+        dtorFn(reinterpret_cast<void*>(sessionPtr), 1);
+
+        mod::Log("%s: DestroyCurrentSession destructor completed", caller);
+    }
+
+zero_globals:
+    // Zero ALL session pointer globals to prevent stale references.
+    int zeroed = 0;
+    for (size_t i = 0; i < g_activeRevival->sessionPtrOffsetCount; ++i)
+    {
+        const uintptr_t offset = g_activeRevival->sessionPtrOffsets[i];
+        if (offset != 0)
+        {
+            uintptr_t* addr = reinterpret_cast<uintptr_t*>(base + offset);
+            if (IsWritableRange(addr, sizeof(uintptr_t)))
+            {
+                *addr = 0;
+                ++zeroed;
+            }
+        }
+    }
+
+    // Reset the mode-constructor trampoline fixup cache.  The destructor
+    // unhooks 0x763E50/0x763F04 and frees the old trampolines.  If a
+    // subsequent init() allocates a new trampoline at the same heap
+    // address, the g_lastFixedTrampoline[] guard must NOT skip it —
+    // the new trampoline has fresh unrelocated bytes that need fixup.
+    ResetModeConstructorTrampolineCache();
+
+    mod::Log(
+        "%s: DestroyCurrentSession done session=0x%08lX role=%d globalsZeroed=%d",
+        caller,
+        static_cast<unsigned long>(sessionPtr),
+        currentRole,
+        zeroed);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Why vtable[1]?  During normal startup, init() creates the session and
 // installs the frame hook (sub_1006E590) at 0x401582.  The frame hook
 // calls vtable[1] every tick, which initializes fields like offset 668
@@ -1276,14 +1567,97 @@ bool ForceLocalPlayInit()
         return false;
     }
 
+    IncrementForceLocalPlayInitCount();
+    const int callCount = GetForceLocalPlayInitCount();
+
+    // --- Full snapshot BEFORE init() ---
+    LogInitWriteSnapshot("ForceLocalPlayInit_pre");
+
+    // Destroy the current session to prevent leaking the old object.
+    // This is the root cause fix for the 2nd-session crash (H1).
+    const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+    DestroyCurrentSession("ForceLocalPlayInit");
+
+    // Prevent init() from chaining another trampoline at 0x401582.
+    mod::Log(
+        "ForceLocalPlayInit: about to save EXE hook bytes before init() "
+        "oldSession=0x%08lX callCount=%d",
+        static_cast<unsigned long>(oldSessionPtr), callCount);
+    SaveExeFrameHookBytes();
+    // Restore original (pre-hook) bytes at mode-ctor hook sites BEFORE
+    // init() so the new trampoline copies clean EXE bytes instead of
+    // stale hooks from a previous session's mode (prevents chaining
+    // trampolines across sessions — root cause of the 0x26D19881 crash).
+    RestoreModeCtorOriginalBytes();
+    ResetModeConstructorTrampolineCache();
+
+    // Dump the 10 bytes at 0x401582 right before init() for verification.
+    {
+        uint8_t pre[10] = {};
+        memcpy(pre, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "ForceLocalPlayInit: 0x401582 pre-init  "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            pre[0], pre[1], pre[2], pre[3], pre[4],
+            pre[5], pre[6], pre[7], pre[8], pre[9]);
+    }
+
     int localParams[2] = {kLocalRoleLocalPlay, 102};
+    mod::Log("ForceLocalPlayInit: calling init(mode=%d, magic=%d)",
+             localParams[0], localParams[1]);
     const int result = g_localInitFn(localParams);
+
+    // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
+    {
+        uint8_t post[10] = {};
+        memcpy(post, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "ForceLocalPlayInit: 0x401582 post-init "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            post[0], post[1], post[2], post[3], post[4],
+            post[5], post[6], post[7], post[8], post[9]);
+    }
+
+    // Undo the trampoline chain growth at 0x401582 — restore saved bytes.
+    mod::Log("ForceLocalPlayInit: restoring saved EXE hook bytes");
+    RestoreExeFrameHookBytes();
+    // Mode-ctor originals were already restored before init(); local play
+    // init(2,102) does not install hooks at 0x763E50/0x763F04, so the
+    // originals are still in place.  No further action needed.
+
+    // Verify the restore worked.
+    {
+        uint8_t verify[10] = {};
+        memcpy(verify, reinterpret_cast<const void*>(0x401582), 10);
+        mod::Log(
+            "ForceLocalPlayInit: 0x401582 restored  "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+            verify[0], verify[1], verify[2], verify[3], verify[4],
+            verify[5], verify[6], verify[7], verify[8], verify[9]);
+    }
+
+    // Fix up relative instructions in mode-constructor trampolines.
+    FixupModeConstructorTrampolines("ForceLocalPlayInit");
+
     g_localRoleFlag = kLocalRoleLocalPlay;
-    mod::Log("ForceLocalPlayInit: init(2,102) result=%d", result);
+
+    const uintptr_t newSessionPtr = ReadSessionPointerFromRevival();
+
+    // --- Full snapshot AFTER init() (before vtable[1]) ---
+    LogInitWriteSnapshot("ForceLocalPlayInit_post_init");
+
+    mod::Log(
+        "ForceLocalPlayInit: init(2,102) result=%d callCount=%d oldSession=0x%08lX newSession=0x%08lX",
+        result, callCount,
+        static_cast<unsigned long>(oldSessionPtr),
+        static_cast<unsigned long>(newSessionPtr));
 
     // Immediately call vtable[1] on the new session so that BGM and other
     // fields are initialized before any dispatch hook fires.
     (void)InvokeSessionVtableInit("ForceLocalPlayInit");
+
+    // --- Full snapshot AFTER vtable[1] init ---
+    LogInitWriteSnapshot("ForceLocalPlayInit_post_vtable1");
 
     return true;
 }
@@ -1325,9 +1699,24 @@ bool SaveRenderContext()
 
     g_savedRenderContext = value;
     g_renderContextSaved = true;
-    mod::Log("SaveRenderContext: saved EfzRender* 0x%08lX from offset 0x%lX",
+
+    // H2 diagnostic: log the init-once guard to show whether future init()
+    // calls will refresh the render context (guard==0) or skip it (guard!=0).
+    int initOnceGuard = -1;
+    if (g_activeRevival->initOnceGuardOffset != 0)
+    {
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->initOnceGuardOffset),
+            &initOnceGuard);
+    }
+    mod::Log("SaveRenderContext: saved EfzRender* 0x%08lX from offset 0x%lX "
+             "initOnceGuard=0x%08X (H2: %s)",
              static_cast<unsigned long>(value),
-             static_cast<unsigned long>(g_activeRevival->renderContextGlobalOffset));
+             static_cast<unsigned long>(g_activeRevival->renderContextGlobalOffset),
+             static_cast<unsigned>(initOnceGuard),
+             (initOnceGuard & 0xFF) != 0
+                 ? "guard SET — init() will NOT refresh renderCtx"
+                 : "guard CLEAR — init() will refresh renderCtx");
     return true;
 }
 
@@ -1351,11 +1740,23 @@ bool RestoreRenderContext()
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+
+    // H2 diagnostic: read current render context before we overwrite it
+    uintptr_t currentRenderCtx = 0;
+    (void)SafeReadPtr(
+        reinterpret_cast<const void*>(base + g_activeRevival->renderContextGlobalOffset),
+        &currentRenderCtx);
+
     auto* ptr = reinterpret_cast<uintptr_t*>(
         base + g_activeRevival->renderContextGlobalOffset);
     *ptr = g_savedRenderContext;
-    mod::Log("RestoreRenderContext: restored EfzRender* 0x%08lX",
-             static_cast<unsigned long>(g_savedRenderContext));
+    mod::Log("RestoreRenderContext: restored EfzRender* 0x%08lX (was 0x%08lX, %s)",
+             static_cast<unsigned long>(g_savedRenderContext),
+             static_cast<unsigned long>(currentRenderCtx),
+             currentRenderCtx == 0 ? "was NULL — H2 confirmed stale!"
+                                   : (currentRenderCtx == g_savedRenderContext
+                                          ? "unchanged"
+                                          : "was different"));
     return true;
 }
 
@@ -1921,6 +2322,513 @@ static bool    g_frameHookInstalled      = false;
 using FrameDispatchFn = void (*)();
 static FrameDispatchFn g_origFrameDispatch = nullptr;
 
+// ---------------------------------------------------------------------------
+// EXE frame-hook trampoline chain prevention
+//
+// Revival DLL's init() calls sub_1006F160(0x401582, 10, sub_1006E590) EVERY
+// TIME it runs.  sub_1006F160 is an inline-hook installer that:
+//   1. Reads the current 10 bytes at 0x401582 into a new malloc'd trampoline
+//      (raw memcpy — no relocation of relative branches).
+//   2. Overwrites 0x401582 with a JMP to the new trampoline + NOP padding.
+//
+// After the very first init() (run by Revival DLL at startup), 0x401582
+// contains a JMP to Trampoline-1, whose displaced bytes are the genuine
+// original EXE instructions — safe to execute from any address.
+//
+// When our code calls init() again (Tick_init_handshake, ForceLocalPlayInit,
+// SetLocalRoleFlag), sub_1006F160 creates Trampoline-2 whose displaced bytes
+// are the raw JMP from 0x401582 → Trampoline-1.  But that JMP is an E9
+// rel32 displacement calculated for 0x401582; executing it from Trampoline-2
+// produces a wild target address → EIP crash (0x22FFF281, 0x2702FBB9, etc.).
+//
+// Fix: save the 10 bytes at 0x401582 BEFORE every init() call from our code
+// and restore them AFTER.  init() still creates/registers the session object
+// and writes all DLL globals; only the trampoline chain growth is undone.
+// ---------------------------------------------------------------------------
+static constexpr uintptr_t kExeFrameHookAddr = 0x401582u;
+static constexpr size_t    kExeFrameHookSize = 10u;
+static uint8_t g_exeFrameHookSaved[kExeFrameHookSize] = {};
+static bool    g_exeFrameHookSavedValid = false;
+
+void SaveExeFrameHookBytes()
+{
+    memcpy(g_exeFrameHookSaved,
+           reinterpret_cast<const void*>(kExeFrameHookAddr),
+           kExeFrameHookSize);
+    g_exeFrameHookSavedValid = true;
+    mod::Log("SaveExeFrameHookBytes: saved %zu bytes at 0x%08lX "
+             "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+             kExeFrameHookSize,
+             static_cast<unsigned long>(kExeFrameHookAddr),
+             g_exeFrameHookSaved[0], g_exeFrameHookSaved[1],
+             g_exeFrameHookSaved[2], g_exeFrameHookSaved[3],
+             g_exeFrameHookSaved[4], g_exeFrameHookSaved[5],
+             g_exeFrameHookSaved[6], g_exeFrameHookSaved[7],
+             g_exeFrameHookSaved[8], g_exeFrameHookSaved[9]);
+}
+
+void RestoreExeFrameHookBytes()
+{
+    if (!g_exeFrameHookSavedValid)
+    {
+        mod::Log("RestoreExeFrameHookBytes: no saved bytes — skipped");
+        return;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(kExeFrameHookAddr),
+                        kExeFrameHookSize,
+                        PAGE_EXECUTE_READWRITE,
+                        &oldProtect))
+    {
+        mod::Log("RestoreExeFrameHookBytes: VirtualProtect failed err=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        return;
+    }
+
+    memcpy(reinterpret_cast<void*>(kExeFrameHookAddr),
+           g_exeFrameHookSaved,
+           kExeFrameHookSize);
+
+    VirtualProtect(reinterpret_cast<void*>(kExeFrameHookAddr),
+                   kExeFrameHookSize,
+                   oldProtect,
+                   &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(),
+                          reinterpret_cast<void*>(kExeFrameHookAddr),
+                          kExeFrameHookSize);
+
+    // Invalidate the saved buffer so a subsequent Restore without a
+    // matching Save gives a clear diagnostic instead of silently
+    // writing stale bytes from a previous session.
+    g_exeFrameHookSavedValid = false;
+
+    // Read back for verification.
+    uint8_t verify[kExeFrameHookSize] = {};
+    memcpy(verify,
+           reinterpret_cast<const void*>(kExeFrameHookAddr),
+           kExeFrameHookSize);
+    mod::Log("RestoreExeFrameHookBytes: restored %zu bytes at 0x%08lX "
+             "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
+             kExeFrameHookSize,
+             static_cast<unsigned long>(kExeFrameHookAddr),
+             verify[0], verify[1], verify[2], verify[3], verify[4],
+             verify[5], verify[6], verify[7], verify[8], verify[9]);
+}
+
+// ---------------------------------------------------------------------------
+// Save / restore bytes at EXE addresses 0x763E50 (7 bytes) and 0x763F04
+// (7 bytes) — the mode-constructor hook sites.  Prevents trampoline chain
+// growth in the same way SaveExeFrameHookBytes prevents it at 0x401582.
+//
+// Each init() call has the mode constructor run sub_1006F160 which reads
+// the bytes at the hook site, allocates a new trampoline, copies the bytes,
+// and overwrites the hook site with JMP trampoline.  Without save/restore
+// the chain grows by one link per init() call — leaking ~16 bytes of
+// malloc'd memory per link and adding hot-path PUSHAD/POPFD overhead.
+// ---------------------------------------------------------------------------
+static constexpr size_t kModeCtorHookCount = 2;
+static constexpr uintptr_t kModeCtorHookAddrs[kModeCtorHookCount] = {
+    0x763E50, 0x763F04
+};
+static constexpr size_t kModeCtorHookPatchSize = 7;
+static uint8_t g_modeCtorHookSaved[kModeCtorHookCount][kModeCtorHookPatchSize] = {};
+static bool    g_modeCtorHookSavedValid = false;
+
+// Permanent copy of the original (pre-hook) EXE bytes at the mode-ctor
+// hook sites.  Captured once on first use and never overwritten.  Used to
+// restore a clean state before every init() call so that new trampolines
+// never chain through stale hooks from a previous session's mode.
+static uint8_t g_modeCtorOriginalBytes[kModeCtorHookCount][kModeCtorHookPatchSize] = {};
+static bool    g_modeCtorOriginalsSaved = false;
+
+static void SaveModeCtorOriginalBytesOnce()
+{
+    if (g_modeCtorOriginalsSaved)
+        return;
+    for (size_t i = 0; i < kModeCtorHookCount; ++i)
+    {
+        memcpy(g_modeCtorOriginalBytes[i],
+               reinterpret_cast<const void*>(kModeCtorHookAddrs[i]),
+               kModeCtorHookPatchSize);
+    }
+    g_modeCtorOriginalsSaved = true;
+    mod::Log(
+        "SaveModeCtorOriginalBytesOnce: captured "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X] "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X]",
+        static_cast<unsigned long>(kModeCtorHookAddrs[0]),
+        g_modeCtorOriginalBytes[0][0], g_modeCtorOriginalBytes[0][1],
+        g_modeCtorOriginalBytes[0][2], g_modeCtorOriginalBytes[0][3],
+        g_modeCtorOriginalBytes[0][4], g_modeCtorOriginalBytes[0][5],
+        g_modeCtorOriginalBytes[0][6],
+        static_cast<unsigned long>(kModeCtorHookAddrs[1]),
+        g_modeCtorOriginalBytes[1][0], g_modeCtorOriginalBytes[1][1],
+        g_modeCtorOriginalBytes[1][2], g_modeCtorOriginalBytes[1][3],
+        g_modeCtorOriginalBytes[1][4], g_modeCtorOriginalBytes[1][5],
+        g_modeCtorOriginalBytes[1][6]);
+}
+
+void SaveModeCtorHookBytes()
+{
+    for (size_t i = 0; i < kModeCtorHookCount; ++i)
+    {
+        memcpy(g_modeCtorHookSaved[i],
+               reinterpret_cast<const void*>(kModeCtorHookAddrs[i]),
+               kModeCtorHookPatchSize);
+    }
+    g_modeCtorHookSavedValid = true;
+
+    mod::Log(
+        "SaveModeCtorHookBytes: saved 0x%08lX=[%02X %02X %02X %02X %02X %02X %02X] "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X]",
+        static_cast<unsigned long>(kModeCtorHookAddrs[0]),
+        g_modeCtorHookSaved[0][0], g_modeCtorHookSaved[0][1],
+        g_modeCtorHookSaved[0][2], g_modeCtorHookSaved[0][3],
+        g_modeCtorHookSaved[0][4], g_modeCtorHookSaved[0][5],
+        g_modeCtorHookSaved[0][6],
+        static_cast<unsigned long>(kModeCtorHookAddrs[1]),
+        g_modeCtorHookSaved[1][0], g_modeCtorHookSaved[1][1],
+        g_modeCtorHookSaved[1][2], g_modeCtorHookSaved[1][3],
+        g_modeCtorHookSaved[1][4], g_modeCtorHookSaved[1][5],
+        g_modeCtorHookSaved[1][6]);
+}
+
+void DiscardModeCtorHookBytes()
+{
+    if (g_modeCtorHookSavedValid)
+    {
+        g_modeCtorHookSavedValid = false;
+        mod::Log("DiscardModeCtorHookBytes: discarded saved bytes without restoring");
+    }
+}
+
+void RestoreModeCtorOriginalBytes()
+{
+    SaveModeCtorOriginalBytesOnce();
+    if (!g_modeCtorOriginalsSaved)
+    {
+        mod::Log("RestoreModeCtorOriginalBytes: no originals captured — skipped");
+        return;
+    }
+
+    for (size_t i = 0; i < kModeCtorHookCount; ++i)
+    {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                            kModeCtorHookPatchSize,
+                            PAGE_EXECUTE_READWRITE,
+                            &oldProtect))
+        {
+            mod::Log(
+                "RestoreModeCtorOriginalBytes: VirtualProtect(0x%08lX) failed err=%lu",
+                static_cast<unsigned long>(kModeCtorHookAddrs[i]),
+                static_cast<unsigned long>(GetLastError()));
+            continue;
+        }
+
+        memcpy(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+               g_modeCtorOriginalBytes[i],
+               kModeCtorHookPatchSize);
+
+        VirtualProtect(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                       kModeCtorHookPatchSize,
+                       oldProtect,
+                       &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(),
+                              reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                              kModeCtorHookPatchSize);
+    }
+
+    // Read back for verification.
+    uint8_t v0[kModeCtorHookPatchSize] = {};
+    uint8_t v1[kModeCtorHookPatchSize] = {};
+    memcpy(v0, reinterpret_cast<const void*>(kModeCtorHookAddrs[0]), kModeCtorHookPatchSize);
+    memcpy(v1, reinterpret_cast<const void*>(kModeCtorHookAddrs[1]), kModeCtorHookPatchSize);
+    mod::Log(
+        "RestoreModeCtorOriginalBytes: restored "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X] "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X]",
+        static_cast<unsigned long>(kModeCtorHookAddrs[0]),
+        v0[0], v0[1], v0[2], v0[3], v0[4], v0[5], v0[6],
+        static_cast<unsigned long>(kModeCtorHookAddrs[1]),
+        v1[0], v1[1], v1[2], v1[3], v1[4], v1[5], v1[6]);
+}
+
+void RestoreModeCtorHookBytes()
+{
+    if (!g_modeCtorHookSavedValid)
+    {
+        mod::Log("RestoreModeCtorHookBytes: no saved bytes — skipped");
+        return;
+    }
+
+    for (size_t i = 0; i < kModeCtorHookCount; ++i)
+    {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                            kModeCtorHookPatchSize,
+                            PAGE_EXECUTE_READWRITE,
+                            &oldProtect))
+        {
+            mod::Log(
+                "RestoreModeCtorHookBytes: VirtualProtect(0x%08lX) failed err=%lu",
+                static_cast<unsigned long>(kModeCtorHookAddrs[i]),
+                static_cast<unsigned long>(GetLastError()));
+            continue;
+        }
+
+        memcpy(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+               g_modeCtorHookSaved[i],
+               kModeCtorHookPatchSize);
+
+        VirtualProtect(reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                       kModeCtorHookPatchSize,
+                       oldProtect,
+                       &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(),
+                              reinterpret_cast<void*>(kModeCtorHookAddrs[i]),
+                              kModeCtorHookPatchSize);
+    }
+
+    g_modeCtorHookSavedValid = false;
+
+    // Read back for verification.
+    uint8_t v0[kModeCtorHookPatchSize] = {};
+    uint8_t v1[kModeCtorHookPatchSize] = {};
+    memcpy(v0, reinterpret_cast<const void*>(kModeCtorHookAddrs[0]), kModeCtorHookPatchSize);
+    memcpy(v1, reinterpret_cast<const void*>(kModeCtorHookAddrs[1]), kModeCtorHookPatchSize);
+    mod::Log(
+        "RestoreModeCtorHookBytes: restored 0x%08lX=[%02X %02X %02X %02X %02X %02X %02X] "
+        "0x%08lX=[%02X %02X %02X %02X %02X %02X %02X]",
+        static_cast<unsigned long>(kModeCtorHookAddrs[0]),
+        v0[0], v0[1], v0[2], v0[3], v0[4], v0[5], v0[6],
+        static_cast<unsigned long>(kModeCtorHookAddrs[1]),
+        v1[0], v1[1], v1[2], v1[3], v1[4], v1[5], v1[6]);
+}
+
+// ---------------------------------------------------------------------------
+// Mode-constructor trampoline fixup
+//
+// Revival DLL's mode constructors (online=sub_10073440, spectator=sub_100749A0,
+// tournament=sub_100792D0) hook EXE addresses 0x763E50 and 0x763F04 via
+// sub_1006F160.  The trampoline installer (sub_1006F060) copies the original
+// bytes into a malloc'd trampoline WITHOUT fixing up relative instructions
+// (E8 CALL rel32, E9 JMP rel32, 0F 8x near Jcc rel32).
+//
+// On re-initialization, new trampolines are allocated at different heap
+// addresses.  Any relative instruction in the copied bytes computes its target
+// as: trampoline_addr + offset + insn_length + original_displacement.  Since
+// the original displacement was calculated for the EXE location (not the
+// trampoline), the computed target is wrong by (trampoline_addr - exe_addr) →
+// wild EIP crash (0x210132F9, 0x22FFF281, 0x2702FBB9, etc.).
+//
+// Trampoline layout from sub_1006F060 for a N-byte hook:
+//   +0: 0x60 PUSHAD
+//   +1: 0x9C PUSHFD
+//   +2: 0xE8 rel32 → CALL callback
+//   +7: 0x9D POPFD
+//   +8: 0x61 POPAD
+//   +9: [N bytes copied from original hook site]
+//   +9+N: 0xE9 rel32 → JMP back to original+N
+// ---------------------------------------------------------------------------
+struct ModeCtorHookSite {
+    uintptr_t hookAddr;
+    size_t    patchSize;
+};
+
+static constexpr ModeCtorHookSite kModeCtorHookSites[] = {
+    { 0x763E50, 7 },
+    { 0x763F04, 7 },
+};
+
+static constexpr size_t kModeCtorTrampolinePrologueSize = 9; // PUSHAD+PUSHFD+CALL+POPFD+POPAD
+
+// Track trampoline addresses we've already fixed up, per hook site.
+// If the same trampoline is seen again, its displacements are already
+// relative to the trampoline — re-fixing would drift the targets
+// further with each call, eventually causing a wild-EIP crash.
+static uintptr_t g_lastFixedTrampoline[sizeof(kModeCtorHookSites) /
+                                        sizeof(kModeCtorHookSites[0])] = {};
+
+void ResetModeConstructorTrampolineCache()
+{
+    memset(g_lastFixedTrampoline, 0, sizeof(g_lastFixedTrampoline));
+    mod::Log("ResetModeConstructorTrampolineCache: cleared %zu entries",
+             sizeof(g_lastFixedTrampoline) / sizeof(g_lastFixedTrampoline[0]));
+}
+
+void FixupModeConstructorTrampolines(const char* caller)
+{
+    for (size_t siteIdx = 0;
+         siteIdx < sizeof(kModeCtorHookSites) / sizeof(kModeCtorHookSites[0]);
+         ++siteIdx)
+    {
+        const auto& site = kModeCtorHookSites[siteIdx];
+        // Check if the hook site starts with E9 (JMP near rel32).
+        uint8_t firstByte = 0;
+        if (!SafeReadByte(reinterpret_cast<uint8_t*>(site.hookAddr), &firstByte)
+            || firstByte != 0xE9)
+        {
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX not hooked (byte=0x%02X), skip",
+                caller,
+                static_cast<unsigned long>(site.hookAddr),
+                static_cast<unsigned>(firstByte));
+            continue;
+        }
+
+        // Read the E9 displacement to find the trampoline address.
+        int32_t jmpDisp = 0;
+        memcpy(&jmpDisp, reinterpret_cast<const void*>(site.hookAddr + 1), 4);
+        const uintptr_t trampAddr = site.hookAddr + 5 + jmpDisp;
+
+        // If we already fixed this trampoline, its displacements are already
+        // correct (relative to the trampoline).  Re-fixing would interpret
+        // them as relative to the EXE hook site, drifting the target each
+        // call until it becomes a wild EIP.
+        if (trampAddr == g_lastFixedTrampoline[siteIdx])
+        {
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX tramp=%p already fixed, skip",
+                caller,
+                static_cast<unsigned long>(site.hookAddr),
+                reinterpret_cast<void*>(trampAddr));
+            continue;
+        }
+
+        // Verify trampoline prologue: must be PUSHAD (0x60) PUSHFD (0x9C).
+        uint8_t prologue[2] = {};
+        memcpy(prologue, reinterpret_cast<const void*>(trampAddr), 2);
+        if (prologue[0] != 0x60 || prologue[1] != 0x9C)
+        {
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX tramp=%p bad prologue [%02X %02X], skip",
+                caller,
+                static_cast<unsigned long>(site.hookAddr),
+                reinterpret_cast<void*>(trampAddr),
+                prologue[0], prologue[1]);
+            continue;
+        }
+
+        // Read the original bytes from trampoline + prologue offset.
+        const size_t origOff = kModeCtorTrampolinePrologueSize;
+        uint8_t origBytes[16] = {};
+        memcpy(origBytes,
+               reinterpret_cast<const void*>(trampAddr + origOff),
+               site.patchSize);
+
+        mod::Log(
+            "%s: modeCtorFixup 0x%08lX tramp=%p orig=[%02X %02X %02X %02X %02X %02X %02X]",
+            caller,
+            static_cast<unsigned long>(site.hookAddr),
+            reinterpret_cast<void*>(trampAddr),
+            origBytes[0], origBytes[1], origBytes[2], origBytes[3],
+            origBytes[4], origBytes[5], origBytes[6]);
+
+        bool anyFixed = false;
+
+        // Scan for E8 (CALL rel32) and E9 (JMP rel32) — 5-byte instructions.
+        for (size_t i = 0; i + 5 <= site.patchSize; ++i)
+        {
+            if (origBytes[i] != 0xE8 && origBytes[i] != 0xE9)
+                continue;
+
+            int32_t origDisp = 0;
+            memcpy(&origDisp, &origBytes[i + 1], 4);
+
+            // Absolute target the original instruction was meant to reach.
+            const uintptr_t origInsnAddr = site.hookAddr + i;
+            const uintptr_t absTarget = origInsnAddr + 5 +
+                                        static_cast<uintptr_t>(static_cast<uint32_t>(origDisp));
+
+            // Correct displacement from the trampoline location.
+            const uintptr_t newInsnAddr = trampAddr + origOff + i;
+            const int32_t newDisp =
+                static_cast<int32_t>(absTarget - (newInsnAddr + 5));
+
+            // Write the fixed-up displacement.
+            DWORD oldProtect = 0;
+            VirtualProtect(reinterpret_cast<void*>(newInsnAddr + 1), 4,
+                           PAGE_EXECUTE_READWRITE, &oldProtect);
+            memcpy(reinterpret_cast<void*>(newInsnAddr + 1), &newDisp, 4);
+            VirtualProtect(reinterpret_cast<void*>(newInsnAddr + 1), 4,
+                           oldProtect, &oldProtect);
+
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX fixed E%X at +%zu: "
+                "origDisp=0x%08X newDisp=0x%08X absTarget=%p",
+                caller,
+                static_cast<unsigned long>(site.hookAddr),
+                static_cast<unsigned>(origBytes[i]),
+                i,
+                static_cast<unsigned>(origDisp),
+                static_cast<unsigned>(newDisp),
+                reinterpret_cast<void*>(absTarget));
+
+            anyFixed = true;
+            i += 4; // skip displacement bytes
+        }
+
+        // Scan for 0F 8x (near conditional JMP rel32) — 6-byte instructions.
+        for (size_t i = 0; i + 6 <= site.patchSize; ++i)
+        {
+            if (origBytes[i] != 0x0F || (origBytes[i + 1] & 0xF0) != 0x80)
+                continue;
+
+            int32_t origDisp = 0;
+            memcpy(&origDisp, &origBytes[i + 2], 4);
+
+            const uintptr_t origInsnAddr = site.hookAddr + i;
+            const uintptr_t absTarget = origInsnAddr + 6 +
+                                        static_cast<uintptr_t>(static_cast<uint32_t>(origDisp));
+
+            const uintptr_t newInsnAddr = trampAddr + origOff + i;
+            const int32_t newDisp =
+                static_cast<int32_t>(absTarget - (newInsnAddr + 6));
+
+            DWORD oldProtect = 0;
+            VirtualProtect(reinterpret_cast<void*>(newInsnAddr + 2), 4,
+                           PAGE_EXECUTE_READWRITE, &oldProtect);
+            memcpy(reinterpret_cast<void*>(newInsnAddr + 2), &newDisp, 4);
+            VirtualProtect(reinterpret_cast<void*>(newInsnAddr + 2), 4,
+                           oldProtect, &oldProtect);
+
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX fixed 0F %02X at +%zu: "
+                "origDisp=0x%08X newDisp=0x%08X absTarget=%p",
+                caller,
+                static_cast<unsigned long>(site.hookAddr),
+                static_cast<unsigned>(origBytes[i + 1]),
+                i,
+                static_cast<unsigned>(origDisp),
+                static_cast<unsigned>(newDisp),
+                reinterpret_cast<void*>(absTarget));
+
+            anyFixed = true;
+            i += 5;
+        }
+
+        // Remember this trampoline so we don't re-fix it on later calls.
+        g_lastFixedTrampoline[siteIdx] = trampAddr;
+
+        if (anyFixed)
+        {
+            FlushInstructionCache(
+                GetCurrentProcess(),
+                reinterpret_cast<void*>(trampAddr + origOff),
+                site.patchSize);
+        }
+        else
+        {
+            mod::Log(
+                "%s: modeCtorFixup 0x%08lX no relative instructions found",
+                caller,
+                static_cast<unsigned long>(site.hookAddr));
+        }
+    }
+}
+
 // g_frameRecoveryPending: set by RunFrameDispatch on longjmp, read and cleared
 // by OurFrameDispatch outside the setjmp scope so C++ code (ForceLocalPlayInit)
 // can run safely.
@@ -1953,6 +2861,268 @@ static void RunFrameDispatch()
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
+
+// ---------------------------------------------------------------------------
+// Per-frame tick hook on sub_1006E570 (RVA 0x6E570)
+//
+// BACKGROUND
+// ----------
+// sub_1006E590 (RVA 0x6E590) runs ONCE during DLL init.  Among other things
+// it patches EXE address 0x401642 to JMP into sub_1006E570.  From that point
+// the EXE's main loop calls sub_1006E570 on EVERY frame.
+//
+// sub_1006E570 is __thiscall — ECX comes from the EXE.  It reads the session
+// pointer from dword_100A02CC, looks up vtable[2], and calls it PASSING ECX
+// (the EXE-supplied this) as the first argument:
+//
+//   return (vtable[2])(this);    // this = ECX from EXE
+//
+// vtable[2] (typically EFZ_Main_RollbackLoopTick) treats that argument as
+// the session's `self` pointer.  During a normal match this is correct:
+// InvokeStartInitPlayer writes the session pointer into an EXE global that
+// feeds ECX.  But ForceLocalPlayInit replaces the DLL-side session pointer
+// without updating the EXE global, so ECX carries the OLD (freed) session
+// address → crash.
+//
+// FIX
+// ---
+// We hook sub_1006E570 and replace ECX with the current value of
+// dword_100A02CC before calling the original.  This guarantees the
+// correct session pointer reaches vtable[2] regardless of what the EXE
+// passes.
+// ---------------------------------------------------------------------------
+
+static constexpr uintptr_t kPerFrameTickRva = 0x6E570u;
+static uint8_t g_perFrameTickTrampoline[12] = {};
+static bool    g_perFrameTickInstalled      = false;
+static bool    g_perFrameMismatchLogged     = false;
+
+// Guard flag: true while g_origPerFrameTick is running.  ForceLocalPlayInit
+// must NOT run during this window because sub_1006E570 -> vtable[2] ->
+// RollbackLoopTick is using the current session as 'this'. Destroying it
+// mid-tick causes a use-after-free crash in SetEvent(this[2]).
+static volatile bool g_insideFrameTick = false;
+static volatile bool g_deferredCancelCleanup = false;
+
+// __thiscall trampoline: ECX = this, no other args.
+using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
+static PerFrameTickFn g_origPerFrameTick = nullptr;
+
+static uint32_t g_frameTick = 0;           // monotonic per-frame counter
+
+// Read the raw session pointer from dword_100A02CC without heuristic
+// validation.  Used in the per-frame tick hot path.
+static uintptr_t ReadSessionPtrRaw()
+{
+    if (g_activeRevival == nullptr || g_activeRevival->sessionPtrOffsetCount == 0)
+        return 0;
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+        return 0;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    uintptr_t sessionPtr = 0;
+    (void)SafeReadPtr(
+        reinterpret_cast<const void*>(base + g_activeRevival->sessionPtrOffsets[0]),
+        &sessionPtr);
+    return sessionPtr;
+}
+
+// Screen-index change monitor — logs every time byte_790148 transitions.
+static uint8_t g_lastMonitoredScreenIndex = 0xFF;
+
+static void MonitorScreenIndexChange()
+{
+    constexpr uintptr_t kScreenIndexAddr = 0x00790148;
+    constexpr uintptr_t kScreenTableAddr = 0x00790110;
+    constexpr uint32_t kOffsetGameSystem = 0x1C;
+    constexpr uint32_t kModeOffset = 4964;
+
+    uint8_t currentIdx = 0xFF;
+    uint8_t gameMode = 0xFF;
+    uint8_t secondaryMode = 0xFF;
+    uint32_t screenObj = 0;
+    uint8_t csInit = 0xFF, csExit = 0xFF;
+    uint32_t csObj = 0;
+
+    __try
+    {
+        currentIdx = *reinterpret_cast<const uint8_t*>(kScreenIndexAddr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+
+    if (currentIdx == g_lastMonitoredScreenIndex)
+        return;
+
+    __try
+    {
+        if (currentIdx < 16)
+        {
+            screenObj = reinterpret_cast<const uint32_t*>(kScreenTableAddr)[currentIdx];
+            if (screenObj != 0)
+            {
+                const uint32_t gameSys =
+                    *reinterpret_cast<const uint32_t*>(screenObj + kOffsetGameSystem);
+                if (gameSys != 0)
+                {
+                    gameMode = *reinterpret_cast<const uint8_t*>(gameSys + kModeOffset);
+                    secondaryMode = *reinterpret_cast<const uint8_t*>(gameSys + kModeOffset + 1);
+                }
+            }
+        }
+
+        csObj = reinterpret_cast<const uint32_t*>(kScreenTableAddr)[1];
+        if (csObj != 0)
+        {
+            csInit = *reinterpret_cast<const uint8_t*>(csObj + 44);
+            csExit = *reinterpret_cast<const uint8_t*>(csObj + 45);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    mod::Log(
+        "SCREEN_MONITOR: index %u -> %u tick=%u mode=%u/%u "
+        "screenObj=0x%08lX charselect(init=%u exit=%u obj=0x%08lX)",
+        static_cast<unsigned>(g_lastMonitoredScreenIndex),
+        static_cast<unsigned>(currentIdx),
+        g_frameTick,
+        static_cast<unsigned>(gameMode),
+        static_cast<unsigned>(secondaryMode),
+        static_cast<unsigned long>(screenObj),
+        static_cast<unsigned>(csInit),
+        static_cast<unsigned>(csExit),
+        static_cast<unsigned long>(csObj));
+
+    g_lastMonitoredScreenIndex = currentIdx;
+}
+
+// Our per-frame tick hook.  Uses __fastcall to capture ECX (first arg) and
+// EDX (second, unused).  Replaces ECX with the current session pointer
+// before calling the original sub_1006E570.
+static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
+{
+    ++g_frameTick;
+    MonitorScreenIndexChange();
+
+    const uintptr_t exeThisAddr = reinterpret_cast<uintptr_t>(exeThis);
+    const uintptr_t currentSession = ReadSessionPtrRaw();
+
+    // Use the current DLL session if available; fall back to EXE's value.
+    void* fixedThis = (currentSession != 0)
+        ? reinterpret_cast<void*>(currentSession)
+        : exeThis;
+
+    // Detect and log the first ECX mismatch (stale session pointer).
+    if (exeThisAddr != currentSession && !g_perFrameMismatchLogged)
+    {
+        g_perFrameMismatchLogged = true;
+        mod::Log(
+            "TICK_HOOK: *** ECX MISMATCH *** frameTick=%u "
+            "exeECX=0x%08lX dllSession=0x%08lX — "
+            "overriding ECX with current session",
+            g_frameTick,
+            static_cast<unsigned long>(exeThisAddr),
+            static_cast<unsigned long>(currentSession));
+
+        // Dump session vtable for context.
+        if (currentSession != 0)
+        {
+            uintptr_t vtable = 0;
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(currentSession), &vtable);
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            const uintptr_t revBase = revival
+                ? reinterpret_cast<uintptr_t>(revival) : 0;
+            mod::Log(
+                "TICK_HOOK: current session vtable=0x%08lX (RVA=0x%lX)",
+                static_cast<unsigned long>(vtable),
+                static_cast<unsigned long>(
+                    revBase != 0 ? vtable - revBase : 0));
+        }
+
+        LogSessionDiagnosticState("tick_ecx_mismatch");
+    }
+
+    // Periodic heartbeat every 600 frames (~10s at 60fps).
+    if (g_frameTick == 1
+        || (g_frameTick % 600 == 0 && g_frameTick <= 6000))
+    {
+        mod::Log(
+            "TICK_HOOK: heartbeat frameTick=%u session=0x%08lX exeECX=0x%08lX match=%d",
+            g_frameTick,
+            static_cast<unsigned long>(currentSession),
+            static_cast<unsigned long>(exeThisAddr),
+            (exeThisAddr == currentSession) ? 1 : 0);
+    }
+
+    // Call the original sub_1006E570 with the corrected ECX.
+    // Set the guard flag so ForceLocalPlayInit knows we're mid-tick.
+    g_insideFrameTick = true;
+    const int result = g_origPerFrameTick(fixedThis);
+    g_insideFrameTick = false;
+
+    // If CancelSession tried to run ForceLocalPlayInit while we were inside
+    // the tick (which would destroy the session that RollbackLoopTick was
+    // using as 'this'), it deferred the work.  Execute it now that the tick
+    // has completed safely.
+    if (g_deferredCancelCleanup)
+    {
+        g_deferredCancelCleanup = false;
+        mod::Log(
+            "TICK_HOOK: executing deferred cancel cleanup "
+            "(ForceLocalPlayInit was unsafe mid-tick)");
+
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "TICK_HOOK: deferred ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        (void)ClearRevivalText();
+        (void)RestoreRenderContext();
+        (void)DisableRevivalTextRendering();
+        mod::ResetCrashRecoveryState();
+        ResetGameModeValidation();
+
+        mod::Log("TICK_HOOK: deferred cancel cleanup complete");
+    }
+
+    return result;
+}
+
+// Returns true while inside the per-frame tick (g_origPerFrameTick running).
+bool IsInsideFrameTick()
+{
+    return g_insideFrameTick;
+}
+
+// Request deferred cancel cleanup after the frame tick returns.
+void RequestDeferredCancelCleanup()
+{
+    g_deferredCancelCleanup = true;
+}
+
+// Reset the per-frame validator state.  Called when a session ends so the
+// next session gets fresh validation.
+void ResetGameModeValidation()
+{
+    g_frameTick = 0;
+    g_perFrameMismatchLogged = false;
+
+    // Clear stale deferred-cleanup flags from a previous session.
+    // If g_deferredCancelCleanup persists into session 2, the first
+    // frame tick would run ForceLocalPlayInit and destroy the new session.
+    // If g_frameRecoveryPending persists, OurFrameDispatch would run
+    // the full ExitProcess recovery path on the wrong session.
+    if (g_deferredCancelCleanup)
+    {
+        mod::Log("ResetGameModeValidation: clearing stale g_deferredCancelCleanup");
+        g_deferredCancelCleanup = false;
+    }
+    if (g_frameRecoveryPending)
+    {
+        mod::Log("ResetGameModeValidation: clearing stale g_frameRecoveryPending");
+        g_frameRecoveryPending = false;
+    }
+}
 
 // OurFrameDispatch — entry point patched over sub_1006E590's prologue.
 //
@@ -1987,6 +3157,7 @@ static void OurFrameDispatch()
         // --------------------------------------------------------------------
         const int recoveredRole = g_localRoleFlag;
         const DWORD recoveredPid = g_revivalProcessId;
+        LogSessionDiagnosticState("OurFrameDispatch_recovery_entry");
         mod::Log(
             "OurFrameDispatch: ExitProcess intercepted during frame tick "
             "(role=%d pid=%lu) — performing full cleanup",
@@ -2040,7 +3211,8 @@ static void OurFrameDispatch()
         // Step 5: Reset the one-shot VEH TOCTOU recovery guard so a
         // subsequent session can still be recovered if needed.
         mod::ResetCrashRecoveryState();
-        mod::Log("OurFrameDispatch: step 5 crash recovery state reset");
+        ResetGameModeValidation();
+        mod::Log("OurFrameDispatch: step 5 crash/validation state reset");
 
         // Step 6: Force game mode to 0 (title screen).  On the next main-
         // loop iteration, HookedTitleUpdateImplBody runs, detects
@@ -2056,6 +3228,7 @@ static void OurFrameDispatch()
             "OurFrameDispatch: full recovery complete (was role=%d), "
             "next title-screen frame will consume exit interception",
             recoveredRole);
+        LogSessionDiagnosticState("OurFrameDispatch_recovery_exit");
     }
 }
 
@@ -2134,6 +3307,132 @@ bool InstallNetplayFrameHook()
         "InstallNetplayFrameHook: installed at DLL RVA 0x%lX, trampoline at %p",
         static_cast<unsigned long>(kFrameHookRva),
         static_cast<void*>(g_frameHookTrampoline));
+
+    // -----------------------------------------------------------------------
+    // Per-frame tick hook on sub_1006E570 (RVA 0x6E570).
+    //
+    // sub_1006E570 is the ACTUAL per-frame entry point.  sub_1006E590 (hooked
+    // above) runs once during init and installs an EXE patch at 0x401642 that
+    // calls sub_1006E570 every frame.  We hook sub_1006E570 to:
+    //   (a) Fix the stale ECX that the EXE passes after session replacement.
+    //   (b) Run per-frame diagnostic heartbeats.
+    //
+    // sub_1006E570 prologue — may start with either:
+    //   55        push ebp       (standard frame-pointer prologue)
+    //   51        push ecx       (__thiscall saving this)
+    // We overwrite the first 6 bytes with a 5-byte JMP + NOP.
+    // -----------------------------------------------------------------------
+    if (!g_perFrameTickInstalled)
+    {
+        uint8_t* const tickTarget =
+            reinterpret_cast<uint8_t*>(base + kPerFrameTickRva);
+
+        uint8_t tickFirstByte = 0;
+        if (!SafeReadByte(tickTarget, &tickFirstByte)
+            || (tickFirstByte != 0x55 && tickFirstByte != 0x51))
+        {
+            mod::Log(
+                "InstallNetplayFrameHook: per-frame tick unexpected byte "
+                "0x%02X at RVA 0x%lX — skipping",
+                static_cast<unsigned>(tickFirstByte),
+                static_cast<unsigned long>(kPerFrameTickRva));
+        }
+        else
+        {
+            // Build trampoline: 6 original bytes + JMP-near back to orig+6.
+            //
+            // IMPORTANT: the stolen bytes contain a relative E8 CALL at
+            // offset 1 (bytes: 51 E8 xx xx xx xx).  A raw memcpy would
+            // preserve the displacement that was correct at the *original*
+            // address but wrong at the trampoline address.  We must fix
+            // up the displacement so the CALL reaches the same absolute
+            // target from the new location.
+            memcpy(g_perFrameTickTrampoline, tickTarget, 6);
+
+            // Fix up the relative CALL at trampoline[1] if present.
+            if (g_perFrameTickTrampoline[1] == 0xE8
+                || g_perFrameTickTrampoline[1] == 0xE9)
+            {
+                // Original call/jmp displacement (little-endian int32).
+                int32_t origDisp = 0;
+                memcpy(&origDisp, &tickTarget[2], sizeof(origDisp));
+
+                // Absolute target the original instruction reached.
+                const uintptr_t origInsnAddr =
+                    reinterpret_cast<uintptr_t>(tickTarget) + 1; // addr of E8
+                const uintptr_t absTarget = origInsnAddr + 5 + origDisp;
+
+                // New displacement from trampoline location.
+                const uintptr_t newInsnAddr =
+                    reinterpret_cast<uintptr_t>(&g_perFrameTickTrampoline[1]);
+                const int32_t newDisp =
+                    static_cast<int32_t>(absTarget - (newInsnAddr + 5));
+                memcpy(&g_perFrameTickTrampoline[2], &newDisp, sizeof(newDisp));
+
+                mod::Log(
+                    "InstallNetplayFrameHook: fixed up trampoline E8/E9 at "
+                    "+1: origDisp=0x%08X newDisp=0x%08X absTarget=%p",
+                    static_cast<unsigned>(origDisp),
+                    static_cast<unsigned>(newDisp),
+                    reinterpret_cast<void*>(absTarget));
+            }
+
+            const uintptr_t tickContinue = base + kPerFrameTickRva + 6;
+            g_perFrameTickTrampoline[6] = 0xE9;
+            const uintptr_t tickJmpFrom =
+                reinterpret_cast<uintptr_t>(&g_perFrameTickTrampoline[6]) + 5;
+            *reinterpret_cast<int32_t*>(&g_perFrameTickTrampoline[7]) =
+                static_cast<int32_t>(tickContinue - tickJmpFrom);
+            g_perFrameTickTrampoline[11] = 0x90;
+
+            DWORD tickTrampolineProtect = 0;
+            if (!VirtualProtect(
+                    g_perFrameTickTrampoline,
+                    sizeof(g_perFrameTickTrampoline),
+                    PAGE_EXECUTE_READWRITE,
+                    &tickTrampolineProtect))
+            {
+                mod::Log(
+                    "InstallNetplayFrameHook: VirtualProtect(tick trampoline) failed");
+            }
+            else
+            {
+                g_origPerFrameTick = reinterpret_cast<PerFrameTickFn>(
+                    reinterpret_cast<void*>(g_perFrameTickTrampoline));
+
+                // Patch sub_1006E570 prologue: JMP to OurPerFrameTickHook.
+                uint8_t tickPatch[6];
+                tickPatch[0] = 0xE9;
+                *reinterpret_cast<int32_t*>(&tickPatch[1]) =
+                    static_cast<int32_t>(
+                        reinterpret_cast<uintptr_t>(&OurPerFrameTickHook)
+                        - (reinterpret_cast<uintptr_t>(tickTarget) + 5));
+                tickPatch[5] = 0x90;
+
+                DWORD tickTargetProtect = 0;
+                if (!VirtualProtect(
+                        tickTarget, 6, PAGE_EXECUTE_READWRITE, &tickTargetProtect))
+                {
+                    mod::Log(
+                        "InstallNetplayFrameHook: VirtualProtect(tick target) failed");
+                }
+                else
+                {
+                    memcpy(tickTarget, tickPatch, 6);
+                    VirtualProtect(tickTarget, 6, tickTargetProtect, &tickTargetProtect);
+                    FlushInstructionCache(GetCurrentProcess(), tickTarget, 6);
+
+                    g_perFrameTickInstalled = true;
+                    mod::Log(
+                        "InstallNetplayFrameHook: per-frame tick hook installed "
+                        "at DLL RVA 0x%lX, trampoline at %p",
+                        static_cast<unsigned long>(kPerFrameTickRva),
+                        static_cast<void*>(g_perFrameTickTrampoline));
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2192,6 +3491,439 @@ bool ForceGameModeToTitle()
         "ForceGameModeToTitle: game mode %d -> 0 (title screen)",
         currentGameMode);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic logging — session lifecycle state dump
+// ---------------------------------------------------------------------------
+
+static int g_forceLocalPlayInitCount = 0;
+
+void IncrementForceLocalPlayInitCount()
+{
+    ++g_forceLocalPlayInitCount;
+}
+
+int GetForceLocalPlayInitCount()
+{
+    return g_forceLocalPlayInitCount;
+}
+
+void ResetForceLocalPlayInitCount()
+{
+    g_forceLocalPlayInitCount = 0;
+}
+
+void LogSessionDiagnosticState(const char* context)
+{
+    const char* ctx = (context != nullptr) ? context : "unknown";
+
+    // --- DLL patch state ---
+    mod::Log(
+        "DIAG[%s]: dllExitPatchesSaved=%d tournamentPatchesSaved=%d "
+        "renderContextSaved=%d savedRenderCtx=0x%08lX",
+        ctx,
+        g_dllExitProcessPatchesSaved ? 1 : 0,
+        g_tournamentPatchesSaved ? 1 : 0,
+        g_renderContextSaved ? 1 : 0,
+        static_cast<unsigned long>(g_savedRenderContext));
+
+    // --- Revival DLL globals ---
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival != nullptr && g_activeRevival != nullptr)
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+
+        // Role flag
+        int roleFlag = -1;
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->roleFlagOffsets[0]),
+            &roleFlag);
+
+        // Session pointer
+        uintptr_t sessionPtr = 0;
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->sessionPtrOffsets[0]),
+            &sessionPtr);
+
+        // Render context
+        uintptr_t renderCtx = 0;
+        if (g_activeRevival->renderContextGlobalOffset != 0)
+        {
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(base + g_activeRevival->renderContextGlobalOffset),
+                &renderCtx);
+        }
+
+        // Global state
+        uintptr_t globalState = 0;
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->globalStatePtrOffset),
+            &globalState);
+
+        mod::Log(
+            "DIAG[%s]: dllBase=0x%08lX roleFlag=%d sessionPtr=0x%08lX "
+            "renderCtx=0x%08lX globalState=0x%08lX",
+            ctx,
+            static_cast<unsigned long>(base),
+            roleFlag,
+            static_cast<unsigned long>(sessionPtr),
+            static_cast<unsigned long>(renderCtx),
+            static_cast<unsigned long>(globalState));
+
+        // Session vtable validation
+        if (sessionPtr != 0 && sessionPtr >= 0x00100000u)
+        {
+            uintptr_t vtable = 0;
+            int initComplete = -1;
+            int activePlayer = -1;
+            (void)SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtable);
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInitComplete),
+                &initComplete);
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetActivePlayer),
+                &activePlayer);
+
+            mod::Log(
+                "DIAG[%s]: session vtable=0x%08lX initComplete=%d activePlayer=%d",
+                ctx,
+                static_cast<unsigned long>(vtable),
+                initComplete,
+                activePlayer);
+        }
+
+        // ExitProcess patch site byte values (verify actual DLL code state)
+        for (size_t i = 0; i < g_activeRevival->exitProcessPatchCount; ++i)
+        {
+            const uintptr_t rva = g_activeRevival->exitProcessPatchRva[i];
+            if (rva == 0) continue;
+            uint8_t currentByte = 0;
+            (void)SafeReadByte(reinterpret_cast<const void*>(base + rva), &currentByte);
+            mod::Log(
+                "DIAG[%s]: exitPatch[%zu] RVA=0x%lX byte=0x%02X expected=0x%02X",
+                ctx,
+                i,
+                static_cast<unsigned long>(rva),
+                static_cast<unsigned>(currentByte),
+                static_cast<unsigned>(g_activeRevival->exitProcessPatchOriginal[i]));
+        }
+        for (size_t i = 0; i < g_activeRevival->exitProcessNearJccCount; ++i)
+        {
+            const uintptr_t rva = g_activeRevival->exitProcessNearJccRva[i];
+            if (rva == 0) continue;
+            uint8_t b0 = 0, b1 = 0;
+            (void)SafeReadByte(reinterpret_cast<const void*>(base + rva), &b0);
+            (void)SafeReadByte(reinterpret_cast<const void*>(base + rva + 1), &b1);
+            mod::Log(
+                "DIAG[%s]: nearJccPatch[%zu] RVA=0x%lX bytes=%02X %02X",
+                ctx,
+                i,
+                static_cast<unsigned long>(rva),
+                static_cast<unsigned>(b0),
+                static_cast<unsigned>(b1));
+        }
+    }
+    else
+    {
+        mod::Log(
+            "DIAG[%s]: EfzRevival.dll not loaded or no active profile",
+            ctx);
+    }
+
+    // --- Takeover state ---
+    mod::Log(
+        "DIAG[%s]: localRoleFlag=%d localInitApplied=%d "
+        "exitIntercepted=%ld exitMode=%ld frameHookInstalled=%d "
+        "frameRecoveryPending=%d forceLocalPlayInitCount=%d",
+        ctx,
+        g_localRoleFlag,
+        g_localInitAppliedForSession ? 1 : 0,
+        static_cast<long>(InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0)),
+        static_cast<long>(InterlockedCompareExchange(&g_revivalExitMode, 0, 0)),
+        g_frameHookInstalled ? 1 : 0,
+        g_frameRecoveryPending ? 1 : 0,
+        g_forceLocalPlayInitCount);
+
+    // --- Process state ---
+    mod::Log(
+        "DIAG[%s]: revivalProcess=0x%p revivalPid=%lu lastValidatedSession=0x%08lX "
+        "lastSessionPtrOffset=0x%lX",
+        ctx,
+        static_cast<void*>(g_revivalProcess),
+        static_cast<unsigned long>(g_revivalProcessId),
+        static_cast<unsigned long>(g_lastValidatedSessionPtr),
+        static_cast<unsigned long>(g_lastSessionPtrOffset));
+}
+
+// ---------------------------------------------------------------------------
+// LogInitWriteSnapshot — comprehensive snapshot of every value init() writes.
+//
+// Captures ALL DLL globals and session object fields that init() modifies,
+// in a format designed for before/after diff comparison.  Call this
+// immediately before AND after every g_localInitFn() call to produce a
+// complete write trace.  This covers all 5 crash hypotheses:
+//
+//   H1 (double init leak):  sessionPtr changes → old object leaked
+//   H2 (stale render ctx):  initOnceGuard, renderCtx, renderCtxBase
+//   H3 (patch state machine): exitPatch bytes (already in LogSessionDiagnosticState)
+//   H4 (saved flag stale):  g_dllExitProcessPatchesSaved
+//   H5 (history binding):   historyPrimary/SecondaryPtr, activePlayer
+// ---------------------------------------------------------------------------
+void LogInitWriteSnapshot(const char* context)
+{
+    const char* ctx = (context != nullptr) ? context : "unknown";
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr || g_activeRevival == nullptr)
+    {
+        mod::Log("INIT_SNAP[%s]: EfzRevival.dll not loaded or no profile", ctx);
+        return;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+
+    // ---- DLL globals that init() writes directly ----
+
+    // Role flag (dword_100A05D0)
+    int roleFlag = -1;
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(base + g_activeRevival->roleFlagOffsets[0]),
+        &roleFlag);
+
+    // Session pointer (dword_100A02CC)
+    uintptr_t sessionPtr = 0;
+    (void)SafeReadPtr(
+        reinterpret_cast<const void*>(base + g_activeRevival->sessionPtrOffsets[0]),
+        &sessionPtr);
+
+    // Init flag (dword_100A05D4) — zeroed at top of init()
+    int initFlag = -1;
+    if (g_activeRevival->initFlagOffset != 0)
+    {
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->initFlagOffset),
+            &initFlag);
+    }
+
+    // Init byte (byte_100A0289) — zeroed after version check
+    uint8_t initByte = 0xFF;
+    if (g_activeRevival->initByteOffset != 0)
+    {
+        (void)SafeReadByte(
+            reinterpret_cast<const void*>(base + g_activeRevival->initByteOffset),
+            &initByte);
+    }
+
+    // Render context (dword_100A0778 = EfzRender*)
+    uintptr_t renderCtx = 0;
+    if (g_activeRevival->renderContextGlobalOffset != 0)
+    {
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->renderContextGlobalOffset),
+            &renderCtx);
+    }
+
+    // Render context base (dword_100A0760)
+    uintptr_t renderCtxBase = 0;
+    if (g_activeRevival->renderContextBaseOffset != 0)
+    {
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->renderContextBaseOffset),
+            &renderCtxBase);
+    }
+
+    // Init-once guard (word_100A0774) — critical for H2
+    int initOnceGuard = -1;
+    if (g_activeRevival->initOnceGuardOffset != 0)
+    {
+        // Read as int (the low byte is the guard; full word gives more context)
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->initOnceGuardOffset),
+            &initOnceGuard);
+    }
+
+    // Timer pointer (dword_100A0764)
+    uintptr_t timerPtr = 0;
+    if (g_activeRevival->timerPtrOffset != 0)
+    {
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->timerPtrOffset),
+            &timerPtr);
+    }
+
+    // Global state pointer (dword_100A07B8)
+    uintptr_t globalStatePtr = 0;
+    (void)SafeReadPtr(
+        reinterpret_cast<const void*>(base + g_activeRevival->globalStatePtrOffset),
+        &globalStatePtr);
+
+    mod::Log(
+        "INIT_SNAP[%s]: roleFlag=%d sessionPtr=0x%08lX initFlag=%d initByte=0x%02X "
+        "renderCtx=0x%08lX renderCtxBase=0x%08lX initOnceGuard=0x%08X "
+        "timerPtr=0x%08lX globalStatePtr=0x%08lX",
+        ctx,
+        roleFlag,
+        static_cast<unsigned long>(sessionPtr),
+        initFlag,
+        static_cast<unsigned>(initByte),
+        static_cast<unsigned long>(renderCtx),
+        static_cast<unsigned long>(renderCtxBase),
+        static_cast<unsigned>(initOnceGuard),
+        static_cast<unsigned long>(timerPtr),
+        static_cast<unsigned long>(globalStatePtr));
+
+    // ---- Secondary role flag / session pointer globals (detect stale copies) ----
+    for (size_t i = 1; i < g_activeRevival->roleFlagOffsetCount; ++i)
+    {
+        int rf = -1;
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->roleFlagOffsets[i]),
+            &rf);
+        mod::Log(
+            "INIT_SNAP[%s]: roleFlag[%zu]=0x%lX val=%d",
+            ctx, i,
+            static_cast<unsigned long>(g_activeRevival->roleFlagOffsets[i]),
+            rf);
+    }
+    for (size_t i = 1; i < g_activeRevival->sessionPtrOffsetCount; ++i)
+    {
+        uintptr_t sp = 0;
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->sessionPtrOffsets[i]),
+            &sp);
+        mod::Log(
+            "INIT_SNAP[%s]: sessionPtr[%zu]=0x%lX val=0x%08lX",
+            ctx, i,
+            static_cast<unsigned long>(g_activeRevival->sessionPtrOffsets[i]),
+            static_cast<unsigned long>(sp));
+    }
+
+    // ---- Session object fields (only if session pointer is valid) ----
+    if (sessionPtr != 0 && sessionPtr >= 0x00100000u)
+    {
+        uintptr_t vtable = 0;
+        int initComplete = -1;
+        int activePlayer = -1;
+        int queuePlayer = -1;
+        int inputDelay = -1;
+        int currentFrame = -1;
+        int gameModeSnapshot = -1;
+        int matchId = -1;
+        int sentinel = -1;
+        uintptr_t helperHandle = 0;
+        uintptr_t histPrimary = 0;
+        uintptr_t histSecondary = 0;
+
+        (void)SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtable);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInitComplete),
+            &initComplete);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetActivePlayer),
+            &activePlayer);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetQueuePlayer),
+            &queuePlayer);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInputDelay),
+            &inputDelay);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetCurrentFrame),
+            &currentFrame);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot),
+            &gameModeSnapshot);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetMatchId),
+            &matchId);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetSentinel),
+            &sentinel);
+        // Guard helperHandle read: mode 2 sessions are only 0x2B0 (688) bytes,
+        // and sessionOffsetHelperHandle (700) is out of bounds.  Only read it
+        // for modes where the session object is large enough.
+        const bool helperHandleInBounds =
+            (g_localRoleFlag != kLocalRoleLocalPlay);
+        if (helperHandleInBounds)
+        {
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetHelperHandle),
+                &helperHandle);
+        }
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetHistoryPrimaryPtr),
+            &histPrimary);
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetHistorySecondaryPtr),
+            &histSecondary);
+
+        mod::Log(
+            "INIT_SNAP[%s]: session vtable=0x%08lX initComplete=%d "
+            "activePlayer=%d queuePlayer=%d inputDelay=%d",
+            ctx,
+            static_cast<unsigned long>(vtable),
+            initComplete,
+            activePlayer,
+            queuePlayer,
+            inputDelay);
+
+        mod::Log(
+            "INIT_SNAP[%s]: session currentFrame=%d gameModeSnap=%d "
+            "matchId=%d sentinel=%d helperHandle=0x%08lX",
+            ctx,
+            currentFrame,
+            gameModeSnapshot,
+            matchId,
+            sentinel,
+            static_cast<unsigned long>(helperHandle));
+
+        mod::Log(
+            "INIT_SNAP[%s]: session histPrimary=0x%08lX histSecondary=0x%08lX "
+            "histPrimaryVec=0x%08lX histSecondaryVec=0x%08lX",
+            ctx,
+            static_cast<unsigned long>(histPrimary),
+            static_cast<unsigned long>(histSecondary),
+            static_cast<unsigned long>(sessionPtr + g_activeRevival->sessionOffsetHistoryPrimaryVec),
+            static_cast<unsigned long>(sessionPtr + g_activeRevival->sessionOffsetHistorySecondaryVec));
+
+        // Read first few bytes of session for mode-specific field detection.
+        // Offset +4/+8/+12/+16 are zeroed by StartInitPlayer; +9 (dword) is
+        // set to 1 by the local-play constructor.
+        int field4 = -1, field8 = -1, field12 = -1, field16 = -1;
+        int field36 = -1;  // this[9] = 1 for local play
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + 4), &field4);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + 8), &field8);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + 12), &field12);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + 16), &field16);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + 36), &field36);
+
+        mod::Log(
+            "INIT_SNAP[%s]: session +4=%d +8=%d +12=%d +16=%d +36=%d",
+            ctx,
+            field4, field8, field12, field16, field36);
+    }
+    else
+    {
+        mod::Log("INIT_SNAP[%s]: sessionPtr=0x%08lX (invalid/NULL, no field dump)",
+                 ctx, static_cast<unsigned long>(sessionPtr));
+    }
+
+    // ---- Our module state (hypothesis flags) ----
+    mod::Log(
+        "INIT_SNAP[%s]: g_localRoleFlag=%d g_localInitApplied=%d "
+        "g_dllExitPatchesSaved=%d g_tournamentPatchesSaved=%d "
+        "g_renderContextSaved=%d g_savedRenderCtx=0x%08lX "
+        "g_frameHookInstalled=%d initCount=%d",
+        ctx,
+        g_localRoleFlag,
+        g_localInitAppliedForSession ? 1 : 0,
+        g_dllExitProcessPatchesSaved ? 1 : 0,
+        g_tournamentPatchesSaved ? 1 : 0,
+        g_renderContextSaved ? 1 : 0,
+        static_cast<unsigned long>(g_savedRenderContext),
+        g_frameHookInstalled ? 1 : 0,
+        g_forceLocalPlayInitCount);
 }
 
 } // namespace netplay::bridge::takeover

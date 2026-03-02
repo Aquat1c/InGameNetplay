@@ -243,6 +243,77 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
         }
     }
 
+    // -----------------------------------------------------------------------
+    // EFZ.exe game mode struct table dump
+    //
+    // The game mode struct table at 0x790110 holds up to 14 object pointers.
+    // 0x790148 holds the current index.  EFZ_GameMode_InvokeAdvance() calls
+    // vtable[1] on table[curIdx] — if corrupt, this is the crash site.
+    // -----------------------------------------------------------------------
+    {
+        constexpr uintptr_t kTableAddr = 0x00790110u;
+        constexpr uintptr_t kIndexAddr = 0x00790148u;
+        constexpr int kMaxEntries = 14;
+
+        const uintptr_t curIdx = SafeReadDword(kIndexAddr);
+        std::fprintf(file, "\n=== Game Mode Struct Table ===\n");
+        std::fprintf(file, "game_mode_index=0x%08lX (%ld)\n",
+                     static_cast<unsigned long>(curIdx),
+                     static_cast<long>(static_cast<int>(curIdx)));
+
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        const uintptr_t revBase = revival
+            ? reinterpret_cast<uintptr_t>(revival) : 0;
+
+        for (int i = 0; i < kMaxEntries; ++i)
+        {
+            const uintptr_t entry = SafeReadDword(kTableAddr + 4u * i);
+            if (entry == 0 || entry == 0xDEADBEEFu)
+                continue;
+
+            const uintptr_t vtable = SafeReadDword(entry);
+            const uintptr_t vt0 = SafeReadDword(vtable);
+            const uintptr_t vt1 = SafeReadDword(vtable + 4);
+            const uintptr_t vt2 = SafeReadDword(vtable + 8);
+
+            const uintptr_t vtRva = (revBase != 0 && vtable >= revBase
+                                     && vtable < (revBase + 0x100000u))
+                                        ? (vtable - revBase) : 0;
+
+            std::fprintf(file,
+                "game_mode_table[%d]=0x%08lX vtable=0x%08lX (RVA=0x%lX) "
+                "vt[0]=0x%08lX vt[1]=0x%08lX vt[2]=0x%08lX%s\n",
+                i,
+                static_cast<unsigned long>(entry),
+                static_cast<unsigned long>(vtable),
+                static_cast<unsigned long>(vtRva),
+                static_cast<unsigned long>(vt0),
+                static_cast<unsigned long>(vt1),
+                static_cast<unsigned long>(vt2),
+                (static_cast<unsigned>(i) == (curIdx & 0xFFu)) ? " <<<CURRENT" : "");
+
+            // Dump first 64 bytes of the current game mode object for analysis.
+            if (static_cast<unsigned>(i) == (curIdx & 0xFFu))
+            {
+                std::fprintf(file, "  object_hex_dump:\n");
+                for (int off = 0; off < 64; off += 16)
+                {
+                    const uintptr_t d0 = SafeReadDword(entry + off);
+                    const uintptr_t d1 = SafeReadDword(entry + off + 4);
+                    const uintptr_t d2 = SafeReadDword(entry + off + 8);
+                    const uintptr_t d3 = SafeReadDword(entry + off + 12);
+                    std::fprintf(file,
+                        "    +0x%02X: %08lX %08lX %08lX %08lX\n",
+                        off,
+                        static_cast<unsigned long>(d0),
+                        static_cast<unsigned long>(d1),
+                        static_cast<unsigned long>(d2),
+                        static_cast<unsigned long>(d3));
+                }
+            }
+        }
+    }
+
     if (exceptionPointers != nullptr && exceptionPointers->ContextRecord != nullptr)
     {
         const CONTEXT* ctx = exceptionPointers->ContextRecord;

@@ -581,9 +581,27 @@ void PrepareVsHumanGameState(uint32_t screenContext)
         const uint32_t charSelectObj = screenTable[1];
         if (charSelectObj != 0)
         {
+            // Read the current exit flag BEFORE we clear it — diagnostic.
+            const uint8_t staleExitFlag =
+                *reinterpret_cast<const uint8_t*>(charSelectObj + kOffsetScreenExitState);
+
             // Trigger the per-entry reinit (resets cursor pixels, camera,
             // colors, timers, grid states, input latches).
             *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetScreenInitState) = 1;
+
+            // CRITICAL: clear the exit flag. initializeCharacterSelectScreen
+            // does NOT clear byte[45]; if it's stale from a previous session
+            // the charselect update would immediately take the exit path.
+            *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetScreenExitState) = 0;
+
+            if (staleExitFlag != 0)
+            {
+                mod::Log(
+                    "PrepareVsHumanGameState: CLEARED stale exit flag! "
+                    "charselect byte[45] was %u (obj=0x%08lX)",
+                    static_cast<unsigned>(staleExitFlag),
+                    static_cast<unsigned long>(charSelectObj));
+            }
 
             if (g_charSelectResetPending)
             {
@@ -863,10 +881,36 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
 {
     const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
     const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+
+    // Pre-handoff diagnostic: read charselect screen object state BEFORE we
+    // modify anything, so we can see if byte[45] (exit flag) was stale.
+    uint8_t preInit = 0xFF, preExit = 0xFF, preMode = 0xFF, preSecondary = 0xFF;
+    uint32_t preCharSelectObj = 0;
+    __try
+    {
+        const auto* screenTable = reinterpret_cast<const uint32_t*>(
+            RuntimeAddress(kVaScreenObjectTable));
+        preCharSelectObj = screenTable[1];
+        if (preCharSelectObj != 0)
+        {
+            preInit = *reinterpret_cast<const uint8_t*>(preCharSelectObj + kOffsetScreenInitState);
+            preExit = *reinterpret_cast<const uint8_t*>(preCharSelectObj + kOffsetScreenExitState);
+            const uint32_t gameSys = *reinterpret_cast<const uint32_t*>(
+                preCharSelectObj + kOffsetGameSystem);
+            if (gameSys != 0)
+            {
+                preMode = *reinterpret_cast<const uint8_t*>(gameSys + kGameSystemOffsetMode);
+                preSecondary = *reinterpret_cast<const uint8_t*>(gameSys + kGameSystemOffsetSecondaryModeFlag);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
     mod::Log(
         "HandoffConnectedSessionToVsHumanState: begin prepared=%d "
         "sync(mode=%d flag1084=%d session=%d flags=%d/%d role=%d) "
-        "screen=%d peerAlive=%d",
+        "screen=%d peerAlive=%d "
+        "PRE_charselect(obj=0x%08lX init=%u exit=%u mode=%u/%u)",
         prepared ? 1 : 0,
         status.syncGameMode,
         status.syncMode0Flag1084,
@@ -875,7 +919,12 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
         status.syncGlobalFlag4965,
         status.roleFlag,
         *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
-        netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+        netplay::bridge::IsPeerProcessAlive() ? 1 : 0,
+        static_cast<unsigned long>(preCharSelectObj),
+        static_cast<unsigned>(preInit),
+        static_cast<unsigned>(preExit),
+        static_cast<unsigned>(preMode),
+        static_cast<unsigned>(preSecondary));
 
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareVsHumanGameState(screenContext);
@@ -907,10 +956,35 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
+    // Post-handoff diagnostic: read charselect screen object state AFTER
+    // PrepareVsHumanGameState to verify flags were set correctly.
+    uint8_t postInit = 0xFF, postExit = 0xFF, postMode = 0xFF, postSecondary = 0xFF;
+    __try
+    {
+        if (preCharSelectObj != 0)
+        {
+            postInit = *reinterpret_cast<const uint8_t*>(preCharSelectObj + kOffsetScreenInitState);
+            postExit = *reinterpret_cast<const uint8_t*>(preCharSelectObj + kOffsetScreenExitState);
+            const uint32_t gameSys = *reinterpret_cast<const uint32_t*>(
+                preCharSelectObj + kOffsetGameSystem);
+            if (gameSys != 0)
+            {
+                postMode = *reinterpret_cast<const uint8_t*>(gameSys + kGameSystemOffsetMode);
+                postSecondary = *reinterpret_cast<const uint8_t*>(gameSys + kGameSystemOffsetSecondaryModeFlag);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
     mod::Log(
-        "HandoffConnectedSessionToVsHumanState: queued global transition nextState=%d returnToNetplay=%d",
+        "HandoffConnectedSessionToVsHumanState: queued global transition nextState=%d returnToNetplay=%d "
+        "POST_charselect(init=%u exit=%u mode=%u/%u)",
         g_pendingGlobalStateTransition,
-        g_returnToNetplayAfterMatch ? 1 : 0);
+        g_returnToNetplayAfterMatch ? 1 : 0,
+        static_cast<unsigned>(postInit),
+        static_cast<unsigned>(postExit),
+        static_cast<unsigned>(postMode),
+        static_cast<unsigned>(postSecondary));
 }
 
 void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)

@@ -286,6 +286,7 @@ bool SaveTournamentExePatches();
 bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
 bool RestoreDllExitProcessPatches();
+bool DestroyCurrentSession(const char* caller);
 bool ForceLocalPlayInit();
 bool InvokeSessionVtableInit(const char* caller);
 bool SaveRenderContext();
@@ -300,6 +301,68 @@ bool InstallNetplayFrameHook();
 // Force the game mode index to 0 (title screen).
 // Safe to call from the crash handler VEH where minimal code should run.
 bool ForceGameModeToTitle();
+
+// Save / restore the 10 bytes at EXE address 0x401582 before and after
+// every g_localInitFn() call.  Prevents Revival's init() from chaining
+// trampolines whose unrelocated E9 displacement causes wild-EIP crashes.
+void SaveExeFrameHookBytes();
+void RestoreExeFrameHookBytes();
+
+// Save / restore the 7 bytes at EXE addresses 0x763E50 and 0x763F04
+// before and after every g_localInitFn() call.  Prevents trampoline
+// chain growth at the mode-constructor hook sites (same pattern as
+// SaveExeFrameHookBytes for 0x401582).
+void SaveModeCtorHookBytes();
+void RestoreModeCtorHookBytes();
+void DiscardModeCtorHookBytes();
+void RestoreModeCtorOriginalBytes();
+
+// Fix up relative instructions (E8/E9/0F 8x) inside the trampolines
+// created by Revival's mode constructors at EXE addresses 0x763E50 and
+// 0x763F04.  Must be called AFTER every init() to prevent wild-EIP crashes
+// caused by unrelocated displacements in the copied original bytes.
+void FixupModeConstructorTrampolines(const char* caller);
+
+// Reset the g_lastFixedTrampoline[] cache so that newly allocated
+// trampolines at reused heap addresses are properly fixed up.
+// Called from DestroyCurrentSession when the old trampolines are freed.
+void ResetModeConstructorTrampolineCache();
+
+// Diagnostic logging for second-session crash investigation.
+// Dumps all critical session lifecycle state to the log file.
+void LogSessionDiagnosticState(const char* context);
+
+// Comprehensive snapshot of ALL values that init() writes to.
+// Call before and after every init() invocation to capture a complete
+// before/after diff for tracing corruption across sessions.
+// Logs: DLL globals (role flag, session ptr, init flag, init byte,
+// render context, render context base, timer ptr, init-once guard,
+// global state ptr), session object fields (vtable, initComplete,
+// activePlayer, queuePlayer, inputDelay, currentFrame,
+// gameModeSnapshot, matchId, sentinel, helperHandle, historyPtrs),
+// and our module's patch/flag state.
+void LogInitWriteSnapshot(const char* context);
+
+// Track ForceLocalPlayInit call count for diagnostic purposes.
+void IncrementForceLocalPlayInitCount();
+int GetForceLocalPlayInitCount();
+void ResetForceLocalPlayInitCount();
+
+// Reset the per-frame game mode vtable validator state so the next session
+// gets fresh validation.  Call when a session starts or is cancelled.
+void ResetGameModeValidation();
+
+// Returns true while the per-frame tick hook (OurPerFrameTickHook) is
+// executing the original sub_1006E570.  Used by CancelSessionUnlocked to
+// defer ForceLocalPlayInit (which destroys the session object) until after
+// the frame tick completes — destroying it mid-tick would cause
+// RollbackLoopTick to use a freed 'this' pointer.
+bool IsInsideFrameTick();
+
+// Request that ForceLocalPlayInit + associated cleanup run after the
+// current frame tick completes instead of immediately.
+void RequestDeferredCancelCleanup();
+
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
 

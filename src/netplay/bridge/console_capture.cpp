@@ -638,21 +638,17 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         line->reserve(256);
     }
 
-    auto flushLine = [&](bool partial) {
+    auto flushLine = [&](bool /*partial*/) {
         const std::string trimmed = TrimAscii(*line);
         line->clear();
         if (trimmed.empty())
         {
             return;
         }
+        // Parse workflow signals (delay prompt, spectate confirm, peer died)
+        // but don't echo Revival's debug text into the mod log — Revival
+        // already writes to its own log files.
         NoteConsolePromptLine(trimmed);
-        const LONG count = InterlockedIncrement(&g_injectedConsoleOutputHits);
-        mod::Log(
-            "Takeover: console[%s] #%ld%s %s",
-            sourceTag,
-            static_cast<long>(count),
-            partial ? " partial" : "",
-            trimmed.c_str());
     };
 
     for (size_t i = 0; i < length; ++i)
@@ -693,7 +689,7 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     }
 }
 
-void FlushPendingConsoleOutput(const char* reason)
+void FlushPendingConsoleOutput(const char* /*reason*/)
 {
     if (!CaptureRevivalNativeLogsEnabled())
     {
@@ -710,7 +706,7 @@ void FlushPendingConsoleOutput(const char* reason)
     }
 
     std::lock_guard<std::mutex> lock(g_consoleLogMutex);
-    auto flushOne = [&](const char* sourceTag, std::string* line) {
+    auto flushOne = [&](const char* /*sourceTag*/, std::string* line) {
         if (line == nullptr || line->empty())
         {
             return;
@@ -723,14 +719,8 @@ void FlushPendingConsoleOutput(const char* reason)
             return;
         }
 
+        // Parse workflow signals but don't echo Revival debug text.
         NoteConsolePromptLine(trimmed);
-        const LONG count = InterlockedIncrement(&g_injectedConsoleOutputHits);
-        mod::Log(
-            "Takeover: console[%s] #%ld partial(%s) %s",
-            sourceTag,
-            static_cast<long>(count),
-            reason != nullptr ? reason : "flush",
-            trimmed.c_str());
     };
 
     flushOne("WriteFile", &g_consolePendingWriteFile);
@@ -811,19 +801,8 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
             pathHitCount = hitRef;
             announcePath = (hitRef == 1);
         }
-        if (announcePath)
-        {
-            mod::Log(
-                "Takeover: disk text capture enabled path='%s'",
-                pathText.c_str());
-        }
-        else if ((pathHitCount % 128) == 0)
-        {
-            mod::Log(
-                "Takeover: disk text capture path='%s' chunks=%ld",
-                pathText.c_str(),
-                static_cast<long>(pathHitCount));
-        }
+        (void)announcePath;
+        (void)pathHitCount;
 
         LogConsoleTextChunk("WriteFileDisk", text, textLen);
         return;

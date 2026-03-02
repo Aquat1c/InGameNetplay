@@ -384,8 +384,41 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 // Called from HookedCharSelectUpdateImpl which wraps it in setjmp/longjmp
 // protection so NeutralizeExitProcess can safely escape.
 // ---------------------------------------------------------------------------
+static uint32_t g_charSelectUpdateCallCount = 0;
+
 static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 {
+    ++g_charSelectUpdateCallCount;
+
+    // Diagnostic: log charselect screen state on the first 5 frames
+    // and then every 300 frames to track init/exit flags and game mode.
+    if (g_charSelectUpdateCallCount <= 5
+        || (g_charSelectUpdateCallCount % 300 == 0 && g_charSelectUpdateCallCount <= 3000))
+    {
+        uint8_t initFlag = 0xFF, exitFlag = 0xFF, gameMode = 0xFF, secondaryMode = 0xFF;
+        __try
+        {
+            initFlag = *reinterpret_cast<const uint8_t*>(screenContext + 44);
+            exitFlag = *reinterpret_cast<const uint8_t*>(screenContext + 45);
+            const uint32_t gameSys = *reinterpret_cast<const uint32_t*>(
+                screenContext + netplay::constants::kOffsetGameSystem);
+            if (gameSys != 0)
+            {
+                gameMode = *reinterpret_cast<const uint8_t*>(gameSys + 4964);
+                secondaryMode = *reinterpret_cast<const uint8_t*>(gameSys + 4965);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        mod::Log(
+            "CHARSELECT_UPDATE: frame=%u ctx=0x%08lX init=%u exit=%u mode=%u/%u",
+            g_charSelectUpdateCallCount,
+            static_cast<unsigned long>(screenContext),
+            static_cast<unsigned>(initFlag),
+            static_cast<unsigned>(exitFlag),
+            static_cast<unsigned>(gameMode),
+            static_cast<unsigned>(secondaryMode));
+    }
+
     if (g_originalCharSelectUpdate == nullptr)
     {
         return 1;
@@ -396,12 +429,20 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
         g_charSelectEntryHoldArmed = false;
         g_charSelectEntryHoldActive = true;
         g_charSelectEntryHoldFramesRemaining = kCharSelectEntryHoldFrames;
+        g_charSelectUpdateCallCount = 0;  // reset for fresh logging window
         mod::Log("CharSelectHold: started on first charselect frame budget=%d", g_charSelectEntryHoldFramesRemaining);
     }
 
     if (!g_charSelectEntryHoldActive)
     {
-        return g_originalCharSelectUpdate(screenContext);
+        const char csResult = g_originalCharSelectUpdate(screenContext);
+        if (csResult != 1)
+        {
+            mod::Log(
+                "CHARSELECT_UPDATE: originalUpdate returned %d (non-1) frame=%u",
+                static_cast<int>(csResult), g_charSelectUpdateCallCount);
+        }
+        return csResult;
     }
 
     netplay::bridge::Tick();
@@ -416,7 +457,13 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
             bridgeStatus.syncGameMode,
             bridgeStatus.syncMode0Flag1084,
             bridgeStatus.syncSessionByte);
-        return g_originalCharSelectUpdate(screenContext);
+        {
+            const char csResult = g_originalCharSelectUpdate(screenContext);
+            if (csResult != 1)
+                mod::Log("CHARSELECT_UPDATE: hold-release originalUpdate returned %d frame=%u",
+                    static_cast<int>(csResult), g_charSelectUpdateCallCount);
+            return csResult;
+        }
     }
 
     --g_charSelectEntryHoldFramesRemaining;
@@ -429,7 +476,13 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
             bridgeStatus.syncGameMode,
             bridgeStatus.syncMode0Flag1084,
             bridgeStatus.syncSessionByte);
-        return g_originalCharSelectUpdate(screenContext);
+        {
+            const char csResult = g_originalCharSelectUpdate(screenContext);
+            if (csResult != 1)
+                mod::Log("CHARSELECT_UPDATE: hold-timeout originalUpdate returned %d frame=%u",
+                    static_cast<int>(csResult), g_charSelectUpdateCallCount);
+            return csResult;
+        }
     }
 
     return 1;

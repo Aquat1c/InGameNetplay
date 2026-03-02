@@ -61,6 +61,29 @@ struct RevivalAddressProfile
     // Global state pointer RVA.
     uintptr_t globalStatePtrOffset;
 
+    // -----------------------------------------------------------------------
+    // Additional DLL globals written by init() — used for diagnostic logging
+    // -----------------------------------------------------------------------
+
+    // RVA of dword_100A05D4: unknown flag zeroed at top of init().
+    uintptr_t initFlagOffset;
+
+    // RVA of byte_100A0289: unknown flag zeroed after version check in init().
+    uintptr_t initByteOffset;
+
+    // RVA of word_100A0774: init-once guard for EFZ_Global_InitializeIfNeeded.
+    // Non-zero low byte means the global init (which sets the render context,
+    // timer, global state ptr, etc.) will be SKIPPED on subsequent init() calls.
+    // This is critical for Hypothesis 2 (stale render context).
+    uintptr_t initOnceGuardOffset;
+
+    // RVA of dword_100A0764: EfzTimer* pointer, set during global init.
+    uintptr_t timerPtrOffset;
+
+    // RVA of dword_100A0760: render context base (= renderContextGlobal - 0x18),
+    // used as 'this' for SetTextEnabled.  Set during frame hook init.
+    uintptr_t renderContextBaseOffset;
+
     // Error-code-is-zero function patch target.
     uintptr_t errorCodeIsZeroRva;
     size_t    errorCodeIsZeroPatchSize;
@@ -83,6 +106,12 @@ struct RevivalAddressProfile
     uintptr_t sessionOffsetHistorySecondaryPtr;
     uintptr_t sessionOffsetHistoryPrimaryVec;
     uintptr_t sessionOffsetHistorySecondaryVec;
+
+    // Additional session fields written by constructors / StartInitPlayer.
+    uintptr_t sessionOffsetCurrentFrame;       // +708 in 1.02e — frame counter
+    uintptr_t sessionOffsetGameModeSnapshot;   // +716 — game mode at session start
+    uintptr_t sessionOffsetMatchId;            // +712 — match identifier
+    uintptr_t sessionOffsetSentinel;           // +1232 — INT_MAX-1 sentinel value
 
     // -----------------------------------------------------------------------
     // Global state offsets (byte offsets from global-state pointer)
@@ -177,6 +206,11 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     {0x00A02CCu, 0x00A02ECu, 0u, 0u},                  // sessionPtrOffsets
     2,                                                  // sessionPtrOffsetCount
     0x000A07B8u,                                        // globalStatePtrOffset
+    0x000A05D4u,                                        // initFlagOffset
+    0x000A0289u,                                        // initByteOffset
+    0x000A0774u,                                        // initOnceGuardOffset
+    0x000A0764u,                                        // timerPtrOffset
+    0x000A0760u,                                        // renderContextBaseOffset
     0x000021E0u,                                        // errorCodeIsZeroRva
     8u,                                                 // errorCodeIsZeroPatchSize
     0x00072880u,                                        // startInitPlayerRva
@@ -191,6 +225,10 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     828u,                                               // sessionOffsetHistorySecondaryPtr
     788u,                                               // sessionOffsetHistoryPrimaryVec
     800u,                                               // sessionOffsetHistorySecondaryVec
+    708u,                                               // sessionOffsetCurrentFrame
+    716u,                                               // sessionOffsetGameModeSnapshot
+    712u,                                               // sessionOffsetMatchId
+    1232u,                                              // sessionOffsetSentinel
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte
