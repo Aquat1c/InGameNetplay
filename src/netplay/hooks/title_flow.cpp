@@ -766,6 +766,11 @@ void HandoffSpectateSession(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
+
+    // Arm the replay screen bypass so the hooked replay update skips
+    // the file-selection UI and immediately transitions to charselect.
+    ArmSpectateReplayBypass();
+
     g_pendingGlobalStateTransition = kScreenIndexReplay;
 
     mod::Log(
@@ -865,6 +870,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
+    DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
     RemoveNetplayWindowHook();
@@ -1492,6 +1498,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "NetplayTransition: ABORT — peer exited before spectate state=%d, "
                     "re-entering netplay menu",
                     nextState);
+                DisarmSpectateReplayBypass();
                 netplay::bridge::CancelSession("peer_died_before_spectate_transition");
                 EnterNetplayMenu(screenContext);
                 return 0;

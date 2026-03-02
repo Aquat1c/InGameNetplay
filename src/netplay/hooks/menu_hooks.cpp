@@ -65,6 +65,22 @@ static constexpr int kCharSelectEntryHoldFrames = 8;
 extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext);
 extern "C" void HookedCharSelectUpdateThunk();
 
+// ---- Replay screen hook (spectate bypass) ----
+// When spectating, the title flow transitions to screen 8 (Replay) so that
+// the Revival DLL's mode-transition detector creates the spectator watcher.
+// However, the native replay screen shows an interactive file-selection UI.
+// This hook intercepts the replay update function and, when the spectate
+// bypass is armed, skips the file selection entirely by returning 1 (go to
+// charselect) after a short delay to let the DLL detect the 0→8 transition.
+static uint32_t g_replayUpdateSlotAddress = 0;
+static TitleUpdateFn g_originalReplayUpdate = nullptr;
+static bool g_spectateReplayBypassActive = false;
+static int g_spectateReplayBypassCountdown = 0;
+static constexpr int kSpectateReplayBypassFrames = 3;
+
+extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext);
+extern "C" void HookedReplayScreenUpdateThunk();
+
 bool EnsureCharSelectEntryHoldHook()
 {
     if (g_charSelectUpdateSlotAddress != 0)
@@ -152,6 +168,106 @@ void ArmCharSelectEntryHold()
     mod::Log("CharSelectHold: armed frames=%d", kCharSelectEntryHoldFrames);
 }
 
+// ---------------------------------------------------------------------------
+// Replay screen hook — spectate bypass
+// ---------------------------------------------------------------------------
+bool EnsureReplayScreenHook()
+{
+    if (g_replayUpdateSlotAddress != 0)
+    {
+        return g_originalReplayUpdate != nullptr;
+    }
+
+    constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
+    const uintptr_t tableAddress = RuntimeAddress(kVaScreenObjectTable);
+    if (tableAddress == 0)
+    {
+        return false;
+    }
+
+    uint32_t replayScreenObject = 0;
+    uint32_t replayVtable = 0;
+    __try
+    {
+        auto* const screenTable = reinterpret_cast<uint32_t*>(tableAddress);
+        replayScreenObject = screenTable[8]; // screen index 8 = replay
+        if (replayScreenObject == 0)
+        {
+            return false;
+        }
+        replayVtable = *reinterpret_cast<uint32_t*>(replayScreenObject);
+        if (replayVtable == 0)
+        {
+            return false;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    auto* const updateSlot = reinterpret_cast<uint32_t*>(replayVtable + 4);
+    uint32_t originalUpdateAddress = 0;
+    __try
+    {
+        originalUpdateAddress = *updateSlot;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    const uint32_t hookAddress = reinterpret_cast<uint32_t>(&HookedReplayScreenUpdateThunk);
+    if (originalUpdateAddress == hookAddress)
+    {
+        g_replayUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
+        return g_originalReplayUpdate != nullptr;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(updateSlot, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        return false;
+    }
+
+    *updateSlot = hookAddress;
+    DWORD ignored = 0;
+    (void)VirtualProtect(updateSlot, sizeof(uint32_t), oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), updateSlot, sizeof(uint32_t));
+
+    g_originalReplayUpdate = reinterpret_cast<TitleUpdateFn>(originalUpdateAddress);
+    g_replayUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
+    mod::Log(
+        "InstallHooks: replay screen update hook installed slot=0x%08X original=0x%08X",
+        g_replayUpdateSlotAddress,
+        originalUpdateAddress);
+    return true;
+}
+
+void ArmSpectateReplayBypass()
+{
+    if (!EnsureReplayScreenHook())
+    {
+        mod::Log("SpectateReplayBypass: failed to arm (replay hook unavailable)");
+        return;
+    }
+
+    g_spectateReplayBypassActive = true;
+    g_spectateReplayBypassCountdown = kSpectateReplayBypassFrames;
+    mod::Log("SpectateReplayBypass: armed countdown=%d", kSpectateReplayBypassFrames);
+}
+
+void DisarmSpectateReplayBypass()
+{
+    if (g_spectateReplayBypassActive)
+    {
+        mod::Log("SpectateReplayBypass: disarmed (was active, countdown=%d)",
+            g_spectateReplayBypassCountdown);
+    }
+    g_spectateReplayBypassActive = false;
+    g_spectateReplayBypassCountdown = 0;
+}
+
 void ObserveOfflineSelectionConfirm(uint32_t screenContext)
 {
     const int gameSystem = GetGameSystem(screenContext);
@@ -221,6 +337,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         {
             mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
+            DisarmSpectateReplayBypass();
             g_pendingVsHumanAutoConfirm = false;
             g_pendingVsHumanAutoConfirmTick = 0;
             g_pendingVsHumanAutoConfirmLastLogTick = 0;
@@ -377,6 +494,48 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 
     g_titleConfirmDown = false;
     return UpdateNetplayMenu(screenContext);
+}
+
+// ---------------------------------------------------------------------------
+// Replay screen bypass — hooked update implementation.
+// ---------------------------------------------------------------------------
+static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
+{
+    if (g_spectateReplayBypassActive)
+    {
+        // Clear init flag to skip BGM playback and replay file scanning.
+        // The native init code plays track 6 BGM and calls
+        // initializeReplaySystem — both are undesirable for spectating.
+        __try
+        {
+            *reinterpret_cast<int8_t*>(screenContext + 44) = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (g_spectateReplayBypassCountdown > 0)
+        {
+            --g_spectateReplayBypassCountdown;
+            mod::Log(
+                "SpectateReplayBypass: waiting for DLL mode detection countdown=%d",
+                g_spectateReplayBypassCountdown);
+            return 8; // Stay on replay screen to let DLL detect 0→8 transition
+        }
+
+        // Done waiting — transition to character select.
+        g_spectateReplayBypassActive = false;
+        mod::Log("SpectateReplayBypass: advancing to charselect (return 1)");
+        return 1;
+    }
+
+    // Normal (non-spectate) replay screen: call original function.
+    if (g_originalReplayUpdate == nullptr)
+        return 8;
+    return g_originalReplayUpdate(screenContext);
+}
+
+extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
+{
+    return HookedReplayScreenUpdateImplBody(screenContext);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +828,17 @@ extern "C" __declspec(naked) void HookedCharSelectUpdateThunk()
     {
         push ecx
         call HookedCharSelectUpdateImpl
+        add esp, 4
+        ret
+    }
+}
+
+extern "C" __declspec(naked) void HookedReplayScreenUpdateThunk()
+{
+    __asm
+    {
+        push ecx
+        call HookedReplayScreenUpdateImpl
         add esp, 4
         ret
     }

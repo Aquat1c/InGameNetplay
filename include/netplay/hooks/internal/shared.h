@@ -180,6 +180,9 @@ void RemoveNetplayWindowHook();
 bool ConsumeNetplayEscapeEdge();
 bool EnsureCharSelectEntryHoldHook();
 void ArmCharSelectEntryHold();
+bool EnsureReplayScreenHook();
+void ArmSpectateReplayBypass();
+void DisarmSpectateReplayBypass();
 
 int GetCurrentMenuEntryCount();
 int ClampSelectionToCurrentMenu(int selection);
@@ -242,5 +245,6 @@ extern "C" void __cdecl ReplayCaseCompatImpl(uint32_t screenContext);
 extern "C" void ReplayCaseCompatThunk();
 extern "C" void HookedTitleUpdateThunk();
 extern "C" void HookedTitleRenderThunk();
+extern "C" void HookedReplayScreenUpdateThunk();
 #endif
 } // namespace netplay::hooks::internal
