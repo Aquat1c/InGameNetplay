@@ -380,6 +380,8 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
+// Charselect intro animation input suppression.
+// ---------------------------------------------------------------------------
 // HookedCharSelectUpdateImplBody — the real charselect update logic.
 // Called from HookedCharSelectUpdateImpl which wraps it in setjmp/longjmp
 // protection so NeutralizeExitProcess can safely escape.

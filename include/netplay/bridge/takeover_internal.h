@@ -45,6 +45,14 @@ constexpr int kLocalRoleSpectate = 1;
 constexpr int kLocalRoleLocalPlay = 2;
 constexpr int kLocalRoleTournament = 3;
 
+// Netplay connection role — distinguishes host from client (joiner) within
+// the kLocalRoleOnline umbrella.  Tracked by the mod so we know whether
+// the P1/P2 input-config swap needs to be reversed on disconnect.
+constexpr int kNetplayRoleNone      = 0;  // not in a netplay session
+constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
+constexpr int kNetplayRoleClient    = 2;  // joined (P2 side — inputs swapped)
+constexpr int kNetplayRoleSpectator = 3;  // spectating
+
 // ---------------------------------------------------------------------------
 // Shared structures
 // ---------------------------------------------------------------------------
@@ -146,6 +154,7 @@ extern RevivalInitFn g_localInitFn;
 extern HANDLE g_revivalProcess;
 extern DWORD g_revivalProcessId;
 extern int g_localRoleFlag;
+extern int g_netplayRole;
 extern uintptr_t g_hostRevivalBase;
 
 extern HANDLE g_hostMapHandle;
@@ -293,6 +302,11 @@ bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
 bool DisableRevivalTextRendering();
+
+// Reverse the P1/P2 input-config swap that Revival applied when we joined
+// as client (P2).  No-op unless g_netplayRole == kNetplayRoleClient.
+bool ReverseInputSwapIfClient();
+
 void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);
 void StabilizeOnlineSessionBindingAfterInit(int initMode);

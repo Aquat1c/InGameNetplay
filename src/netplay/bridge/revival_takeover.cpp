@@ -32,6 +32,7 @@ RevivalInitFn g_localInitFn = nullptr;
 HANDLE g_revivalProcess = nullptr;
 DWORD g_revivalProcessId = 0;
 int g_localRoleFlag = -1;
+int g_netplayRole = kNetplayRoleNone;
 uintptr_t g_hostRevivalBase = 0;
 
 HANDLE g_hostMapHandle = nullptr;
@@ -1203,6 +1204,38 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             const bool startInitOk = InvokeStartInitPlayer(initParams[0]);
 
+            // --- Detect netplay role (host / client / spectator) ---
+            if (initParams[0] == kLocalRoleSpectate)
+            {
+                g_netplayRole = kNetplayRoleSpectator;
+                mod::Log("Takeover: netplay role = Spectator");
+            }
+            else if (initParams[0] == kLocalRoleOnline && startInitOk)
+            {
+                // Read the activePlayer field that StartInitPlayer just wrote.
+                // 0 = host (P1), 1 = joiner/client (P2 — inputs were swapped).
+                const uintptr_t sessionPtr = ReadSessionPointerFromRevival();
+                int activePlayer = -1;
+                if (sessionPtr != 0)
+                {
+                    (void)SafeReadInt(
+                        reinterpret_cast<const void*>(
+                            sessionPtr + g_activeRevival->sessionOffsetActivePlayer),
+                        &activePlayer);
+                }
+                if (activePlayer == 1)
+                {
+                    g_netplayRole = kNetplayRoleClient;
+                    mod::Log("Takeover: netplay role = Client (P2, inputs swapped)");
+                }
+                else
+                {
+                    g_netplayRole = kNetplayRoleHost;
+                    mod::Log("Takeover: netplay role = Host (P1, activePlayer=%d)",
+                             activePlayer);
+                }
+            }
+
             // --- Snapshot after StartInitPlayer (writes session fields) ---
             LogInitWriteSnapshot("Tick_startInitPlayer_post");
 
@@ -1425,6 +1458,9 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         mod::Log(
             "Takeover: cancel cleanup — skipped DLL re-init (shutdown path reason='%s')",
             reason != nullptr ? reason : "");
+        // Still reset the netplay role even on shutdown so stale state
+        // doesn't leak to a future session (belt-and-suspenders).
+        g_netplayRole = kNetplayRoleNone;
     }
     // ---- End additional cleanup ------------------------------------------------
 

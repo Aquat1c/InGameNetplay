@@ -1573,6 +1573,16 @@ bool ForceLocalPlayInit()
     // --- Full snapshot BEFORE init() ---
     LogInitWriteSnapshot("ForceLocalPlayInit_pre");
 
+    // If we were the client (P2 / joiner), Revival swapped the P1/P2
+    // input-config blocks during StartInitPlayer.  Reverse that swap now
+    // BEFORE destroying the session so controls return to their default
+    // layout for local play.
+    if (g_netplayRole == kNetplayRoleClient)
+    {
+        ReverseInputSwapIfClient();
+    }
+    g_netplayRole = kNetplayRoleNone;
+
     // Destroy the current session to prevent leaking the old object.
     // This is the root cause fix for the 2nd-session crash (H1).
     const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
@@ -1658,6 +1668,72 @@ bool ForceLocalPlayInit()
 
     // --- Full snapshot AFTER vtable[1] init ---
     LogInitWriteSnapshot("ForceLocalPlayInit_post_vtable1");
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ReverseInputSwapIfClient — calls Revival's EFZ_Obj_SubStruct448_CleanupPair
+// on dword_100A0760 to toggle the P1/P2 input-config swap back to its
+// original state.  Only fires when g_netplayRole == kNetplayRoleClient,
+// meaning we joined as P2 and Revival swapped the two 4-DWORD controller
+// blocks during StartInitPlayer.  The swap is a toggle (XOR-style), so
+// calling it a second time restores the original layout.
+//
+// Must be called during session teardown (ForceLocalPlayInit) BEFORE the
+// session object is destroyed, though the swap targets a persistent global
+// structure (dword_100A0760[20]+448) that survives session changes.
+// ---------------------------------------------------------------------------
+bool ReverseInputSwapIfClient()
+{
+    if (g_netplayRole != kNetplayRoleClient)
+    {
+        mod::Log("ReverseInputSwapIfClient: skipped (role=%d, not client)",
+                 g_netplayRole);
+        return false;
+    }
+
+    if (g_activeRevival == nullptr
+        || g_activeRevival->inputSwapPairRva == 0
+        || g_activeRevival->renderContextBaseOffset == 0)
+    {
+        mod::Log("ReverseInputSwapIfClient: skipped (address profile incomplete)");
+        return false;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        mod::Log("ReverseInputSwapIfClient: skipped (Revival DLL not loaded)");
+        return false;
+    }
+
+    const uintptr_t dllBase = reinterpret_cast<uintptr_t>(revival);
+    const uintptr_t contextBaseAddr = dllBase + g_activeRevival->renderContextBaseOffset;
+
+    // EFZ_Obj_SubStruct448_CleanupPair is __thiscall with
+    // this = &dword_100A0760 = dllBase + renderContextBaseOffset.
+    typedef int(__thiscall* SwapInputsFn)(void* thisPtr);
+    auto swapFn = reinterpret_cast<SwapInputsFn>(
+        dllBase + g_activeRevival->inputSwapPairRva);
+
+    __try
+    {
+        const int result = swapFn(reinterpret_cast<void*>(contextBaseAddr));
+        mod::Log(
+            "ReverseInputSwapIfClient: swap reversed OK (fn=0x%08lX this=0x%08lX result=%d)",
+            static_cast<unsigned long>(dllBase + g_activeRevival->inputSwapPairRva),
+            static_cast<unsigned long>(contextBaseAddr),
+            result);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log(
+            "ReverseInputSwapIfClient: EXCEPTION calling swap fn=0x%08lX this=0x%08lX",
+            static_cast<unsigned long>(dllBase + g_activeRevival->inputSwapPairRva),
+            static_cast<unsigned long>(contextBaseAddr));
+        return false;
+    }
 
     return true;
 }

@@ -91,6 +91,13 @@ struct RevivalAddressProfile
     // "Start init player" function RVA (sub_10072880 in 1.02e).
     uintptr_t startInitPlayerRva;
 
+    // RVA of EFZ_Obj_SubStruct448_CleanupPair (sub_1006CAD0 in 1.02e).
+    // A __thiscall(void* &dword_100A0760) function that swaps the two
+    // adjacent 4-DWORD input-config blocks (P1 ↔ P2 controllers).
+    // The swap is a toggle — calling it twice restores the original state.
+    // Used to reverse the P2 input swap when a client disconnects.
+    uintptr_t inputSwapPairRva;
+
     // -----------------------------------------------------------------------
     // Session object field offsets (byte offsets from session pointer)
     // -----------------------------------------------------------------------
@@ -214,6 +221,7 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     0x000021E0u,                                        // errorCodeIsZeroRva
     8u,                                                 // errorCodeIsZeroPatchSize
     0x00072880u,                                        // startInitPlayerRva
+    0x0006CAD0u,                                        // inputSwapPairRva
     1220u,                                              // sessionOffsetInitComplete
     688u,                                               // sessionOffsetInputDelay
     936u,                                               // sessionOffsetPingMs
