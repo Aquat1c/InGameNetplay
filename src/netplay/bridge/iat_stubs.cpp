@@ -1766,14 +1766,14 @@ BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumbe
 BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
     const BOOL result = WriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterAChunk(lpCharacter, nLength);
+    MaybeLogConsoleOutputCharacterAChunk(lpCharacter, nLength, dwWriteCoord);
     return result;
 }
 
 BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
     const BOOL result = WriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterWChunk(lpCharacter, nLength);
+    MaybeLogConsoleOutputCharacterWChunk(lpCharacter, nLength, dwWriteCoord);
     return result;
 }
 

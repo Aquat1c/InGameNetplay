@@ -49,6 +49,8 @@ bool g_charSelectEntryHoldArmed = false;
 InputSnapshot g_lastInputSnapshot = {};
 DelaySetupOverlayState g_delaySetupOverlay = {};
 SpectateConfirmOverlayState g_spectateConfirmOverlay = {};
+HostingOverlayState g_hostingOverlay = {};
+JoiningOverlayState g_joiningOverlay = {};
 DebugOverlayState g_debugOverlay = {};
 std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 bool g_titleConfirmDown = false;

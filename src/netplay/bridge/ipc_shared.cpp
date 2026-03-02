@@ -192,6 +192,58 @@ void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServe
     }
 }
 
+void PublishConsoleError(const char* errorText)
+{
+    if (errorText == nullptr || errorText[0] == '\0')
+    {
+        return;
+    }
+
+    auto writeError = [&](SharedBlock* block)
+    {
+        CopyString(block->consoleErrorText, sizeof(block->consoleErrorText), errorText);
+        InterlockedIncrement(&block->consoleErrorSerial);
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        writeError(g_injectedBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        writeError(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize)
+{
+    LONG serial = 0;
+    const char* text = nullptr;
+
+    if (g_hostBlock != nullptr)
+    {
+        serial = InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
+        text = g_hostBlock->consoleErrorText;
+    }
+
+    if (outSerial != nullptr)
+    {
+        *outSerial = serial;
+    }
+    if (outText != nullptr && outTextSize > 0 && text != nullptr && serial > 0)
+    {
+        CopyString(outText, outTextSize, text);
+    }
+    else if (outText != nullptr && outTextSize > 0)
+    {
+        outText[0] = '\0';
+    }
+}
+
 HMODULE SelfModule()
 {
     HMODULE module = nullptr;

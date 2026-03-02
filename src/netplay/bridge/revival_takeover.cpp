@@ -1309,6 +1309,22 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     }
 
     RefreshRuntimeStatus(ioStatus);
+
+    // --- Console error detection ---
+    // If the Revival process reported a connection error (e.g., "Connection timed out",
+    // "Socket error"), transition to Failed phase immediately.
+    if (ioStatus->consoleErrorSerial > 0
+        && (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup))
+    {
+        mod::Log(
+            "Takeover: console error detected serial=%d text='%s' — transitioning to Failed",
+            ioStatus->consoleErrorSerial,
+            ioStatus->consoleErrorText);
+        SetPhase(ioStatus, NetbridgePhase::Failed, ioStatus->consoleErrorText);
+        ReinitLocalPlay();
+        return;
+    }
+
     NetbridgePhase currentPhase = static_cast<NetbridgePhase>(ioStatus->phase);
     RuntimeReadyProbe runtimeProbe = {};
     if (currentPhase == NetbridgePhase::Connecting || currentPhase == NetbridgePhase::DelaySetup)
@@ -1496,6 +1512,8 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_hostBlock->spectateConfirmInputSerial, 0);
         InterlockedExchange(&g_hostBlock->spectateConfirmInputServedSerial, 0);
         g_hostBlock->spectateConfirmInputValue = 0;
+        InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
+        g_hostBlock->consoleErrorText[0] = '\0';
     }
     ResetNativeWorkflowFlags();
     g_lastConnectingDiagnosticTick = 0;

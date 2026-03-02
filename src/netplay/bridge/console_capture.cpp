@@ -488,6 +488,40 @@ void NoteConsolePromptLine(const std::string& text)
         }
     }
 
+    // --- Connection error detection ---
+    // Revival prints these messages to console on failure. Publish them
+    // through IPC so the host process can transition to Failed phase.
+    if (ContainsCaseInsensitive(text, "Connection timed out"))
+    {
+        mod::Log("Takeover: console error detected='Connection timed out' text='%s'", text.c_str());
+        PublishConsoleError("Connection timed out");
+        return;
+    }
+    if (ContainsCaseInsensitive(text, "Source quit or timed out"))
+    {
+        mod::Log("Takeover: console error detected='Source quit or timed out' text='%s'", text.c_str());
+        PublishConsoleError("Source quit or timed out");
+        return;
+    }
+    if (ContainsCaseInsensitive(text, "Spectators have been disabled"))
+    {
+        mod::Log("Takeover: console error detected='Spectators disabled' text='%s'", text.c_str());
+        PublishConsoleError("Spectators have been disabled by the host");
+        return;
+    }
+    if (ContainsCaseInsensitive(text, "Socket error"))
+    {
+        mod::Log("Takeover: console error detected='Socket error' text='%s'", text.c_str());
+        // Use the full text since it includes the socket error details
+        std::string errorMsg = text;
+        if (errorMsg.size() > 120)
+        {
+            errorMsg.resize(120);
+        }
+        PublishConsoleError(errorMsg.c_str());
+        return;
+    }
+
     const bool isSpectateConfirmPrompt =
         ContainsCaseInsensitive(text, "Host already playing, join as a spectator");
 
@@ -617,10 +651,10 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
+    // NOTE: CaptureRevivalNativeLogsEnabled() gate intentionally removed.
+    // This function only does workflow signal detection (NoteConsolePromptLine)
+    // and no longer logs to the mod log.  Gating it prevents detection of
+    // connection errors, delay prompts, and spectate confirmations.
     if (!IsLikelyTextChunk(text, length))
     {
         return;
@@ -682,6 +716,28 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         }
     }
 
+    // Revival writes characters without newlines via WriteConsoleOutputCharacterW
+    // (newlines are cursor moves only).  Check for known error keywords in the
+    // partially-accumulated buffer and flush immediately so the error is
+    // published to IPC before Revival blocks in system("pause").
+    if (line != nullptr && !line->empty() && line->size() >= 12)
+    {
+        static const char* kErrorKeywords[] = {
+            "Connection timed out",
+            "Source quit or timed out",
+            "Spectators have been disabled",
+            "Socket error",
+        };
+        for (const char* kw : kErrorKeywords)
+        {
+            if (line->find(kw) != std::string::npos)
+            {
+                flushLine(true);
+                break;
+            }
+        }
+    }
+
     // For unknown/untracked sources, don't hold partial fragments indefinitely.
     if (SelectPendingConsoleLine(sourceTag) == nullptr && !line->empty())
     {
@@ -691,19 +747,9 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
 
 void FlushPendingConsoleOutput(const char* /*reason*/)
 {
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        std::lock_guard<std::mutex> lock(g_consoleLogMutex);
-        g_consolePendingWriteFile.clear();
-        g_consolePendingWriteFileDisk.clear();
-        g_consolePendingWriteConsoleA.clear();
-        g_consolePendingWriteConsoleW.clear();
-        g_consolePendingWriteConsoleOutputCharacterA.clear();
-        g_consolePendingWriteConsoleOutputCharacterW.clear();
-        g_consolePendingOutputDebugStringA.clear();
-        g_consolePendingOutputDebugStringW.clear();
-        return;
-    }
+    // NOTE: CaptureRevivalNativeLogsEnabled() gate intentionally removed.
+    // Flushing must always happen so NoteConsolePromptLine can detect
+    // workflow signals (errors, delay prompts, spectate confirms).
 
     std::lock_guard<std::mutex> lock(g_consoleLogMutex);
     auto flushOne = [&](const char* /*sourceTag*/, std::string* line) {
@@ -869,30 +915,42 @@ void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars)
     LogConsoleTextChunk("WriteConsoleW", utf8.c_str(), utf8.size());
 }
 
-void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars)
+void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord)
 {
     if (lpBuffer == nullptr || nChars == 0)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
+
+    // Inject synthetic newline when cursor Y changes.  Revival uses cursor
+    // moves for newlines — actual '\n' characters are never written via
+    // WriteConsoleOutputCharacterA.
+    static SHORT s_lastY = -1;
+    if (s_lastY >= 0 && writeCoord.Y != s_lastY)
     {
-        return;
+        LogConsoleTextChunk("WriteConsoleOutputCharacterA", "\n", 1);
     }
+    s_lastY = writeCoord.Y;
 
     LogConsoleTextChunk("WriteConsoleOutputCharacterA", reinterpret_cast<const char*>(lpBuffer), static_cast<size_t>(nChars));
 }
 
-void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars)
+void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord)
 {
     if (lpBuffer == nullptr || nChars == 0)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
+
+    // Inject synthetic newline when cursor Y changes.  Revival uses cursor
+    // moves for newlines — actual '\n' characters are never written via
+    // WriteConsoleOutputCharacterW.
+    static SHORT s_lastY = -1;
+    if (s_lastY >= 0 && writeCoord.Y != s_lastY)
     {
-        return;
+        LogConsoleTextChunk("WriteConsoleOutputCharacterW", "\n", 1);
     }
+    s_lastY = writeCoord.Y;
 
     const wchar_t* wideText = reinterpret_cast<const wchar_t*>(lpBuffer);
     const int wideLen = (std::min)(static_cast<int>(nChars), 0x4000);

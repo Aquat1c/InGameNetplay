@@ -405,6 +405,147 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     return true;
 }
 
+bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
+{
+    if (!g_netplayMenuState.active || !g_hostingOverlay.active)
+    {
+        return false;
+    }
+
+    netplay::draw::LockedMenuSurface lockedSurface;
+    if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
+    {
+        return false;
+    }
+
+    const netplay::font::IndexedSurfaceView sv = {
+        lockedSurface.pixels,
+        lockedSurface.width,
+        lockedSurface.height,
+        lockedSurface.pitch,
+    };
+
+    const uint8_t bgColor     = netplay::draw::ResolveBestPaletteColor(screenContext, 8, 16, 28);
+    const uint8_t frameColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 96, 210, 200);
+    const uint8_t titleColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 220, 245, 245);
+    const uint8_t textColor   = netplay::draw::ResolveBestPaletteColor(screenContext, 180, 208, 208);
+    const uint8_t brightColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 255, 255);
+    const uint8_t dimColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 176, 198, 198);
+    const uint8_t greenColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 100, 255, 130);
+
+    constexpr int panelW = 260;
+    constexpr int panelH = 64;
+    constexpr int panelX = (320 - panelW) / 2;
+    constexpr int panelY = (240 - panelH) / 2;
+    netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
+    netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+
+    const int tL = panelX + 6;
+    const int tR = panelX + panelW - 4;
+
+    netplay::font::DrawTextLeft5x7(sv, "HOSTING", tL, tR, panelY + 4, 1, 1, titleColor);
+
+    char line[192] = {};
+    if (!g_hostingOverlay.ipFetchDone)
+    {
+        std::snprintf(line, sizeof(line), "Fetching public IP...");
+        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 18, 1, 1, dimColor);
+    }
+    else if (g_hostingOverlay.ipFetchFailed)
+    {
+        std::snprintf(line, sizeof(line), "Port: %u  (IP detection failed)",
+            static_cast<unsigned>(g_hostingOverlay.port));
+        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 18, 1, 1, textColor);
+    }
+    else
+    {
+        std::snprintf(line, sizeof(line), "%s:%u",
+            g_hostingOverlay.publicIp, static_cast<unsigned>(g_hostingOverlay.port));
+        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 18, 1, 1, brightColor);
+    }
+
+    // Copied feedback or help text
+    const bool showCopiedFlash = g_hostingOverlay.copiedToClipboard
+        && (GetTickCount() - g_hostingOverlay.copiedFlashTick) < 2000;
+    if (showCopiedFlash)
+    {
+        netplay::font::DrawTextLeft5x7(sv, "Copied to clipboard!", tL, tR, panelY + 34, 1, 1, greenColor);
+    }
+    else if (g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
+    {
+        netplay::font::DrawTextLeft5x7(sv, "Press C button to copy the address", tL, tR, panelY + 34, 1, 1, dimColor);
+    }
+
+    netplay::font::DrawTextLeft5x7(sv, "Waiting for opponent...  ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, textColor);
+
+    netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
+    return true;
+}
+
+bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
+{
+    if (!g_netplayMenuState.active || !g_joiningOverlay.active)
+    {
+        return false;
+    }
+
+    netplay::draw::LockedMenuSurface lockedSurface;
+    if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
+    {
+        return false;
+    }
+
+    const netplay::font::IndexedSurfaceView sv = {
+        lockedSurface.pixels,
+        lockedSurface.width,
+        lockedSurface.height,
+        lockedSurface.pitch,
+    };
+
+    const uint8_t bgColor     = netplay::draw::ResolveBestPaletteColor(screenContext, 8, 16, 28);
+    const uint8_t frameColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 96, 210, 200);
+    const uint8_t titleColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 220, 245, 245);
+    const uint8_t textColor   = netplay::draw::ResolveBestPaletteColor(screenContext, 180, 208, 208);
+    const uint8_t dimColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 176, 198, 198);
+    const uint8_t redColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 80, 80);
+
+    constexpr int panelW = 260;
+    constexpr int panelH = 64;
+    constexpr int panelX = (320 - panelW) / 2;
+    constexpr int panelY = (240 - panelH) / 2;
+    netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
+    netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+
+    const int tL = panelX + 6;
+    const int tR = panelX + panelW - 4;
+
+    netplay::font::DrawTextLeft5x7(sv, "JOINING", tL, tR, panelY + 4, 1, 1, titleColor);
+
+    char line[192] = {};
+    if (g_joiningOverlay.failed)
+    {
+        // Error state
+        netplay::font::DrawTextLeft5x7(sv, "Connection failed:", tL, tR, panelY + 18, 1, 1, redColor);
+        if (g_joiningOverlay.errorText[0] != '\0')
+        {
+            netplay::font::DrawTextLeft5x7(sv, g_joiningOverlay.errorText, tL, tR, panelY + 30, 1, 1, textColor);
+        }
+        netplay::font::DrawTextLeft5x7(sv, "Press any button to dismiss", tL, tR, panelY + 50, 1, 1, dimColor);
+    }
+    else
+    {
+        // Connecting state
+        std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
+            g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
+        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, textColor);
+
+        netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);
+    }
+
+    netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
+    return true;
+}
+
 bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 {
     static bool s_loggedForCurrentOverlay = false;

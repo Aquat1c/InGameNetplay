@@ -574,7 +574,13 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
     }
 #endif
 
-    WriteCrashArtifacts(exceptionPointers, "vectored");
+    // Do NOT write crash artifacts here.  The VEH fires for ALL exceptions
+    // that match IsCrashCode(), including those that are subsequently handled
+    // by frame-based SEH handlers (e.g. guard pages, copy-on-write, internal
+    // library exception flow).  Writing here produces spurious empty crash
+    // files when the game hasn't actually crashed.
+    // Crash artifacts are written only from UnhandledExceptionThunk, which
+    // fires exclusively for truly fatal, unhandled exceptions.
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

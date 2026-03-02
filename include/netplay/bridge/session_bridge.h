@@ -50,6 +50,8 @@ struct NetbridgeStatus
     char errorMsg[128] = {};
     uint32_t phaseTick = 0;
     uint32_t processId = 0;
+    int consoleErrorSerial = 0;
+    char consoleErrorText[128] = {};
 };
 
 struct DelayPromptMetrics

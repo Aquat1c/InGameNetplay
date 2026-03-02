@@ -514,6 +514,10 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     ioStatus->spectateConfirmPromptSerial = static_cast<int>(spectateConfirmSerial);
     ioStatus->spectateConfirmPromptServedSerial = static_cast<int>(spectateConfirmServedSerial);
 
+    LONG consoleErrorSerial = 0;
+    ReadConsoleError(&consoleErrorSerial, ioStatus->consoleErrorText, sizeof(ioStatus->consoleErrorText));
+    ioStatus->consoleErrorSerial = static_cast<int>(consoleErrorSerial);
+
     DelayPromptMetrics promptMetrics = g_delayPromptMetrics;
     if (g_hostBlock != nullptr)
     {

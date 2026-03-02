@@ -1,5 +1,8 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/input_utils.h"
+#include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
 
@@ -8,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 
 namespace netplay::hooks::internal
 {
@@ -83,6 +87,102 @@ void ResetSpectateConfirmOverlayState()
 {
     g_spectateConfirmOverlay = {};
 }
+
+} // namespace (close anonymous to expose hosting overlay functions)
+
+// ---------------------------------------------------------------------------
+// Hosting overlay — shows "Hosting on IP:PORT" while waiting for a client.
+// A background thread fetches the public IPv4 from api4.ipify.org.
+// ---------------------------------------------------------------------------
+void ResetHostingOverlayState()
+{
+    g_hostingOverlay = {};
+}
+
+static bool TryFetchIpFromUrl(const char* url, const char* label)
+{
+    constexpr uint32_t kTimeoutMs = 5000;
+    std::string body;
+    std::string error;
+    // verifyPeer=false: the embedded mbedTLS build has no CA root store,
+    // so certificate verification always fails.  This request only fetches
+    // a plain-text public IP address — no sensitive data.
+    if (!netplay::tls::HttpGet(url, false, kTimeoutMs, &body, &error))
+    {
+        mod::Log("HostingOverlay: %s fetch failed: %s", label, error.c_str());
+        return false;
+    }
+
+    // Trim whitespace / newlines from the response
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+    {
+        body.pop_back();
+    }
+    if (!body.empty() && body.size() < sizeof(g_hostingOverlay.publicIp))
+    {
+        std::memcpy(g_hostingOverlay.publicIp, body.c_str(), body.size() + 1);
+        mod::Log("HostingOverlay: %s = %s", label, g_hostingOverlay.publicIp);
+        return true;
+    }
+    mod::Log("HostingOverlay: %s bad response body size=%zu", label, body.size());
+    return false;
+}
+
+static void FetchPublicIpThread()
+{
+    // Try IPv4 first (api4.ipify.org), fall back to IPv6 (api6.ipify.org)
+    // if the ISP doesn't support IPv4.
+    if (TryFetchIpFromUrl("https://api4.ipify.org", "public IPv4"))
+    {
+        g_hostingOverlay.ipFetchFailed = false;
+        g_hostingOverlay.ipFetchDone = true;
+        return;
+    }
+    mod::Log("HostingOverlay: IPv4 unavailable, trying IPv6 fallback...");
+    if (TryFetchIpFromUrl("https://api6.ipify.org", "public IPv6"))
+    {
+        g_hostingOverlay.ipFetchFailed = false;
+        g_hostingOverlay.ipFetchDone = true;
+        return;
+    }
+    g_hostingOverlay.ipFetchFailed = true;
+    g_hostingOverlay.ipFetchDone = true;
+    mod::Log("HostingOverlay: all IP detection methods failed");
+}
+
+void ActivateHostingOverlay(uint16_t port)
+{
+    ResetHostingOverlayState();
+    g_hostingOverlay.active = true;
+    g_hostingOverlay.port = port;
+    mod::Log("HostingOverlay: activated port=%u, starting IP fetch",
+        static_cast<unsigned>(port));
+
+    // Fire-and-forget background thread for the blocking HTTP request.
+    std::thread(FetchPublicIpThread).detach();
+}
+
+// ---------------------------------------------------------------------------
+// Joining overlay — shows "Connecting to IP:PORT ..." while connecting.
+// Transitions to delay setup on success, or shows the error on failure.
+// ---------------------------------------------------------------------------
+void ResetJoiningOverlayState()
+{
+    g_joiningOverlay = {};
+}
+
+void ActivateJoiningOverlay(const char* address, uint16_t port)
+{
+    ResetJoiningOverlayState();
+    g_joiningOverlay.active = true;
+    g_joiningOverlay.port = port;
+    strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
+    g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
+    mod::Log("JoiningOverlay: activated  target=%s:%u", address, static_cast<unsigned>(port));
+}
+
+namespace  // reopen anonymous namespace
+{
 
 void ActivateSpectateConfirmOverlay()
 {
@@ -257,6 +357,8 @@ int CalculateRecommendedDelayLikeRevival(int delayFloor, float rttMs, float curr
 
 void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeStatus)
 {
+    ResetHostingOverlayState();  // dismiss hosting panel before showing delay setup
+    ResetJoiningOverlayState();   // dismiss joining panel before showing delay setup
     ResetDelaySetupOverlayState();
     g_delaySetupOverlay.active = true;
     g_delaySetupOverlay.waitingForRuntimeReady = false;
@@ -380,6 +482,8 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
             PlayUiSound(screenContext, kSfxConfirm);
             ResetDelaySetupOverlayState();
             ResetSpectateConfirmOverlayState();
+            ResetHostingOverlayState();
+            ResetJoiningOverlayState();
             netplay::bridge::CancelSession("user_cancel");
             mod::Log("DelayOverlay: canceled while waiting for runtime sync");
             return true;
@@ -460,6 +564,8 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         PlayUiSound(screenContext, kSfxConfirm);
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
         netplay::bridge::CancelSession("user_cancel");
         mod::Log("DelayOverlay: canceled");
         return true;
@@ -764,6 +870,8 @@ void HandoffSpectateSession(uint32_t screenContext)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
 
@@ -818,6 +926,8 @@ void EnterNetplayMenu(uint32_t screenContext)
     g_returnToNetplayAfterMatch = false;
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
     SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
     InstallNetplayWindowHook(screenContext);
 
@@ -873,6 +983,8 @@ void LeaveNetplayMenu(uint32_t screenContext)
     DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -1111,7 +1223,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_netplayMenuState.hostPort,
             "",
             g_netplayMenuState.nickname.c_str());
-        if (!started)
+        if (started)
+        {
+            ActivateHostingOverlay(g_netplayMenuState.hostPort);
+        }
+        else
         {
             const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
             char text[320] = {};
@@ -1131,7 +1247,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_netplayMenuState.joinPort,
             g_netplayMenuState.joinAddress.c_str(),
             g_netplayMenuState.nickname.c_str());
-        if (!started)
+        if (started)
+        {
+            ActivateJoiningOverlay(
+                g_netplayMenuState.joinAddress.c_str(),
+                g_netplayMenuState.joinPort);
+        }
+        else
         {
             const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
             char text[320] = {};
@@ -1164,7 +1286,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_netplayMenuState.joinPort,
             status.playing[0].hostIp.c_str(),
             "");
-        if (!started)
+        if (started)
+        {
+            ActivateJoiningOverlay(status.playing[0].hostIp.c_str(), g_netplayMenuState.joinPort);
+        }
+        else
         {
             const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
             char text[320] = {};
@@ -1201,7 +1327,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_netplayMenuState.joinPort,
             g_netplayMenuState.joinAddress.c_str(),
             g_netplayMenuState.nickname.c_str());
-        if (!started)
+        if (started)
+        {
+            ActivateJoiningOverlay(
+                g_netplayMenuState.joinAddress.c_str(),
+                g_netplayMenuState.joinPort);
+        }
+        else
         {
             const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
             char text[320] = {};
@@ -1372,6 +1504,54 @@ char UpdateNetplayMenu(uint32_t screenContext)
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         *inactivityCounter = 0;
         return 0;
+    }
+
+    // --- Join menu: C button = paste IP:port from clipboard ---
+    if (g_netplayMenuState.menuId == NetplayMenuId::Join && !g_inlineEditState.active)
+    {
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 20] == 1)
+            {
+                const HWND owner = reinterpret_cast<HWND>(
+                    *reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+                std::string clipText;
+                if (netplay::input::TryReadClipboardAsciiText(owner, &clipText))
+                {
+                    // Trim whitespace
+                    while (!clipText.empty() && (clipText.back() == ' ' || clipText.back() == '\n' || clipText.back() == '\r' || clipText.back() == '\t'))
+                        clipText.pop_back();
+                    while (!clipText.empty() && (clipText.front() == ' ' || clipText.front() == '\n' || clipText.front() == '\r' || clipText.front() == '\t'))
+                        clipText.erase(clipText.begin());
+
+                    // Split on the last ':' to handle IPv6 addresses (e.g. [::1]:7500)
+                    const std::size_t colonPos = clipText.rfind(':');
+                    if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < clipText.size())
+                    {
+                        const std::string ipPart = clipText.substr(0, colonPos);
+                        const std::string portPart = clipText.substr(colonPos + 1);
+                        const unsigned long parsedPort = std::strtoul(portPart.c_str(), nullptr, 10);
+                        if (parsedPort > 0 && parsedPort <= 65535 && !ipPart.empty())
+                        {
+                            g_netplayMenuState.joinAddress = ipPart;
+                            g_netplayMenuState.joinPort = static_cast<uint16_t>(parsedPort);
+                            PlayUiSound(screenContext, kSfxConfirm);
+                            mod::Log("JoinPaste: pasted address='%s' port=%u from clipboard",
+                                ipPart.c_str(), static_cast<unsigned>(parsedPort));
+                        }
+                        else
+                        {
+                            mod::Log("JoinPaste: invalid IP:port in clipboard '%s'", clipText.c_str());
+                        }
+                    }
+                    else
+                    {
+                        mod::Log("JoinPaste: no ':' separator found in clipboard '%s'", clipText.c_str());
+                    }
+                }
+                break;
+            }
+        }
     }
 
     // --- Debug overlay (D key) ---
@@ -1675,6 +1855,61 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
+    {
+        if (g_joiningOverlay.active && !g_joiningOverlay.failed)
+        {
+            // First frame of failure — populate the overlay with the error
+            g_joiningOverlay.failed = true;
+            if (bridgeStatus.errorMsg[0] != '\0')
+            {
+                strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText),
+                    bridgeStatus.errorMsg, _TRUNCATE);
+                g_joiningOverlay.errorText[sizeof(g_joiningOverlay.errorText) - 1] = '\0';
+            }
+            else
+            {
+                strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText),
+                    bridgePhase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error",
+                    _TRUNCATE);
+            }
+            mod::Log("JoiningOverlay: connection failed — %s", g_joiningOverlay.errorText);
+        }
+
+        // While the joining overlay is showing the error, wait for any button press to dismiss
+        if (g_joiningOverlay.active && g_joiningOverlay.failed)
+        {
+            bool dismissed = ConsumeNetplayEscapeEdge();
+            for (int playerIndex = 0; !dismissed && playerIndex < 2; ++playerIndex)
+            {
+                // Check confirm (A), cancel (B), heavy (C), or direction
+                if (inputBytes[playerIndex + 16] == 1  // A
+                    || inputBytes[playerIndex + 18] == 1  // B
+                    || inputBytes[playerIndex + 20] == 1  // C
+                    || inputBytes[playerIndex + 22] == 1) // D
+                {
+                    dismissed = true;
+                }
+            }
+            if (dismissed)
+            {
+                PlayUiSound(screenContext, kSfxConfirm);
+                ResetJoiningOverlayState();
+                ResetHostingOverlayState();
+                netplay::bridge::CancelSession("dismissed_error");
+                mod::Log("JoiningOverlay: error dismissed by user");
+            }
+            *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+            *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+            ++(*inactivityCounter);
+            return 0;
+        }
+
+        // No joining overlay active — just reset and fall through to idle menu
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+    }
+
     if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
     {
         bool cancelRequested = ConsumeNetplayEscapeEdge();
@@ -1687,9 +1922,39 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
         }
 
+        // C button (heavy attack, offset 20/21) — copy IP:PORT to clipboard
+        if (g_hostingOverlay.active && g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
+        {
+            bool copyRequested = false;
+            for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+            {
+                if (inputBytes[playerIndex + 20] == 1)
+                {
+                    copyRequested = true;
+                    break;
+                }
+            }
+            if (copyRequested)
+            {
+                char clipText[192] = {};
+                std::snprintf(clipText, sizeof(clipText), "%s:%u",
+                    g_hostingOverlay.publicIp,
+                    static_cast<unsigned>(g_hostingOverlay.port));
+                if (netplay::bridge::takeover::TryWriteClipboardAscii(clipText))
+                {
+                    g_hostingOverlay.copiedToClipboard = true;
+                    g_hostingOverlay.copiedFlashTick = GetTickCount();
+                    PlayUiSound(screenContext, kSfxConfirm);
+                    mod::Log("HostingOverlay: copied '%s' to clipboard", clipText);
+                }
+            }
+        }
+
         if (cancelRequested)
         {
             PlayUiSound(screenContext, kSfxConfirm);
+            ResetHostingOverlayState();
+            ResetJoiningOverlayState();
             netplay::bridge::CancelSession("user_cancel");
             mod::Log("NetplayBridge: cancel requested during connecting");
         }

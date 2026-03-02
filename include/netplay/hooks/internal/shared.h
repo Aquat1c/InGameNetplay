@@ -88,6 +88,26 @@ struct SpectateConfirmOverlayState
     char errorMessage[96] = {};
 };
 
+struct HostingOverlayState
+{
+    bool active = false;
+    uint16_t port = 0;
+    char publicIp[128] = {};       // filled asynchronously
+    bool ipFetchDone = false;      // true once background fetch completes (success or fail)
+    bool ipFetchFailed = false;    // true if all attempts failed
+    bool copiedToClipboard = false;
+    DWORD copiedFlashTick = 0;     // GetTickCount() when copy happened (for brief visual feedback)
+};
+
+struct JoiningOverlayState
+{
+    bool active = false;
+    uint16_t port = 0;
+    char address[128] = {};         // target address
+    char errorText[128] = {};       // populated when bridge reports failure
+    bool failed = false;            // true when connection attempt failed
+};
+
 struct DebugOverlayState
 {
     bool open = false;
@@ -161,6 +181,8 @@ extern bool g_charSelectEntryHoldArmed;
 extern InputSnapshot g_lastInputSnapshot;
 extern DelaySetupOverlayState g_delaySetupOverlay;
 extern SpectateConfirmOverlayState g_spectateConfirmOverlay;
+extern HostingOverlayState g_hostingOverlay;
+extern JoiningOverlayState g_joiningOverlay;
 extern DebugOverlayState g_debugOverlay;
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
@@ -175,6 +197,10 @@ void ResetInlineEditState();
 void CancelInlineEdit();
 bool HandleInlineEditInput(uint32_t screenContext, const uint8_t* inputBytes);
 void PlayUiSound(uint32_t screenContext, unsigned short soundIndex);
+void ActivateHostingOverlay(uint16_t port);
+void ResetHostingOverlayState();
+void ActivateJoiningOverlay(const char* address, uint16_t port);
+void ResetJoiningOverlayState();
 void InstallNetplayWindowHook(uint32_t screenContext);
 void RemoveNetplayWindowHook();
 bool ConsumeNetplayEscapeEdge();
@@ -220,6 +246,8 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks();
 bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawHostingOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawJoiningOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDebugOverlay(uint32_t screenContext);
 bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter);

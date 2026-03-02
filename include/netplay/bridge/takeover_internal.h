@@ -92,6 +92,8 @@ struct SharedBlock
     volatile LONG dbgCreateProcessHits = 0;
     volatile LONG dbgWriteProcessHits = 0;
     volatile LONG dbgCreateRemoteThreadHits = 0;
+    volatile LONG consoleErrorSerial = 0;
+    char consoleErrorText[128] = {};
 };
 #pragma pack(pop)
 
@@ -263,8 +265,8 @@ void FlushPendingConsoleOutput(const char* reason);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
 void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars);
-void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars);
-void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars);
+void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord);
+void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord);
 void MaybeLogOutputDebugStringA(LPCSTR lpOutputString);
 void MaybeLogOutputDebugStringW(LPCWSTR lpOutputString);
 std::string ErrorString(DWORD code);
@@ -403,6 +405,8 @@ void PublishDelayPromptSerial(LONG serial);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
 void PublishSpectateConfirmPromptSerial(LONG serial);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
+void PublishConsoleError(const char* errorText);
+void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
 HMODULE SelfModule();
 std::string ModulePath(HMODULE module);
 bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag);

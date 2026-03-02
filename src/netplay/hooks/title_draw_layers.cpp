@@ -398,6 +398,8 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawDebugOverlay(screenContext);
     return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
@@ -409,6 +411,8 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     DrawAnimatedCompactMenuLayer(screenContext);
     (void)DrawDynamicFieldValuesGdi(screenContext, false);
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawDebugOverlay(screenContext);
     return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
