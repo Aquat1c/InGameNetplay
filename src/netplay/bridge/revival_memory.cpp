@@ -683,8 +683,8 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
 
     if (allowSessionInlineNames)
     {
-        tryReadInlineName(sessionPtr + 740u, ioStatus->p1Name, sizeof(ioStatus->p1Name));
-        tryReadInlineName(sessionPtr + 764u, ioStatus->p2Name, sizeof(ioStatus->p2Name));
+        tryReadInlineName(sessionPtr + g_activeRevival->sessionOffsetP1Name, ioStatus->p1Name, sizeof(ioStatus->p1Name));
+        tryReadInlineName(sessionPtr + g_activeRevival->sessionOffsetP2Name, ioStatus->p2Name, sizeof(ioStatus->p2Name));
         sanitizeInlineName(ioStatus->p1Name, sizeof(ioStatus->p1Name));
         sanitizeInlineName(ioStatus->p2Name, sizeof(ioStatus->p2Name));
     }
@@ -2383,7 +2383,7 @@ void RepairRollbackHistoryBindingsIfNeeded()
 //   83 E4 C0  and  esp, 0xC0   (64-byte stack alignment)
 // ---------------------------------------------------------------------------
 
-static constexpr uintptr_t kFrameHookRva = 0x6E590u;
+// Frame hook RVA is now profile-driven: g_activeRevival->frameHookRva
 
 // The jmp_buf and active-flag are read by NeutralizeExitProcess in
 // iat_stubs.cpp.  They are declared extern in takeover_internal.h.
@@ -2914,6 +2914,12 @@ void FixupModeConstructorTrampolines(const char* caller)
 // can run safely.
 static volatile bool g_frameRecoveryPending = false;
 
+// g_tickRecoveryPending: same pattern but for RunPerFrameTickDispatch /
+// OurPerFrameTickHook.  The per-frame tick is the ACTUAL every-frame entry
+// point (sub_1006E570 → vtable[2] → RollbackLoopTick).  ExitProcess most
+// commonly fires here when the peer process dies mid-match.
+static volatile bool g_tickRecoveryPending = false;
+
 // RunFrameDispatch — MSVC C4611 guard: no C++ objects with destructors in scope.
 // Only POD types here.
 #if defined(_MSC_VER)
@@ -2938,6 +2944,7 @@ static void RunFrameDispatch()
     }
     g_netplayFrameJmpActive = false;
 }
+
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
@@ -2972,7 +2979,7 @@ static void RunFrameDispatch()
 // passes.
 // ---------------------------------------------------------------------------
 
-static constexpr uintptr_t kPerFrameTickRva = 0x6E570u;
+// Per-frame tick RVA is now profile-driven: g_activeRevival->perFrameTickRva
 static uint8_t g_perFrameTickTrampoline[12] = {};
 static bool    g_perFrameTickInstalled      = false;
 static bool    g_perFrameMismatchLogged     = false;
@@ -3075,6 +3082,34 @@ static void MonitorScreenIndexChange()
     g_lastMonitoredScreenIndex = currentIdx;
 }
 
+// RunPerFrameTickDispatch — setjmp guard for the per-frame tick hook.
+// Same pattern as RunFrameDispatch: isolates setjmp into a POD-only
+// function so C++ recovery can run safely in OurPerFrameTickHook.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4611)
+#endif
+static int RunPerFrameTickDispatch(void* fixedThis)
+{
+    g_netplayFrameJmpActive = true;
+    if (setjmp(g_netplayFrameJmpBuf) != 0)
+    {
+        // longjmp path: ExitProcess was intercepted during this frame tick.
+        g_netplayFrameJmpActive = false;
+        g_insideFrameTick = false;
+        g_tickRecoveryPending = true;
+        return 0;
+    }
+    g_insideFrameTick = true;
+    const int result = g_origPerFrameTick(fixedThis);
+    g_insideFrameTick = false;
+    g_netplayFrameJmpActive = false;
+    return result;
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
 // Our per-frame tick hook.  Uses __fastcall to capture ECX (first arg) and
 // EDX (second, unused).  Replaces ECX with the current session pointer
 // before calling the original sub_1006E570.
@@ -3135,10 +3170,194 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     }
 
     // Call the original sub_1006E570 with the corrected ECX.
-    // Set the guard flag so ForceLocalPlayInit knows we're mid-tick.
-    g_insideFrameTick = true;
-    const int result = g_origPerFrameTick(fixedThis);
-    g_insideFrameTick = false;
+    // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
+    // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
+    // during the DLL's session tick (vtable[2] → RollbackLoopTick).
+    const int result = RunPerFrameTickDispatch(fixedThis);
+
+    // ---- ExitProcess recovery path -----------------------------------------
+    // If ExitProcess fired during the per-frame tick, NeutralizeExitProcess
+    // longjmp'd back through RunPerFrameTickDispatch, which set
+    // g_tickRecoveryPending.  Perform full cleanup now that we're outside
+    // the setjmp scope and can safely use C++ constructs.
+    if (g_tickRecoveryPending)
+    {
+        g_tickRecoveryPending = false;
+
+        const int recoveredRole = g_localRoleFlag;
+        const DWORD recoveredPid = g_revivalProcessId;
+        LogSessionDiagnosticState("TickHook_recovery_entry");
+        mod::Log(
+            "TICK_HOOK: ExitProcess intercepted during per-frame tick "
+            "(role=%d pid=%lu) — performing full cleanup",
+            recoveredRole,
+            static_cast<unsigned long>(recoveredPid));
+
+        // Step 1: Reinstate a live local-play session.
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "TICK_HOOK: recovery step 1 ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        // Step 2: Terminate the dead helper process.
+        if (g_revivalProcess != nullptr)
+        {
+            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+            const DWORD termErr = termOk ? 0 : GetLastError();
+            CloseHandle(g_revivalProcess);
+            g_revivalProcess = nullptr;
+            g_revivalProcessId = 0;
+            mod::Log(
+                "TICK_HOOK: recovery step 2 helper terminated "
+                "(pid=%lu termOk=%d err=%lu)",
+                static_cast<unsigned long>(recoveredPid),
+                termOk ? 1 : 0,
+                static_cast<unsigned long>(termErr));
+        }
+        else
+        {
+            mod::Log("TICK_HOOK: recovery step 2 skipped (no helper handle)");
+        }
+
+        // Step 3: Restore DLL Jcc patches.
+        const bool patchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "TICK_HOOK: recovery step 3 RestoreDllExitProcessPatches result=%d",
+            patchOk ? 1 : 0);
+
+        // Step 4: Disable stale text overlays.
+        const bool textOk = DisableRevivalTextRendering();
+        mod::Log(
+            "TICK_HOOK: recovery step 4 DisableRevivalTextRendering result=%d",
+            textOk ? 1 : 0);
+
+        // Step 5: Reset crash/validation state.
+        mod::ResetCrashRecoveryState();
+        ResetGameModeValidation();
+        mod::Log("TICK_HOOK: recovery step 5 crash/validation state reset");
+
+        // Step 6: Force game mode to title screen.
+        const bool modeOk = ForceGameModeToTitle();
+        mod::Log(
+            "TICK_HOOK: recovery step 6 ForceGameModeToTitle result=%d",
+            modeOk ? 1 : 0);
+
+        g_localInitAppliedForSession = false;
+        mod::Log(
+            "TICK_HOOK: full recovery complete (was role=%d), "
+            "next title-screen frame will consume exit interception",
+            recoveredRole);
+        LogSessionDiagnosticState("TickHook_recovery_exit");
+
+        return 0;
+    }
+
+    // ---- Proactive network-disconnect detection ----------------------------
+    // The DLL exit-process Jcc patches make ExitProcess unreachable, which
+    // is a problem during charselect/loading: the DLL's session tick doesn't
+    // actively drive rollback and never triggers ExitProcess even after the
+    // remote opponent disconnects.  The helper process (EfzRevival.exe)
+    // stays alive because ExitProcess is patched out, but its console
+    // capture *does* detect the disconnect and publishes an error string
+    // to the IPC shared block.  Detected messages include:
+    //   - "Connection timed out"      (initial handshake timeout)
+    //   - "Source quit or timed out"  (connected source peer died)
+    //   - "Host timed out"            (host peer timed out)
+    //   - "Remote timed out"          (remote peer timed out, general)
+    //   - "Peer died"                 (backup: any "<endpoint> died" trace)
+    //   - "Socket error"              (low-level network failure)
+    //
+    // Poll g_hostBlock->consoleErrorSerial every ~60 frames (~1s) and
+    // synthesize the same recovery that NeutralizeExitProcess would
+    // perform, so the game returns to the netplay menu instead of hanging.
+    // -----------------------------------------------------------------------
+    if (g_dllExitProcessPatchesSaved
+        && g_hostBlock != nullptr
+        && (g_frameTick % 60) == 0)
+    {
+        const LONG consoleErrSerial =
+            InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
+        if (consoleErrSerial > 0)
+        {
+            // Read the error text for logging before recovery clears it.
+            char consoleErrText[128] = {};
+            ReadConsoleError(nullptr, consoleErrText, sizeof(consoleErrText));
+
+            const int deadRole = g_localRoleFlag;
+            const DWORD deadPid = g_revivalProcessId;
+            LogSessionDiagnosticState("TickHook_disconnectDetected_entry");
+            mod::Log(
+                "TICK_HOOK: *** NETWORK DISCONNECT *** frameTick=%u "
+                "role=%d pid=%lu consoleError='%s' — synthesizing exit interception",
+                g_frameTick,
+                deadRole,
+                static_cast<unsigned long>(deadPid),
+                consoleErrText);
+
+            // Mimic NeutralizeExitProcess: set exit-interception flags so
+            // ConsumeRevivalExitInterception fires on the title screen.
+            InterlockedExchange(&g_revivalExitMode,
+                                static_cast<LONG>(g_localRoleFlag));
+            InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+            // Neutralise the session vtable so subsequent ticks are no-ops.
+            NeutralizeRevivalSessionVtable();
+
+            // Step 1: Reinstate a live local-play session.
+            const bool initOk = ForceLocalPlayInit();
+            mod::Log(
+                "TICK_HOOK: disconnect step 1 ForceLocalPlayInit result=%d",
+                initOk ? 1 : 0);
+
+            // Step 2: Terminate the dead helper process.
+            if (g_revivalProcess != nullptr)
+            {
+                const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+                const DWORD termErr = termOk ? 0 : GetLastError();
+                CloseHandle(g_revivalProcess);
+                g_revivalProcess = nullptr;
+                g_revivalProcessId = 0;
+                mod::Log(
+                    "TICK_HOOK: disconnect step 2 helper terminated "
+                    "(pid=%lu termOk=%d err=%lu)",
+                    static_cast<unsigned long>(deadPid),
+                    termOk ? 1 : 0,
+                    static_cast<unsigned long>(termErr));
+            }
+
+            // Step 3: Restore DLL Jcc patches.
+            const bool patchOk = RestoreDllExitProcessPatches();
+            mod::Log(
+                "TICK_HOOK: disconnect step 3 RestoreDllExitProcessPatches result=%d",
+                patchOk ? 1 : 0);
+
+            // Step 4: Disable stale text overlays.
+            const bool textOk = DisableRevivalTextRendering();
+            mod::Log(
+                "TICK_HOOK: disconnect step 4 DisableRevivalTextRendering result=%d",
+                textOk ? 1 : 0);
+
+            // Step 5: Reset crash/validation state.
+            mod::ResetCrashRecoveryState();
+            ResetGameModeValidation();
+            mod::Log("TICK_HOOK: disconnect step 5 crash/validation state reset");
+
+            // Step 6: Force game mode to title screen.
+            const bool modeOk = ForceGameModeToTitle();
+            mod::Log(
+                "TICK_HOOK: disconnect step 6 ForceGameModeToTitle result=%d",
+                modeOk ? 1 : 0);
+
+            g_localInitAppliedForSession = false;
+            mod::Log(
+                "TICK_HOOK: disconnect recovery complete (was role=%d), "
+                "next title-screen frame will consume exit interception",
+                deadRole);
+            LogSessionDiagnosticState("TickHook_disconnectDetected_exit");
+
+            return 0;
+        }
+    }
 
     // If CancelSession tried to run ForceLocalPlayInit while we were inside
     // the tick (which would destroy the session that RollbackLoopTick was
@@ -3201,6 +3420,11 @@ void ResetGameModeValidation()
     {
         mod::Log("ResetGameModeValidation: clearing stale g_frameRecoveryPending");
         g_frameRecoveryPending = false;
+    }
+    if (g_tickRecoveryPending)
+    {
+        mod::Log("ResetGameModeValidation: clearing stale g_tickRecoveryPending");
+        g_tickRecoveryPending = false;
     }
 }
 
@@ -3327,7 +3551,8 @@ bool InstallNetplayFrameHook()
     }
 
     const uintptr_t base    = reinterpret_cast<uintptr_t>(revival);
-    uint8_t* const  target  = reinterpret_cast<uint8_t*>(base + kFrameHookRva);
+    const uintptr_t frameHookRva = g_activeRevival->frameHookRva;
+    uint8_t* const  target  = reinterpret_cast<uint8_t*>(base + frameHookRva);
 
     // Sanity-check: expect push ebp (0x55) as the first byte.
     uint8_t firstByte = 0;
@@ -3336,13 +3561,13 @@ bool InstallNetplayFrameHook()
         mod::Log(
             "InstallNetplayFrameHook: unexpected byte 0x%02X at RVA 0x%lX — skipping",
             static_cast<unsigned>(firstByte),
-            static_cast<unsigned long>(kFrameHookRva));
+            static_cast<unsigned long>(frameHookRva));
         return false;
     }
 
     // Build trampoline: 6 original bytes + JMP-near back to original+6.
     memcpy(g_frameHookTrampoline, target, 6);
-    const uintptr_t origContinue = base + kFrameHookRva + 6;
+    const uintptr_t origContinue = base + frameHookRva + 6;
     g_frameHookTrampoline[6]     = 0xE9; // JMP near rel32
     const uintptr_t jmpFrom      = reinterpret_cast<uintptr_t>(&g_frameHookTrampoline[6]) + 5;
     *reinterpret_cast<int32_t*>(&g_frameHookTrampoline[7]) =
@@ -3385,7 +3610,7 @@ bool InstallNetplayFrameHook()
     g_frameHookInstalled = true;
     mod::Log(
         "InstallNetplayFrameHook: installed at DLL RVA 0x%lX, trampoline at %p",
-        static_cast<unsigned long>(kFrameHookRva),
+        static_cast<unsigned long>(frameHookRva),
         static_cast<void*>(g_frameHookTrampoline));
 
     // -----------------------------------------------------------------------
@@ -3404,8 +3629,9 @@ bool InstallNetplayFrameHook()
     // -----------------------------------------------------------------------
     if (!g_perFrameTickInstalled)
     {
+        const uintptr_t perFrameTickRva = g_activeRevival->perFrameTickRva;
         uint8_t* const tickTarget =
-            reinterpret_cast<uint8_t*>(base + kPerFrameTickRva);
+            reinterpret_cast<uint8_t*>(base + perFrameTickRva);
 
         uint8_t tickFirstByte = 0;
         if (!SafeReadByte(tickTarget, &tickFirstByte)
@@ -3415,7 +3641,7 @@ bool InstallNetplayFrameHook()
                 "InstallNetplayFrameHook: per-frame tick unexpected byte "
                 "0x%02X at RVA 0x%lX — skipping",
                 static_cast<unsigned>(tickFirstByte),
-                static_cast<unsigned long>(kPerFrameTickRva));
+                static_cast<unsigned long>(perFrameTickRva));
         }
         else
         {
@@ -3457,7 +3683,7 @@ bool InstallNetplayFrameHook()
                     reinterpret_cast<void*>(absTarget));
             }
 
-            const uintptr_t tickContinue = base + kPerFrameTickRva + 6;
+            const uintptr_t tickContinue = base + perFrameTickRva + 6;
             g_perFrameTickTrampoline[6] = 0xE9;
             const uintptr_t tickJmpFrom =
                 reinterpret_cast<uintptr_t>(&g_perFrameTickTrampoline[6]) + 5;
@@ -3506,7 +3732,7 @@ bool InstallNetplayFrameHook()
                     mod::Log(
                         "InstallNetplayFrameHook: per-frame tick hook installed "
                         "at DLL RVA 0x%lX, trampoline at %p",
-                        static_cast<unsigned long>(kPerFrameTickRva),
+                        static_cast<unsigned long>(perFrameTickRva),
                         static_cast<void*>(g_perFrameTickTrampoline));
                 }
             }

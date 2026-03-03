@@ -752,6 +752,11 @@ bool EnsureLocalRevivalLoaded()
         return false;
     }
 
+    // Detect the DLL version BEFORE any profile-dependent operations.
+    // Without this, InstallNetplayFrameHook() (called below) would use
+    // the default 1.02e profile addresses which are wrong for 1.02g+.
+    DetectRevivalVersion();
+
     PublishHostRevivalBase();
     if (!PatchRevivalErrorCodeNullGuard())
     {
@@ -1007,6 +1012,7 @@ bool IsCurrentProcessRevival()
 void InitializeInjected()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    DetectRevivalVersion();
     for (int attempt = 0; attempt < 200; ++attempt)
     {
         if (g_injectedMapHandle == nullptr)

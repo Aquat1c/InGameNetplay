@@ -303,8 +303,63 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         // If resumed, just sleep forever.
         while (true) { Sleep(INFINITE); }
     }
-    // No recovery point active (tournament fallback or unguarded path).
-    // Jcc patches normally prevent reaching here during tournament mode.
+    // No recovery point active.  For tournament mode, Jcc patches normally
+    // prevent ExitProcess from being reached.  If we land here, the patches
+    // failed (e.g. wrong version profile) or an unexpected DLL code path
+    // fired.  Do full cleanup so the game can continue from the title screen.
+    if (currentRole == kLocalRoleTournament)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: tournament fallback cleanup — no jmp "
+            "recovery role=%d screen=%d caller=%s+0x%lX (%p)",
+            currentRole, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        // Step 1: Restore DLL Jcc patches (prevents recursive ExitProcess
+        // during the ForceLocalPlayInit below).
+        const bool patchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 1 RestoreDllExitProcessPatches=%d",
+            patchOk ? 1 : 0);
+
+        // Step 2: Restore tournament-specific EXE patches.
+        const bool exeOk = RestoreTournamentExePatches();
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 2 RestoreTournamentExePatches=%d",
+            exeOk ? 1 : 0);
+
+        // Step 3: Reinstate a live local-play session.
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 3 ForceLocalPlayInit=%d",
+            initOk ? 1 : 0);
+
+        // Step 4: Disable stale text overlays.
+        DisableRevivalTextRendering();
+
+        // Step 5: Reset VEH one-shot guard and game-mode validation.
+        mod::ResetCrashRecoveryState();
+        ResetGameModeValidation();
+
+        // Step 6: Force game mode to title screen.
+        const bool modeOk = ForceGameModeToTitle();
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 6 ForceGameModeToTitle=%d",
+            modeOk ? 1 : 0);
+
+        // Reset tournament role so the title-screen code doesn't think
+        // we're still in tournament mode.
+        g_localRoleFlag = kLocalRoleLocalPlay;
+
+        mod::Log(
+            "NeutralizeExitProcess: tournament cleanup complete, "
+            "suspending thread (role=%d)",
+            currentRole);
+        SuspendThread(GetCurrentThread());
+        while (true) { Sleep(INFINITE); }
+    }
+
+    // Truly unguarded path — unknown role or unexpected state.
     mod::Log(
         "NeutralizeExitProcess: no longjmp recovery point active — "
         "suspending thread (role=%d screen=%d caller=%s+0x%lX, safety fallback)",

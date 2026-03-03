@@ -909,9 +909,14 @@ void EnterNetplayMenu(uint32_t screenContext)
     LoadNetplayMenuSettingsFromIni();
     ResetTitleMenuState(screenContext, 0);
 
+    // If a lobby session is still alive (e.g. returning from a lobby match),
+    // re-enter the Lobby menu directly instead of Main so the user stays in
+    // the lobby and can immediately see the player list / challenge again.
+    const bool returnToLobby = (g_lobbySession != nullptr);
+
     g_netplayMenuState.active = true;
     g_netplayMenuState.bgmActive = true;
-    g_netplayMenuState.menuId = NetplayMenuId::Main;
+    g_netplayMenuState.menuId = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     g_netplayMenuState.mainSelection = 0;
     g_charSelectResetPending = true;
     ResetMenuSlideTransition();
@@ -928,7 +933,8 @@ void EnterNetplayMenu(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
-    SwitchToMenu(screenContext, NetplayMenuId::Main, -1);
+    const NetplayMenuId targetMenu = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
+    SwitchToMenu(screenContext, targetMenu, -1);
     InstallNetplayWindowHook(screenContext);
 
     auto const playBackgroundMusic = reinterpret_cast<PlayBackgroundMusicFn>(RuntimeAddress(kVaPlayBackgroundMusic));
@@ -1281,14 +1287,28 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             break;
         }
 
+        // Parse ip:port from the playing pair's hostIp field.
+        std::string spectateAddr = status.playing[0].hostIp;
+        uint16_t spectatePort = g_netplayMenuState.joinPort;
+        const size_t colonPos = spectateAddr.rfind(':');
+        if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < spectateAddr.size())
+        {
+            const unsigned long parsedPort = std::strtoul(spectateAddr.c_str() + colonPos + 1, nullptr, 10);
+            if (parsedPort > 0 && parsedPort <= 65535)
+            {
+                spectatePort = static_cast<uint16_t>(parsedPort);
+                spectateAddr = spectateAddr.substr(0, colonPos);
+            }
+        }
+
         const bool started = netplay::bridge::StartSession(
             NetbridgeRole::JoinSpectate,
-            g_netplayMenuState.joinPort,
-            status.playing[0].hostIp.c_str(),
+            spectatePort,
+            spectateAddr.c_str(),
             "");
         if (started)
         {
-            ActivateJoiningOverlay(status.playing[0].hostIp.c_str(), g_netplayMenuState.joinPort);
+            ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
         }
         else
         {
@@ -1312,49 +1332,161 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
         const int visSlot = static_cast<int>(action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
         const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
-        std::string targetName;
-        if (g_lobbySession)
+
+        if (!g_lobbySession)
         {
-            const auto status = g_lobbySession->GetStatus();
-            if (realSlot < static_cast<int>(status.idlePlayers.size()))
-            {
-                targetName = status.idlePlayers[realSlot].name;
-            }
+            ShowStubActionMessage(owner, "Lobby session unavailable.");
+            break;
         }
 
-        const bool started = netplay::bridge::StartSession(
-            NetbridgeRole::Join,
-            g_netplayMenuState.joinPort,
-            g_netplayMenuState.joinAddress.c_str(),
-            g_netplayMenuState.nickname.c_str());
-        if (started)
+        const auto lobStatus = g_lobbySession->GetStatus();
+        if (realSlot >= static_cast<int>(lobStatus.displayEntries.size()))
         {
-            ActivateJoiningOverlay(
-                g_netplayMenuState.joinAddress.c_str(),
-                g_netplayMenuState.joinPort);
+            ShowStubActionMessage(owner, "Invalid lobby slot.");
+            break;
         }
-        else
+
+        const auto& entry = lobStatus.displayEntries[realSlot];
+
+        // Block interactions with our own entry and playing entries.
+        if (entry.isSelf)
         {
-            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
-            char text[320] = {};
-            if (targetName.empty())
+            ShowStubActionMessage(owner, "That's you!");
+            break;
+        }
+        if (entry.isPlaying && !entry.isChallenge)
+        {
+            // --- Spectating a playing player ---
+            if (entry.spectateIp.empty())
             {
-                snprintf(
-                    text,
-                    sizeof(text),
-                    "Challenge start failed.\n\n%s",
-                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                ShowStubActionMessage(owner, "No host information available\nfor spectating.");
+                break;
+            }
+
+            std::string spectateAddr = entry.spectateIp;
+            uint16_t spectatePort = g_netplayMenuState.joinPort;
+            const size_t specColonPos = spectateAddr.rfind(':');
+            if (specColonPos != std::string::npos && specColonPos > 0 && specColonPos + 1 < spectateAddr.size())
+            {
+                const unsigned long parsedPort = std::strtoul(spectateAddr.c_str() + specColonPos + 1, nullptr, 10);
+                if (parsedPort > 0 && parsedPort <= 65535)
+                {
+                    spectatePort = static_cast<uint16_t>(parsedPort);
+                    spectateAddr = spectateAddr.substr(0, specColonPos);
+                }
+            }
+
+            mod::Log("LobbySpectate: spectating '%s' id=%d via %s addr=%s port=%u",
+                entry.name.c_str(), entry.playerId, entry.spectateIp.c_str(),
+                spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
+
+            const bool started = netplay::bridge::StartSession(
+                NetbridgeRole::JoinSpectate,
+                spectatePort,
+                spectateAddr.c_str(),
+                "");
+            if (started)
+            {
+                ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
             }
             else
             {
-                snprintf(
-                    text,
-                    sizeof(text),
-                    "Challenge start failed for '%s'.\n\n%s",
-                    targetName.c_str(),
+                const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+                char text[320] = {};
+                snprintf(text, sizeof(text),
+                    "Spectate failed for '%s'.\n\n%s",
+                    entry.name.c_str(),
                     bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                ShowStubActionMessage(owner, text);
             }
-            ShowStubActionMessage(owner, text);
+            break;
+        }
+
+        if (entry.isChallenge)
+        {
+            // --- Accepting an incoming challenge ---
+            // Parse the challenger's ip:port into address + port for StartSession.
+            std::string challengeAddr = entry.ipPort;
+            uint16_t challengePort = g_netplayMenuState.hostPort;
+            const size_t colonPos = entry.ipPort.rfind(':');
+            if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < entry.ipPort.size())
+            {
+                challengeAddr = entry.ipPort.substr(0, colonPos);
+                const unsigned long parsedPort = std::strtoul(entry.ipPort.c_str() + colonPos + 1, nullptr, 10);
+                if (parsedPort > 0 && parsedPort <= 65535)
+                {
+                    challengePort = static_cast<uint16_t>(parsedPort);
+                }
+            }
+
+            mod::Log("LobbyAccept: accepting challenge from '%s' id=%d ip=%s addr=%s port=%u",
+                entry.name.c_str(), entry.playerId, entry.ipPort.c_str(),
+                challengeAddr.c_str(), static_cast<unsigned>(challengePort));
+
+            // Send pre_accept + accept via the lobby session (async on poll thread).
+            g_lobbySession->AcceptChallenge(entry.playerId);
+
+            // Connect to the challenger's address.
+            const bool started = netplay::bridge::StartSession(
+                NetbridgeRole::Join,
+                challengePort,
+                challengeAddr.c_str(),
+                g_netplayMenuState.nickname.c_str());
+            if (started)
+            {
+                ActivateJoiningOverlay(challengeAddr.c_str(), challengePort);
+            }
+            else
+            {
+                const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+                char text[320] = {};
+                snprintf(text, sizeof(text),
+                    "Accept failed for '%s'.\n\n%s",
+                    entry.name.c_str(),
+                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                ShowStubActionMessage(owner, text);
+            }
+        }
+        else
+        {
+            // --- Challenging an idle player (we become host) ---
+            const std::string publicIp = lobStatus.publicIp;
+            if (publicIp.empty())
+            {
+                ShowStubActionMessage(owner, "Public IP not yet discovered.\nPlease wait a moment and try again.");
+                break;
+            }
+
+            char ipPortBuf[128] = {};
+            snprintf(ipPortBuf, sizeof(ipPortBuf), "%s:%u",
+                publicIp.c_str(), static_cast<unsigned>(g_netplayMenuState.hostPort));
+
+            mod::Log("LobbyChallenge: challenging '%s' id=%d with our ip=%s",
+                entry.name.c_str(), entry.playerId, ipPortBuf);
+
+            // Start hosting first so we're ready to accept connections.
+            const bool started = netplay::bridge::StartSession(
+                NetbridgeRole::Host,
+                g_netplayMenuState.hostPort,
+                "",
+                g_netplayMenuState.nickname.c_str());
+            if (started)
+            {
+                ActivateHostingOverlay(g_netplayMenuState.hostPort);
+
+                // Send the challenge to the lobby server (async on poll thread).
+                g_lobbySession->SendChallenge(entry.playerId, std::string(ipPortBuf));
+            }
+            else
+            {
+                const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+                char text[320] = {};
+                snprintf(text, sizeof(text),
+                    "Host start failed for challenge to '%s'.\n\n%s",
+                    entry.name.c_str(),
+                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                ShowStubActionMessage(owner, text);
+            }
         }
         break;
     }
@@ -1447,26 +1579,26 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
 
     // Lobby: rebuild dynamic entries each frame so that the visible row count
-    // tracks the actual number of idle players.  Also clamp the scroll offset
-    // and sync optionCount / backIndex.
+    // tracks the actual number of display entries (challenges + idle).
+    // Also clamp the scroll offset and sync optionCount / backIndex.
     if (g_netplayMenuState.menuId == NetplayMenuId::Lobby)
     {
-        int idleCount = 0;
+        int displayCount = 0;
         int playingCount = 0;
         if (g_lobbySession)
         {
             const auto lobSt = g_lobbySession->GetStatus();
             if (lobSt.pollState == netplay::lobby::PollState::Polling)
             {
-                idleCount    = static_cast<int>(lobSt.idlePlayers.size());
+                displayCount = static_cast<int>(lobSt.displayEntries.size());
                 playingCount = static_cast<int>(lobSt.playing.size());
             }
         }
-        RebuildLobbyMenuEntries(idleCount, playingCount);
+        RebuildLobbyMenuEntries(displayCount, playingCount);
 
-        // Clamp scroll so we never point past the end of the player list.
-        const int visSlots = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
-        const int maxScroll = std::max(0, idleCount - visSlots);
+        // Clamp scroll so we never point past the end of the display list.
+        const int visSlots = std::min(displayCount, netplay::menu::kLobbyMaxDisplayPlayers);
+        const int maxScroll = std::max(0, displayCount - visSlots);
         if (g_netplayMenuState.lobbyScrollOffset > maxScroll)
         {
             g_netplayMenuState.lobbyScrollOffset = maxScroll;
@@ -1602,6 +1734,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "re-entering netplay menu",
                     nextState);
                 netplay::bridge::CancelSession("peer_died_before_transition");
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
                 EnterNetplayMenu(screenContext);
                 return 0;
             }
@@ -1680,6 +1816,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     nextState);
                 DisarmSpectateReplayBypass();
                 netplay::bridge::CancelSession("peer_died_before_spectate_transition");
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
                 EnterNetplayMenu(screenContext);
                 return 0;
             }
@@ -1703,6 +1843,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (!g_delaySetupOverlay.active)
         {
             ActivateDelaySetupOverlay(bridgeStatus);
+
+            // Notify the lobby that the P2P connection was established so it
+            // can send the deferred 'accept' and transition to "playing".
+            if (g_lobbySession)
+            {
+                g_lobbySession->NotifyMatchConnected();
+            }
         }
         else
         {
@@ -1798,6 +1945,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                         "re-entering netplay menu",
                         nextState);
                     netplay::bridge::CancelSession("peer_died_before_transition");
+                    if (g_lobbySession)
+                    {
+                        g_lobbySession->NotifyEndMatch();
+                    }
                     EnterNetplayMenu(screenContext);
                     return 0;
                 }
@@ -1819,6 +1970,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "re-entering netplay menu",
                     nextState);
                 netplay::bridge::CancelSession("peer_died_before_transition");
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
                 EnterNetplayMenu(screenContext);
                 return 0;
             }
@@ -1849,6 +2004,20 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
+            if (!netplay::bridge::IsPeerProcessAlive())
+            {
+                mod::Log(
+                    "NetplayTransition: ABORT — peer exited before auto-handoff state=%d, "
+                    "re-entering netplay menu",
+                    nextState);
+                netplay::bridge::CancelSession("peer_died_before_transition");
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
+                EnterNetplayMenu(screenContext);
+                return 0;
+            }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
             return static_cast<char>(nextState);
         }
@@ -1897,6 +2066,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 ResetJoiningOverlayState();
                 ResetHostingOverlayState();
                 netplay::bridge::CancelSession("dismissed_error");
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
                 mod::Log("JoiningOverlay: error dismissed by user");
             }
             *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
@@ -1908,6 +2081,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         // No joining overlay active — just reset and fall through to idle menu
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
+        if (g_lobbySession)
+        {
+            g_lobbySession->NotifyEndMatch();
+        }
     }
 
     if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
@@ -1956,6 +2133,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
             netplay::bridge::CancelSession("user_cancel");
+            if (g_lobbySession)
+            {
+                g_lobbySession->NotifyEndMatch();
+            }
             mod::Log("NetplayBridge: cancel requested during connecting");
         }
 
@@ -2002,19 +2183,19 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 const int delta = vertical > 0 ? 1 : -1;
                 int next = (current + delta + entryCount) % entryCount;
 
-                // Lobby: intercept boundary movement to scroll the player list
+                // Lobby: intercept boundary movement to scroll the display list
                 // instead of wrapping when more entries exist off-screen.
                 if (g_netplayMenuState.menuId == NetplayMenuId::Lobby && g_lobbySession)
                 {
                     const auto lobSt = g_lobbySession->GetStatus();
-                    const int idleCount = static_cast<int>(lobSt.idlePlayers.size());
-                    const int visSlots  = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
+                    const int displayCount = static_cast<int>(lobSt.displayEntries.size());
+                    const int visSlots  = std::min(displayCount, netplay::menu::kLobbyMaxDisplayPlayers);
 
                     if (delta > 0 && current == visSlots - 1 && next == visSlots)
                     {
                         // Moving down from the last visible slot: scroll if more
-                        // players are below, otherwise fall through to LobbyPlaying0.
-                        const int maxScroll = std::max(0, idleCount - visSlots);
+                        // entries are below, otherwise fall through to LobbyPlaying0.
+                        const int maxScroll = std::max(0, displayCount - visSlots);
                         if (g_netplayMenuState.lobbyScrollOffset < maxScroll)
                         {
                             g_netplayMenuState.lobbyScrollOffset++;

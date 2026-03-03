@@ -350,6 +350,10 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
                 // Schedule multi-frame text clearing to ensure any DLL-side
                 // text overlays (nicknames, ping, delay) are fully purged.
                 g_postExitTextClearFrames = 5;
+                if (g_lobbySession)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
                 mod::Log(
                     "HookedTitleUpdateImpl: exit intercepted (netplay mode=%d), re-entering netplay menu",
                     exitMode);
@@ -383,6 +387,10 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             // persists and the delay overlay re-activates immediately.
             mod::Log("HookedTitleUpdateImpl: post-match return, cancelling session and re-entering netplay menu");
             netplay::bridge::CancelSession("match_ended");
+            if (g_lobbySession)
+            {
+                g_lobbySession->NotifyEndMatch();
+            }
             // Keep clearing DLL text rendering for several frames, just as
             // the tournament-mode exit path does.  init(3,102) or a transient
             // session tick can re-add text after the first clear.

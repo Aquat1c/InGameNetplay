@@ -122,6 +122,65 @@ std::string g_configuredHolePunchServer;
 static HANDLE g_childJobObject = nullptr;
 
 // ---------------------------------------------------------------------------
+// Version detection
+// ---------------------------------------------------------------------------
+
+/// Detect the loaded Revival DLL version by reading its PE TimeDateStamp
+/// and matching against known profiles.  Sets g_activeRevival to the
+/// matching profile (or leaves it at the default 1.02e if detection fails).
+/// Call this once early — before any profile-dependent code runs.
+void DetectRevivalVersion()
+{
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        mod::Log("DetectRevivalVersion: EfzRevival.dll not loaded — keeping "
+                 "default profile %s", g_activeRevival->versionTag);
+        return;
+    }
+
+    // Read PE TimeDateStamp from the loaded image header.
+    const auto* base = reinterpret_cast<const uint8_t*>(revival);
+    const auto dosE_lfanew = *reinterpret_cast<const int32_t*>(base + 0x3C);
+    if (dosE_lfanew < 0 || dosE_lfanew > 0x1000)
+    {
+        mod::Log("DetectRevivalVersion: invalid e_lfanew=0x%X — keeping default",
+                 static_cast<unsigned>(dosE_lfanew));
+        return;
+    }
+
+    const auto* peSignature = reinterpret_cast<const uint32_t*>(base + dosE_lfanew);
+    if (*peSignature != 0x00004550u)  // "PE\0\0"
+    {
+        mod::Log("DetectRevivalVersion: bad PE signature 0x%08X — keeping default",
+                 static_cast<unsigned>(*peSignature));
+        return;
+    }
+
+    // COFF header TimeDateStamp is at PE+8.
+    const uint32_t timestamp = *reinterpret_cast<const uint32_t*>(base + dosE_lfanew + 8);
+
+    // Search known profiles.
+    for (size_t i = 0; i < kRevivalProfileCount; ++i)
+    {
+        if (kAllRevivalProfiles[i]->peTimestamp == timestamp)
+        {
+            g_activeRevival = kAllRevivalProfiles[i];
+            mod::Log("DetectRevivalVersion: matched timestamp 0x%08X → %s",
+                     static_cast<unsigned>(timestamp),
+                     g_activeRevival->versionTag);
+            return;
+        }
+    }
+
+    // Unknown timestamp — keep default and warn.
+    mod::Log("DetectRevivalVersion: UNKNOWN timestamp 0x%08X — keeping default %s. "
+             "Addresses may be wrong!",
+             static_cast<unsigned>(timestamp),
+             g_activeRevival->versionTag);
+}
+
+// ---------------------------------------------------------------------------
 // Job object helpers
 // ---------------------------------------------------------------------------
 
@@ -183,6 +242,8 @@ void InitializeHost()
     }
     else
     {
+        // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
+        // before any profile-dependent operations (frame hook, etc.).
         (void)SetLocalRoleFlag(kLocalRoleLocalPlay, "host_initialize");
     }
     mod::Log("Takeover: host initialized");
@@ -931,14 +992,16 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         }
         else
         {
-            if (!runtimeReady)
+            // Connected phase: peer process has exited.  Regardless of
+            // whether the rollback runtime still reports ready, terminate
+            // the session.  Keeping it alive leads to a stuck state where
+            // no further progress is possible.
+            SetPhase(ioStatus, NetbridgePhase::SessionEnded,
+                     runtimeReady ? "peer disconnected" : nullptr);
+            ReinitLocalPlay();
+            if (runtimeReady)
             {
-                SetPhase(ioStatus, NetbridgePhase::SessionEnded, nullptr);
-                ReinitLocalPlay();
-            }
-            else
-            {
-                mod::Log("Takeover: helper process exited but runtime session still active");
+                mod::Log("Takeover: helper process exited during Connected phase — forcing SessionEnded (runtime was still ready)");
             }
         }
         return;
@@ -1312,17 +1375,37 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
     // --- Console error detection ---
     // If the Revival process reported a connection error (e.g., "Connection timed out",
-    // "Socket error"), transition to Failed phase immediately.
-    if (ioStatus->consoleErrorSerial > 0
-        && (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup))
+    // "Source quit or timed out", "Host timed out", "Remote timed out", "Peer died",
+    // "Socket error"), act immediately.
+    if (ioStatus->consoleErrorSerial > 0)
     {
-        mod::Log(
-            "Takeover: console error detected serial=%d text='%s' — transitioning to Failed",
-            ioStatus->consoleErrorSerial,
-            ioStatus->consoleErrorText);
-        SetPhase(ioStatus, NetbridgePhase::Failed, ioStatus->consoleErrorText);
-        ReinitLocalPlay();
-        return;
+        if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
+        {
+            mod::Log(
+                "Takeover: console error detected serial=%d text='%s' phase=%d — transitioning to Failed",
+                ioStatus->consoleErrorSerial,
+                ioStatus->consoleErrorText,
+                static_cast<int>(phase));
+            SetPhase(ioStatus, NetbridgePhase::Failed, ioStatus->consoleErrorText);
+            ReinitLocalPlay();
+            return;
+        }
+        if (phase == NetbridgePhase::Connected)
+        {
+            // During Connected phase (charselect/gameplay after handoff),
+            // the helper process detected a network disconnect.  The per-
+            // frame tick hook (OurPerFrameTickHook) also polls this flag
+            // and performs full recovery.  Here we transition the bridge
+            // phase so any code that checks GetStatus() sees the session
+            // has ended.  The heavy recovery (ForceLocalPlayInit, restore
+            // patches, ForceGameModeToTitle) is handled by the tick hook.
+            mod::Log(
+                "Takeover: console error detected serial=%d text='%s' phase=Connected — transitioning to SessionEnded",
+                ioStatus->consoleErrorSerial,
+                ioStatus->consoleErrorText);
+            SetPhase(ioStatus, NetbridgePhase::SessionEnded, ioStatus->consoleErrorText);
+            return;
+        }
     }
 
     NetbridgePhase currentPhase = static_cast<NetbridgePhase>(ioStatus->phase);

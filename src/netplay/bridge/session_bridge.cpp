@@ -1,6 +1,7 @@
 #include "netplay/bridge/session_bridge.h"
 
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/takeover_internal.h"
 #include "logger.h"
 
 #include <cstdio>
@@ -598,6 +599,17 @@ bool ForceLocalPlayInit()
 bool ForceGameModeToTitle()
 {
     return takeover::ForceGameModeToTitle();
+}
+uintptr_t GetRevivalRenderContextOffset()
+{
+    const auto* profile = takeover::g_activeRevival;
+    return profile != nullptr ? profile->renderContextGlobalOffset : 0;
+}
+uintptr_t GetRevivalSessionPtrOffset()
+{
+    const auto* profile = takeover::g_activeRevival;
+    return (profile != nullptr && profile->sessionPtrOffsetCount > 0)
+        ? profile->sessionPtrOffsets[0] : 0;
 }
 } // namespace netplay::bridge
 

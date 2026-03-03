@@ -207,15 +207,17 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
             const uintptr_t revBase = reinterpret_cast<uintptr_t>(revival);
             std::fprintf(file, "revival_base=0x%08lX\n", static_cast<unsigned long>(revBase));
 
-            // Dump dword_100A0778 (renderContextGlobalOffset = 0xA0778).
-            const uintptr_t renderCtxAddr = revBase + 0x000A0778u;
-            const uintptr_t renderCtxVal = SafeReadDword(renderCtxAddr);
+            // Dump the render context global using the active version profile.
+            const uintptr_t renderCtxOffset = netplay::bridge::GetRevivalRenderContextOffset();
+            const uintptr_t renderCtxAddr = (renderCtxOffset != 0) ? revBase + renderCtxOffset : 0;
+            const uintptr_t renderCtxVal = (renderCtxAddr != 0) ? SafeReadDword(renderCtxAddr) : 0;
             std::fprintf(file, "revival_renderCtx_addr=0x%08lX\n", static_cast<unsigned long>(renderCtxAddr));
             std::fprintf(file, "revival_renderCtx_value=0x%08lX\n", static_cast<unsigned long>(renderCtxVal));
 
-            // Dump dword_100A02CC (session pointer).
-            const uintptr_t sessionAddr = revBase + 0x000A02CCu;
-            const uintptr_t sessionVal = SafeReadDword(sessionAddr);
+            // Dump the session pointer using the active version profile.
+            const uintptr_t sessionPtrOffset = netplay::bridge::GetRevivalSessionPtrOffset();
+            const uintptr_t sessionAddr = (sessionPtrOffset != 0) ? revBase + sessionPtrOffset : 0;
+            const uintptr_t sessionVal = (sessionAddr != 0) ? SafeReadDword(sessionAddr) : 0;
             std::fprintf(file, "revival_session_addr=0x%08lX\n", static_cast<unsigned long>(sessionAddr));
             std::fprintf(file, "revival_session_value=0x%08lX\n", static_cast<unsigned long>(sessionVal));
 

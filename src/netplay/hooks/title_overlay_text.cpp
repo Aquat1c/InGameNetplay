@@ -93,21 +93,43 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     case NetplayMenuAction::LobbySlot5:
     {
         // The visible slot index in the dynamic entry list.  Add the scroll
-        // offset to get the real index into idlePlayers[].
+        // offset to get the real index into displayEntries[].
         const int visSlot  = static_cast<int>(entry.action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
         const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
         if (g_lobbySession)
         {
             const auto status = g_lobbySession->GetStatus();
-            if (realSlot < static_cast<int>(status.idlePlayers.size()))
+            if (realSlot < static_cast<int>(status.displayEntries.size()))
             {
+                const auto& de = status.displayEntries[realSlot];
                 // Show a scroll indicator on the first/last visible row so the
-                // user knows there are more players above/below.
-                const int idleCount = static_cast<int>(status.idlePlayers.size());
-                const int visSlots  = std::min(idleCount, netplay::menu::kLobbyMaxDisplayPlayers);
-                std::string name    = status.idlePlayers[realSlot].name;
+                // user knows there are more entries above/below.
+                const int displayCount = static_cast<int>(status.displayEntries.size());
+                const int visSlots  = std::min(displayCount, netplay::menu::kLobbyMaxDisplayPlayers);
+                // Prefix names with status indicators:
+                //   [!]  = incoming challenge
+                //   [O]  = player is in a match
+                //   [YOU] = our own entry
+                // All prefixes are padded to 6 chars so names align.
+                std::string name;
+                if (de.isSelf)
+                {
+                    name = "[YOU] " + de.name;
+                }
+                else if (de.isChallenge)
+                {
+                    name = " [!]  " + de.name;
+                }
+                else if (de.isPlaying)
+                {
+                    name = " [O]  " + de.name;
+                }
+                else
+                {
+                    name = "      " + de.name;
+                }
                 const bool canScrollUp   = (g_netplayMenuState.lobbyScrollOffset > 0);
-                const bool canScrollDown = (g_netplayMenuState.lobbyScrollOffset < std::max(0, idleCount - visSlots));
+                const bool canScrollDown = (g_netplayMenuState.lobbyScrollOffset < std::max(0, displayCount - visSlots));
                 if (visSlot == 0 && canScrollUp)
                 {
                     return "^ " + name;
@@ -172,12 +194,21 @@ std::string BuildFooterText()
             return "Connecting to lobby...";
         case netplay::lobby::PollState::Polling:
         {
-            const DWORD elapsed = (GetTickCount() - status.lastPollTick) / 1000u;
-            snprintf(buffer, sizeof(buffer),
-                "%d idle  %d match  R=REFRESH  CONFIRM=Challenge  ESC=BACK",
-                static_cast<int>(status.idlePlayers.size()),
-                static_cast<int>(status.playing.size()));
-            (void)elapsed; // used only for debug; keep footer short
+            const int challengeCount = static_cast<int>(status.challenges.size());
+            const int idleCount = static_cast<int>(status.idlePlayers.size());
+            const int matchCount = static_cast<int>(status.playing.size());
+            if (challengeCount > 0)
+            {
+                snprintf(buffer, sizeof(buffer),
+                    "%d idle  %d challenge  %d match  R=REFRESH  ESC=BACK",
+                    idleCount, challengeCount, matchCount);
+            }
+            else
+            {
+                snprintf(buffer, sizeof(buffer),
+                    "%d idle  %d match  R=REFRESH  CONFIRM=Challenge  ESC=BACK",
+                    idleCount, matchCount);
+            }
             return buffer;
         }
         case netplay::lobby::PollState::Error:

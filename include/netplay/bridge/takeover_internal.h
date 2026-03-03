@@ -151,6 +151,9 @@ struct RuntimeReadyProbe
 extern std::mutex g_mutex;
 extern const RevivalAddressProfile* g_activeRevival;
 
+// Runtime version detection — reads PE TimeDateStamp, sets g_activeRevival.
+void DetectRevivalVersion();
+
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
 extern HANDLE g_revivalProcess;

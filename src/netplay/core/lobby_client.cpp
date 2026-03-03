@@ -84,7 +84,7 @@ constexpr const wchar_t* kConcertoHost = L"concerto-mbaacc.shib.live";
 constexpr INTERNET_PORT kConcertoPort = INTERNET_DEFAULT_HTTPS_PORT;
 constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kReceiveTimeoutMs = 12000;
-constexpr DWORD kPollIntervalMs = 3000;
+constexpr DWORD kPollIntervalMs = 1000;
 std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
 
 struct LobbyEndpointConfig
@@ -1108,9 +1108,81 @@ LobbyStatus LobbySession::GetStatus() const
     return m_status;
 }
 
+int LobbySession::GetPlayerId() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_playerId;
+}
+
 void LobbySession::RequestRefresh()
 {
     m_refreshRequested.store(true);
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+}
+
+void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PendingAction action;
+        action.type = PendingAction::Challenge;
+        action.targetPlayerId = targetPlayerId;
+        action.ipPort = ipPort;
+        m_pendingActions.push_back(std::move(action));
+    }
+    // Wake the poll thread to process immediately.
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+}
+
+void LobbySession::AcceptChallenge(int challengerPlayerId)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PendingAction action;
+        action.type = PendingAction::PreAccept;
+        action.targetPlayerId = challengerPlayerId;
+        m_pendingActions.push_back(std::move(action));
+    }
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+}
+
+void LobbySession::NotifyMatchConnected()
+{
+    // Called when the P2P connection is established (delay setup overlay shown).
+    // Queue the deferred 'accept' so the lobby shows the pair as "playing".
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PendingAction action;
+        action.type = PendingAction::ConfirmAccept;
+        // targetPlayerId is not needed for accept — the server tracks the
+        // pending challenge state.  We send 0 and DoAccept will use
+        // the last pre_accept target if needed.
+        action.targetPlayerId = 0;
+        m_pendingActions.push_back(std::move(action));
+    }
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+}
+
+void LobbySession::NotifyEndMatch()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PendingAction action;
+        action.type = PendingAction::End;
+        m_pendingActions.push_back(std::move(action));
+    }
     if (m_wakeEvent != nullptr)
     {
         SetEvent(m_wakeEvent);
@@ -1146,10 +1218,17 @@ void LobbySession::PollThreadEntry()
 
     mod::Log("LobbySession::PollThread: joined lobby id=%d playerId=%d", m_lobbyNumericId, m_playerId);
 
+    // Discover public IP in the background after joining.
+    DiscoverPublicIp();
+
     // Poll loop.
     while (!m_shouldStop.load())
     {
         m_refreshRequested.store(false);
+
+        // Process any queued challenge/accept actions before polling.
+        ProcessPendingActions();
+
         DoPollStatus();
 
         // Wait for kPollIntervalMs or until woken early.
@@ -1267,13 +1346,22 @@ bool LobbySession::DoPollStatus()
     std::vector<LobbyPlayer> idlePlayers;
     ParseIdlePlayers(body, &idlePlayers);
 
+    std::vector<LobbyChallenge> challenges;
+    ParseChallenges(body, &challenges);
+
     std::vector<LobbyPlayingPair> playingPairs;
     ParsePlayingPairs(body, &playingPairs);
+
+    std::vector<LobbyDisplayEntry> displayEntries;
+    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, &displayEntries);
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_status.pollState = PollState::Polling;
     m_status.idlePlayers = std::move(idlePlayers);
+    m_status.challenges = std::move(challenges);
+    m_status.displayEntries = std::move(displayEntries);
     m_status.playing = std::move(playingPairs);
+    m_status.publicIp = m_publicIp;
     m_status.statusMessage.clear();
     m_status.lastPollTick = GetTickCount();
     return true;
@@ -1610,6 +1698,415 @@ void LobbySession::ParsePlayingPairs(const std::string& json, std::vector<LobbyP
         }
 
         out->push_back(std::move(pair));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Challenge JSON parsing
+// ---------------------------------------------------------------------------
+
+void LobbySession::ParseChallenges(const std::string& json, std::vector<LobbyChallenge>* out)
+{
+    out->clear();
+
+    // Find the challenges array: "challenges":[
+    // Each element is ["name", playerId, "ip:port"]
+    const char* tag = "\"challenges\":[";
+    const size_t tagPos = json.find(tag);
+    if (tagPos == std::string::npos)
+    {
+        return;
+    }
+
+    size_t cursor = tagPos + std::strlen(tag);
+
+    while (cursor < json.size() && out->size() < 16u)
+    {
+        // Skip whitespace and commas.
+        while (cursor < json.size() && (json[cursor] == ',' || json[cursor] == ' ' || json[cursor] == '\n' || json[cursor] == '\r'))
+        {
+            ++cursor;
+        }
+
+        if (cursor >= json.size() || json[cursor] == ']')
+        {
+            break;
+        }
+
+        if (json[cursor] != '[')
+        {
+            break;
+        }
+        ++cursor; // consume '['
+
+        // Read quoted name.
+        while (cursor < json.size() && json[cursor] == ' ')
+        {
+            ++cursor;
+        }
+        if (cursor >= json.size() || json[cursor] != '"')
+        {
+            break;
+        }
+        ++cursor; // consume opening '"'
+
+        std::string name;
+        while (cursor < json.size() && json[cursor] != '"')
+        {
+            if (json[cursor] == '\\' && cursor + 1 < json.size())
+            {
+                ++cursor;
+            }
+            name += json[cursor];
+            ++cursor;
+        }
+        if (cursor < json.size())
+        {
+            ++cursor; // consume closing '"'
+        }
+
+        // Skip comma.
+        while (cursor < json.size() && (json[cursor] == ',' || json[cursor] == ' '))
+        {
+            ++cursor;
+        }
+
+        // Read player id.
+        if (cursor >= json.size() || !std::isdigit(static_cast<unsigned char>(json[cursor])))
+        {
+            break;
+        }
+        char* endPtr = nullptr;
+        const int playerId = static_cast<int>(std::strtol(json.c_str() + cursor, &endPtr, 10));
+        cursor = static_cast<size_t>(endPtr - json.c_str());
+
+        // Skip comma.
+        while (cursor < json.size() && (json[cursor] == ',' || json[cursor] == ' '))
+        {
+            ++cursor;
+        }
+
+        // Read ip:port string.
+        std::string ipPort;
+        if (cursor < json.size() && json[cursor] == '"')
+        {
+            ++cursor; // consume opening '"'
+            while (cursor < json.size() && json[cursor] != '"')
+            {
+                ipPort += json[cursor];
+                ++cursor;
+            }
+            if (cursor < json.size())
+            {
+                ++cursor; // consume closing '"'
+            }
+        }
+
+        // Advance past closing ']'.
+        while (cursor < json.size() && json[cursor] != ']')
+        {
+            ++cursor;
+        }
+        if (cursor < json.size())
+        {
+            ++cursor;
+        }
+
+        LobbyChallenge ch;
+        ch.name = std::move(name);
+        ch.playerId = playerId;
+        ch.ipPort = std::move(ipPort);
+        out->push_back(std::move(ch));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build merged display list
+// ---------------------------------------------------------------------------
+
+void LobbySession::BuildDisplayEntries(
+    const std::vector<LobbyChallenge>& challenges,
+    const std::vector<LobbyPlayer>& idlePlayers,
+    const std::vector<LobbyPlayingPair>& playing,
+    int selfPlayerId,
+    std::vector<LobbyDisplayEntry>* out)
+{
+    out->clear();
+    out->reserve(challenges.size() + idlePlayers.size());
+
+    // Build a set of player IDs that appear in challenges, so we can
+    // deduplicate them from the idle list (a challenger also shows in idle).
+    std::vector<int> challengerIds;
+    challengerIds.reserve(challenges.size());
+
+    // Build a set of player IDs that are currently playing.
+    std::vector<int> playingIds;
+    playingIds.reserve(playing.size() * 2);
+    for (const auto& pp : playing)
+    {
+        playingIds.push_back(pp.p1Id);
+        playingIds.push_back(pp.p2Id);
+    }
+
+    auto isPlayerPlaying = [&](int id) -> bool {
+        for (int pid : playingIds)
+        {
+            if (pid == id) return true;
+        }
+        return false;
+    };
+
+    auto findSpectateIp = [&](int id) -> std::string {
+        for (const auto& pp : playing)
+        {
+            if (pp.p1Id == id || pp.p2Id == id)
+            {
+                return pp.hostIp;
+            }
+        }
+        return std::string();
+    };
+
+    // Challenges first — they are actionable and time-sensitive.
+    for (const auto& ch : challenges)
+    {
+        challengerIds.push_back(ch.playerId);
+
+        LobbyDisplayEntry entry;
+        entry.name = ch.name;
+        entry.playerId = ch.playerId;
+        entry.isChallenge = true;
+        entry.isSelf = (ch.playerId == selfPlayerId);
+        entry.isPlaying = isPlayerPlaying(ch.playerId);
+        entry.ipPort = ch.ipPort;
+        entry.spectateIp = findSpectateIp(ch.playerId);
+        out->push_back(std::move(entry));
+    }
+
+    // Then idle players, skipping any that already appear as challengers.
+    for (const auto& p : idlePlayers)
+    {
+        bool isDuplicate = false;
+        for (int cid : challengerIds)
+        {
+            if (cid == p.playerId)
+            {
+                isDuplicate = true;
+                break;
+            }
+        }
+        if (isDuplicate)
+        {
+            continue;
+        }
+
+        LobbyDisplayEntry entry;
+        entry.name = p.name;
+        entry.playerId = p.playerId;
+        entry.isChallenge = false;
+        entry.isSelf = (p.playerId == selfPlayerId);
+        entry.isPlaying = isPlayerPlaying(p.playerId);
+        entry.spectateIp = findSpectateIp(p.playerId);
+        out->push_back(std::move(entry));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Challenge / Accept / Pre-Accept HTTP calls
+// ---------------------------------------------------------------------------
+
+bool LobbySession::DoChallenge(int targetPlayerId, const std::string& ipPort)
+{
+    char path[512];
+    std::snprintf(
+        path,
+        sizeof(path),
+        "/l?action=challenge&id=%d&p=%d&secret=%d&t=%d&ip=%s",
+        m_lobbyNumericId,
+        m_playerId,
+        m_secret,
+        targetPlayerId,
+        UrlEncode(ipPort).c_str());
+
+    const std::string body = DoHttpGet(path);
+    mod::Log("LobbySession::DoChallenge: target=%d ip=%s response='%s'",
+        targetPlayerId, ipPort.c_str(), body.c_str());
+
+    return !body.empty() && body.find("\"OK\"") != std::string::npos;
+}
+
+bool LobbySession::DoPreAccept(int challengerPlayerId)
+{
+    char path[512];
+    std::snprintf(
+        path,
+        sizeof(path),
+        "/l?action=pre_accept&id=%d&p=%d&secret=%d&t=%d",
+        m_lobbyNumericId,
+        m_playerId,
+        m_secret,
+        challengerPlayerId);
+
+    const std::string body = DoHttpGet(path);
+    mod::Log("LobbySession::DoPreAccept: challenger=%d response='%s'",
+        challengerPlayerId, body.c_str());
+
+    return !body.empty();
+}
+
+bool LobbySession::DoAccept(int challengerPlayerId)
+{
+    char path[512];
+    std::snprintf(
+        path,
+        sizeof(path),
+        "/l?action=accept&id=%d&p=%d&secret=%d&t=%d",
+        m_lobbyNumericId,
+        m_playerId,
+        m_secret,
+        challengerPlayerId);
+
+    const std::string body = DoHttpGet(path);
+    mod::Log("LobbySession::DoAccept: challenger=%d response='%s'",
+        challengerPlayerId, body.c_str());
+
+    return !body.empty();
+}
+
+bool LobbySession::DoEnd()
+{
+    char path[512];
+    std::snprintf(
+        path,
+        sizeof(path),
+        "/l?action=end&id=%d&p=%d&secret=%d",
+        m_lobbyNumericId,
+        m_playerId,
+        m_secret);
+
+    const std::string body = DoHttpGet(path);
+    mod::Log("LobbySession::DoEnd: response='%s'", body.c_str());
+
+    return !body.empty();
+}
+
+// ---------------------------------------------------------------------------
+// Public IP discovery
+// ---------------------------------------------------------------------------
+
+void LobbySession::DiscoverPublicIp()
+{
+    // Try the embedded TLS client first (works on all platforms).
+    if (netplay::tls::IsAvailable())
+    {
+        std::string body;
+        std::string error;
+        if (netplay::tls::HttpGet("https://api.ipify.org", false, 5000, &body, &error))
+        {
+            // Trim whitespace.
+            while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+            {
+                body.pop_back();
+            }
+            if (!body.empty())
+            {
+                m_publicIp = body;
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_status.publicIp = m_publicIp;
+                mod::Log("LobbySession::DiscoverPublicIp: resolved=%s", m_publicIp.c_str());
+                return;
+            }
+        }
+        mod::Log("LobbySession::DiscoverPublicIp: TLS request failed: %s", error.c_str());
+    }
+
+    // Fallback: plain HTTP to 4.ident.me (same service Concerto uses) via WinINet.
+    static auto TrimIpBody = [](std::string& s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+        {
+            s.pop_back();
+        }
+    };
+
+    std::string body = DoHttpGetViaWinInet("http://4.ident.me");
+    TrimIpBody(body);
+    if (!body.empty())
+    {
+        m_publicIp = body;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.publicIp = m_publicIp;
+        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.ident.me", m_publicIp.c_str());
+        return;
+    }
+
+    body = DoHttpGetViaWinInet("http://4.tnedi.me");
+    TrimIpBody(body);
+    if (!body.empty())
+    {
+        m_publicIp = body;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.publicIp = m_publicIp;
+        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.tnedi.me", m_publicIp.c_str());
+        return;
+    }
+
+    mod::Log("LobbySession::DiscoverPublicIp: unable to resolve public IP");
+}
+
+// ---------------------------------------------------------------------------
+// Pending action processing
+// ---------------------------------------------------------------------------
+
+void LobbySession::ProcessPendingActions()
+{
+    std::vector<PendingAction> actions;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        actions.swap(m_pendingActions);
+    }
+
+    for (const auto& action : actions)
+    {
+        if (m_shouldStop.load())
+        {
+            break;
+        }
+
+        switch (action.type)
+        {
+        case PendingAction::Challenge:
+            mod::Log("LobbySession: processing challenge target=%d ip=%s",
+                action.targetPlayerId, action.ipPort.c_str());
+            DoChallenge(action.targetPlayerId, action.ipPort);
+            break;
+
+        case PendingAction::PreAccept:
+            mod::Log("LobbySession: processing pre_accept challenger=%d",
+                action.targetPlayerId);
+            m_pendingAcceptTargetId = action.targetPlayerId;
+            DoPreAccept(action.targetPlayerId);
+            break;
+
+        case PendingAction::ConfirmAccept:
+            if (m_pendingAcceptTargetId != 0)
+            {
+                mod::Log("LobbySession: processing deferred accept target=%d",
+                    m_pendingAcceptTargetId);
+                DoAccept(m_pendingAcceptTargetId);
+                m_pendingAcceptTargetId = 0;
+            }
+            else
+            {
+                mod::Log("LobbySession: ConfirmAccept with no pending target, ignoring");
+            }
+            break;
+
+        case PendingAction::End:
+            mod::Log("LobbySession: processing end");
+            DoEnd();
+            m_pendingAcceptTargetId = 0;
+            break;
+        }
     }
 }
 }

@@ -5,6 +5,7 @@
 namespace netplay::bridge::takeover
 {
 bool IsCurrentProcessRevival();
+void DetectRevivalVersion();
 void InitializeHost();
 void ShutdownHost();
 void EmergencyShutdownHost();

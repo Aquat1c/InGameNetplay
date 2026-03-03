@@ -485,6 +485,11 @@ void NoteConsolePromptLine(const std::string& text)
                 "Takeover: native workflow event=peer_died endpoint='%s' text='%s'",
                 diedEndpoint.c_str(),
                 text.c_str());
+            // Also publish through IPC as a backup signal so the host process
+            // can detect the disconnect even if no explicit timeout message
+            // follows (e.g. "Host timed out" or "Remote timed out" may arrive
+            // later, but this ensures immediate detection).
+            PublishConsoleError("Peer died");
         }
     }
 
@@ -501,6 +506,18 @@ void NoteConsolePromptLine(const std::string& text)
     {
         mod::Log("Takeover: console error detected='Source quit or timed out' text='%s'", text.c_str());
         PublishConsoleError("Source quit or timed out");
+        return;
+    }
+    if (ContainsCaseInsensitive(text, "Host timed out"))
+    {
+        mod::Log("Takeover: console error detected='Host timed out' text='%s'", text.c_str());
+        PublishConsoleError("Host timed out");
+        return;
+    }
+    if (ContainsCaseInsensitive(text, "Remote timed out"))
+    {
+        mod::Log("Takeover: console error detected='Remote timed out' text='%s'", text.c_str());
+        PublishConsoleError("Remote timed out");
         return;
     }
     if (ContainsCaseInsensitive(text, "Spectators have been disabled"))

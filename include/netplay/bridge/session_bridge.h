@@ -100,6 +100,10 @@ bool ForceLocalPlayInit();
 // hook runs on the next main-loop iteration.  Returns true on success.
 // Safe to call from the VEH crash handler.
 bool ForceGameModeToTitle();
+// Crash-handler diagnostic accessors — return active Revival profile offsets.
+// Returns 0 if no profile is active yet.
+uintptr_t GetRevivalRenderContextOffset();
+uintptr_t GetRevivalSessionPtrOffset();
 void OnTitleSelectionConfirmed(int selection);
 NetbridgeStatus GetStatus();
 DelayPromptMetrics GetDelayPromptMetrics();
