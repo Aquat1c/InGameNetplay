@@ -1,5 +1,6 @@
 #include "netplay/bridge/session_bridge.h"
 
+#include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "logger.h"
@@ -75,6 +76,7 @@ void Initialize()
     }
 
     InitializeHostUnlocked("startup");
+    state_export::Initialize();
 }
 
 void Shutdown()
@@ -112,6 +114,7 @@ void Shutdown()
         std::lock_guard<std::mutex> lock(g_mutex);
         takeover::CancelSession("shutdown", &g_status);
         takeover::ShutdownHost();
+        state_export::Shutdown();
         g_status = {};
         SetPhase(NetbridgePhase::Idle, nullptr);
         g_connectStartTick = 0;
@@ -173,6 +176,33 @@ void Tick()
 
     JoinFinishedWorkerUnlocked();
     takeover::Tick(&g_status, &g_connectStartTick);
+    state_export::Update(g_status);
+}
+
+void TickExportOnly()
+{
+    // Lightweight per-frame export pulse.  Called every game frame from
+    // OurPerFrameTickHook (revival_memory.cpp) so that activityPhase,
+    // inNetplayMenu, stateSeq, scores, ping, delay, and all other exported
+    // fields remain current during loading screen and battle — screens that
+    // have no title/charselect hook calling the full Tick().
+    //
+    // Also called immediately after g_netplayMenuState.active is cleared in
+    // HandoffConnectedSessionToVsHumanState / HandoffSpectateSession so that
+    // the handoff is reflected in the export before the next frame hook fires.
+    //
+    // We call RefreshRuntimeStatus() here to re-read volatile session fields
+    // (wins, ping, delay, activePlayer, etc.) from Revival memory.  Without
+    // this, those fields stay stale at whatever value they had when the last
+    // full Tick() ran — typically during connection, before any match was
+    // played — so wins would read 0-0 even after a match ends.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return;
+    }
+    takeover::RefreshRuntimeStatus(&g_status);
+    state_export::Update(g_status);
 }
 
 bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname)

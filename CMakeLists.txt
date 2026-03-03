@@ -34,6 +34,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/assets/assets.cpp
     src/netplay/bridge/session_bridge.cpp
     src/netplay/bridge/revival_takeover.cpp
+    src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/ipc_shared.cpp

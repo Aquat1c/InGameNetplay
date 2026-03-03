@@ -355,9 +355,9 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
                     g_lobbySession->NotifyEndMatch();
                 }
                 mod::Log(
-                    "HookedTitleUpdateImpl: exit intercepted (netplay mode=%d), re-entering netplay menu",
+                    "HookedTitleUpdateImpl: exit intercepted (netplay mode=%d), re-entering netplay menu (skipFadeOut)",
                     exitMode);
-                EnterNetplayMenu(screenContext);
+                EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
                 return 0;
             }
 
@@ -561,6 +561,11 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 {
     ++g_charSelectUpdateCallCount;
 
+    // Drive the bridge and state export every charselect frame.
+    // Previously this was only called during the entry-hold window, which
+    // caused the exported state to freeze as soon as the hold ended.
+    netplay::bridge::Tick();
+
     // Diagnostic: log charselect screen state on the first 5 frames
     // and then every 300 frames to track init/exit flags and game mode.
     if (g_charSelectUpdateCallCount <= 5
@@ -615,8 +620,6 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
         }
         return csResult;
     }
-
-    netplay::bridge::Tick();
     const auto bridgeStatus = netplay::bridge::GetStatus();
     const bool syncReady = bridgeStatus.vsHumanSyncReady != 0;
     if (syncReady)

@@ -256,7 +256,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext);
 void DrawAnimatedCompactMenuLayer(uint32_t screenContext);
 void DrawNetplayBaseLayer(uint32_t screenContext);
 
-void EnterNetplayMenu(uint32_t screenContext);
+void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut = false);
 void LeaveNetplayMenu(uint32_t screenContext);
 void ExecuteNetplayAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action, int logicalSelection);
 char UpdateNetplayMenu(uint32_t screenContext);

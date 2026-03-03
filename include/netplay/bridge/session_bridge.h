@@ -52,6 +52,12 @@ struct NetbridgeStatus
     uint32_t processId = 0;
     int consoleErrorSerial = 0;
     char consoleErrorText[128] = {};
+
+    // Revival session-object fields — populated when an online session is
+    // active and the session pointer has been validated.
+    int activePlayer = -1;      // 0 = P1 (host), 1 = P2 (client), -1 = unknown
+    int sessionP1Wins = 0;      // P1 win count from Revival session object
+    int sessionP2Wins = 0;      // P2 win count from Revival session object
 };
 
 struct DelayPromptMetrics
@@ -74,6 +80,10 @@ void EmergencyShutdown();
 void InitializeInjectedProcess();
 void ShutdownInjectedProcess();
 void Tick();
+// Lightweight per-frame export pulse — refreshes shared-memory state from
+// the current g_status snapshot without calling takeover::Tick().  Safe to
+// call from any game thread context (loading screen, battle, frame hook).
+void TickExportOnly();
 bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname);
 bool ApplyInputDelay(int delayFrames);
 bool AnswerSpectateConfirm(bool acceptSpectate);

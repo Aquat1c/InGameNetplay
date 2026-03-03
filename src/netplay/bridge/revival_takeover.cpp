@@ -747,6 +747,23 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // Input delay is only applicable to online sessions (mode 0).
+    // Spectator sessions have a different layout and the delay offset
+    // would write into unrelated spectator fields.
+    // During the connecting phase g_localRoleFlag is still kLocalRoleLocalPlay
+    // because the init handshake hasn't completed yet.  Check the *intended*
+    // role stored in the shared block as well so the delay prompt works.
+    const bool currentRoleOnline = (g_localRoleFlag == kLocalRoleOnline);
+    const bool intendedRoleOnline = (g_hostBlock != nullptr
+        && g_hostBlock->initParams[0] == kLocalRoleOnline);
+    if (!currentRoleOnline && !intendedRoleOnline)
+    {
+        mod::Log("Takeover: ApplyInputDelay rejected (role=%d, intended=%d, online-only)",
+                 g_localRoleFlag,
+                 g_hostBlock ? g_hostBlock->initParams[0] : -1);
+        return false;
+    }
+
     if (delayFrames < 0 || delayFrames > 20)
     {
         mod::Log("Takeover: ApplyInputDelay rejected out-of-range value=%d", delayFrames);
@@ -1234,7 +1251,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // (stale), which would cause InvokeStartInitPlayer to skip the
             // critical sub_10072880 call — leaving the session in an
             // uninitialized state and freezing the game.
-            if (newSessionPtr != 0 && newSessionPtr >= 0x00100000u)
+            //
+            // Only meaningful for online sessions (mode 0) where
+            // InvokeStartInitPlayer runs.  For spectator/local/tournament
+            // sessions, the initComplete offset overlaps with different
+            // fields in the smaller session object.
+            if (initParams[0] == kLocalRoleOnline
+                && newSessionPtr != 0 && newSessionPtr >= 0x00100000u)
             {
                 int prevInitComplete = -1;
                 (void)SafeReadInt(
@@ -1343,6 +1366,62 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[0]);
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
+
+            // --- Flush stale shared memory ring buffers (spectate only) ---
+            // Revival's input ring buffers (InputP1, InputP2, etc.) use
+            // named Win32 file mappings with bare names.  If a previous
+            // session left stale data (the child EfzRevival.exe still has
+            // handles open), the OpenOrCreate path in the DLL constructor
+            // opens the existing mapping and inherits the old head/tail
+            // cursors.  The type 1 (spectator) session would then drain
+            // these stale entries as if they were current inputs, causing
+            // frame misalignment and desync.
+            //
+            // Fix: open each mapping by name, set head = tail to discard
+            // all pending entries, then close.  This runs before the first
+            // tick, so the local vectors (offset +28/+40) are still empty
+            // and currentFrame (offset +104) is 0.
+            //
+            // IMPORTANT: Only flush for spectate sessions.  For online
+            // (host/join) sessions, the type 0 DLL session WRITES to these
+            // ring buffers and the child EfzRevival.exe READS them.
+            // Flushing would discard entries the child needs, breaking
+            // synchronization and freezing the charselect handoff.
+            if (initParams[0] == kLocalRoleSpectate)
+            {
+                static const char* kRingNames[] = {
+                    "InputP1", "InputP2",
+                    "PaletteP1", "PaletteP2",
+                    "Sync", "Quit", "LoadMatch",
+                };
+                for (const char* ringName : kRingNames)
+                {
+                    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, ringName);
+                    if (hMap == nullptr)
+                        continue;  // doesn't exist → freshly created, head=tail=0
+                    // Map just the 8-byte header: [DWORD head][DWORD tail]
+                    volatile DWORD* view = static_cast<volatile DWORD*>(
+                        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 8));
+                    if (view != nullptr)
+                    {
+                        const DWORD oldHead = view[0];
+                        const DWORD oldTail = view[1];
+                        if (oldHead != oldTail)
+                        {
+                            view[0] = oldTail;  // discard all pending entries
+                            mod::Log(
+                                "Takeover: flushed stale shared memory '%s' "
+                                "head=%lu->%lu tail=%lu",
+                                ringName,
+                                static_cast<unsigned long>(oldHead),
+                                static_cast<unsigned long>(oldTail),
+                                static_cast<unsigned long>(oldTail));
+                        }
+                        UnmapViewOfFile(const_cast<DWORD*>(view));
+                    }
+                    CloseHandle(hMap);
+                }
+            } // if spectate — end of ring buffer flush guard
 
             // --- Final snapshot after all init steps complete ---
             LogInitWriteSnapshot("Tick_initSequence_complete");

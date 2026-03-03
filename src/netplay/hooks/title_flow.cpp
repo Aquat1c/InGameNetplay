@@ -806,11 +806,13 @@ void PrepareSpectateReplayState(uint32_t screenContext)
 } // namespace
 
 // ---------------------------------------------------------------------------
-// HandoffSpectateSession — transition directly to the Replay Screen (mode 8)
-// for spectating.  Unlike the VS Human handoff which goes to Character Select
-// (mode 1), spectators skip charselect entirely; the DLL's frame-hook
-// (sub_1006D810) detects the 0→8 transition, verifies role==2 and menu
-// selection==4, then creates a lightweight spectator-watcher session.
+// HandoffSpectateSession — transition directly to Character Select (mode 1)
+// for spectating.  The DLL creates a client session (type 1) for spectating
+// which uses shared-memory IPC and input replay.  The client session
+// survives all mode transitions (no watcher is created — the DLL's watcher
+// creation path requires session type 2 which the mod never uses).  Going
+// directly to charselect allows the client session's input replay to drive
+// the character selection from the host's captured inputs.
 // ---------------------------------------------------------------------------
 void HandoffSpectateSession(uint32_t screenContext)
 {
@@ -829,11 +831,23 @@ void HandoffSpectateSession(uint32_t screenContext)
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareSpectateReplayState(screenContext);
 
-    // Post-preparation verification: confirm the DLL's key conditions will
-    // be met after the screen index transition fires (0 → 8).
-    //   1. role == 2 (spectator)  — set by bridge init
-    //   2. menu selection == 4    — we just wrote it above
-    //   3. previous screen == 0   — DLL caches this each tick; we're on 0 now
+    // The spectator's charselect screen requires the same game-system state
+    // as online VS Human: mode 4, CPU flags 0, rounds, and a clean
+    // charselect init/exit flag pair.  The DLL's spectator never sets these
+    // — it relies on the host EXE having the right state.  Without this
+    // call the spectator enters charselect with stale flags (wrong mode,
+    // possibly CPU players, stale exit flag) which causes silent desync.
+    PrepareVsHumanGameState(screenContext);
+
+    // Post-preparation verification.
+    // The DLL client session (type 1, dword_100A05D0=1) uses shared memory
+    // IPC and input replay.  The DLL frame hook's spectate watcher creation
+    // requires dword_100A05D0==2 (practice session) which never matches the
+    // mod's spectate sessions.  Therefore no watcher is ever created and the
+    // client session survives through all mode transitions.  We transition
+    // directly to charselect (mode 1) — bypassing the replay screen (mode 8)
+    // avoids wasting shared-memory input frames on a screen that serves no
+    // purpose for the client session.
     {
         const int verifyMenuSel = static_cast<int>(
             *reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection));
@@ -875,11 +889,18 @@ void HandoffSpectateSession(uint32_t screenContext)
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
 
-    // Arm the replay screen bypass so the hooked replay update skips
-    // the file-selection UI and immediately transitions to charselect.
-    ArmSpectateReplayBypass();
+    // Transition directly to charselect (mode 1).  The DLL's client
+    // session (type 1) survives mode transitions and drives the game via
+    // input replay from shared memory — the mode-8 replay screen detour
+    // was unnecessary because the DLL's watcher creation path only triggers
+    // for session type 2 (dword_100A05D0==2), not the mod's type 1.
+    // Going directly to charselect avoids wasting shared-memory input
+    // frames on the unused replay screen.
+    g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
-    g_pendingGlobalStateTransition = kScreenIndexReplay;
+    // Immediately publish the post-handoff state so inNetplayMenu=0 is visible
+    // to export consumers before the next frame hook fires.
+    netplay::bridge::TickExportOnly();
 
     mod::Log(
         "HandoffSpectateSession: queued global transition nextState=%d returnToNetplay=%d",
@@ -887,22 +908,36 @@ void HandoffSpectateSession(uint32_t screenContext)
         g_returnToNetplayAfterMatch ? 1 : 0);
 }
 
-void EnterNetplayMenu(uint32_t screenContext)
+void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 {
-    mod::Log("EnterNetplayMenu: request active=%d", g_netplayMenuState.active);
+    mod::Log("EnterNetplayMenu: request active=%d skipFadeOut=%d", g_netplayMenuState.active, skipFadeOut ? 1 : 0);
     if (g_netplayMenuState.active)
     {
         mod::Log("EnterNetplayMenu: already active, ignoring duplicate entry");
         return;
     }
 
-    RunTransitionFadeOut(screenContext, 0, 0);
+    if (!skipFadeOut)
+    {
+        RunTransitionFadeOut(screenContext, 0, 0);
+    }
+    else
+    {
+        // Disconnect recovery: the DirectDraw front/back buffers still
+        // contain stale battle-scene pixels with a mismatched palette.
+        // Skip the fade-out entirely — we will load fresh assets and
+        // set the hardware palette before doing a clean fade-in.
+        mod::Log("EnterNetplayMenu: skipping fade-out (disconnect recovery)");
+    }
 
     if (!LoadNetplayAssets(screenContext))
     {
         mod::Log("EnterNetplayMenu: assets load failed, keeping title menu active");
-        (void)LoadTitleAssets(screenContext);
-        RunTransitionFadeIn(screenContext);
+        if (!skipFadeOut)
+        {
+            (void)LoadTitleAssets(screenContext);
+            RunTransitionFadeIn(screenContext);
+        }
         return;
     }
 
@@ -939,15 +974,39 @@ void EnterNetplayMenu(uint32_t screenContext)
 
     auto const playBackgroundMusic = reinterpret_cast<PlayBackgroundMusicFn>(RuntimeAddress(kVaPlayBackgroundMusic));
     playBackgroundMusic(GetGameSystem(screenContext), kNetplayBgmTrack);
+
+    if (skipFadeOut)
+    {
+        // Disconnect recovery: force the hardware palette to the freshly-
+        // loaded netplay palette so the first rendered frame uses correct
+        // colors, then render one clean frame into the back buffer and
+        // present it.  This guarantees the front buffer has netplay-menu
+        // content before the fade-in begins.
+        auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
+        setPalette(GetGraphicsContext(screenContext), static_cast<int>(screenContext + kOffsetPalette));
+
+        if (g_useRuntimeTextOverlay)
+            (void)RenderNetplayMenuRuntimeText(screenContext);
+        else if (g_netplayMenuState.useConfigStyleRender)
+            (void)RenderNetplayMenuConfigStyle(screenContext);
+        else
+        {
+            auto const render = GetOriginalTitleRender();
+            (void)render(screenContext);
+        }
+        mod::Log("EnterNetplayMenu: disconnect recovery — rendered initial clean frame");
+    }
+
     RunTransitionFadeIn(screenContext);
     mod::Log(
-        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d",
+        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d skipFadeOut=%d",
         MenuIdToString(g_netplayMenuState.menuId),
         static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
         kNetplayBgmTrack,
         g_netplayMenuState.useConfigStyleRender,
         g_netplayMenuState.optionCount,
-        g_netplayMenuState.backIndex);
+        g_netplayMenuState.backIndex,
+        skipFadeOut ? 1 : 0);
 }
 
 void LeaveNetplayMenu(uint32_t screenContext)
@@ -1079,6 +1138,11 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
+
+    // Immediately publish the post-handoff state so that inNetplayMenu=0 and
+    // activityPhase=InMatch are visible to export consumers before the next
+    // frame hook fires (avoids a stale "menu=1" window during the fade-out).
+    netplay::bridge::TickExportOnly();
 
     // Post-handoff diagnostic: read charselect screen object state AFTER
     // PrepareVsHumanGameState to verify flags were set correctly.

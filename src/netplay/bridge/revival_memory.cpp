@@ -574,10 +574,58 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         return;
     }
 
+    // The session-field offsets (inputDelay, pingMs, P1Name, P2Name, etc.)
+    // are only valid for online sessions (mode 0).  Spectator sessions
+    // (mode 1) have a different, smaller layout (0x440 = 1088 bytes) where
+    // the online-session offsets map to Config / shared-memory fields.
+    // Spectator sessions store wins and names at different offsets:
+    //   +128 = P1 wins, +132 = P2 wins
+    //   +154 = raw wchar_t[64] P1 name, +282 = raw wchar_t[64] P2 name
+    // These spectator offsets are identical across all Revival versions
+    // (1.02e through 1.02i).
+    const bool isOnlineSession    = (g_localRoleFlag == kLocalRoleOnline);
+    const bool isSpectatorSession = (g_localRoleFlag == kLocalRoleSpectate);
+
+    // Spectator session field offsets (constant across all Revival versions).
+    constexpr uintptr_t kSpectatorOffsetP1Wins = 128;
+    constexpr uintptr_t kSpectatorOffsetP2Wins = 132;
+    constexpr uintptr_t kSpectatorOffsetP1Name = 154;  // raw wchar_t[64]
+    constexpr uintptr_t kSpectatorOffsetP2Name = 282;  // raw wchar_t[64]
+
     int delayFrames = -1;
     int pingMs = -1;
-    (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInputDelay), &delayFrames);
-    (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetPingMs), &pingMs);
+    int sessionActivePlayer = -1;
+    int sessionP1Wins = 0;
+    int sessionP2Wins = 0;
+    if (isOnlineSession)
+    {
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInputDelay), &delayFrames);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetPingMs), &pingMs);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetActivePlayer), &sessionActivePlayer);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetP1Wins), &sessionP1Wins);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetP2Wins), &sessionP2Wins);
+    }
+    else if (isSpectatorSession)
+    {
+        // Spectator sessions have no activePlayer, inputDelay, or ping —
+        // only wins are meaningful.
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + kSpectatorOffsetP1Wins), &sessionP1Wins);
+        (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + kSpectatorOffsetP2Wins), &sessionP2Wins);
+    }
+
+    // Expose activePlayer and wins through the bridge status.
+    if (sessionActivePlayer == 0 || sessionActivePlayer == 1)
+    {
+        ioStatus->activePlayer = sessionActivePlayer;
+    }
+    if (sessionP1Wins >= 0 && sessionP1Wins < 1000)
+    {
+        ioStatus->sessionP1Wins = sessionP1Wins;
+    }
+    if (sessionP2Wins >= 0 && sessionP2Wins < 1000)
+    {
+        ioStatus->sessionP2Wins = sessionP2Wins;
+    }
 
     if (delayFrames >= 0 && delayFrames < 128)
     {
@@ -597,6 +645,10 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         ioStatus->rollbackFrames = promptMetrics.recommendedDelay;
     }
 
+    // Read a raw null-terminated wchar_t[] buffer (NOT an std::wstring SSO
+    // object) and convert to UTF-8 into outText.  The source buffers are
+    // wchar_t[64] (128 bytes) inside the 276-byte config snapshot at
+    // session + configStructOffset + 14 / + 142.
     auto tryReadInlineName = [](uintptr_t baseAddress, char* outText, size_t outSize) -> void {
         if (outText == nullptr || outSize == 0)
         {
@@ -604,7 +656,10 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         }
         outText[0] = '\0';
 
-        constexpr size_t kMaxChars = 24;
+        // The raw config Name buffers are wchar_t[64] (128 bytes).
+        // We read up to 63 characters; the 64th is guaranteed null by
+        // the memset(0, 0x100) in the config struct constructor.
+        constexpr size_t kMaxChars = 63;
         wchar_t wide[kMaxChars + 1] = {};
         if (!IsReadableRange(reinterpret_cast<const void*>(baseAddress), kMaxChars * sizeof(wchar_t)))
         {
@@ -635,7 +690,24 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
             return;
         }
 
-        const int converted = WideCharToMultiByte(CP_ACP, 0, wide, static_cast<int>(n), outText, static_cast<int>(outSize - 1), nullptr, nullptr);
+        // Convert to UTF-8.  If the full name exceeds the output buffer,
+        // WideCharToMultiByte returns 0 (ERROR_INSUFFICIENT_BUFFER), so we
+        // fall back to a safe prefix guaranteed to fit ((outSize-1)/3 chars
+        // → worst-case 3 bytes/char for BMP code-points).
+        int converted = WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(n),
+                                            outText, static_cast<int>(outSize - 1),
+                                            nullptr, nullptr);
+        if (converted <= 0 && n > 0)
+        {
+            const int safeLen = static_cast<int>((outSize - 1) / 3);
+            if (safeLen > 0)
+            {
+                converted = WideCharToMultiByte(CP_UTF8, 0, wide,
+                                                (safeLen < static_cast<int>(n)) ? safeLen : static_cast<int>(n),
+                                                outText, static_cast<int>(outSize - 1),
+                                                nullptr, nullptr);
+            }
+        }
         if (converted > 0)
         {
             outText[converted] = '\0';
@@ -677,14 +749,26 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     };
 
     const bool allowSessionInlineNames =
-        syncFlags.inRollbackSyncState
-        || syncFlags.inRollbackActiveState
-        || static_cast<NetbridgePhase>(ioStatus->phase) == NetbridgePhase::Connected;
+        isOnlineSession
+        && (syncFlags.inRollbackSyncState
+            || syncFlags.inRollbackActiveState
+            || static_cast<NetbridgePhase>(ioStatus->phase) == NetbridgePhase::Connected);
 
     if (allowSessionInlineNames)
     {
         tryReadInlineName(sessionPtr + g_activeRevival->sessionOffsetP1Name, ioStatus->p1Name, sizeof(ioStatus->p1Name));
         tryReadInlineName(sessionPtr + g_activeRevival->sessionOffsetP2Name, ioStatus->p2Name, sizeof(ioStatus->p2Name));
+        sanitizeInlineName(ioStatus->p1Name, sizeof(ioStatus->p1Name));
+        sanitizeInlineName(ioStatus->p2Name, sizeof(ioStatus->p2Name));
+    }
+    else if (isSpectatorSession
+             && static_cast<NetbridgePhase>(ioStatus->phase) == NetbridgePhase::Connected)
+    {
+        // Spectator session stores raw wchar_t[64] names at different offsets
+        // than the online session.  These are populated from the Init shared
+        // memory when the spectator object is fully initialized.
+        tryReadInlineName(sessionPtr + kSpectatorOffsetP1Name, ioStatus->p1Name, sizeof(ioStatus->p1Name));
+        tryReadInlineName(sessionPtr + kSpectatorOffsetP2Name, ioStatus->p2Name, sizeof(ioStatus->p2Name));
         sanitizeInlineName(ioStatus->p1Name, sizeof(ioStatus->p1Name));
         sanitizeInlineName(ioStatus->p2Name, sizeof(ioStatus->p2Name));
     }
@@ -2254,6 +2338,17 @@ void RepairRollbackHistoryBindingsIfNeeded()
         return;
     }
 
+    // Only online sessions (mode 0) have the rollback history bindings.
+    // Spectator sessions (mode 1) have a different, smaller layout where
+    // the online-session offsets (activePlayer, queuePlayer, historyPtrs)
+    // overlap with the Config object.  Running this repair on a spectator
+    // session would write heap addresses into Config WString fields,
+    // corrupting them and likely crashing on the next string operation.
+    if (g_localRoleFlag != kLocalRoleOnline)
+    {
+        return;
+    }
+
     bool usedCachedSessionPtr = false;
     const uintptr_t sessionPtr = ReadSessionPointerForMutation(&usedCachedSessionPtr);
     if (sessionPtr == 0)
@@ -3017,12 +3112,40 @@ static uintptr_t ReadSessionPtrRaw()
 // Screen-index change monitor — logs every time byte_790148 transitions.
 static uint8_t g_lastMonitoredScreenIndex = 0xFF;
 
+// ---------------------------------------------------------------------------
+// Screen-transition–based win tracking.
+//
+// Revival's internal win increment (session+1224/1228) does not fire in our
+// takeover context because the vtable[2] → RollbackLoopTick →
+// BuildMatchInfoAndHUD change-detection wrapper never triggers.  Instead of
+// relying on Revival's session wins, we replicate the logic directly:
+//
+//   When the screen index transitions from 3 (battle) to 5 (results), we
+//   read byte 4940 from the EFZ global-state object to determine the match
+//   winner (0 = P1, 1 = P2) and increment our own counter.
+//
+// The global-state object is the same one accessed via gameSys (screenObj+0x1C)
+// and via the Revival DLL's globalStatePtrOffset.  Offset 4940 is the
+// EFZ_GlobalStruct_GetByte4940() return value used in BuildMatchInfoAndHUD's
+// mode-5 branch.
+// ---------------------------------------------------------------------------
+static volatile LONG g_trackedP1Wins = 0;
+static volatile LONG g_trackedP2Wins = 0;
+
+void ResetTrackedWins()
+{
+    InterlockedExchange(&g_trackedP1Wins, 0);
+    InterlockedExchange(&g_trackedP2Wins, 0);
+    mod::Log("WIN_TRACK: reset tracked wins to 0-0");
+}
+
 static void MonitorScreenIndexChange()
 {
     constexpr uintptr_t kScreenIndexAddr = 0x00790148;
     constexpr uintptr_t kScreenTableAddr = 0x00790110;
     constexpr uint32_t kOffsetGameSystem = 0x1C;
     constexpr uint32_t kModeOffset = 4964;
+    constexpr uint32_t kWinnerByteOffset = 4940;
 
     uint8_t currentIdx = 0xFF;
     uint8_t gameMode = 0xFF;
@@ -3359,6 +3482,91 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Spectator ESC exit
+    // -----------------------------------------------------------------------
+    // While spectating, the Revival DLL's input-replay system consumes all
+    // local keyboard input, so the game's own Esc handler never fires.
+    // We detect Esc ourselves with GetAsyncKeyState and synthesize the same
+    // exit interception that the disconnect path uses, which routes the
+    // player back through the title screen into the netplay menu.
+    // -----------------------------------------------------------------------
+    if (g_localRoleFlag == kLocalRoleSpectate
+        && g_dllExitProcessPatchesSaved)
+    {
+        static bool s_spectateEscWasDown = false;
+        const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        const bool escRisingEdge = escDown && !s_spectateEscWasDown;
+        s_spectateEscWasDown = escDown;
+
+        if (escRisingEdge)
+        {
+            const int deadRole = g_localRoleFlag;
+            const DWORD deadPid = g_revivalProcessId;
+            LogSessionDiagnosticState("TickHook_spectatorEsc_entry");
+            mod::Log(
+                "TICK_HOOK: *** SPECTATOR ESC EXIT *** frameTick=%u "
+                "role=%d pid=%lu — user requested spectate disconnect",
+                g_frameTick,
+                deadRole,
+                static_cast<unsigned long>(deadPid));
+
+            InterlockedExchange(&g_revivalExitMode,
+                                static_cast<LONG>(g_localRoleFlag));
+            InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+            NeutralizeRevivalSessionVtable();
+
+            const bool initOk = ForceLocalPlayInit();
+            mod::Log(
+                "TICK_HOOK: spectator-esc step 1 ForceLocalPlayInit result=%d",
+                initOk ? 1 : 0);
+
+            if (g_revivalProcess != nullptr)
+            {
+                const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+                const DWORD termErr = termOk ? 0 : GetLastError();
+                CloseHandle(g_revivalProcess);
+                g_revivalProcess = nullptr;
+                g_revivalProcessId = 0;
+                mod::Log(
+                    "TICK_HOOK: spectator-esc step 2 helper terminated "
+                    "(pid=%lu termOk=%d err=%lu)",
+                    static_cast<unsigned long>(deadPid),
+                    termOk ? 1 : 0,
+                    static_cast<unsigned long>(termErr));
+            }
+
+            const bool patchOk = RestoreDllExitProcessPatches();
+            mod::Log(
+                "TICK_HOOK: spectator-esc step 3 RestoreDllExitProcessPatches result=%d",
+                patchOk ? 1 : 0);
+
+            const bool textOk = DisableRevivalTextRendering();
+            mod::Log(
+                "TICK_HOOK: spectator-esc step 4 DisableRevivalTextRendering result=%d",
+                textOk ? 1 : 0);
+
+            mod::ResetCrashRecoveryState();
+            ResetGameModeValidation();
+            mod::Log("TICK_HOOK: spectator-esc step 5 crash/validation state reset");
+
+            const bool modeOk = ForceGameModeToTitle();
+            mod::Log(
+                "TICK_HOOK: spectator-esc step 6 ForceGameModeToTitle result=%d",
+                modeOk ? 1 : 0);
+
+            g_localInitAppliedForSession = false;
+            mod::Log(
+                "TICK_HOOK: spectator-esc recovery complete (was role=%d), "
+                "next title-screen frame will consume exit interception",
+                deadRole);
+            LogSessionDiagnosticState("TickHook_spectatorEsc_exit");
+
+            return 0;
+        }
+    }
+
     // If CancelSession tried to run ForceLocalPlayInit while we were inside
     // the tick (which would destroy the session that RollbackLoopTick was
     // using as 'this'), it deferred the work.  Execute it now that the tick
@@ -3383,6 +3591,14 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         mod::Log("TICK_HOOK: deferred cancel cleanup complete");
     }
+
+    // Pulse a lightweight export tick every frame so that activityPhase,
+    // inNetplayMenu, stateSeq, and all other shared-memory fields remain
+    // current during loading (screenIdx=2) and battle (screenIdx=3) — screens
+    // that have no title/charselect hook calling the full session_bridge::Tick().
+    // TickExportOnly() only calls state_export::Update(g_status) under the
+    // bridge mutex; it does NOT call takeover::Tick() and is safe here.
+    netplay::bridge::TickExportOnly();
 
     return result;
 }
@@ -3796,6 +4012,90 @@ bool ForceGameModeToTitle()
     mod::Log(
         "ForceGameModeToTitle: game mode %d -> 0 (title screen)",
         currentGameMode);
+
+    // Reset the charselect screen's init/exit flags so it properly
+    // re-initializes on next entry.  The DLL's init(mode=2) does NOT
+    // restore these EXE-side screen flags, so without this the charselect
+    // screen skips its initializeCharacterSelectScreen call and renders
+    // incorrectly when the user enters any local game mode (e.g. practice)
+    // after a netplay disconnect recovery.
+    //
+    // Screen table at 0x00790110; index 1 = charselect object.
+    // Offset +44 = init-required flag (1 = re-init on next frame).
+    // Offset +45 = exit flag (0 = cleared, prevents premature exit).
+    __try
+    {
+        constexpr uintptr_t kScreenTable = 0x00790110;
+        const uint32_t csObj =
+            reinterpret_cast<const uint32_t*>(kScreenTable)[1];
+        if (csObj != 0)
+        {
+            const uint8_t oldInit = *reinterpret_cast<const uint8_t*>(csObj + 44);
+            const uint8_t oldExit = *reinterpret_cast<const uint8_t*>(csObj + 45);
+            *reinterpret_cast<uint8_t*>(csObj + 44) = 1;  // init required
+            *reinterpret_cast<uint8_t*>(csObj + 45) = 0;  // exit cleared
+            mod::Log(
+                "ForceGameModeToTitle: charselect screen reset "
+                "init %u->1 exit %u->0 (obj=0x%08lX)",
+                static_cast<unsigned>(oldInit),
+                static_cast<unsigned>(oldExit),
+                static_cast<unsigned long>(csObj));
+        }
+
+        // Also reset the title screen's init byte so the original EFZ
+        // update handler (case 1) re-applies setPalette on re-entry.
+        // Without this, stale init state from the pre-match title screen
+        // can cause palette mismatches after disconnect recovery.
+        const uint32_t titleObj =
+            reinterpret_cast<const uint32_t*>(kScreenTable)[0];
+        if (titleObj != 0)
+        {
+            const uint8_t oldTitleInit = *reinterpret_cast<const uint8_t*>(titleObj + 44);
+            *reinterpret_cast<uint8_t*>(titleObj + 44) = 1;  // init required
+            *reinterpret_cast<uint8_t*>(titleObj + 45) = 0;  // exit cleared
+            mod::Log(
+                "ForceGameModeToTitle: title screen reset "
+                "init %u->1 (obj=0x%08lX)",
+                static_cast<unsigned>(oldTitleInit),
+                static_cast<unsigned long>(titleObj));
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log("ForceGameModeToTitle: SEH exception resetting screen flags");
+    }
+
+    // Reset game mode bytes (gameSystem + 4964/4965) from battle values
+    // (e.g. mode=5, secondary=1) back to safe defaults.  Without this,
+    // EFZ subsystems that read the game mode during title-screen updates
+    // may behave incorrectly (e.g. the charselect intro sequence, BGM
+    // selection, or input routing).
+    __try
+    {
+        constexpr uintptr_t kGameSystemPtr = 0x0079010C;
+        const uint32_t gameSys =
+            *reinterpret_cast<const uint32_t*>(kGameSystemPtr);
+        if (gameSys != 0)
+        {
+            auto* primaryMode = reinterpret_cast<uint8_t*>(gameSys + 4964);
+            auto* secondaryMode = reinterpret_cast<uint8_t*>(gameSys + 4965);
+            const uint8_t oldPrimary = *primaryMode;
+            const uint8_t oldSecondary = *secondaryMode;
+            *primaryMode = 0;    // reset to Arcade/default
+            *secondaryMode = 0;  // reset secondary
+            mod::Log(
+                "ForceGameModeToTitle: game mode reset "
+                "primary %u->0 secondary %u->0 (gameSys=0x%08lX)",
+                static_cast<unsigned>(oldPrimary),
+                static_cast<unsigned>(oldSecondary),
+                static_cast<unsigned long>(gameSys));
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log("ForceGameModeToTitle: SEH exception resetting game mode bytes");
+    }
+
     return true;
 }
 

@@ -138,9 +138,16 @@ struct RevivalAddressProfile
     uintptr_t sessionOffsetMatchId;            // +712 — match identifier
     uintptr_t sessionOffsetSentinel;           // +1232 — INT_MAX-1 sentinel value
 
-    // Inline player-name string offsets (24-byte fields).
-    uintptr_t sessionOffsetP1Name;             // +740 in 1.02e — P1 nickname
-    uintptr_t sessionOffsetP2Name;             // +764 in 1.02e — P2 nickname
+    // Raw wchar_t[64] player-name buffers inside the 276-byte config
+    // snapshot at sessionOffsetConfigStruct + 14 / + 142.
+    // NOT the std::wstring SSO objects at +740/+764 (which require heap
+    // indirection for names > 7 wchars and cannot be read as flat arrays).
+    uintptr_t sessionOffsetP1Name;             // +958 in 1.02e — P1 nickname
+    uintptr_t sessionOffsetP2Name;             // +1086 in 1.02e — P2 nickname
+
+    // Win counters stored in the session object.
+    uintptr_t sessionOffsetP1Wins;             // +1224 in 1.02e — P1 win count
+    uintptr_t sessionOffsetP2Wins;             // +1228 in 1.02e — P2 win count
 
     // -----------------------------------------------------------------------
     // Global state offsets (byte offsets from global-state pointer)
@@ -262,8 +269,10 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     716u,                                               // sessionOffsetGameModeSnapshot
     712u,                                               // sessionOffsetMatchId
     1232u,                                              // sessionOffsetSentinel
-    740u,                                               // sessionOffsetP1Name
-    764u,                                               // sessionOffsetP2Name
+    958u,                                               // sessionOffsetP1Name (raw wchar_t[64] in config struct)
+    1086u,                                              // sessionOffsetP2Name (raw wchar_t[64] in config struct)
+    1224u,                                              // sessionOffsetP1Wins
+    1228u,                                              // sessionOffsetP2Wins
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte
@@ -321,8 +330,10 @@ constexpr RevivalAddressProfile kRevival_1_02f = {
     716u,                                               // sessionOffsetGameModeSnapshot
     712u,                                               // sessionOffsetMatchId
     1232u,                                              // sessionOffsetSentinel
-    740u,                                               // sessionOffsetP1Name
-    764u,                                               // sessionOffsetP2Name
+    958u,                                               // sessionOffsetP1Name (raw wchar_t[64] in config struct)
+    1086u,                                              // sessionOffsetP2Name (raw wchar_t[64] in config struct)
+    1224u,                                              // sessionOffsetP1Wins
+    1228u,                                              // sessionOffsetP2Wins
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte
@@ -381,8 +392,10 @@ constexpr RevivalAddressProfile kRevival_1_02g = {
     716u,                                               // sessionOffsetGameModeSnapshot
     712u,                                               // sessionOffsetMatchId
     1232u,                                              // sessionOffsetSentinel
-    740u,                                               // sessionOffsetP1Name
-    764u,                                               // sessionOffsetP2Name
+    958u,                                               // sessionOffsetP1Name (raw wchar_t[64] in config struct)
+    1086u,                                              // sessionOffsetP2Name (raw wchar_t[64] in config struct)
+    1224u,                                              // sessionOffsetP1Wins
+    1228u,                                              // sessionOffsetP2Wins
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte
@@ -416,7 +429,7 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
     2,                                                  // roleFlagOffsetCount
     {0x000A02ECu, 0u, 0u, 0u},                          // sessionPtrOffsets
     1,                                                  // sessionPtrOffsetCount
-    0x000A07D8u,                                        // globalStatePtrOffset
+    0x000A07E4u,                                        // globalStatePtrOffset
     0x000A05F4u,                                        // initFlagOffset
     0x000A02A9u,                                        // initByteOffset
     0x000A0794u,                                        // initOnceGuardOffset
@@ -443,8 +456,10 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
     716u,                                               // sessionOffsetGameModeSnapshot
     712u,                                               // sessionOffsetMatchId
     1232u,                                              // sessionOffsetSentinel
-    740u,                                               // sessionOffsetP1Name
-    764u,                                               // sessionOffsetP2Name
+    958u,                                               // sessionOffsetP1Name (raw wchar_t[64] in config struct)
+    1086u,                                              // sessionOffsetP2Name (raw wchar_t[64] in config struct)
+    1224u,                                              // sessionOffsetP1Wins
+    1228u,                                              // sessionOffsetP2Wins
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte
@@ -477,7 +492,7 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
     2,                                                  // roleFlagOffsetCount
     {0x000A15F8u, 0u, 0u, 0u},                          // sessionPtrOffsets
     1,                                                  // sessionPtrOffsetCount
-    0x000A17E8u,                                        // globalStatePtrOffset
+    0x000A17F4u,                                        // globalStatePtrOffset
     0x000A1600u,                                        // initFlagOffset
     0x000A12B1u,                                        // initByteOffset
     0x000A17A4u,                                        // initOnceGuardOffset
@@ -504,8 +519,10 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
     724u,                                               // sessionOffsetGameModeSnapshot (+8)
     720u,                                               // sessionOffsetMatchId (+8)
     1240u,                                              // sessionOffsetSentinel (+8)
-    748u,                                               // sessionOffsetP1Name (+8)
-    772u,                                               // sessionOffsetP2Name (+8)
+    966u,                                               // sessionOffsetP1Name (+8, raw wchar_t[64] in config struct)
+    1094u,                                              // sessionOffsetP2Name (+8, raw wchar_t[64] in config struct)
+    1232u,                                              // sessionOffsetP1Wins (+8)
+    1236u,                                              // sessionOffsetP2Wins (+8)
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte

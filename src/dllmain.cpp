@@ -5,6 +5,7 @@
 #include "crash_handler.h"
 #include "logger.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
 
 namespace
@@ -134,6 +135,12 @@ netbridge_CancelSession(void)
 {
     mod::Log("netbridge_CancelSession called");
     netplay::bridge::CancelSession("external_cancel");
+}
+
+extern "C" __declspec(dllexport) const EFZNetplayState* __cdecl
+EFZNetplay_GetState(void)
+{
+    return netplay::bridge::state_export::GetExportedState();
 }
 
 
