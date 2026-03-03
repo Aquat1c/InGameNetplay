@@ -1550,6 +1550,25 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             ioStatus->pingMs,
             ioStatus->rollbackFrames);
     }
+
+    // Spectator sessions don't go through the rollback sync handshake, so
+    // the runtime-ready probe never fires.  Promote to Connected as soon as
+    // init is applied and the DLL exit-process patches are saved (the last
+    // step of the spectator init sequence).  This allows phase-gated code
+    // (name reading, disconnect handling) to work correctly for spectators.
+    if ((currentPhase == NetbridgePhase::Connecting || currentPhase == NetbridgePhase::DelaySetup)
+        && g_localInitAppliedForSession
+        && g_localRoleFlag == kLocalRoleSpectate
+        && AreDllExitPatchesSaved())
+    {
+        SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
+        if (ioConnectStartTick != nullptr)
+        {
+            *ioConnectStartTick = GetTickCount();
+        }
+        mod::Log(
+            "Takeover: spectator promoted to connected (init applied, exit patches saved)");
+    }
 }
 
 // ---------------------------------------------------------------------------

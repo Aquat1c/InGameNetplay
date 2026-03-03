@@ -93,8 +93,6 @@ uint8_t g_prevP2Locked = 0;
 constexpr uintptr_t kScreenTableAddr = 0x00790110;
 constexpr uintptr_t kScreenIndexAddr = 0x00790148;
 constexpr uint32_t kOffsetGameSystemInScreen = 0x1C;
-constexpr uint32_t kGameSystemOffsetP1Wins  = 4920;
-constexpr uint32_t kGameSystemOffsetP2Wins  = 4924;
 constexpr uint32_t kGameSystemOffsetMatchCtr = 4952;
 
 // Character-select screen object offsets.
@@ -161,19 +159,15 @@ static void ReadScores(int32_t& p1Wins, int32_t& p2Wins, int32_t& matchCtr)
     if (gameSys == 0)
         return;
 
+    // EFZ.exe does NOT have win counters — only Revival does.
+    // We only read the match counter (round counter) from the game system.
     __try
     {
-        p1Wins = static_cast<int32_t>(
-            *reinterpret_cast<const uint32_t*>(gameSys + kGameSystemOffsetP1Wins));
-        p2Wins = static_cast<int32_t>(
-            *reinterpret_cast<const uint32_t*>(gameSys + kGameSystemOffsetP2Wins));
         matchCtr = static_cast<int32_t>(
             *reinterpret_cast<const uint8_t*>(gameSys + kGameSystemOffsetMatchCtr));
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        p1Wins = 0;
-        p2Wins = 0;
         matchCtr = 0;
     }
 }
@@ -472,26 +466,21 @@ void Update(const NetbridgeStatus& status)
     // Session identity is always available.
     caps |= EFZ_CAP_SESSION;
 
-    // Scores — merge Revival session wins, EFZ game-system wins, and a
-    // high-water-mark latch.  During screen transitions the live data
-    // sources may briefly read as 0 (session pointer validation gap or
-    // game-system reset when the screen object changes).  The latch
-    // preserves the highest wins seen within the current session.
+    // Scores — Revival session is the sole authority for win counts.
+    // EFZ.exe does NOT track wins at all; only the Revival DLL does,
+    // via the session object at the version-specific offsets.
+    //
+    // A high-water-mark latch prevents the exported wins from dropping
+    // back to 0 during transient session-pointer validation gaps or
+    // game-system resets that occur at screen transitions.
     {
         int32_t liveP1 = status.sessionP1Wins;
         int32_t liveP2 = status.sessionP2Wins;
 
-        int32_t gsP1 = 0, gsP2 = 0, gsMatch = 0;
-        ReadScores(gsP1, gsP2, gsMatch);
+        // Read match counter from the EXE game system (it does track rounds).
+        int32_t gsP1Unused = 0, gsP2Unused = 0, gsMatch = 0;
+        ReadScores(gsP1Unused, gsP2Unused, gsMatch);
         s.matchCounter = gsMatch;
-
-        // If Revival session has no wins yet but the game system does,
-        // use the game system values as a transient bridge.
-        if (liveP1 == 0 && liveP2 == 0 && (gsP1 != 0 || gsP2 != 0))
-        {
-            liveP1 = gsP1;
-            liveP2 = gsP2;
-        }
 
         // Update the high-water-mark latch when the live total exceeds it.
         const int32_t liveTotal = liveP1 + liveP2;

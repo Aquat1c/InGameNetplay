@@ -300,6 +300,7 @@ bool SaveTournamentExePatches();
 bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
 bool RestoreDllExitProcessPatches();
+bool AreDllExitPatchesSaved();
 bool DestroyCurrentSession(const char* caller);
 bool ForceLocalPlayInit();
 bool InvokeSessionVtableInit(const char* caller);

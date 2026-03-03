@@ -478,6 +478,11 @@ bool ReadRevivalSyncFlags(RevivalSyncFlags* outFlags)
     return hasAny;
 }
 
+// Forward-declared here (before RefreshRuntimeStatus) because the spectator
+// name-reading path needs it.  Defined alongside the DLL exit-process patch
+// save/restore logic further below.
+static bool g_dllExitProcessPatchesSaved = false;
+
 void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
 {
     if (ioStatus == nullptr)
@@ -761,12 +766,17 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         sanitizeInlineName(ioStatus->p1Name, sizeof(ioStatus->p1Name));
         sanitizeInlineName(ioStatus->p2Name, sizeof(ioStatus->p2Name));
     }
-    else if (isSpectatorSession
-             && static_cast<NetbridgePhase>(ioStatus->phase) == NetbridgePhase::Connected)
+    else if (isSpectatorSession && g_dllExitProcessPatchesSaved)
     {
         // Spectator session stores raw wchar_t[64] names at different offsets
         // than the online session.  These are populated from the Init shared
         // memory when the spectator object is fully initialized.
+        //
+        // We gate on g_dllExitProcessPatchesSaved (set at the end of the
+        // init sequence) instead of phase==Connected because spectator
+        // sessions may not be promoted to Connected until the next
+        // takeover::Tick() call — and TickExportOnly() (per-frame tick
+        // hook) only calls RefreshRuntimeStatus(), not the full Tick().
         tryReadInlineName(sessionPtr + kSpectatorOffsetP1Name, ioStatus->p1Name, sizeof(ioStatus->p1Name));
         tryReadInlineName(sessionPtr + kSpectatorOffsetP2Name, ioStatus->p2Name, sizeof(ioStatus->p2Name));
         sanitizeInlineName(ioStatus->p1Name, sizeof(ioStatus->p1Name));
@@ -1112,7 +1122,7 @@ bool RestoreTournamentExePatches()
 
 static uint8_t g_savedDllExitProcessBytes[RevivalAddressProfile::kMaxExitProcessPatches];
 static uint8_t g_savedDllExitNearJccBytes[RevivalAddressProfile::kMaxExitProcessNearJccPatches][6];
-static bool g_dllExitProcessPatchesSaved = false;
+// g_dllExitProcessPatchesSaved is declared earlier (before RefreshRuntimeStatus).
 
 bool SaveAndApplyDllExitProcessPatches()
 {
@@ -1375,6 +1385,11 @@ bool RestoreDllExitProcessPatches()
              restored, g_activeRevival->exitProcessPatchCount,
              nearRestored, g_activeRevival->exitProcessNearJccCount);
     return (restored + nearRestored) > 0;
+}
+
+bool AreDllExitPatchesSaved()
+{
+    return g_dllExitProcessPatchesSaved;
 }
 
 // ---------------------------------------------------------------------------
@@ -3292,11 +3307,50 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             (exeThisAddr == currentSession) ? 1 : 0);
     }
 
-    // Call the original sub_1006E570 with the corrected ECX.
-    // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
-    // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
-    // during the DLL's session tick (vtable[2] → RollbackLoopTick).
-    const int result = RunPerFrameTickDispatch(fixedThis);
+    // ---- Pre-tick disconnect detection ------------------------------------
+    // Check consoleErrorSerial BEFORE calling RunPerFrameTickDispatch.
+    // The helper process (EfzRevival.exe) captures DLL console output
+    // asynchronously and writes disconnect errors to the IPC shared block.
+    // If the error was set between frames (i.e. during the previous tick
+    // or during a DLL-side timeout), catching it here lets us SKIP the
+    // DLL's session tick entirely — preventing the DLL's RollbackLoopTick
+    // from rendering a corrupted frame with missing opponent data and then
+    // Flip()ping it to the display.
+    //
+    // Without this pre-tick check, the DLL renders + flips the corrupted
+    // frame inside RunPerFrameTickDispatch, and we only detect the error
+    // afterwards — too late to prevent the visual corruption.
+    // --------------------------------------------------------------------
+    bool preTickDisconnect = false;
+    if (g_dllExitProcessPatchesSaved
+        && g_hostBlock != nullptr)
+    {
+        const LONG preTickErrSerial =
+            InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
+        if (preTickErrSerial > 0)
+        {
+            mod::Log(
+                "TICK_HOOK: *** PRE-TICK DISCONNECT *** frameTick=%u "
+                "consoleErrorSerial=%ld — skipping DLL tick to prevent "
+                "corrupted render",
+                g_frameTick,
+                static_cast<long>(preTickErrSerial));
+            preTickDisconnect = true;
+        }
+    }
+
+    // Call the original sub_1006E570 with the corrected ECX — unless
+    // a pre-tick disconnect was detected, in which case we skip the DLL's
+    // tick entirely to avoid a corrupted render+Flip.
+    int result = 0;
+
+    if (!preTickDisconnect)
+    {
+        // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
+        // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
+        // during the DLL's session tick (vtable[2] → RollbackLoopTick).
+        result = RunPerFrameTickDispatch(fixedThis);
+    }
 
     // ---- ExitProcess recovery path -----------------------------------------
     // If ExitProcess fired during the per-frame tick, NeutralizeExitProcess
@@ -3375,7 +3429,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         return 0;
     }
 
-    // ---- Proactive network-disconnect detection ----------------------------
+    // ---- Proactive network-disconnect detection ---------------------------
     // The DLL exit-process Jcc patches make ExitProcess unreachable, which
     // is a problem during charselect/loading: the DLL's session tick doesn't
     // actively drive rollback and never triggers ExitProcess even after the
@@ -3390,13 +3444,14 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     //   - "Peer died"                 (backup: any "<endpoint> died" trace)
     //   - "Socket error"              (low-level network failure)
     //
-    // Poll g_hostBlock->consoleErrorSerial every ~60 frames (~1s) and
-    // synthesize the same recovery that NeutralizeExitProcess would
-    // perform, so the game returns to the netplay menu instead of hanging.
+    // Check every frame (not just every ~60) to minimise the window where
+    // the DLL could render corrupted frames with missing opponent data.
+    // This post-tick check catches errors set DURING the current tick
+    // (complementing the pre-tick check which catches errors from BETWEEN
+    // frames).
     // -----------------------------------------------------------------------
     if (g_dllExitProcessPatchesSaved
-        && g_hostBlock != nullptr
-        && (g_frameTick % 60) == 0)
+        && g_hostBlock != nullptr)
     {
         const LONG consoleErrSerial =
             InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
@@ -4012,6 +4067,198 @@ bool ForceGameModeToTitle()
     mod::Log(
         "ForceGameModeToTitle: game mode %d -> 0 (title screen)",
         currentGameMode);
+
+    // -----------------------------------------------------------------------
+    // Battle resource cleanup — replicate the EFZ battle screen's exit
+    // cleanup that we bypass when force-transitioning mid-match.
+    //
+    // Verified against the EXE's own replay exit path in
+    // updateBattleScreenLogic (0x763C20), byte[45]==2 replay branch:
+    //   1. safelyCloseFileHandle(gameSys+82564) — close replay file
+    //   2. gameSys+82563 = 0                   — clear replay I/O state
+    //   3. stopBackgroundMusic(gameSys)         — stop battle BGM
+    //   4. cleanupPlayerObject(P1, 1)           — release surfaces/sounds/free
+    //   5. null P1 slot
+    //   6. cleanupPlayerObject(P2, 1)
+    //   7. null P2 slot
+    //   8. free(gameSys+4988)                   — free animated stage-bg
+    //   9. gameSys+4988 = 0
+    //
+    // We additionally reset:
+    //   - battleObj+0x578 (game speed) back to 3 (default)
+    //   - gameSys+82540 (fade controller byte) to 0
+    //   - gameSys+82556 (speed override flag) to 0
+    //   - battleObj byte[44]=1, byte[45]=0 (screen reinit flags)
+    //
+    // All addresses verified via capstone disassembly of efz.exe.
+    // -----------------------------------------------------------------------
+    __try
+    {
+        if (currentGameMode == 2  // loading screen
+            || currentGameMode == 3  // battle screen
+            || currentGameMode == 5) // results screen
+        {
+            constexpr uintptr_t kScreenTable   = 0x00790110;
+            constexpr uintptr_t kGameSystemPtr = 0x0079010C;
+
+            const uint32_t battleObj =
+                reinterpret_cast<const uint32_t*>(kScreenTable)[3];
+            const uint32_t gameSys =
+                *reinterpret_cast<const uint32_t*>(kGameSystemPtr);
+
+            if (battleObj != 0 && gameSys != 0)
+            {
+                // ---- Close replay file if active ---------------------------
+                // safelyCloseFileHandle: __thiscall at 0x405F50.
+                // Checks [this+4] for a valid handle, calls CloseHandle, nulls.
+                const int8_t replayState =
+                    *reinterpret_cast<const int8_t*>(gameSys + 82563);
+                if (replayState > 0)
+                {
+                    using CloseFileFn = void*(__thiscall*)(void* fileStruct);
+                    constexpr uintptr_t kCloseFileAddr = 0x00405F50;
+                    auto const closeFile =
+                        reinterpret_cast<CloseFileFn>(kCloseFileAddr);
+                    closeFile(reinterpret_cast<void*>(gameSys + 82564));
+                    *reinterpret_cast<int8_t*>(gameSys + 82563) = 0;
+                    mod::Log(
+                        "ForceGameModeToTitle: closed replay file "
+                        "(replayState was %d)",
+                        static_cast<int>(replayState));
+                }
+
+                // ---- Stop battle BGM ---------------------------------------
+                // stopBackgroundMusic: __thiscall at 0x406A10.
+                using StopBgmFn = int(__thiscall*)(void* gameSys);
+                constexpr uintptr_t kStopBgmAddr = 0x00406A10;
+                auto const stopBgm =
+                    reinterpret_cast<StopBgmFn>(kStopBgmAddr);
+                stopBgm(reinterpret_cast<void*>(gameSys));
+
+                // ---- Clean up character objects via the EXE's own function --
+                // cleanupPlayerObject: __thiscall at 0x401920.
+                //   Calls cleanupCharacterObject (releases DD surfaces, 50
+                //   sound buffers, resource arrays), then j__free(this) when
+                //   freeMemory & 1.
+                using CleanupPlayerFn =
+                    void(__thiscall*)(void* playerObj, char freeMemory);
+                constexpr uintptr_t kCleanupPlayerAddr = 0x00401920;
+                auto const cleanupPlayer =
+                    reinterpret_cast<CleanupPlayerFn>(kCleanupPlayerAddr);
+
+                // battleObj+0x14 (20) = P1 slot ptr, +0x18 (24) = P2 slot ptr
+                for (int pIdx = 0; pIdx < 2; ++pIdx)
+                {
+                    const uint32_t slotAddr =
+                        *reinterpret_cast<const uint32_t*>(
+                            battleObj + 0x14 + static_cast<uint32_t>(pIdx) * 4);
+                    if (slotAddr != 0)
+                    {
+                        const uint32_t playerObj =
+                            *reinterpret_cast<const uint32_t*>(slotAddr);
+                        if (playerObj != 0)
+                        {
+                            cleanupPlayer(
+                                reinterpret_cast<void*>(playerObj), 1);
+                            *reinterpret_cast<uint32_t*>(slotAddr) = 0;
+                            mod::Log(
+                                "ForceGameModeToTitle: cleaned up P%d "
+                                "obj=0x%08lX (slot=0x%08lX)",
+                                pIdx + 1,
+                                static_cast<unsigned long>(playerObj),
+                                static_cast<unsigned long>(slotAddr));
+                        }
+                    }
+                }
+
+                // ---- Free the animated stage-bg handler --------------------
+                // Uses j__free at 0x777E20 (the EXE's own CRT free), matching
+                // the EXE's own cleanup at 0x763FE4.
+                auto* const bgObjPtr =
+                    reinterpret_cast<uint32_t*>(gameSys + 4988);
+                if (*bgObjPtr != 0)
+                {
+                    using ExeFreeFn = void(__cdecl*)(void* ptr);
+                    constexpr uintptr_t kExeFreeAddr = 0x00777E20;
+                    auto const exeFree =
+                        reinterpret_cast<ExeFreeFn>(kExeFreeAddr);
+                    const uint32_t bgObj = *bgObjPtr;
+                    exeFree(reinterpret_cast<void*>(bgObj));
+                    *bgObjPtr = 0;
+                    mod::Log(
+                        "ForceGameModeToTitle: freed animated bg "
+                        "obj=0x%08lX via EXE j__free",
+                        static_cast<unsigned long>(bgObj));
+                }
+
+                // ---- Reset game speed to default ---------------------------
+                // battleObj+0x578 (1400) = game speed (frames per update).
+                // Default is 3; spectating/practice can change it.
+                *reinterpret_cast<uint8_t*>(battleObj + 0x578) = 3;
+
+                // ---- Reset fade & speed-override controllers ---------------
+                // gameSys+82540 (byte): 1=lighten, -1=darken, 0=off.
+                // gameSys+82556 (dword): speed override pending flag.
+                *reinterpret_cast<uint8_t*>(gameSys + 82540) = 0;
+                *reinterpret_cast<uint32_t*>(gameSys + 82556) = 0;
+
+                // ---- Reset battle screen init/exit flags -------------------
+                *reinterpret_cast<uint8_t*>(battleObj + 44) = 1;  // reinit
+                *reinterpret_cast<uint8_t*>(battleObj + 45) = 0;  // clear exit
+
+                mod::Log(
+                    "ForceGameModeToTitle: battle resources cleaned up "
+                    "(screen=%d battleObj=0x%08lX gameSys=0x%08lX)",
+                    currentGameMode,
+                    static_cast<unsigned long>(battleObj),
+                    static_cast<unsigned long>(gameSys));
+
+                // ---- Black out the hardware palette immediately ------------
+                // Between this function returning and EnterNetplayMenu firing
+                // on the next title-screen update frame, the EXE's main loop
+                // renders at least one frame via HookedTitleRenderImpl.
+                // Without blacking out the palette here, that frame displays
+                // the stale battle back-buffer with the battle's 8-bit palette
+                // → garbled blue/black/white corruption visible to the user.
+                //
+                // Fix: zero the title screen's software palette buffer (256
+                // BGRA entries at screenObj+46) and call the EXE's own
+                // setPalette to upload it to the hardware IDirectDrawPalette.
+                // This makes any intermediate frame render as solid black.
+                const uint32_t titleObj =
+                    reinterpret_cast<const uint32_t*>(kScreenTable)[0];
+                if (titleObj != 0)
+                {
+                    // kOffsetPalette = 46, palette is 256 * 4 = 1024 bytes
+                    memset(reinterpret_cast<void*>(titleObj + 46), 0, 1024);
+
+                    // kOffsetGraphicsContext = 0x20
+                    void** gfxCtx =
+                        *reinterpret_cast<void***>(titleObj + 0x20);
+                    if (gfxCtx != nullptr)
+                    {
+                        using SetPaletteFn =
+                            int(__thiscall*)(void** ctx, int paletteData);
+                        constexpr uintptr_t kSetPaletteAddr = 0x0040BD30;
+                        auto const setPal =
+                            reinterpret_cast<SetPaletteFn>(kSetPaletteAddr);
+                        setPal(gfxCtx, static_cast<int>(titleObj + 46));
+                        mod::Log(
+                            "ForceGameModeToTitle: blacked out hardware "
+                            "palette via title screen obj=0x%08lX gfx=0x%08lX",
+                            static_cast<unsigned long>(titleObj),
+                            reinterpret_cast<unsigned long>(gfxCtx));
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log(
+            "ForceGameModeToTitle: SEH exception during battle resource "
+            "cleanup (screen=%d)", currentGameMode);
+    }
 
     // Reset the charselect screen's init/exit flags so it properly
     // re-initializes on next entry.  The DLL's init(mode=2) does NOT
