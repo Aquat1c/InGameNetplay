@@ -3101,6 +3101,21 @@ static bool    g_perFrameMismatchLogged     = false;
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
 
+// Spectator tick holdoff: when true, the per-frame tick hook will not
+// call RunPerFrameTickDispatch while the spectator session is active on
+// the title screen.  This prevents the DLL's spectator input-replay
+// loop from consuming shared-memory ring buffer entries before the game
+// has transitioned to charselect, which would cause frame misalignment
+// and desync (the spectator would advance past charselect inputs while
+// still on the title screen, then see mid-game data once charselect
+// actually appears).
+static bool g_spectateHoldoffLogged = false;
+// Set true once the holdoff has been active during a session.  Used to
+// trigger a one-shot ring-buffer flush at the exact moment the holdoff
+// releases, discarding pre-charselect inputs that accumulated while the
+// spectator was still on the title screen.
+static bool g_spectateHoldoffWasActive = false;
+
 // __thiscall trampoline: ECX = this, no other args.
 using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
 static PerFrameTickFn g_origPerFrameTick = nullptr;
@@ -3339,12 +3354,163 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
+    // ---- Spectator tick holdoff -----------------------------------------------
+    // While spectating and still on the title screen, the DLL's spectator
+    // session tick must NOT run.  The session's input-replay loop reads
+    // InputP1/P2 ring buffers and calls EFZ_ReplayStream_PushTwoChars +
+    // EFZ_GameMode_InvokeAdvance for each available frame.  If this runs
+    // while the game is on the title screen (before HandoffSpectateSession
+    // transitions to charselect), the spectator would:
+    //   (a) consume the match's opening input frames on a screen where
+    //       they serve no purpose,
+    //   (b) advance EFZ_GameMode_InvokeAdvance on a stale game state,
+    //   (c) desync once charselect arrives because the shared-memory
+    //       cursor has already moved past the charselect data.
+    //
+    // Fix: skip RunPerFrameTickDispatch when role == spectator AND the
+    // game is on screen index 0 (title).  HandoffSpectateSession sets
+    // g_pendingGlobalStateTransition = 1 (charselect), which takes effect
+    // on the same frame.  The next frame sees screen index 1 and the
+    // holdoff naturally clears.
+    //
+    // Post-tick paths (disconnect detection, ESC exit) still run normally
+    // because we only gate the RunPerFrameTickDispatch call.
+    // -----------------------------------------------------------------------
+    bool spectateTickHoldoff = false;
+    if (g_localRoleFlag == kLocalRoleSpectate
+        && g_localInitAppliedForSession
+        && g_dllExitProcessPatchesSaved)
+    {
+        uint8_t holdoffScreen = 0xFF;
+        __try {
+            holdoffScreen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (holdoffScreen == 0)
+        {
+            spectateTickHoldoff = true;
+            g_spectateHoldoffWasActive = true;
+            if (!g_spectateHoldoffLogged)
+            {
+                g_spectateHoldoffLogged = true;
+                mod::Log(
+                    "TICK_HOOK: spectator tick holdoff engaged — preventing "
+                    "input consumption while on title screen (frameTick=%u)",
+                    g_frameTick);
+            }
+        }
+        else if (g_spectateHoldoffLogged)
+        {
+            // ---- Holdoff-release ring buffer flush -------------------------
+            // While the holdoff was active (game on title screen), the child
+            // EfzRevival.exe received the host's entire replay history and
+            // wrote it to the shared-memory ring buffers.  This history
+            // starts from the host's session start — which was on the *host's*
+            // title screen, NOT charselect.  The first T frames contain inputs
+            // the host's online session captured while the player navigated
+            // the mod's netplay menu (potentially Down, Enter, Escape, etc.).
+            //
+            // The spectator is now entering charselect directly.  If the DLL's
+            // spectator tick processes those T title-screen-era inputs on the
+            // charselect screen, they would be interpreted as cursor movements
+            // and character selections — causing an immediate desync ("inputs
+            // became misaligned ... spectator side don't even see characters
+            // picked").
+            //
+            // Fix: flush ALL ring buffers at the holdoff→release transition.
+            // This discards every entry accumulated during the holdoff (both
+            // title-screen and early-charselect data from the host's replay).
+            // The child EXE continues writing live data, so the spectator
+            // picks up from the current match state going forward.
+            //
+            // The trade-off is that the spectator won't replay the charselect
+            // from the beginning — it joins the match in progress.  This
+            // matches what users observe in practice and avoids the desync.
+            // ----------------------------------------------------------------
+            if (g_spectateHoldoffWasActive)
+            {
+                g_spectateHoldoffWasActive = false;
+
+                struct RingMapping {
+                    const char* name;
+                    HANDLE      hMap;
+                    volatile DWORD* view;
+                };
+                RingMapping mappings[] = {
+                    {"InputP1",   nullptr, nullptr},
+                    {"InputP2",   nullptr, nullptr},
+                    {"PaletteP1", nullptr, nullptr},
+                    {"PaletteP2", nullptr, nullptr},
+                    {"Sync",      nullptr, nullptr},
+                    {"Quit",      nullptr, nullptr},
+                    {"LoadMatch", nullptr, nullptr},
+                };
+                constexpr int kMappingCount = 7;
+
+                for (int mi = 0; mi < kMappingCount; ++mi)
+                {
+                    mappings[mi].hMap = OpenFileMappingA(
+                        FILE_MAP_ALL_ACCESS, FALSE, mappings[mi].name);
+                    if (mappings[mi].hMap != nullptr)
+                    {
+                        mappings[mi].view = static_cast<volatile DWORD*>(
+                            MapViewOfFile(mappings[mi].hMap,
+                                         FILE_MAP_ALL_ACCESS, 0, 0, 8));
+                    }
+                }
+                int flushedCount = 0;
+                for (int mi = 0; mi < kMappingCount; ++mi)
+                {
+                    if (mappings[mi].view == nullptr)
+                        continue;
+                    const DWORD oldHead = mappings[mi].view[0];
+                    const DWORD oldTail = mappings[mi].view[1];
+                    if (oldHead != oldTail)
+                    {
+                        mappings[mi].view[0] = oldTail;
+                        ++flushedCount;
+                        mod::Log(
+                            "TICK_HOOK: holdoff-release flushed '%s' "
+                            "head=%lu->%lu tail=%lu",
+                            mappings[mi].name,
+                            static_cast<unsigned long>(oldHead),
+                            static_cast<unsigned long>(oldTail),
+                            static_cast<unsigned long>(oldTail));
+                    }
+                }
+                for (int mi = 0; mi < kMappingCount; ++mi)
+                {
+                    if (mappings[mi].view != nullptr)
+                        UnmapViewOfFile(const_cast<DWORD*>(mappings[mi].view));
+                    if (mappings[mi].hMap != nullptr)
+                        CloseHandle(mappings[mi].hMap);
+                }
+                mod::Log(
+                    "TICK_HOOK: spectator holdoff-release flush complete "
+                    "flushed=%d buffers (frameTick=%u)",
+                    flushedCount, g_frameTick);
+            }
+
+            mod::Log(
+                "TICK_HOOK: spectator tick holdoff released — screen=%u, "
+                "DLL session tick now active (frameTick=%u)",
+                static_cast<unsigned>(holdoffScreen),
+                g_frameTick);
+            g_spectateHoldoffLogged = false;
+        }
+    }
+    else if (g_spectateHoldoffLogged)
+    {
+        // Session ended or role changed while holdoff was logged.
+        g_spectateHoldoffLogged = false;
+    }
+
     // Call the original sub_1006E570 with the corrected ECX — unless
-    // a pre-tick disconnect was detected, in which case we skip the DLL's
-    // tick entirely to avoid a corrupted render+Flip.
+    // a pre-tick disconnect was detected or spectator tick holdoff is
+    // active, in which case we skip the DLL's tick entirely.
     int result = 0;
 
-    if (!preTickDisconnect)
+    if (!preTickDisconnect && !spectateTickHoldoff)
     {
         // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
         // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
@@ -3676,6 +3842,8 @@ void ResetGameModeValidation()
 {
     g_frameTick = 0;
     g_perFrameMismatchLogged = false;
+    g_spectateHoldoffLogged = false;
+    g_spectateHoldoffWasActive = false;
 
     // Clear stale deferred-cleanup flags from a previous session.
     // If g_deferredCancelCleanup persists into session 2, the first

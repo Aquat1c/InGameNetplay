@@ -2,16 +2,12 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"label": "CMake Configure Win32",
+			"label": "CMake Configure XP Win32",
 			"type": "shell",
 			"command": "cmake",
 			"args": [
-				"-S",
-				".",
-				"-B",
-				"build",
-				"-A",
-				"Win32"
+				"--preset",
+				"xp-release"
 			],
 			"group": "build"
 		},
@@ -21,7 +17,7 @@
 			"command": "cmake",
 			"args": [
 				"--build",
-				"build",
+				"build_xp_win32",
 				"--config",
 				"Release",
 				"--clean-first"
@@ -29,17 +25,19 @@
 			"group": "build"
 		},
 		{
-			"label": "CMake Rebuild Debug",
+			"label": "CMake Build Release",
 			"type": "shell",
 			"command": "cmake",
 			"args": [
 				"--build",
-				"build",
+				"build_xp_win32",
 				"--config",
-				"Debug",
-				"--clean-first"
+				"Release"
 			],
-			"group": "build"
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
 		}
 	]
 }

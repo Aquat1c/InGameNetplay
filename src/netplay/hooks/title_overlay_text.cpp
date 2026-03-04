@@ -672,11 +672,12 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
 // Debug overlay — toggled with keyboard D key
 // ---------------------------------------------------------------------------
 
-static constexpr int kDebugMenuItemCount = 4;
+static constexpr int kDebugMenuItemCount = 5;
 static constexpr const char* kDebugMenuItems[kDebugMenuItemCount] = {
     "Delay Overlay",
     "Spectate Overlay",
     "Runtime Text Overlay",
+    "Wait to Spectate",
     "Close",
 };
 
@@ -724,13 +725,14 @@ bool DrawDebugOverlay(uint32_t screenContext)
     netplay::font::DrawIndexedSurfaceFrame(sv, panelLeft, panelTop, panelW, panelH, frameColor);
 
     // Title
-    netplay::font::DrawTextCentered5x7(sv, "D MENU", panelLeft + 2, panelRight - 2, panelTop + 4, 1, 1, titleColor);
+    netplay::font::DrawTextCentered5x7(sv, "DEBUG MENU", panelLeft + 2, panelRight - 2, panelTop + 4, 1, 1, titleColor);
 
     // Items
     const bool toggleStates[kDebugMenuItemCount] = {
         g_debugOverlay.forceDelayOverlay,
         g_debugOverlay.forceSpectateOverlay,
         g_debugOverlay.forceRuntimeTextOverlay,
+        false, // "Wait to Spectate" — action, no toggle
         false, // "Close" has no toggle state
     };
 
@@ -745,8 +747,10 @@ bool DrawDebugOverlay(uint32_t screenContext)
         }
 
         // Build label: "> Item [ON]" or "  Item [OFF]"
+        // Items 0..2 are toggles, items 3+ are plain actions/close
         char label[64] = {};
-        if (i < kDebugMenuItemCount - 1)
+        const bool isToggleItem = (i <= 2);
+        if (isToggleItem)
         {
             std::snprintf(label, sizeof(label), "%s%s [%s]",
                 isSelected ? "> " : "  ",
@@ -761,11 +765,11 @@ bool DrawDebugOverlay(uint32_t screenContext)
         }
 
         uint8_t textColor = isSelected ? selectedColor : normalColor;
-        if (i < kDebugMenuItemCount - 1 && toggleStates[i])
+        if (isToggleItem && toggleStates[i])
         {
-            textColor = isSelected ? onColor : onColor;
+            textColor = onColor;
         }
-        else if (i < kDebugMenuItemCount - 1 && !toggleStates[i])
+        else if (isToggleItem && !toggleStates[i])
         {
             textColor = isSelected ? offColor : normalColor;
         }
@@ -893,6 +897,34 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                     g_debugOverlay.forceRuntimeTextOverlay ? "ON" : "OFF");
             }
             else if (sel == 3)
+            {
+                // "Wait to Spectate" — start a Spectate session using Join address/port
+                const auto& ms = g_netplayMenuState;
+                if (ms.joinAddress.empty() || ms.joinPort == 0)
+                {
+                    mod::Log("DebugOverlay: Wait to Spectate — no join address/port configured");
+                }
+                else
+                {
+                    const bool started = netplay::bridge::StartSession(
+                        netplay::bridge::NetbridgeRole::Spectate,
+                        ms.joinPort,
+                        ms.joinAddress.c_str(),
+                        "");
+                    if (started)
+                    {
+                        ActivateJoiningOverlay(ms.joinAddress.c_str(), ms.joinPort);
+                        g_debugOverlay.open = false;
+                        mod::Log("DebugOverlay: Wait to Spectate started -> %s:%u",
+                            ms.joinAddress.c_str(), static_cast<unsigned>(ms.joinPort));
+                    }
+                    else
+                    {
+                        mod::Log("DebugOverlay: Wait to Spectate — StartSession failed");
+                    }
+                }
+            }
+            else if (sel == 4)
             {
                 g_debugOverlay.open = false;
                 mod::Log("DebugOverlay: closed via menu");

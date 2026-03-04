@@ -839,6 +839,85 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     ResetEvent(g_hostInitEvent);
     ResetEvent(g_hostConsoleEvent);
 
+    // --- Pre-launch ring buffer flush (spectate only) ----------------------
+    // Revival's named shared-memory ring buffers ("InputP1", "InputP2", etc.)
+    // may still contain stale data from a previous session if the kernel
+    // objects haven't been destroyed.  Flush them NOW — before the child
+    // process is resumed — so that only fresh data from the new session is
+    // present when the DLL eventually starts consuming.
+    //
+    // Previously this flush lived inside the Tick() init-handshake block
+    // (after the child signalled its init event).  That placement caused a
+    // spectator desync: between the child's WriteProcessMemory IAT hook
+    // signalling the init event and the next game-frame's Tick() detecting
+    // it (~16 ms), the child had already started writing the host's
+    // historical input stream into the ring buffers.  The flush then
+    // discarded those early entries — the very beginning of the charselect
+    // replay — leaving the DLL to start mid-stream against a freshly-
+    // initialised charselect state.
+    //
+    // By flushing here (child still suspended), we clear only genuinely
+    // stale data; once the child resumes and connects, every input frame
+    // it writes is preserved for the DLL to consume.
+    // -------------------------------------------------------------------
+    if (localRoleMode == kLocalRoleSpectate)
+    {
+        struct RingMapping {
+            const char* name;
+            HANDLE      hMap;
+            volatile DWORD* view;
+        };
+        RingMapping mappings[] = {
+            {"InputP1",   nullptr, nullptr},
+            {"InputP2",   nullptr, nullptr},
+            {"PaletteP1", nullptr, nullptr},
+            {"PaletteP2", nullptr, nullptr},
+            {"Sync",      nullptr, nullptr},
+            {"Quit",      nullptr, nullptr},
+            {"LoadMatch", nullptr, nullptr},
+        };
+        constexpr int kMappingCount = 7;
+
+        for (int mi = 0; mi < kMappingCount; ++mi)
+        {
+            mappings[mi].hMap = OpenFileMappingA(
+                FILE_MAP_ALL_ACCESS, FALSE, mappings[mi].name);
+            if (mappings[mi].hMap != nullptr)
+            {
+                mappings[mi].view = static_cast<volatile DWORD*>(
+                    MapViewOfFile(mappings[mi].hMap,
+                                 FILE_MAP_ALL_ACCESS, 0, 0, 8));
+            }
+        }
+        for (int mi = 0; mi < kMappingCount; ++mi)
+        {
+            if (mappings[mi].view == nullptr)
+                continue;
+            const DWORD oldHead = mappings[mi].view[0];
+            const DWORD oldTail = mappings[mi].view[1];
+            if (oldHead != oldTail)
+            {
+                mappings[mi].view[0] = oldTail;
+                mod::Log(
+                    "Takeover: pre-launch flushed stale '%s' "
+                    "head=%lu->%lu tail=%lu",
+                    mappings[mi].name,
+                    static_cast<unsigned long>(oldHead),
+                    static_cast<unsigned long>(oldTail),
+                    static_cast<unsigned long>(oldTail));
+            }
+        }
+        // Alignment verification is unnecessary here — no producer is
+        // running yet, so no interleaved writes can occur.
+        for (int mi = 0; mi < kMappingCount; ++mi)
+        {
+            if (mappings[mi].view != nullptr)
+                UnmapViewOfFile(const_cast<DWORD*>(mappings[mi].view));
+            if (mappings[mi].hMap != nullptr)
+                CloseHandle(mappings[mi].hMap);
+        }
+    }
+
     // Both Wine and native: the process was created suspended, resume it
     // now that injection and IAT patching are complete.
     {
@@ -1502,61 +1581,12 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
 
-            // --- Flush stale shared memory ring buffers (spectate only) ---
-            // Revival's input ring buffers (InputP1, InputP2, etc.) use
-            // named Win32 file mappings with bare names.  If a previous
-            // session left stale data (the child EfzRevival.exe still has
-            // handles open), the OpenOrCreate path in the DLL constructor
-            // opens the existing mapping and inherits the old head/tail
-            // cursors.  The type 1 (spectator) session would then drain
-            // these stale entries as if they were current inputs, causing
-            // frame misalignment and desync.
-            //
-            // Fix: open each mapping by name, set head = tail to discard
-            // all pending entries, then close.  This runs before the first
-            // tick, so the local vectors (offset +28/+40) are still empty
-            // and currentFrame (offset +104) is 0.
-            //
-            // IMPORTANT: Only flush for spectate sessions.  For online
-            // (host/join) sessions, the type 0 DLL session WRITES to these
-            // ring buffers and the child EfzRevival.exe READS them.
-            // Flushing would discard entries the child needs, breaking
-            // synchronization and freezing the charselect handoff.
-            if (initParams[0] == kLocalRoleSpectate)
-            {
-                static const char* kRingNames[] = {
-                    "InputP1", "InputP2",
-                    "PaletteP1", "PaletteP2",
-                    "Sync", "Quit", "LoadMatch",
-                };
-                for (const char* ringName : kRingNames)
-                {
-                    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, ringName);
-                    if (hMap == nullptr)
-                        continue;  // doesn't exist → freshly created, head=tail=0
-                    // Map just the 8-byte header: [DWORD head][DWORD tail]
-                    volatile DWORD* view = static_cast<volatile DWORD*>(
-                        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 8));
-                    if (view != nullptr)
-                    {
-                        const DWORD oldHead = view[0];
-                        const DWORD oldTail = view[1];
-                        if (oldHead != oldTail)
-                        {
-                            view[0] = oldTail;  // discard all pending entries
-                            mod::Log(
-                                "Takeover: flushed stale shared memory '%s' "
-                                "head=%lu->%lu tail=%lu",
-                                ringName,
-                                static_cast<unsigned long>(oldHead),
-                                static_cast<unsigned long>(oldTail),
-                                static_cast<unsigned long>(oldTail));
-                        }
-                        UnmapViewOfFile(const_cast<DWORD*>(view));
-                    }
-                    CloseHandle(hMap);
-                }
-            } // if spectate — end of ring buffer flush guard
+            // NOTE: The spectate ring-buffer flush that used to live here
+            // has been moved to StartSession (before ResumeThread).  Flushing
+            // here — after the child process has already been running for up
+            // to a game frame — discarded the beginning of the host's input
+            // replay stream, causing spectator desync at charselect.
+            // See the "Pre-launch ring buffer flush" block in StartSession.
 
             // --- Final snapshot after all init steps complete ---
             LogInitWriteSnapshot("Tick_initSequence_complete");

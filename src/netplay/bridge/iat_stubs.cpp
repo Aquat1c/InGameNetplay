@@ -1325,6 +1325,22 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         {
                             InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, auxSerial);
                         }
+
+                        // When aux auto-answers the spectate confirm prompt
+                        // (JoinSpectate flow), sync the served serial so that
+                        // the title-screen overlay knows the prompt is resolved
+                        // and does not loop the confirmation window.
+                        if (roleMode == kLocalRoleSpectate)
+                        {
+                            const LONG scPS = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
+                            if (scPS > 0)
+                            {
+                                InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPS);
+                                InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPS);
+                                mod::Log("Takeover: aux auto-answered spectate confirm — synced servedSerial=%ld", static_cast<long>(scPS));
+                            }
+                        }
+
                         return serveScriptedInput(block, auxLine, sourceTag, "aux_line", auxSerial, true);
                     }
 

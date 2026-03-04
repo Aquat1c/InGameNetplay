@@ -72,6 +72,7 @@ struct LobbyStatus
     std::string statusMessage; // human-readable status or error text
     std::string publicIp;      // our discovered public IP (empty until resolved)
     DWORD lastPollTick = 0;
+    bool inBattle = false;     // true while we are in an active match
 };
 
 // Manages a single Concerto lobby session for the EFZ lobby (alias "EFZ").
@@ -123,6 +124,10 @@ public:
     // connection dropped).  Sends 'end' to reset lobby status to idle.
     void NotifyEndMatch();
 
+    // Returns true while we are in an active match (between
+    // NotifyMatchConnected and NotifyEndMatch).  Thread-safe.
+    bool IsInBattle() const;
+
 private:
     // Background thread entry point: join → poll loop → leave.
     void PollThreadEntry();
@@ -170,6 +175,7 @@ private:
         const std::vector<LobbyPlayer>& idlePlayers,
         const std::vector<LobbyPlayingPair>& playing,
         int selfPlayerId,
+        bool selfInBattle,
         std::vector<LobbyDisplayEntry>* out);
 
     std::string m_nickname;
@@ -200,6 +206,7 @@ private:
 
     std::atomic<bool> m_shouldStop{false};
     std::atomic<bool> m_refreshRequested{false};
+    std::atomic<bool> m_inBattle{false};
 
     // Signalled to wake the polling thread early (refresh or stop).
     HANDLE m_wakeEvent = nullptr;

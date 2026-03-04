@@ -876,7 +876,7 @@ int SelfPatchIat()
 
             const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                 imageBase + oft[i].u1.AddressOfData);
-            const char* importName = importByName->Name;
+            const char* importName = reinterpret_cast<const char*>(importByName->Name);
 
             // Linear scan through entries — the list is small (21 entries).
             uint32_t targetAddr = 0;

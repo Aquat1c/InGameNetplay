@@ -485,6 +485,10 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
             netplay::bridge::CancelSession("user_cancel");
+            if (g_lobbySession)
+            {
+                g_lobbySession->NotifyEndMatch();
+            }
             mod::Log("DelayOverlay: canceled while waiting for runtime sync");
             return true;
         }
@@ -567,6 +571,10 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
         netplay::bridge::CancelSession("user_cancel");
+        if (g_lobbySession)
+        {
+            g_lobbySession->NotifyEndMatch();
+        }
         mod::Log("DelayOverlay: canceled");
         return true;
     }
@@ -895,13 +903,14 @@ void HandoffSpectateSession(uint32_t screenContext)
     // transition to "playing" for spectate sessions.
     if (g_lobbySession)
     {
+        mod::Log("HandoffSpectateSession: notifying lobby — setting inBattle=true (spectate path)");
         g_lobbySession->NotifyMatchConnected();
     }
 
     // Transition directly to charselect (mode 1).  The DLL's client
     // session (type 1) survives mode transitions and drives the game via
     // input replay from shared memory — the mode-8 replay screen detour
-    // was unnecessary because the DLL's watcher creation path only triggers
+    // is unnecessary because the DLL's watcher creation path only triggers
     // for session type 2 (dword_100A05D0==2), not the mod's type 1.
     // Going directly to charselect avoids wasting shared-memory input
     // frames on the unused replay screen.
@@ -1037,6 +1046,18 @@ void LeaveNetplayMenu(uint32_t screenContext)
     }
 
     netplay::bridge::CancelSession("leave_menu");
+
+    // Defensive: tear down any active lobby session so the server is
+    // notified (/leave) and the poll thread stops.  Normally unreachable
+    // because SwitchToMenu handles this when navigating away from the
+    // Lobby menu, but guards against future call-site additions.
+    if (g_lobbySession)
+    {
+        mod::Log("LeaveNetplayMenu: tearing down g_lobbySession defensively");
+        std::thread([session = std::move(g_lobbySession)]() mutable {
+            session.reset();
+        }).detach();
+    }
 
     g_netplayMenuState.active = false;
     g_netplayMenuState.bgmActive = false;
@@ -1380,6 +1401,10 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             break;
         }
 
+        mod::Log("LobbyPlaying0: spectating playing pair '%s' vs '%s' hostIp=%s inBattle=%d",
+            status.playing[0].p1Name.c_str(), status.playing[0].p2Name.c_str(),
+            status.playing[0].hostIp.c_str(), status.inBattle ? 1 : 0);
+
         // Parse ip:port from the playing pair's hostIp field.
         std::string spectateAddr = status.playing[0].hostIp;
         uint16_t spectatePort = g_netplayMenuState.joinPort;
@@ -1394,11 +1419,20 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             }
         }
 
+        mod::Log("LobbyPlaying0: parsed spectateAddr=%s spectatePort=%u",
+            spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
+
+        // Use JoinSpectate (Revival choice 3 + auto-accept) instead of
+        // Spectate (choice 4).  Direct spectate (choice 4) disrupts the
+        // host's active match and freezes all clients.  JoinSpectate goes
+        // through the normal join flow which safely redirects to spectate
+        // when the host is already playing.
         const bool started = netplay::bridge::StartSession(
             NetbridgeRole::JoinSpectate,
             spectatePort,
             spectateAddr.c_str(),
-            "");
+            g_netplayMenuState.nickname.c_str());
+        mod::Log("LobbyPlaying0: StartSession(JoinSpectate) returned %d", started ? 1 : 0);
         if (started)
         {
             ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
@@ -1412,6 +1446,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 sizeof(text),
                 "Spectate start failed.\n\n%s",
                 bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+            mod::Log("LobbyPlaying0: spectate start FAILED: %s", bridgeStatus.errorMsg);
             ShowStubActionMessage(owner, text);
         }
         break;
@@ -1473,11 +1508,14 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 entry.name.c_str(), entry.playerId, entry.spectateIp.c_str(),
                 spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
 
+            // Use JoinSpectate (Revival choice 3 + auto-accept) instead of
+            // Spectate (choice 4).  Direct spectate (choice 4) disrupts the
+            // host's active match and freezes all clients.
             const bool started = netplay::bridge::StartSession(
                 NetbridgeRole::JoinSpectate,
                 spectatePort,
                 spectateAddr.c_str(),
-                "");
+                g_netplayMenuState.nickname.c_str());
             if (started)
             {
                 ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
@@ -1498,6 +1536,17 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         if (entry.isChallenge)
         {
             // --- Accepting an incoming challenge ---
+            // Safety guard: if we are in a match, do not accept challenges.
+            // BuildDisplayEntries already filters them out, but guard here
+            // against race conditions.
+            if (g_lobbySession && g_lobbySession->IsInBattle())
+            {
+                mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d — we are in battle",
+                    entry.name.c_str(), entry.playerId);
+                ShowStubActionMessage(owner, "Cannot accept challenges\nwhile in a match.");
+                break;
+            }
+
             // Parse the challenger's ip:port into address + port for StartSession.
             std::string challengeAddr = entry.ipPort;
             uint16_t challengePort = g_netplayMenuState.hostPort;
@@ -1543,6 +1592,15 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         else
         {
             // --- Challenging an idle player (we become host) ---
+            // Safety guard: if we are in a match, do not send challenges.
+            if (g_lobbySession && g_lobbySession->IsInBattle())
+            {
+                mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d — we are in battle",
+                    entry.name.c_str(), entry.playerId);
+                ShowStubActionMessage(owner, "Cannot send challenges\nwhile in a match.");
+                break;
+            }
+
             const std::string publicIp = lobStatus.publicIp;
             if (publicIp.empty())
             {
@@ -1844,17 +1902,32 @@ char UpdateNetplayMenu(uint32_t screenContext)
     // The spectate confirm prompt fires during Connecting when the host is
     // already mid-match.  We must handle it BEFORE the delay-setup check so
     // that the user can accept/decline before Revival continues.
+    // Consider the spectate-confirm prompt resolved if:
+    //  - serials match (normal path), OR
+    //  - localInitApplied is set (aux auto-answered before overlay tracking,
+    //    e.g. JoinSpectate from a lobby session).
     const bool spectateConfirmPending =
         bridgeStatus.spectateConfirmPromptSerial > 0
-        && bridgeStatus.spectateConfirmPromptServedSerial < bridgeStatus.spectateConfirmPromptSerial;
+        && bridgeStatus.spectateConfirmPromptServedSerial < bridgeStatus.spectateConfirmPromptSerial
+        && bridgeStatus.localInitApplied == 0;
     if (spectateConfirmPending && !g_spectateConfirmOverlay.active)
     {
         ActivateSpectateConfirmOverlay();
     }
     if (g_spectateConfirmOverlay.active)
     {
-        (void)HandleSpectateConfirmOverlayInput(screenContext, inputBytes, inactivityCounter);
-        return 0;
+        if (!spectateConfirmPending)
+        {
+            // Prompt was resolved externally (aux auto-answer / init applied).
+            // Dismiss the overlay so it doesn't block the handoff.
+            mod::Log("SpectateConfirmOverlay: auto-dismissed (prompt resolved externally)");
+            ResetSpectateConfirmOverlayState();
+        }
+        else
+        {
+            (void)HandleSpectateConfirmOverlayInput(screenContext, inputBytes, inactivityCounter);
+            return 0;
+        }
     }
 
     // --- Spectate handoff ---
@@ -1941,6 +2014,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             // can send the deferred 'accept' and transition to "playing".
             if (g_lobbySession)
             {
+                mod::Log("DelaySetupOverlay: notifying lobby — setting inBattle=true (P2P match path)");
                 g_lobbySession->NotifyMatchConnected();
             }
         }
@@ -2172,6 +2246,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         // No joining overlay active — just reset and fall through to idle menu
+        mod::Log("UpdateNetplayMenu: session ended with no overlay active, resetting (inBattle will be cleared)");
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
         DisarmSpectateReplayBypass();

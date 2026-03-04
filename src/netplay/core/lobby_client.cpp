@@ -1127,6 +1127,11 @@ int LobbySession::GetPlayerId() const
     return m_playerId;
 }
 
+bool LobbySession::IsInBattle() const
+{
+    return m_inBattle.load();
+}
+
 void LobbySession::RequestRefresh()
 {
     m_refreshRequested.store(true);
@@ -1172,8 +1177,11 @@ void LobbySession::NotifyMatchConnected()
 {
     // Called when the P2P connection is established (delay setup overlay shown).
     // Queue the deferred 'accept' so the lobby shows the pair as "playing".
+    m_inBattle.store(true);
+    mod::Log("LobbySession::NotifyMatchConnected: inBattle=true");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::ConfirmAccept;
         // targetPlayerId is not needed for accept — the server tracks the
@@ -1190,8 +1198,11 @@ void LobbySession::NotifyMatchConnected()
 
 void LobbySession::NotifyEndMatch()
 {
+    m_inBattle.store(false);
+    mod::Log("LobbySession::NotifyEndMatch: inBattle=false");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = false;
         PendingAction action;
         action.type = PendingAction::End;
         m_pendingActions.push_back(std::move(action));
@@ -1366,17 +1377,25 @@ bool LobbySession::DoPollStatus()
     ParsePlayingPairs(body, &playingPairs);
 
     std::vector<LobbyDisplayEntry> displayEntries;
-    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, &displayEntries);
+    const bool inBattle = m_inBattle.load();
+    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, inBattle, &displayEntries);
+
+    if (inBattle && !challenges.empty())
+    {
+        mod::Log("LobbySession::DoPollStatus: inBattle=true, dropping %zu incoming challenges",
+                 challenges.size());
+    }
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_status.pollState = PollState::Polling;
     m_status.idlePlayers = std::move(idlePlayers);
-    m_status.challenges = std::move(challenges);
+    m_status.challenges = inBattle ? std::vector<LobbyChallenge>{} : std::move(challenges);
     m_status.displayEntries = std::move(displayEntries);
     m_status.playing = std::move(playingPairs);
     m_status.publicIp = m_publicIp;
     m_status.statusMessage.clear();
     m_status.lastPollTick = GetTickCount();
+    m_status.inBattle = inBattle;
     return true;
 }
 
@@ -1842,15 +1861,24 @@ void LobbySession::BuildDisplayEntries(
     const std::vector<LobbyPlayer>& idlePlayers,
     const std::vector<LobbyPlayingPair>& playing,
     int selfPlayerId,
+    bool selfInBattle,
     std::vector<LobbyDisplayEntry>* out)
 {
     out->clear();
-    out->reserve(challenges.size() + idlePlayers.size());
+
+    // When we are in battle, skip all incoming challenges entirely.
+    // They cannot be acted on and processing them may interfere with
+    // the active match.
+    const std::vector<LobbyChallenge> effectiveChallenges = selfInBattle
+        ? std::vector<LobbyChallenge>{}
+        : challenges;
+
+    out->reserve(effectiveChallenges.size() + idlePlayers.size());
 
     // Build a set of player IDs that appear in challenges, so we can
     // deduplicate them from the idle list (a challenger also shows in idle).
     std::vector<int> challengerIds;
-    challengerIds.reserve(challenges.size());
+    challengerIds.reserve(effectiveChallenges.size());
 
     // Build a set of player IDs that are currently playing.
     std::vector<int> playingIds;
@@ -1881,7 +1909,7 @@ void LobbySession::BuildDisplayEntries(
     };
 
     // Challenges first — they are actionable and time-sensitive.
-    for (const auto& ch : challenges)
+    for (const auto& ch : effectiveChallenges)
     {
         challengerIds.push_back(ch.playerId);
 
@@ -1897,6 +1925,31 @@ void LobbySession::BuildDisplayEntries(
     }
 
     // Then idle players, skipping any that already appear as challengers.
+    // Helper: check if a name already exists in the output list.
+    // Used to deduplicate stale server entries where the same player
+    // appears with multiple IDs (e.g. reconnect without leaving first).
+    auto isNameAlreadyListed = [&](const std::string& name) -> bool {
+        for (const auto& e : *out)
+        {
+            if (e.name == name) return true;
+        }
+        return false;
+    };
+
+    // Also collect names from playing pairs so we can mark idle entries
+    // that are stale duplicates of a currently-playing player.
+    auto isNameInPlayingPair = [&](const std::string& name, std::string* outSpectateIp) -> bool {
+        for (const auto& pp : playing)
+        {
+            if (pp.p1Name == name || pp.p2Name == name)
+            {
+                if (outSpectateIp) *outSpectateIp = pp.hostIp;
+                return true;
+            }
+        }
+        return false;
+    };
+
     for (const auto& p : idlePlayers)
     {
         bool isDuplicate = false;
@@ -1913,13 +1966,29 @@ void LobbySession::BuildDisplayEntries(
             continue;
         }
 
+        // Skip if this name already appears (stale duplicate with new ID).
+        if (isNameAlreadyListed(p.name))
+        {
+            continue;
+        }
+
         LobbyDisplayEntry entry;
         entry.name = p.name;
         entry.playerId = p.playerId;
         entry.isChallenge = false;
         entry.isSelf = (p.playerId == selfPlayerId);
-        entry.isPlaying = isPlayerPlaying(p.playerId);
-        entry.spectateIp = findSpectateIp(p.playerId);
+        // Check both by ID and by name: the server may assign a different
+        // ID to a player in the playing list vs their idle entry.
+        std::string spectateIpByName;
+        entry.isPlaying = isPlayerPlaying(p.playerId) || isNameInPlayingPair(p.name, &spectateIpByName);
+        if (entry.isPlaying && entry.spectateIp.empty())
+        {
+            entry.spectateIp = spectateIpByName;
+        }
+        if (entry.spectateIp.empty())
+        {
+            entry.spectateIp = findSpectateIp(p.playerId);
+        }
         out->push_back(std::move(entry));
     }
 
@@ -1937,10 +2006,13 @@ void LobbySession::BuildDisplayEntries(
 
     for (const auto& pp : playing)
     {
-        // Use the first player in the pair who isn't already listed.
-        // Prefer p1 (typically the host) so the spectateIp resolves correctly.
-        const int displayId = !isAlreadyListed(pp.p1Id) ? pp.p1Id
-                            : !isAlreadyListed(pp.p2Id) ? pp.p2Id
+        // Use the first player in the pair who isn't already listed
+        // (by ID or by name).  Prefer p1 (typically the host) so the
+        // spectateIp resolves correctly.
+        const bool p1Listed = isAlreadyListed(pp.p1Id) || isNameAlreadyListed(pp.p1Name);
+        const bool p2Listed = isAlreadyListed(pp.p2Id) || isNameAlreadyListed(pp.p2Name);
+        const int displayId = !p1Listed ? pp.p1Id
+                            : !p2Listed ? pp.p2Id
                             : 0;
         if (displayId == 0)
         {
