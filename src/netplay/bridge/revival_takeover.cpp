@@ -470,25 +470,146 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     }
     exePath += "EfzRevival.exe";
 
-    BOOL created = CreateProcessA(
-        exePath.c_str(),
-        nullptr,
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW,
-        nullptr,
-        gameDir.empty() ? nullptr : gameDir.c_str(),
-        &si,
-        &pi);
+    // ---- Wine/Proton path --------------------------------------------------
+    // Both Wine and native paths use CREATE_SUSPENDED so that the child's
+    // main thread is frozen before its entry point.  We inject our DLL via
+    // CreateRemoteThread(LoadLibraryA), patch the IAT, then ResumeThread.
+    // This ensures our ReadConsoleA hook is in place before main() runs.
+    //
+    // Under Wine we also set WINEDLLOVERRIDES as a belt-and-suspenders
+    // measure (it does not force-load custom DLLs on current Wine, but
+    // may help on future versions).
+    //
+    // SelfPatchIat() in DllMain(DLL_PROCESS_ATTACH) provides an additional
+    // safety net under Wine, patching the EXE's IAT from within the
+    // process before the loader lock is released.
+    // --------------------------------------------------------------------
+    const bool useWinePath = IsRunningUnderWine();
 
-    if (!created)
+    if (useWinePath)
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "CreateProcess(EfzRevival.exe) failed");
-        return false;
-    }
+        // Build an environment block that includes WINEDLLOVERRIDES so Wine
+        // force-loads our DLL into the child process.
+        //
+        // Get our DLL's full path.  Wine's WINEDLLOVERRIDES expects the
+        // module name (without extension), e.g. "efz_netplay_mod=n".
+        // Using just the basename is the documented format for Wine.
+        // We also set the DLL's directory on the search path so Wine can
+        // find the native DLL file when the override triggers.
+        const std::string selfPath = ModulePath(SelfModule());
+        if (selfPath.empty())
+        {
+            SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] failed to get self module path");
+            return false;
+        }
 
-    mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
+        // Build the override string: "efz_netplay_mod=n"
+        // n = native — tells Wine to load the DLL from the filesystem.
+        std::string baseName = BaseLower(selfPath);
+        {
+            // Strip .dll extension if present.
+            const size_t dot = baseName.rfind('.');
+            if (dot != std::string::npos)
+                baseName.erase(dot);
+        }
+        std::string overrideValue = baseName + "=n";
+
+        // Merge with any existing WINEDLLOVERRIDES.
+        char existingOverride[4096] = {};
+        const DWORD existingLen = GetEnvironmentVariableA(
+            "WINEDLLOVERRIDES", existingOverride, sizeof(existingOverride));
+        if (existingLen > 0 && existingLen < sizeof(existingOverride))
+        {
+            overrideValue = std::string(existingOverride) + ";" + overrideValue;
+        }
+
+        // Build an environment block — a double-null-terminated sequence of
+        // "KEY=VALUE\0" strings.  We inherit the current environment and
+        // append/override WINEDLLOVERRIDES.
+        std::vector<char> envBlock;
+        {
+            // Get the current environment.
+            char* currentEnv = GetEnvironmentStringsA();
+            if (currentEnv != nullptr)
+            {
+                // Walk the double-null-terminated block.
+                const char* p = currentEnv;
+                bool overrideWritten = false;
+                while (*p != '\0')
+                {
+                    const size_t entryLen = std::strlen(p);
+                    // Check if this is the WINEDLLOVERRIDES entry.
+                    if (_strnicmp(p, "WINEDLLOVERRIDES=", 17) == 0)
+                    {
+                        // Replace with our merged value.
+                        std::string merged = "WINEDLLOVERRIDES=" + overrideValue;
+                        envBlock.insert(envBlock.end(), merged.begin(), merged.end());
+                        envBlock.push_back('\0');
+                        overrideWritten = true;
+                    }
+                    else
+                    {
+                        envBlock.insert(envBlock.end(), p, p + entryLen + 1);
+                    }
+                    p += entryLen + 1;
+                }
+                if (!overrideWritten)
+                {
+                    std::string entry = "WINEDLLOVERRIDES=" + overrideValue;
+                    envBlock.insert(envBlock.end(), entry.begin(), entry.end());
+                    envBlock.push_back('\0');
+                }
+                envBlock.push_back('\0'); // double-null terminator
+                FreeEnvironmentStringsA(currentEnv);
+            }
+        }
+
+        BOOL created = CreateProcessA(
+            exePath.c_str(),
+            nullptr,
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            envBlock.empty() ? nullptr : envBlock.data(),
+            gameDir.empty() ? nullptr : gameDir.c_str(),
+            &si,
+            &pi);
+
+        if (!created)
+        {
+            mod::Log("Takeover [Wine]: CreateProcess failed err=%lu",
+                     static_cast<unsigned long>(GetLastError()));
+            SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] CreateProcess(EfzRevival.exe) failed");
+            return false;
+        }
+
+        mod::Log("Takeover [Wine]: spawned EfzRevival suspended pid=%lu (DLL override active)",
+                 static_cast<unsigned long>(pi.dwProcessId));
+    }
+    else
+    {
+        // ---- Native Windows path -------------------------------------------
+        BOOL created = CreateProcessA(
+            exePath.c_str(),
+            nullptr,
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            nullptr,
+            gameDir.empty() ? nullptr : gameDir.c_str(),
+            &si,
+            &pi);
+
+        if (!created)
+        {
+            SetPhase(ioStatus, NetbridgePhase::Failed, "CreateProcess(EfzRevival.exe) failed");
+            return false;
+        }
+
+        mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
+    }
 
     // Assign to kill-on-close job so that if the host process terminates
     // (crash, Alt+F4, etc.) without explicit cleanup, all child processes
@@ -510,9 +631,17 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     }
 
     uintptr_t remoteBase = 0;
+
+    // Inject our DLL into the child process.
+    // - Under Wine: InjectSelf() first checks if WINEDLLOVERRIDES loaded the
+    //   DLL, then falls back to CreateRemoteThread(LoadLibraryA).
+    // - Native Windows: InjectSelf() uses CreateRemoteThread(LoadLibraryA).
     if (!InjectSelf(pi.hProcess, &remoteBase))
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "Self injection failed");
+        const char* reason = useWinePath
+            ? "[Wine] DLL injection failed"
+            : "Self injection failed";
+        SetPhase(ioStatus, NetbridgePhase::Failed, reason);
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -710,8 +839,14 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     ResetEvent(g_hostInitEvent);
     ResetEvent(g_hostConsoleEvent);
 
-    const DWORD resumeResult = ResumeThread(pi.hThread);
-    mod::Log("Takeover: resumed main thread result=%lu", static_cast<unsigned long>(resumeResult));
+    // Both Wine and native: the process was created suspended, resume it
+    // now that injection and IAT patching are complete.
+    {
+        const DWORD resumeResult = ResumeThread(pi.hThread);
+        mod::Log("Takeover: resumed main thread result=%lu%s",
+                 static_cast<unsigned long>(resumeResult),
+                 useWinePath ? " [Wine]" : "");
+    }
 
     g_revivalProcess = pi.hProcess;
     g_revivalProcessId = pi.dwProcessId;

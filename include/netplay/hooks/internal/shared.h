@@ -155,6 +155,7 @@ extern uint32_t g_customDispatchTable[8];
 extern uint32_t g_replayCaseDispatchAddress;
 extern "C" uint32_t g_titleCaseReturnAddress;
 extern std::string g_moduleDirectory;
+extern bool g_netplayAssetsAvailable;
 extern NetplayMenuState g_netplayMenuState;
 extern MenuSlideTransition g_menuSlideTransition;
 extern netplay::inline_edit::State g_inlineEditState;

@@ -143,6 +143,7 @@ bool LoadNetplaySpriteFont(const std::string& moduleDirectory, SpriteFont* outFo
         "netplay_font_map.txt",
     };
 
+    // Tier 1: DLL directory (GetModuleFileNameA-derived).
     for (const char* candidate : candidates)
     {
         const std::string path = netplay::assets::JoinPath(moduleDirectory, candidate);
@@ -163,6 +164,55 @@ bool LoadNetplaySpriteFont(const std::string& moduleDirectory, SpriteFont* outFo
             return true;
         }
         mod::Log("LoadNetplaySpriteFont: failed to parse '%s'", path.c_str());
+    }
+
+    // Tier 2: mods\<modname>\ relative to working directory (Wine fallback).
+    const std::string modsRelDir = netplay::assets::DeriveModsRelativeDirectory(moduleDirectory);
+    if (!modsRelDir.empty())
+    {
+        for (const char* candidate : candidates)
+        {
+            const std::string path = netplay::assets::JoinPath(modsRelDir, candidate);
+            if (!netplay::assets::FileExists(path))
+            {
+                continue;
+            }
+
+            if (LoadSpriteFontMapFromFile(path, outFont))
+            {
+                mod::Log(
+                    "LoadNetplaySpriteFont: loaded '%s' (mods-dir fallback) glyphs=%zu lineHeight=%d spacing=%d uppercase=%d",
+                    path.c_str(),
+                    outFont->glyphs.size(),
+                    outFont->lineHeight,
+                    outFont->letterSpacing,
+                    outFont->uppercaseInput ? 1 : 0);
+                return true;
+            }
+            mod::Log("LoadNetplaySpriteFont: failed to parse '%s'", path.c_str());
+        }
+    }
+
+    // Tier 3: working-directory loose files.
+    for (const char* candidate : candidates)
+    {
+        if (!netplay::assets::FileExists(candidate))
+        {
+            continue;
+        }
+
+        if (LoadSpriteFontMapFromFile(candidate, outFont))
+        {
+            mod::Log(
+                "LoadNetplaySpriteFont: loaded '%s' (cwd fallback) glyphs=%zu lineHeight=%d spacing=%d uppercase=%d",
+                candidate,
+                outFont->glyphs.size(),
+                outFont->lineHeight,
+                outFont->letterSpacing,
+                outFont->uppercaseInput ? 1 : 0);
+            return true;
+        }
+        mod::Log("LoadNetplaySpriteFont: failed to parse '%s'", candidate);
     }
 
     mod::Log("LoadNetplaySpriteFont: no sprite font map found (runtime text disabled)");

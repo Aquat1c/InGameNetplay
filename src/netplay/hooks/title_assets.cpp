@@ -20,6 +20,7 @@ using netplay::assets::ParseEfzDatImage;
 using netplay::assets::ParsedDatImage;
 using netplay::assets::ResolveNetplayBackgroundPath;
 using netplay::assets::ResolveNetplayObjectsPath;
+using netplay::assets::ResolveTitleObjectsPath;
 using netplay::assets::NetplayObjectProfile;
 using netplay::validation::IsValidNickname;
 using netplay::validation::ParsePort;
@@ -171,6 +172,10 @@ bool LoadTitleAssets(uint32_t screenContext)
     auto const readPixelValue = reinterpret_cast<ReadPixelValueFn>(RuntimeAddress(kVaReadPixelValue));
     auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
 
+    // Resolve title_ob.dat — prefer mod folder override, fallback to vanilla.
+    const std::string titleObjPath = ResolveTitleObjectsPath(g_moduleDirectory);
+    const char* titleObjPathC = titleObjPath.c_str();
+
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
         reinterpret_cast<uint32_t*>(screenContext + kOffsetBackgroundSurface),
@@ -180,12 +185,12 @@ bool LoadTitleAssets(uint32_t screenContext)
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
         reinterpret_cast<uint32_t*>(screenContext + kOffsetObjectsSurface),
-        "system\\title_ob.dat",
+        titleObjPathC,
         0,
         193);
 
     const bool bgPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), "system\\title.dat", 0, 1, 192) != 0;
-    const bool objPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), "system\\title_ob.dat", 0, 193, 48) != 0;
+    const bool objPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), titleObjPathC, 0, 193, 48) != 0;
 
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor) = static_cast<uint8_t>(readPixelValue(*reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface)));
     setPalette(GetGraphicsContext(screenContext), static_cast<int>(screenContext + kOffsetPalette));

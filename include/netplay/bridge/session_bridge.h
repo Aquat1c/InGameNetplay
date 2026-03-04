@@ -74,6 +74,9 @@ struct DelayPromptMetrics
 };
 
 bool IsCurrentProcessRevival();
+bool IsRunningUnderWine();
+// In-process IAT patching for Wine — safe to call from DllMain.
+int SelfPatchIat();
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();

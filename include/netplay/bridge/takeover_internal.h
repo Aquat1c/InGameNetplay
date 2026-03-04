@@ -440,6 +440,7 @@ void PublishHostRevivalBase();
 uintptr_t ResolveInjectedExpectedRevivalBase();
 bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* address, const char* nickname);
 bool IsCurrentProcessRevival();
+bool IsRunningUnderWine();
 void InitializeInjected();
 void ShutdownInjected();
 
@@ -456,6 +457,7 @@ struct RemoteModuleRecord
 std::vector<RemoteModuleRecord> EnumerateRemoteModules(DWORD processId);
 bool ReadRemoteString(HANDLE process, uintptr_t address, char* out, size_t outSize);
 bool InjectSelf(HANDLE process, uintptr_t* outRemoteBase);
+bool WaitForPreloadedSelf(DWORD processId, uintptr_t* outRemoteBase, DWORD timeoutMs);
 bool PatchIatModule(
     HANDLE process,
     uintptr_t moduleBase,
@@ -465,6 +467,9 @@ bool PatchIatModule(
     bool verboseLogs);
 std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase);
 bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs);
+// In-process IAT patching for Wine — safe to call from DllMain.
+// Returns number of entries patched, or -1 on error.
+int SelfPatchIat();
 HANDLE CreateFakeThread(DWORD exitCode);
 bool LookupFakeThread(HANDLE handle, DWORD* outExitCode);
 void ClearFakeThreads();

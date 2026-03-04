@@ -1009,6 +1009,26 @@ bool IsCurrentProcessRevival()
     return BaseLower(path) == "efzrevival.exe";
 }
 
+bool IsRunningUnderWine()
+{
+    // Wine exposes wine_get_version() from ntdll.dll.  Probing for this
+    // export is the canonical way to detect Wine at runtime.  This does
+    // not exist on native Windows, so GetProcAddress returns nullptr.
+    static int cached = -1;
+    if (cached >= 0)
+    {
+        return cached != 0;
+    }
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    cached = (ntdll != nullptr
+              && GetProcAddress(ntdll, "wine_get_version") != nullptr) ? 1 : 0;
+    if (cached != 0)
+    {
+        mod::Log("Platform: running under Wine/Proton");
+    }
+    return cached != 0;
+}
+
 void InitializeInjected()
 {
     std::lock_guard<std::mutex> lock(g_mutex);

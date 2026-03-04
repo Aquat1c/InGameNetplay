@@ -103,6 +103,15 @@ bool InjectSelf(HANDLE process, uintptr_t* outRemoteBase)
         return false;
     }
 
+    // ---- Injection path (shared by Wine and native Windows) ----------------
+    // The child process is created suspended (CREATE_SUSPENDED), so we can
+    // safely inject via CreateRemoteThread(LoadLibraryA).  Under Wine,
+    // SelfPatchIat() in DllMain provides an additional safety net.
+    // -----------------------------------------------------------------------
+    if (IsRunningUnderWine())
+    {
+        mod::Log("Takeover [Wine]: injecting via CreateRemoteThread(LoadLibraryA)");
+    }
     const std::string selfPath = ModulePath(SelfModule());
     if (selfPath.empty())
     {
@@ -157,6 +166,59 @@ bool InjectSelf(HANDLE process, uintptr_t* outRemoteBase)
     *outRemoteBase = static_cast<uintptr_t>(remoteBase);
     mod::Log("Takeover: injected self module base=0x%08lX", static_cast<unsigned long>(remoteBase));
     return true;
+}
+
+bool WaitForPreloadedSelf(DWORD processId, uintptr_t* outRemoteBase, DWORD timeoutMs)
+{
+    // Under Wine, WINEDLLOVERRIDES causes our DLL to load automatically
+    // into the child process.  We poll the remote module list until the
+    // DLL appears (or we time out).
+
+    if (outRemoteBase == nullptr)
+    {
+        return false;
+    }
+
+    const std::string selfBaseLower = BaseLower(ModulePath(SelfModule()));
+    if (selfBaseLower.empty())
+    {
+        mod::Log("Takeover [Wine]: failed to determine own module filename");
+        return false;
+    }
+
+    const DWORD startTick = GetTickCount();
+    for (;;)
+    {
+        const std::vector<RemoteModuleRecord> modules = EnumerateRemoteModules(processId);
+        for (const RemoteModuleRecord& m : modules)
+        {
+            if (m.moduleLower == selfBaseLower && m.base != 0)
+            {
+                *outRemoteBase = m.base;
+                mod::Log(
+                    "Takeover [Wine]: found preloaded self module '%s' "
+                    "base=0x%08lX in remote pid=%lu (waited %lums)",
+                    selfBaseLower.c_str(),
+                    static_cast<unsigned long>(m.base),
+                    static_cast<unsigned long>(processId),
+                    static_cast<unsigned long>(GetTickCount() - startTick));
+                return true;
+            }
+        }
+
+        const DWORD elapsed = GetTickCount() - startTick;
+        if (elapsed >= timeoutMs)
+        {
+            mod::Log(
+                "Takeover [Wine]: timed out waiting for preloaded '%s' "
+                "in pid=%lu after %lums",
+                selfBaseLower.c_str(),
+                static_cast<unsigned long>(processId),
+                static_cast<unsigned long>(elapsed));
+            return false;
+        }
+        Sleep(50);
+    }
 }
 
 std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
@@ -703,6 +765,152 @@ bool EnsureInjectedContextFast()
     }
 
     return HasInjectedContext();
+}
+
+// ---------------------------------------------------------------------------
+// SelfPatchIat — in-process IAT patching for Wine/Proton
+// ---------------------------------------------------------------------------
+// Called from DllMain(DLL_PROCESS_ATTACH) under Wine so that all IAT entries
+// in the host EXE already point to our nb_stub_* exports BEFORE the loader
+// lock is released and main() starts.  This eliminates the race between the
+// helper's main thread (which calls ReadConsoleA, CreateProcessA, etc.)
+// and the host-side remote PatchIat() call.
+//
+// Safety notes for DllMain context:
+//   - GetModuleHandleA(nullptr) — safe (no DLL load)
+//   - Direct PE header reads — safe (in-process memory)
+//   - VirtualProtect — safe (no cross-process call)
+//   - No heap allocation beyond the patch map (std::unordered_map)
+//   - No logging (mod::Log not initialised yet); use OutputDebugStringA
+// ---------------------------------------------------------------------------
+int SelfPatchIat()
+{
+    // Build a local patch map: function name → address of our stub.
+    // Since we are in-process, the stub addresses are direct — no
+    // base-relocation arithmetic needed.
+    struct PatchEntry { const char* name; uint32_t address; };
+    const PatchEntry entries[] = {
+        { "CreateProcessA",                 static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateProcessA)) },
+        { "OpenProcess",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_OpenProcess)) },
+        { "ReadProcessMemory",              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadProcessMemory)) },
+        { "VirtualAllocEx",                 static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_VirtualAllocEx)) },
+        { "VirtualFreeEx",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_VirtualFreeEx)) },
+        { "WriteProcessMemory",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteProcessMemory)) },
+        { "CreateRemoteThread",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateRemoteThread)) },
+        { "TerminateProcess",               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_TerminateProcess)) },
+        { "ReadConsoleA",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleA)) },
+        { "ReadConsoleW",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleW)) },
+        { "WriteFile",                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)) },
+        { "WriteConsoleA",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleA)) },
+        { "WriteConsoleW",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleW)) },
+        { "WriteConsoleOutputCharacterA",   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleOutputCharacterA)) },
+        { "WriteConsoleOutputCharacterW",   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleOutputCharacterW)) },
+        { "OutputDebugStringA",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_OutputDebugStringA)) },
+        { "OutputDebugStringW",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_OutputDebugStringW)) },
+        { "WaitForSingleObject",            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WaitForSingleObject)) },
+        { "GetExitCodeThread",              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_GetExitCodeThread)) },
+        { "ResumeThread",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ResumeThread)) },
+    };
+    constexpr int kEntryCount = sizeof(entries) / sizeof(entries[0]);
+
+    // Get the host EXE's base address (always mapped at process creation).
+    const uintptr_t imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (imageBase == 0)
+    {
+        OutputDebugStringA("SelfPatchIat: GetModuleHandleA(nullptr) failed\n");
+        return -1;
+    }
+
+    // Parse PE header from in-process memory.
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        OutputDebugStringA("SelfPatchIat: bad DOS signature\n");
+        return -1;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(imageBase + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+    {
+        OutputDebugStringA("SelfPatchIat: bad NT signature\n");
+        return -1;
+    }
+
+    const DWORD importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (importRva == 0)
+    {
+        // No imports — nothing to patch (unusual but not an error).
+        return 0;
+    }
+
+    int totalPatched = 0;
+    const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(imageBase + importRva);
+    for (; desc->Name != 0; ++desc)
+    {
+        const char* dllName = reinterpret_cast<const char*>(imageBase + desc->Name);
+
+        // Only patch kernel32.dll and its API-set forwarders.
+        const bool isKernelProvider =
+            (_stricmp(dllName, "KERNEL32.dll") == 0) ||
+            (_stricmp(dllName, "KERNELBASE.dll") == 0) ||
+            (_strnicmp(dllName, "api-ms-win-core-", 16) == 0) ||
+            (_strnicmp(dllName, "api-ms-win-crt-", 15) == 0) ||
+            (_strnicmp(dllName, "ext-ms-win-", 11) == 0);
+        if (!isKernelProvider)
+        {
+            continue;
+        }
+
+        const DWORD oftRva = (desc->OriginalFirstThunk != 0) ? desc->OriginalFirstThunk : desc->FirstThunk;
+        const DWORD ftRva = desc->FirstThunk;
+
+        const auto* oft = reinterpret_cast<const IMAGE_THUNK_DATA32*>(imageBase + oftRva);
+        auto* ft = reinterpret_cast<uint32_t*>(imageBase + ftRva);
+
+        for (DWORD i = 0; oft[i].u1.AddressOfData != 0; ++i)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL32(oft[i].u1.Ordinal))
+            {
+                continue;
+            }
+
+            const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                imageBase + oft[i].u1.AddressOfData);
+            const char* importName = importByName->Name;
+
+            // Linear scan through entries — the list is small (21 entries).
+            uint32_t targetAddr = 0;
+            for (int e = 0; e < kEntryCount; ++e)
+            {
+                if (_stricmp(importName, entries[e].name) == 0)
+                {
+                    targetAddr = entries[e].address;
+                    break;
+                }
+            }
+            if (targetAddr == 0)
+            {
+                continue;
+            }
+
+            if (ft[i] != targetAddr)
+            {
+                DWORD oldProtect = 0;
+                VirtualProtect(&ft[i], sizeof(uint32_t), PAGE_READWRITE, &oldProtect);
+                ft[i] = targetAddr;
+                DWORD ignored = 0;
+                VirtualProtect(&ft[i], sizeof(uint32_t), oldProtect, &ignored);
+                ++totalPatched;
+            }
+        }
+    }
+
+    // Diagnostic output via OutputDebugString (safe in DllMain context).
+    char debugMsg[128];
+    wsprintfA(debugMsg, "SelfPatchIat [Wine]: patched %d IAT entries in host EXE\n", totalPatched);
+    OutputDebugStringA(debugMsg);
+
+    return totalPatched;
 }
 
 } // namespace netplay::bridge::takeover

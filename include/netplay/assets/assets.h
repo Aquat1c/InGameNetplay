@@ -32,8 +32,10 @@ struct ParsedDatImage
 bool FileExists(const std::string& path);
 std::string JoinPath(const std::string& left, const char* right);
 std::string BuildModuleDirectory(HMODULE moduleHandle);
+std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory);
 std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory);
 std::string ResolveNetplayObjectsPath(const std::string& moduleDirectory);
+std::string ResolveTitleObjectsPath(const std::string& moduleDirectory);
 
 bool ParseEfzDatImage(const std::string& path, ParsedDatImage* outImage);
 bool DeriveConfigStyleRowsFromDat(

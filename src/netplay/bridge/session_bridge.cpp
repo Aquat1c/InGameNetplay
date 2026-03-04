@@ -67,6 +67,16 @@ bool IsCurrentProcessRevival()
     return takeover::IsCurrentProcessRevival();
 }
 
+bool IsRunningUnderWine()
+{
+    return takeover::IsRunningUnderWine();
+}
+
+int SelfPatchIat()
+{
+    return takeover::SelfPatchIat();
+}
+
 void Initialize()
 {
     std::lock_guard<std::mutex> lock(g_mutex);

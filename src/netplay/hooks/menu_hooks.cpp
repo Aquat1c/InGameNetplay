@@ -22,6 +22,7 @@ uint32_t g_customDispatchTable[8] = {};
 uint32_t g_replayCaseDispatchAddress = 0;
 extern "C" uint32_t g_titleCaseReturnAddress = 0;
 std::string g_moduleDirectory;
+bool g_netplayAssetsAvailable = false;
 
 NetplayMenuState g_netplayMenuState;
 MenuSlideTransition g_menuSlideTransition;
@@ -762,6 +763,11 @@ extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
 #if defined(_M_IX86)
 extern "C" void __cdecl NetplayCaseImpl(uint32_t screenContext)
 {
+    if (!g_netplayAssetsAvailable)
+    {
+        mod::Log("NetplayCaseImpl: netplay assets unavailable, ignoring");
+        return;
+    }
     mod::Log("NetplayCaseImpl: invoked");
     TriggerNetplayMenuEntry(screenContext);
 }

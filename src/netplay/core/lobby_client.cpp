@@ -499,6 +499,19 @@ const LobbyEndpointConfig& GetLobbyEndpointConfig()
                 static_cast<unsigned long>(windowsVersion.minor),
                 static_cast<unsigned long>(windowsVersion.build));
         }
+
+        // Wine's WinHTTP implementation has known TLS negotiation edge
+        // cases.  Auto-select the embedded TLS backend for reliability
+        // when running under Wine/Proton.
+        if (!config.forceEmbeddedTls)
+        {
+            HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+            if (ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr)
+            {
+                config.forceEmbeddedTls = true;
+                mod::Log("LobbySession: detected Wine/Proton; auto enabling ForceEmbeddedTls=1");
+            }
+        }
     }
 
     if (config.forceEmbeddedTls && config.forceWinInet)
