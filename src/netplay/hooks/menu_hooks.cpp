@@ -23,6 +23,7 @@ uint32_t g_replayCaseDispatchAddress = 0;
 extern "C" uint32_t g_titleCaseReturnAddress = 0;
 std::string g_moduleDirectory;
 bool g_netplayAssetsAvailable = false;
+bool g_titleAssetsOverrideApplied = false;
 
 NetplayMenuState g_netplayMenuState;
 MenuSlideTransition g_menuSlideTransition;
@@ -304,6 +305,23 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             "HookedTitleUpdateImpl: calls=%llu netplayActive=%d",
             static_cast<unsigned long long>(g_titleUpdateCallCount),
             g_netplayMenuState.active);
+    }
+
+    // One-shot (Wine/Proton only): the game's own title screen init loads
+    // vanilla title_ob.dat before our hook runs.  Under Wine the DLL module
+    // path can resolve to "." which causes vanilla to be picked instead of
+    // the mod override.  Reload assets on the first hooked title update so
+    // ResolveTitleObjectsPath can probe the correct paths.
+    // On native Windows the game's own init already resolves the mod file
+    // correctly, so this is unnecessary.
+    if (!g_titleAssetsOverrideApplied && !g_netplayMenuState.active)
+    {
+        g_titleAssetsOverrideApplied = true;
+        if (netplay::bridge::IsRunningUnderWine())
+        {
+            mod::Log("HookedTitleUpdateImpl: Wine detected — applying one-shot title assets override");
+            (void)LoadTitleAssets(screenContext);
+        }
     }
 
     // Post-exit text clearing: keep issuing ClearRevivalText for a few

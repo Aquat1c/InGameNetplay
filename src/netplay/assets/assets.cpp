@@ -259,17 +259,30 @@ std::string ResolveNetplayObjectsPath(const std::string& moduleDirectory)
 
 std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
 {
+    mod::Log("ResolveTitleObjectsPath: searching for title_ob.dat override (moduleDirectory='%s')", moduleDirectory.c_str());
+
     // Check if the mod ships its own system\title_ob.dat override.
     // This allows mods to replace the vanilla title menu sprite sheet.
 
     // --- Tier 1: DLL directory (e.g. mods\efz_netplay_mod\system\title_ob.dat)
+    // Skip when moduleDirectory is "." — under Wine / Proton the DLL path
+    // is often unresolvable, leaving moduleDirectory as ".".  Probing
+    // ".\system\title_ob.dat" would falsely match the *vanilla* file and
+    // prevent the real mod override from being found.
+    if (moduleDirectory != ".")
     {
         const std::string path = JoinPath(moduleDirectory, "system\\title_ob.dat");
+        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: using mod override '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] FOUND — using '%s'", path.c_str());
             return path;
         }
+        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] not found");
+    }
+    else
+    {
+        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.' — Wine/Proton fallback to avoid vanilla false positive)");
     }
 
     // --- Tier 2: mods\<modname>\ relative to working directory
@@ -277,14 +290,37 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
     if (!modsRelDir.empty())
     {
         const std::string path = JoinPath(modsRelDir, "system\\title_ob.dat");
+        mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: using mod override '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] FOUND — using '%s'", path.c_str());
             return path;
         }
+        mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] not found");
+    }
+    else
+    {
+        mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] SKIPPED (could not derive mods relative dir from '%s')", moduleDirectory.c_str());
+    }
+
+    // --- Tier 3: well-known mod path relative to working directory ----------
+    // Under Wine / Proton the module directory resolves to "." and
+    // DeriveModsRelativeDirectory cannot derive the mod folder from it.
+    // Probe the conventional modloader path directly so the custom
+    // title_ob.dat is still found in that environment.
+    {
+        const char* wellKnownPath = "mods\\efz_netplay_mod\\system\\title_ob.dat";
+        mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] probing '%s'", wellKnownPath);
+        if (FileExists(wellKnownPath))
+        {
+            mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] FOUND — using '%s'", wellKnownPath);
+            return wellKnownPath;
+        }
+        mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] not found");
     }
 
     // --- Fallback: vanilla game path
+    mod::Log("ResolveTitleObjectsPath: no mod override found in any tier, falling back to vanilla 'system\\title_ob.dat'");
     return "system\\title_ob.dat";
 }
 
