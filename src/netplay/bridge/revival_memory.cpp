@@ -3116,6 +3116,13 @@ static bool g_spectateHoldoffLogged = false;
 // spectator was still on the title screen.
 static bool g_spectateHoldoffWasActive = false;
 
+// Hard-fallback watchdog: counts consecutive frames where the Revival child
+// process is dead but no existing recovery mechanism (ExitProcess interception,
+// consoleErrorSerial, spectator ESC) has fired.  After a grace period the
+// watchdog forces a full cleanup and return to the netplay menu.
+static unsigned int g_watchdogDeadFrameCount = 0;
+static constexpr unsigned int kWatchdogGraceFrames = 30; // ~0.5s at 60fps
+
 // __thiscall trampoline: ECX = this, no other args.
 using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
 static PerFrameTickFn g_origPerFrameTick = nullptr;
@@ -3788,6 +3795,164 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
+    // ---- Hard-fallback watchdog -------------------------------------------
+    // Detect Revival child process death that slipped past ExitProcess
+    // interception and consoleErrorSerial detection.  This catches external
+    // process kills (Task Manager, OS termination), crashes in non-DLL code
+    // (unhandled SEH in the helper), and any scenario where the process
+    // dies without going through our hooked ExitProcess or publishing a
+    // console error.
+    //
+    // Uses a grace-period counter to avoid racing with the existing recovery
+    // mechanisms (which fire synchronously within the same frame).  Only
+    // triggers after kWatchdogGraceFrames consecutive frames of sustained
+    // dead-process detection with no other recovery path having fired.
+    // -----------------------------------------------------------------------
+    if (g_dllExitProcessPatchesSaved
+        && g_localRoleFlag != kLocalRoleLocalPlay
+        && !g_tickRecoveryPending
+        && !g_frameRecoveryPending
+        && !g_deferredCancelCleanup)
+    {
+        const bool processWasCreated = (g_revivalProcess != nullptr);
+        const bool processAlive = processWasCreated && IsPeerProcessAlive();
+        const bool exitAlreadyPending =
+            (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0);
+
+        if (!processAlive && processWasCreated && !exitAlreadyPending)
+        {
+            // Read screen index — only trigger on non-title screens.
+            uint8_t wdScreen = 0;
+            __try {
+                wdScreen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+            if (wdScreen != 0)
+            {
+                ++g_watchdogDeadFrameCount;
+                if (g_watchdogDeadFrameCount == 1)
+                {
+                    mod::Log(
+                        "TICK_HOOK: WATCHDOG: Revival process dead, grace period "
+                        "started (frameTick=%u screen=%u role=%d pid=%lu)",
+                        g_frameTick,
+                        static_cast<unsigned int>(wdScreen),
+                        g_localRoleFlag,
+                        static_cast<unsigned long>(g_revivalProcessId));
+                }
+
+                if (g_watchdogDeadFrameCount >= kWatchdogGraceFrames)
+                {
+                    const int deadRole = g_localRoleFlag;
+                    const DWORD deadPid = g_revivalProcessId;
+                    LogSessionDiagnosticState("TickHook_hardFallback_entry");
+                    mod::Log(
+                        "TICK_HOOK: *** HARD FALLBACK *** frameTick=%u "
+                        "role=%d pid=%lu screen=%u — Revival process died "
+                        "without ExitProcess/consoleError, performing "
+                        "emergency cleanup",
+                        g_frameTick,
+                        deadRole,
+                        static_cast<unsigned long>(deadPid),
+                        static_cast<unsigned int>(wdScreen));
+
+                    // Synthesize exit interception so ConsumeRevivalExitInterception
+                    // fires on the next title-screen frame and routes to the
+                    // netplay menu (with lobby NotifyEndMatch if applicable).
+                    InterlockedExchange(&g_revivalExitMode,
+                                        static_cast<LONG>(g_localRoleFlag));
+                    InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+                    NeutralizeRevivalSessionVtable();
+
+                    // Step 1: Reinstate a live local-play session.
+                    const bool initOk = ForceLocalPlayInit();
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback step 1 ForceLocalPlayInit "
+                        "result=%d",
+                        initOk ? 1 : 0);
+
+                    // Step 2: Terminate / close the dead helper process.
+                    if (g_revivalProcess != nullptr)
+                    {
+                        const BOOL termOk =
+                            TerminateProcess(g_revivalProcess, 0);
+                        const DWORD termErr = termOk ? 0 : GetLastError();
+                        CloseHandle(g_revivalProcess);
+                        g_revivalProcess = nullptr;
+                        g_revivalProcessId = 0;
+                        mod::Log(
+                            "TICK_HOOK: hard-fallback step 2 helper terminated "
+                            "(pid=%lu termOk=%d err=%lu)",
+                            static_cast<unsigned long>(deadPid),
+                            termOk ? 1 : 0,
+                            static_cast<unsigned long>(termErr));
+                    }
+                    else
+                    {
+                        mod::Log(
+                            "TICK_HOOK: hard-fallback step 2 skipped "
+                            "(no helper handle)");
+                    }
+
+                    // Step 3: Restore DLL Jcc patches.
+                    const bool patchOk = RestoreDllExitProcessPatches();
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback step 3 "
+                        "RestoreDllExitProcessPatches result=%d",
+                        patchOk ? 1 : 0);
+
+                    // Step 4: Disable stale text overlays.
+                    const bool textOk = DisableRevivalTextRendering();
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback step 4 "
+                        "DisableRevivalTextRendering result=%d",
+                        textOk ? 1 : 0);
+
+                    // Step 5: Reset crash/validation state.
+                    mod::ResetCrashRecoveryState();
+                    ResetGameModeValidation();
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback step 5 "
+                        "crash/validation state reset");
+
+                    // Step 6: Force game mode to title screen.
+                    const bool modeOk = ForceGameModeToTitle();
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback step 6 "
+                        "ForceGameModeToTitle result=%d",
+                        modeOk ? 1 : 0);
+
+                    g_localInitAppliedForSession = false;
+                    g_watchdogDeadFrameCount = 0;
+                    mod::Log(
+                        "TICK_HOOK: hard-fallback recovery complete "
+                        "(was role=%d), next title-screen frame will "
+                        "consume exit interception",
+                        deadRole);
+                    LogSessionDiagnosticState("TickHook_hardFallback_exit");
+
+                    return 0;
+                }
+            }
+            else
+            {
+                // On title screen — existing title-hook mechanisms handle it.
+                g_watchdogDeadFrameCount = 0;
+            }
+        }
+        else
+        {
+            // Process alive, no process, or exit already pending.
+            g_watchdogDeadFrameCount = 0;
+        }
+    }
+    else
+    {
+        // Not in an active session or recovery already in progress.
+        g_watchdogDeadFrameCount = 0;
+    }
+
     // If CancelSession tried to run ForceLocalPlayInit while we were inside
     // the tick (which would destroy the session that RollbackLoopTick was
     // using as 'this'), it deferred the work.  Execute it now that the tick
@@ -3864,6 +4029,12 @@ void ResetGameModeValidation()
     {
         mod::Log("ResetGameModeValidation: clearing stale g_tickRecoveryPending");
         g_tickRecoveryPending = false;
+    }
+    if (g_watchdogDeadFrameCount != 0)
+    {
+        mod::Log("ResetGameModeValidation: clearing stale g_watchdogDeadFrameCount=%u",
+                 g_watchdogDeadFrameCount);
+        g_watchdogDeadFrameCount = 0;
     }
 }
 
