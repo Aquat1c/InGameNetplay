@@ -889,6 +889,15 @@ void HandoffSpectateSession(uint32_t screenContext)
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
 
+    // Spectate bypasses the delay overlay, so the normal
+    // NotifyMatchConnected call inside ActivateDelaySetupOverlay never fires.
+    // Notify the lobby here so it can send the deferred 'accept' and
+    // transition to "playing" for spectate sessions.
+    if (g_lobbySession)
+    {
+        g_lobbySession->NotifyMatchConnected();
+    }
+
     // Transition directly to charselect (mode 1).  The DLL's client
     // session (type 1) survives mode transitions and drives the game via
     // input replay from shared memory — the mode-8 replay screen detour
@@ -1137,6 +1146,8 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
@@ -2163,6 +2174,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         // No joining overlay active — just reset and fall through to idle menu
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
+        DisarmSpectateReplayBypass();
+        netplay::bridge::CancelSession("no_overlay_session_ended");
         if (g_lobbySession)
         {
             g_lobbySession->NotifyEndMatch();

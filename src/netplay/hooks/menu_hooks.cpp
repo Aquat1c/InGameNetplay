@@ -398,6 +398,8 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         if (g_returnToNetplayAfterMatch)
         {
             g_returnToNetplayAfterMatch = false;
+            mod::ResetCrashRecoveryState();
+            DisarmSpectateReplayBypass();
 
             // The match ended and the game naturally returned to title screen.
             // Cancel the session to terminate the peer process, restore DLL
@@ -414,7 +416,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             // the tournament-mode exit path does.  init(3,102) or a transient
             // session tick can re-add text after the first clear.
             g_postExitTextClearFrames = 5;
-            EnterNetplayMenu(screenContext);
+            EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
             return 0;
         }
 
