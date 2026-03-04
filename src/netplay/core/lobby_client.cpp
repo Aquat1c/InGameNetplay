@@ -1922,6 +1922,42 @@ void LobbySession::BuildDisplayEntries(
         entry.spectateIp = findSpectateIp(p.playerId);
         out->push_back(std::move(entry));
     }
+
+    // Finally, add playing pairs whose players are NOT already in the list.
+    // On many Concerto servers, playing players are removed from the idle
+    // list.  We add synthetic display entries for each pair so they appear
+    // in the scrollable slot list and can be selected to spectate.
+    auto isAlreadyListed = [&](int id) -> bool {
+        for (const auto& e : *out)
+        {
+            if (e.playerId == id) return true;
+        }
+        return false;
+    };
+
+    for (const auto& pp : playing)
+    {
+        // Use the first player in the pair who isn't already listed.
+        // Prefer p1 (typically the host) so the spectateIp resolves correctly.
+        const int displayId = !isAlreadyListed(pp.p1Id) ? pp.p1Id
+                            : !isAlreadyListed(pp.p2Id) ? pp.p2Id
+                            : 0;
+        if (displayId == 0)
+        {
+            continue; // both players already appear via idle/challenge entries
+        }
+
+        LobbyDisplayEntry entry;
+        entry.name = (displayId == pp.p1Id)
+            ? pp.p1Name + " vs " + pp.p2Name
+            : pp.p2Name + " vs " + pp.p1Name;
+        entry.playerId = displayId;
+        entry.isChallenge = false;
+        entry.isSelf = (displayId == selfPlayerId);
+        entry.isPlaying = true;
+        entry.spectateIp = pp.hostIp;
+        out->push_back(std::move(entry));
+    }
 }
 
 // ---------------------------------------------------------------------------

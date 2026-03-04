@@ -14,8 +14,8 @@ namespace netplay::lobby
 // Maximum number of idle players shown in the lobby browser.
 constexpr int kMaxDisplayPlayers = 6;
 
-// Maximum number of playing pairs shown in the lobby browser.
-constexpr int kMaxPlayingPairs = 1;
+// Maximum number of playing pairs tracked from the server.
+constexpr int kMaxPlayingPairs = 8;
 
 struct LobbyPlayer
 {

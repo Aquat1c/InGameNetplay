@@ -1188,8 +1188,13 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         if (g_lobbySession)
         {
-            mod::Log("SwitchToMenu: leaving Lobby, resetting lobby session");
-            g_lobbySession.reset();
+            mod::Log("SwitchToMenu: leaving Lobby, tearing down lobby session asynchronously");
+            // Move the session into a detached thread so the destructor
+            // (which joins the poll thread and sends the HTTP /leave request)
+            // does not block the UI thread and cause a visible hitch.
+            std::thread([session = std::move(g_lobbySession)]() mutable {
+                session.reset();
+            }).detach();
         }
         g_netplayMenuState.lobbyScrollOffset = 0;
     }
@@ -1206,6 +1211,17 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
         g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
             g_netplayMenuState.nickname,
             g_netplayMenuState.hostPort);
+    }
+    else if (menuId == NetplayMenuId::Lobby && g_lobbySession)
+    {
+        // Re-entering Lobby with an existing session (e.g. returning from a
+        // lobby match).  Reset the menu state and trigger an immediate poll
+        // so the display list refreshes right away instead of waiting for
+        // the next kPollIntervalMs cycle.
+        RebuildLobbyMenuEntries(0, 0);
+        g_netplayMenuState.lobbyScrollOffset = 0;
+        g_lobbySession->RequestRefresh();
+        mod::Log("SwitchToMenu: re-entering Lobby with existing session, requested immediate refresh");
     }
     int requestedSelection = selection;
     if (requestedSelection < 0)
