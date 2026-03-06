@@ -3279,6 +3279,10 @@ static bool     g_toggleDiagLogged = false;
 // immediately tell which session produced a given log entry.
 static uint32_t g_sessionNumber = 0;
 
+// Guard for per-frame SPEED_DIAG logging.  Disabled by default to avoid
+// flooding the log in tournament mode.  Enable when debugging speed issues.
+static bool g_speedDiagEnabled = false;
+
 // Timer baseline snapshot: captured on the first SPEED_DIAG read of each
 // session.  If timerScalar or timerInterval change later, we log an alert.
 static double   g_baselineTimerScalar   = 0.0;
@@ -3769,7 +3773,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // Fires: every frame for first 30 ticks (burst), every 30 frames after
     // (2x/sec at 60fps), and ALWAYS when result > 1 (multi-iteration).
     // ====================================================================
-    if (g_activeRevival != nullptr
+    if (g_speedDiagEnabled
+        && g_activeRevival != nullptr
         && currentSession != 0
         && g_dllExitProcessPatchesSaved
         && g_localRoleFlag != kLocalRoleLocalPlay)

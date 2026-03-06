@@ -426,6 +426,11 @@ void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial)
     }
 }
 
+// Accumulates recent console lines so that metrics printed on preceding lines
+// ("Average Ping:", "Min Ping:", etc.) are available when the delay prompt
+// line is detected.  Cleared on consumption and on session reset.
+static std::string g_delayMetricsAccumulator;
+
 void ResetNativeWorkflowFlags()
 {
     g_nativeWorkflowLoadedSeen = false;
@@ -435,6 +440,7 @@ void ResetNativeWorkflowFlags()
     g_nativeWorkflowHolePunchDiedSeen = false;
     g_holePunchServerConfigLoaded = false;
     g_configuredHolePunchServer.clear();
+    g_delayMetricsAccumulator.clear();
 }
 
 void NoteConsolePromptLine(const std::string& text)
@@ -442,6 +448,19 @@ void NoteConsolePromptLine(const std::string& text)
     if (text.empty())
     {
         return;
+    }
+
+    // Accumulate lines for delay prompt metrics parsing.  EfzRevival.exe prints
+    // "Average Ping:", "Min Ping:" etc. on separate lines BEFORE the prompt.
+    if (!g_delayMetricsAccumulator.empty())
+    {
+        g_delayMetricsAccumulator.push_back('\n');
+    }
+    g_delayMetricsAccumulator.append(text);
+    // Cap to prevent unbounded growth between sessions.
+    if (g_delayMetricsAccumulator.size() > 2048)
+    {
+        g_delayMetricsAccumulator.erase(0, g_delayMetricsAccumulator.size() - 2048);
     }
 
     if (!g_nativeWorkflowLoadedSeen && ContainsCaseInsensitive(text, "Successfully loaded"))
@@ -567,8 +586,12 @@ void NoteConsolePromptLine(const std::string& text)
     const LONG serial = InterlockedIncrement(&g_injectedDelayPromptSerial);
     PublishDelayPromptSerial(serial);
     g_injectedDelayPromptWaitStartTick = GetTickCount();
+    // Parse the accumulated buffer (includes preceding "Average Ping:" etc.
+    // lines) rather than just the prompt line itself.
     bool hasMetrics = false;
-    const DelayPromptMetrics metrics = ParseDelayPromptMetricsFromText(text, &hasMetrics);
+    const DelayPromptMetrics metrics = ParseDelayPromptMetricsFromText(
+        g_delayMetricsAccumulator, &hasMetrics);
+    g_delayMetricsAccumulator.clear();
     PublishDelayPromptMetrics(metrics, serial);
     if (hasMetrics)
     {
