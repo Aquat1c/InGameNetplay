@@ -212,32 +212,31 @@ void LoadNetplayMenuSettingsFromIni()
         return;
     }
 
-    char nicknameBuffer[128] = {};
-    (void)GetPrivateProfileStringA("Network", "Name", "", nicknameBuffer, static_cast<DWORD>(std::size(nicknameBuffer)), iniPath.c_str());
-    std::string nickname = TrimAscii(nicknameBuffer);
-
-    // Convert from system codepage to UTF-8 if it contains non-ASCII bytes.
-    if (!nickname.empty())
+    // Use GetPrivateProfileStringW so Windows gives us the real wide
+    // characters rather than converting through CP_ACP (which destroys
+    // CJK/Cyrillic characters on non-matching system locales).
+    std::string nickname;
     {
-        bool hasNonAscii = false;
-        for (unsigned char ch : nickname)
+        const std::wstring wideIniPath(iniPath.begin(), iniPath.end());
+        wchar_t wideNickname[128] = {};
+        (void)GetPrivateProfileStringW(L"Network", L"Name", L"", wideNickname, static_cast<DWORD>(std::size(wideNickname)), wideIniPath.c_str());
+        // Trim whitespace from the wide string.
+        int len = static_cast<int>(wcslen(wideNickname));
+        while (len > 0 && (wideNickname[len - 1] == L' ' || wideNickname[len - 1] == L'\t' ||
+                           wideNickname[len - 1] == L'\r' || wideNickname[len - 1] == L'\n'))
+            --len;
+        int start = 0;
+        while (start < len && (wideNickname[start] == L' ' || wideNickname[start] == L'\t' ||
+                               wideNickname[start] == L'\r' || wideNickname[start] == L'\n'))
+            ++start;
+        // Convert wide -> UTF-8.
+        if (start < len)
         {
-            if (ch >= 0x80u) { hasNonAscii = true; break; }
-        }
-        if (hasNonAscii)
-        {
-            const int wideLen = MultiByteToWideChar(CP_ACP, 0, nickname.c_str(), static_cast<int>(nickname.size()), nullptr, 0);
-            if (wideLen > 0)
+            const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nullptr, 0, nullptr, nullptr);
+            if (utf8Len > 0)
             {
-                std::wstring wide(static_cast<std::size_t>(wideLen), L'\0');
-                MultiByteToWideChar(CP_ACP, 0, nickname.c_str(), static_cast<int>(nickname.size()), wide.data(), wideLen);
-                const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-                if (utf8Len > 0)
-                {
-                    std::string utf8(static_cast<std::size_t>(utf8Len), '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), utf8Len, nullptr, nullptr);
-                    nickname = std::move(utf8);
-                }
+                nickname.resize(static_cast<std::size_t>(utf8Len));
+                WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nickname.data(), utf8Len, nullptr, nullptr);
             }
         }
     }

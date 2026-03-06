@@ -965,35 +965,15 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
     const char* safeAddress = (address != nullptr) ? address : "";
     const char* safeNickname = (nickname != nullptr && nickname[0] != '\0') ? nickname : "Player";
 
-    // Convert UTF-8 nickname to system codepage for INI storage.
-    std::string nickAcp;
-    {
-        bool hasNonAscii = false;
-        for (const char* p = safeNickname; *p != '\0'; ++p)
-        {
-            if (static_cast<unsigned char>(*p) >= 0x80u) { hasNonAscii = true; break; }
-        }
-        if (hasNonAscii)
-        {
-            const int wideLen = MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, nullptr, 0);
-            if (wideLen > 0)
-            {
-                std::wstring wide(static_cast<std::size_t>(wideLen), L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, wide.data(), wideLen);
-                const int acpLen = WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
-                if (acpLen > 0)
-                {
-                    nickAcp.resize(static_cast<std::size_t>(acpLen - 1));
-                    WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nickAcp.data(), acpLen, nullptr, nullptr);
-                    safeNickname = nickAcp.c_str();
-                }
-            }
-        }
-    }
+    // Use WritePrivateProfileStringW for the nickname so that Unicode
+    // characters (CJK, Cyrillic, etc.) survive regardless of system codepage.
+    // Convert the UTF-8 nickname to a wide string, then write via the W API.
     char portText[16] = {};
     std::snprintf(portText, sizeof(portText), "%u", static_cast<unsigned>(port));
 
-    auto writeIniKey = [&iniPath](const char* section, const char* key, const char* value) -> bool {
+    const std::wstring wideIniPath(iniPath.begin(), iniPath.end());
+
+    auto writeIniKeyA = [&iniPath](const char* section, const char* key, const char* value) -> bool {
         if (WritePrivateProfileStringA(section, key, value, iniPath.c_str()) == FALSE)
         {
             mod::Log(
@@ -1008,10 +988,33 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
     };
     bool ok = true;
 
+    // Write nickname via W API to preserve Unicode characters.
+    {
+        const int wideLen = MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, nullptr, 0);
+        if (wideLen > 0)
+        {
+            std::wstring wideNickname(static_cast<std::size_t>(wideLen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, wideNickname.data(), wideLen);
+            // wideLen includes null terminator; WritePrivateProfileStringW
+            // expects a null-terminated string, which .c_str() provides.
+            if (WritePrivateProfileStringW(L"Network", L"Name", wideNickname.c_str(), wideIniPath.c_str()) == FALSE)
+            {
+                mod::Log(
+                    "Takeover: WriteIni key failed section='Network' key='Name' value='%s' err=%s",
+                    safeNickname,
+                    ErrorString(GetLastError()).c_str());
+                ok = false;
+            }
+        }
+        else
+        {
+            ok = writeIniKeyA("Network", "Name", safeNickname) && ok;
+        }
+    }
+
     // Keep user INI intact. Update only the settings currently supported by
     // InGameNetplay menu integration.
-    ok = writeIniKey("Network", "Name", safeNickname) && ok;
-    ok = writeIniKey("Network", "Port", portText) && ok;
+    ok = writeIniKeyA("Network", "Port", portText) && ok;
 
     mod::Log(
         "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d (updated keys: Network.Name, Network.Port)",
