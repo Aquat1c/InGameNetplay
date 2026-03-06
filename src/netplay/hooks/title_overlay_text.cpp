@@ -672,11 +672,12 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
 // Debug overlay — toggled with keyboard D key
 // ---------------------------------------------------------------------------
 
-static constexpr int kDebugMenuItemCount = 5;
+static constexpr int kDebugMenuItemCount = 6;
 static constexpr const char* kDebugMenuItems[kDebugMenuItemCount] = {
     "Delay Overlay",
     "Spectate Overlay",
     "Runtime Text Overlay",
+    "Console Window",
     "Wait to Spectate",
     "Close",
 };
@@ -732,6 +733,7 @@ bool DrawDebugOverlay(uint32_t screenContext)
         g_debugOverlay.forceDelayOverlay,
         g_debugOverlay.forceSpectateOverlay,
         g_debugOverlay.forceRuntimeTextOverlay,
+        g_debugOverlay.showConsole,
         false, // "Wait to Spectate" — action, no toggle
         false, // "Close" has no toggle state
     };
@@ -747,9 +749,9 @@ bool DrawDebugOverlay(uint32_t screenContext)
         }
 
         // Build label: "> Item [ON]" or "  Item [OFF]"
-        // Items 0..2 are toggles, items 3+ are plain actions/close
+        // Items 0..3 are toggles, items 4+ are plain actions/close
         char label[64] = {};
-        const bool isToggleItem = (i <= 2);
+        const bool isToggleItem = (i <= 3);
         if (isToggleItem)
         {
             std::snprintf(label, sizeof(label), "%s%s [%s]",
@@ -898,6 +900,13 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             }
             else if (sel == 3)
             {
+                g_debugOverlay.showConsole = !g_debugOverlay.showConsole;
+                mod::SetConsoleVisible(g_debugOverlay.showConsole);
+                mod::Log("DebugOverlay: Console window %s",
+                    g_debugOverlay.showConsole ? "ON" : "OFF");
+            }
+            else if (sel == 4)
+            {
                 // "Wait to Spectate" — start a Spectate session using Join address/port
                 const auto& ms = g_netplayMenuState;
                 if (ms.joinAddress.empty() || ms.joinPort == 0)
@@ -924,7 +933,7 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                     }
                 }
             }
-            else if (sel == 4)
+            else if (sel == 5)
             {
                 g_debugOverlay.open = false;
                 mod::Log("DebugOverlay: closed via menu");

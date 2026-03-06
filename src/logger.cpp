@@ -90,6 +90,33 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole)
     return true;
 }
 
+void SetConsoleVisible(bool visible)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    if (visible && !g_consoleReady)
+    {
+        if (AllocConsole() != FALSE)
+        {
+            SetConsoleTitleA("EFZ Netplay Mod Logger");
+
+            FILE* outStream = nullptr;
+            FILE* errStream = nullptr;
+            FILE* inStream = nullptr;
+            freopen_s(&outStream, "CONOUT$", "w", stdout);
+            freopen_s(&errStream, "CONOUT$", "w", stderr);
+            freopen_s(&inStream, "CONIN$", "r", stdin);
+
+            g_consoleReady = true;
+        }
+    }
+    else if (!visible && g_consoleReady)
+    {
+        FreeConsole();
+        g_consoleReady = false;
+    }
+}
+
 void ShutdownLogger()
 {
     std::lock_guard<std::mutex> lock(g_logMutex);

@@ -129,6 +129,55 @@ bool TryReadClipboardAsciiText(HWND owner, std::string* outText)
     *outText = clipboardText;
     return !clipboardText.empty();
 }
+
+bool TryReadClipboardUtf8Text(HWND owner, std::string* outText)
+{
+    if (outText == nullptr || OpenClipboard(owner) == FALSE)
+    {
+        return false;
+    }
+
+    std::string clipboardText;
+
+    // Prefer CF_UNICODETEXT and convert to UTF-8.
+    HANDLE unicodeHandle = GetClipboardData(CF_UNICODETEXT);
+    if (unicodeHandle != nullptr)
+    {
+        const wchar_t* text = reinterpret_cast<const wchar_t*>(GlobalLock(unicodeHandle));
+        if (text != nullptr)
+        {
+            const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+            if (needed > 1)
+            {
+                std::vector<char> converted(static_cast<size_t>(needed));
+                if (WideCharToMultiByte(CP_UTF8, 0, text, -1, converted.data(), needed, nullptr, nullptr) > 0)
+                {
+                    clipboardText.assign(converted.data());
+                }
+            }
+            GlobalUnlock(unicodeHandle);
+        }
+    }
+
+    // Fall back to CF_TEXT (already single-byte, likely CP_ACP).
+    if (clipboardText.empty())
+    {
+        HANDLE textHandle = GetClipboardData(CF_TEXT);
+        if (textHandle != nullptr)
+        {
+            const char* text = reinterpret_cast<const char*>(GlobalLock(textHandle));
+            if (text != nullptr)
+            {
+                clipboardText = text;
+                GlobalUnlock(textHandle);
+            }
+        }
+    }
+
+    CloseClipboard();
+    *outText = clipboardText;
+    return !clipboardText.empty();
+}
 }
 
 

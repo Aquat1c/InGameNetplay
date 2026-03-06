@@ -121,11 +121,14 @@ public:
     void NotifyMatchConnected();
 
     // Notify that a match/challenge has ended (user cancelled or
-    // connection dropped).  Sends 'end' to reset lobby status to idle.
+    // connection dropped).  The lobby 'end' action is deferred until
+    // RequestRefresh() is called (i.e. we re-enter the lobby menu),
+    // preventing other players from challenging us during cleanup.
     void NotifyEndMatch();
 
-    // Returns true while we are in an active match (between
-    // NotifyMatchConnected and NotifyEndMatch).  Thread-safe.
+    // Returns true while we are in an active match or returning from
+    // one (between NotifyMatchConnected and the next RequestRefresh
+    // after NotifyEndMatch).  Thread-safe.
     bool IsInBattle() const;
 
 private:
@@ -168,8 +171,10 @@ private:
     // Build the merged display list from challenges + idle players.
     // |selfPlayerId| is our own player ID (used to mark our entry and
     // exclude ourselves from being challengeable).  Challengers that also
-    // appear in idlePlayers are deduplicated.  Players in |playing| pairs
-    // are flagged so the UI can show them distinctly.
+    // appear in idlePlayers are deduplicated by player ID.  Players in
+    // |playing| pairs are flagged so the UI can show them distinctly.
+    // Deduplication uses player IDs rather than names because different
+    // players can share a nickname.
     static void BuildDisplayEntries(
         const std::vector<LobbyChallenge>& challenges,
         const std::vector<LobbyPlayer>& idlePlayers,
@@ -207,6 +212,10 @@ private:
     std::atomic<bool> m_shouldStop{false};
     std::atomic<bool> m_refreshRequested{false};
     std::atomic<bool> m_inBattle{false};
+    std::atomic<bool> m_returningFromMatch{false};
+    // true when we initiated the lobby match (sent the challenge);
+    // false when we accepted an incoming challenge (joined as client).
+    std::atomic<bool> m_isMatchHost{false};
 
     // Signalled to wake the polling thread early (refresh or stop).
     HANDLE m_wakeEvent = nullptr;

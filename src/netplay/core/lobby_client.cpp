@@ -98,6 +98,117 @@ struct LobbyEndpointConfig
     std::string proxyBaseUrl;
 };
 
+// Decode a single \uXXXX hex value. Returns 0 on failure.
+unsigned int ParseHex4(const std::string& json, size_t pos)
+{
+    if (pos + 4 > json.size())
+    {
+        return 0;
+    }
+    unsigned int result = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const char ch = json[pos + static_cast<size_t>(i)];
+        unsigned int nibble = 0;
+        if (ch >= '0' && ch <= '9')
+            nibble = static_cast<unsigned int>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f')
+            nibble = static_cast<unsigned int>(ch - 'a') + 10u;
+        else if (ch >= 'A' && ch <= 'F')
+            nibble = static_cast<unsigned int>(ch - 'A') + 10u;
+        else
+            return 0;
+        result = (result << 4u) | nibble;
+    }
+    return result;
+}
+
+// Append a Unicode codepoint as UTF-8 to a string.
+void AppendCodepointUtf8(std::string& out, unsigned int cp)
+{
+    if (cp < 0x80u)
+    {
+        out += static_cast<char>(cp);
+    }
+    else if (cp < 0x800u)
+    {
+        out += static_cast<char>(0xC0u | (cp >> 6u));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+    else if (cp < 0x10000u)
+    {
+        out += static_cast<char>(0xE0u | (cp >> 12u));
+        out += static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+    else if (cp <= 0x10FFFFu)
+    {
+        out += static_cast<char>(0xF0u | (cp >> 18u));
+        out += static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu));
+        out += static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+}
+
+// Read a JSON string body (cursor must be past the opening '"') into dst.
+// Advances cursor past the closing '"'.  Handles \uXXXX and surrogate pairs.
+void ReadJsonStringBody(const std::string& json, size_t& cursor, std::string* dst)
+{
+    dst->clear();
+    while (cursor < json.size() && json[cursor] != '"')
+    {
+        if (json[cursor] == '\\' && cursor + 1 < json.size())
+        {
+            const char esc = json[cursor + 1];
+            if (esc == 'u' && cursor + 5 < json.size())
+            {
+                const unsigned int cp = ParseHex4(json, cursor + 2);
+                cursor += 6; // skip \uXXXX
+                // Handle UTF-16 surrogate pairs.
+                if (cp >= 0xD800u && cp <= 0xDBFFu
+                    && cursor + 5 < json.size()
+                    && json[cursor] == '\\' && json[cursor + 1] == 'u')
+                {
+                    const unsigned int lo = ParseHex4(json, cursor + 2);
+                    if (lo >= 0xDC00u && lo <= 0xDFFFu)
+                    {
+                        cursor += 6;
+                        const unsigned int full = 0x10000u + ((cp - 0xD800u) << 10u) + (lo - 0xDC00u);
+                        AppendCodepointUtf8(*dst, full);
+                    }
+                    else
+                    {
+                        AppendCodepointUtf8(*dst, cp);
+                    }
+                }
+                else if (cp > 0)
+                {
+                    AppendCodepointUtf8(*dst, cp);
+                }
+                continue;
+            }
+            // Standard JSON escapes.
+            ++cursor; // skip backslash
+            if (esc == 'n')
+                *dst += '\n';
+            else if (esc == 'r')
+                *dst += '\r';
+            else if (esc == 't')
+                *dst += '\t';
+            else
+                *dst += esc; // \", \\, \/ and anything else
+            ++cursor;
+            continue;
+        }
+        *dst += json[cursor];
+        ++cursor;
+    }
+    if (cursor < json.size())
+    {
+        ++cursor; // consume closing '"'
+    }
+}
+
 std::string TrimAscii(std::string value)
 {
     size_t begin = 0;
@@ -1129,11 +1240,34 @@ int LobbySession::GetPlayerId() const
 
 bool LobbySession::IsInBattle() const
 {
-    return m_inBattle.load();
+    return m_inBattle.load() || m_returningFromMatch.load();
 }
 
 void LobbySession::RequestRefresh()
 {
+    // If we were returning from a match, now is the time to finalise.
+    if (m_returningFromMatch.exchange(false))
+    {
+        const bool wasHost = m_isMatchHost.load();
+        if (wasHost)
+        {
+            // HOST: the End action was deferred — send it now.
+            mod::Log("LobbySession::RequestRefresh (host): returning-from-match cleared, queuing End");
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_status.inBattle = false;
+            PendingAction action;
+            action.type = PendingAction::End;
+            m_pendingActions.push_back(std::move(action));
+        }
+        else
+        {
+            // CLIENT: End was already sent in NotifyEndMatch — just
+            // clear the local suppression so we can be challenged again.
+            mod::Log("LobbySession::RequestRefresh (client): returning-from-match cleared");
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_status.inBattle = false;
+        }
+    }
     m_refreshRequested.store(true);
     if (m_wakeEvent != nullptr)
     {
@@ -1143,6 +1277,7 @@ void LobbySession::RequestRefresh()
 
 void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
 {
+    m_isMatchHost.store(true);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         PendingAction action;
@@ -1160,6 +1295,7 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
 
 void LobbySession::AcceptChallenge(int challengerPlayerId)
 {
+    m_isMatchHost.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         PendingAction action;
@@ -1199,14 +1335,34 @@ void LobbySession::NotifyMatchConnected()
 void LobbySession::NotifyEndMatch()
 {
     m_inBattle.store(false);
-    mod::Log("LobbySession::NotifyEndMatch: inBattle=false");
+    m_returningFromMatch.store(true);
+
+    const bool wasHost = m_isMatchHost.load();
+    if (wasHost)
     {
+        // HOST: defer the End action until we re-enter the lobby menu
+        // (via RequestRefresh).  This keeps the playing-pair visible on
+        // the server and prevents us from appearing idle prematurely.
+        mod::Log("LobbySession::NotifyEndMatch (host): inBattle=false "
+                 "returningFromMatch=true (End deferred)");
+    }
+    else
+    {
+        // CLIENT: send End immediately so the server drops the playing
+        // pair.  The host is responsible for maintaining lobby presence;
+        // having the client also "post" would create duplicates.  We
+        // still set m_returningFromMatch so IsInBattle() returns true
+        // and local challenge acceptance is suppressed until we return
+        // to the lobby menu.
+        mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
+                 "returningFromMatch=true, queuing End immediately");
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.inBattle = false;
         PendingAction action;
         action.type = PendingAction::End;
         m_pendingActions.push_back(std::move(action));
     }
+
     if (m_wakeEvent != nullptr)
     {
         SetEvent(m_wakeEvent);
@@ -1253,7 +1409,15 @@ void LobbySession::PollThreadEntry()
         // Process any queued challenge/accept actions before polling.
         ProcessPendingActions();
 
-        DoPollStatus();
+        // CLIENT in an active match: skip polling to avoid "posting"
+        // our presence to the lobby — only the host maintains lobby
+        // visibility during a match.  We still process pending actions
+        // above (e.g. ConfirmAccept, End) so the server is notified.
+        const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
+        if (!skipPoll)
+        {
+            DoPollStatus();
+        }
 
         // Wait for kPollIntervalMs or until woken early.
         if (m_wakeEvent != nullptr)
@@ -1378,24 +1542,25 @@ bool LobbySession::DoPollStatus()
 
     std::vector<LobbyDisplayEntry> displayEntries;
     const bool inBattle = m_inBattle.load();
-    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, inBattle, &displayEntries);
+    const bool suppressChallenges = inBattle || m_returningFromMatch.load();
+    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, suppressChallenges, &displayEntries);
 
-    if (inBattle && !challenges.empty())
+    if (suppressChallenges && !challenges.empty())
     {
-        mod::Log("LobbySession::DoPollStatus: inBattle=true, dropping %zu incoming challenges",
-                 challenges.size());
+        mod::Log("LobbySession::DoPollStatus: suppressing %zu incoming challenges (inBattle=%d returning=%d)",
+                 challenges.size(), (int)inBattle, (int)m_returningFromMatch.load());
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_status.pollState = PollState::Polling;
     m_status.idlePlayers = std::move(idlePlayers);
-    m_status.challenges = inBattle ? std::vector<LobbyChallenge>{} : std::move(challenges);
+    m_status.challenges = suppressChallenges ? std::vector<LobbyChallenge>{} : std::move(challenges);
     m_status.displayEntries = std::move(displayEntries);
     m_status.playing = std::move(playingPairs);
     m_status.publicIp = m_publicIp;
     m_status.statusMessage.clear();
     m_status.lastPollTick = GetTickCount();
-    m_status.inBattle = inBattle;
+    m_status.inBattle = suppressChallenges;
     return true;
 }
 
@@ -1555,20 +1720,7 @@ void LobbySession::ParseIdlePlayers(const std::string& json, std::vector<LobbyPl
 
         // Read the player name until closing '"'.
         std::string playerName;
-        while (cursor < json.size() && json[cursor] != '"')
-        {
-            // Basic escape: skip backslash and next char.
-            if (json[cursor] == '\\' && cursor + 1 < json.size())
-            {
-                ++cursor;
-            }
-            playerName += json[cursor];
-            ++cursor;
-        }
-        if (cursor < json.size())
-        {
-            ++cursor; // Consume closing '"'.
-        }
+        ReadJsonStringBody(json, cursor, &playerName);
 
         // Skip comma between name and id.
         while (cursor < json.size() && (json[cursor] == ',' || json[cursor] == ' '))
@@ -1639,20 +1791,7 @@ void LobbySession::ParsePlayingPairs(const std::string& json, std::vector<LobbyP
             return false;
         }
         ++cursor; // consume opening '"'
-        dst->clear();
-        while (cursor < json.size() && json[cursor] != '"')
-        {
-            if (json[cursor] == '\\' && cursor + 1 < json.size())
-            {
-                ++cursor;
-            }
-            *dst += json[cursor];
-            ++cursor;
-        }
-        if (cursor < json.size())
-        {
-            ++cursor; // consume closing '"'
-        }
+        ReadJsonStringBody(json, cursor, dst);
         return true;
     };
 
@@ -1783,19 +1922,7 @@ void LobbySession::ParseChallenges(const std::string& json, std::vector<LobbyCha
         ++cursor; // consume opening '"'
 
         std::string name;
-        while (cursor < json.size() && json[cursor] != '"')
-        {
-            if (json[cursor] == '\\' && cursor + 1 < json.size())
-            {
-                ++cursor;
-            }
-            name += json[cursor];
-            ++cursor;
-        }
-        if (cursor < json.size())
-        {
-            ++cursor; // consume closing '"'
-        }
+        ReadJsonStringBody(json, cursor, &name);
 
         // Skip comma.
         while (cursor < json.size() && (json[cursor] == ',' || json[cursor] == ' '))
@@ -1925,26 +2052,36 @@ void LobbySession::BuildDisplayEntries(
     }
 
     // Then idle players, skipping any that already appear as challengers.
-    // Helper: check if a name already exists in the output list.
-    // Used to deduplicate stale server entries where the same player
-    // appears with multiple IDs (e.g. reconnect without leaving first).
-    auto isNameAlreadyListed = [&](const std::string& name) -> bool {
+    // Helper: check if a player ID already exists in the output list.
+    auto isIdAlreadyListed = [&](int id) -> bool {
         for (const auto& e : *out)
         {
-            if (e.name == name) return true;
+            if (e.playerId == id) return true;
         }
         return false;
     };
 
-    // Also collect names from playing pairs so we can mark idle entries
-    // that are stale duplicates of a currently-playing player.
-    auto isNameInPlayingPair = [&](const std::string& name, std::string* outSpectateIp) -> bool {
+    // Check if a player (by ID or name+ip fallback) appears in a playing pair.
+    // Two different people can sharea nickname, so name alone is not reliable.
+    // We prefer IDs; name is only used as a secondary signal when combined
+    // with matching inside our own pair (identified by selfPlayerId).
+    auto isIdInPlayingPair = [&](int id, const std::string& name, std::string* outSpectateIp) -> bool {
         for (const auto& pp : playing)
         {
-            if (pp.p1Name == name || pp.p2Name == name)
+            if (pp.p1Id == id || pp.p2Id == id)
             {
                 if (outSpectateIp) *outSpectateIp = pp.hostIp;
                 return true;
+            }
+            // Fallback: name match only when the player is in OUR pair
+            // (server sometimes assigns new IDs across lists).
+            if (pp.p1Id == selfPlayerId || pp.p2Id == selfPlayerId)
+            {
+                if (pp.p1Name == name || pp.p2Name == name)
+                {
+                    if (outSpectateIp) *outSpectateIp = pp.hostIp;
+                    return true;
+                }
             }
         }
         return false;
@@ -1966,8 +2103,10 @@ void LobbySession::BuildDisplayEntries(
             continue;
         }
 
-        // Skip if this name already appears (stale duplicate with new ID).
-        if (isNameAlreadyListed(p.name))
+        // Skip if this exact player ID already appears (e.g. challenger
+        // with the same ID).  We no longer deduplicate by name alone —
+        // two different players can legitimately share a nickname.
+        if (isIdAlreadyListed(p.playerId))
         {
             continue;
         }
@@ -1977,10 +2116,10 @@ void LobbySession::BuildDisplayEntries(
         entry.playerId = p.playerId;
         entry.isChallenge = false;
         entry.isSelf = (p.playerId == selfPlayerId);
-        // Check both by ID and by name: the server may assign a different
-        // ID to a player in the playing list vs their idle entry.
+        // Check by ID first; name fallback only for our own pair where
+        // the server may assign a different ID across lists.
         std::string spectateIpByName;
-        entry.isPlaying = isPlayerPlaying(p.playerId) || isNameInPlayingPair(p.name, &spectateIpByName);
+        entry.isPlaying = isPlayerPlaying(p.playerId) || isIdInPlayingPair(p.playerId, p.name, &spectateIpByName);
         if (entry.isPlaying && entry.spectateIp.empty())
         {
             entry.spectateIp = spectateIpByName;
@@ -1996,21 +2135,12 @@ void LobbySession::BuildDisplayEntries(
     // On many Concerto servers, playing players are removed from the idle
     // list.  We add synthetic display entries for each pair so they appear
     // in the scrollable slot list and can be selected to spectate.
-    auto isAlreadyListed = [&](int id) -> bool {
-        for (const auto& e : *out)
-        {
-            if (e.playerId == id) return true;
-        }
-        return false;
-    };
-
     for (const auto& pp : playing)
     {
-        // Use the first player in the pair who isn't already listed
-        // (by ID or by name).  Prefer p1 (typically the host) so the
-        // spectateIp resolves correctly.
-        const bool p1Listed = isAlreadyListed(pp.p1Id) || isNameAlreadyListed(pp.p1Name);
-        const bool p2Listed = isAlreadyListed(pp.p2Id) || isNameAlreadyListed(pp.p2Name);
+        // Use the first player in the pair who isn't already listed (by ID).
+        // Prefer p1 (typically the host) so the spectateIp resolves correctly.
+        const bool p1Listed = isIdAlreadyListed(pp.p1Id);
+        const bool p2Listed = isIdAlreadyListed(pp.p2Id);
         const int displayId = !p1Listed ? pp.p1Id
                             : !p2Listed ? pp.p2Id
                             : 0;

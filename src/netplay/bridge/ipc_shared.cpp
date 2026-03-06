@@ -964,6 +964,32 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
     const bool existed = (existingAttrs != INVALID_FILE_ATTRIBUTES);
     const char* safeAddress = (address != nullptr) ? address : "";
     const char* safeNickname = (nickname != nullptr && nickname[0] != '\0') ? nickname : "Player";
+
+    // Convert UTF-8 nickname to system codepage for INI storage.
+    std::string nickAcp;
+    {
+        bool hasNonAscii = false;
+        for (const char* p = safeNickname; *p != '\0'; ++p)
+        {
+            if (static_cast<unsigned char>(*p) >= 0x80u) { hasNonAscii = true; break; }
+        }
+        if (hasNonAscii)
+        {
+            const int wideLen = MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, nullptr, 0);
+            if (wideLen > 0)
+            {
+                std::wstring wide(static_cast<std::size_t>(wideLen), L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, wide.data(), wideLen);
+                const int acpLen = WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (acpLen > 0)
+                {
+                    nickAcp.resize(static_cast<std::size_t>(acpLen - 1));
+                    WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nickAcp.data(), acpLen, nullptr, nullptr);
+                    safeNickname = nickAcp.c_str();
+                }
+            }
+        }
+    }
     char portText[16] = {};
     std::snprintf(portText, sizeof(portText), "%u", static_cast<unsigned>(port));
 

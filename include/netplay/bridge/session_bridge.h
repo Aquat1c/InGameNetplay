@@ -44,7 +44,7 @@ struct NetbridgeStatus
     int vsHumanSyncReady = 0;
     uint16_t port = 0;
     char address[64] = {};
-    char nickname[32] = {};
+    char nickname[64] = {};
     char p1Name[64] = {};
     char p2Name[64] = {};
     char errorMsg[128] = {};

@@ -214,7 +214,33 @@ void LoadNetplayMenuSettingsFromIni()
 
     char nicknameBuffer[128] = {};
     (void)GetPrivateProfileStringA("Network", "Name", "", nicknameBuffer, static_cast<DWORD>(std::size(nicknameBuffer)), iniPath.c_str());
-    const std::string nickname = TrimAscii(nicknameBuffer);
+    std::string nickname = TrimAscii(nicknameBuffer);
+
+    // Convert from system codepage to UTF-8 if it contains non-ASCII bytes.
+    if (!nickname.empty())
+    {
+        bool hasNonAscii = false;
+        for (unsigned char ch : nickname)
+        {
+            if (ch >= 0x80u) { hasNonAscii = true; break; }
+        }
+        if (hasNonAscii)
+        {
+            const int wideLen = MultiByteToWideChar(CP_ACP, 0, nickname.c_str(), static_cast<int>(nickname.size()), nullptr, 0);
+            if (wideLen > 0)
+            {
+                std::wstring wide(static_cast<std::size_t>(wideLen), L'\0');
+                MultiByteToWideChar(CP_ACP, 0, nickname.c_str(), static_cast<int>(nickname.size()), wide.data(), wideLen);
+                const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+                if (utf8Len > 0)
+                {
+                    std::string utf8(static_cast<std::size_t>(utf8Len), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), utf8Len, nullptr, nullptr);
+                    nickname = std::move(utf8);
+                }
+            }
+        }
+    }
     if (!nickname.empty())
     {
         if (IsValidNickname(nickname))

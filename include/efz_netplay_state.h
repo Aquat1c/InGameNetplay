@@ -35,7 +35,7 @@ extern "C" {
 // Validation magic: 'EFZN' in little-endian byte order.
 #define EFZ_NETPLAY_STATE_MAGIC       0x4E5A4645u
 // Current struct layout version.  Increment when fields are added/changed.
-#define EFZ_NETPLAY_STATE_VERSION     4u
+#define EFZ_NETPLAY_STATE_VERSION     5u
 // Well-known name for the named shared memory block.
 #define EFZ_NETPLAY_STATE_SHM_NAME    "EFZNetplay_State"
 
@@ -156,7 +156,7 @@ struct EFZNetplayState
     int32_t  matchCounter;       // Current match index within the set
 
     // --- Nicknames ---------------------------------------------------------
-    char     localNickname[32];  // Our chosen nickname (from EfzRevival.ini)
+    char     localNickname[64];  // Our chosen nickname (UTF-8, from EfzRevival.ini)
     char     p1Name[64];         // P1 nickname (from Revival session object)
     char     p2Name[64];         // P2 nickname (from Revival session object)
 

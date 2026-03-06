@@ -115,6 +115,7 @@ struct DebugOverlayState
     bool forceDelayOverlay = false;
     bool forceSpectateOverlay = false;
     bool forceRuntimeTextOverlay = false;
+    bool showConsole = false;
 };
 
 using PlaySoundEffectFn = int(__thiscall*)(void* gameSystem, unsigned short soundIndex);
