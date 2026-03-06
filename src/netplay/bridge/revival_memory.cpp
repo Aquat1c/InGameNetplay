@@ -3,6 +3,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "crash_handler.h"
 
+#include <cmath>
 #include <cstring>
 #include <cwchar>
 
@@ -156,6 +157,57 @@ bool SafeReadByte(const void* address, uint8_t* outValue)
     __try
     {
         *outValue = *reinterpret_cast<const uint8_t*>(address);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool SafeReadWord(const void* address, uint16_t* outValue)
+{
+    if (outValue == nullptr || !IsReadableRange(address, sizeof(uint16_t)))
+    {
+        return false;
+    }
+    __try
+    {
+        *outValue = *reinterpret_cast<const uint16_t*>(address);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool SafeReadDouble(const void* address, double* outValue)
+{
+    if (outValue == nullptr || !IsReadableRange(address, sizeof(double)))
+    {
+        return false;
+    }
+    __try
+    {
+        *outValue = *reinterpret_cast<const double*>(address);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool SafeReadDword(const void* address, uint32_t* outValue)
+{
+    if (outValue == nullptr || !IsReadableRange(address, sizeof(uint32_t)))
+    {
+        return false;
+    }
+    __try
+    {
+        *outValue = *reinterpret_cast<const uint32_t*>(address);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -1697,6 +1749,8 @@ bool ForceLocalPlayInit()
         "oldSession=0x%08lX callCount=%d",
         static_cast<unsigned long>(oldSessionPtr), callCount);
     SaveExeFrameHookBytes();
+    // Save the 8 bytes at 0x401642 before init() to prevent trampoline leak.
+    SaveExeDispatchHookBytes();
     // Restore original (pre-hook) bytes at mode-ctor hook sites BEFORE
     // init() so the new trampoline copies clean EXE bytes instead of
     // stale hooks from a previous session's mode (prevents chaining
@@ -1734,6 +1788,8 @@ bool ForceLocalPlayInit()
     // Undo the trampoline chain growth at 0x401582 — restore saved bytes.
     mod::Log("ForceLocalPlayInit: restoring saved EXE hook bytes");
     RestoreExeFrameHookBytes();
+    // Restore saved 0x401642 bytes to undo init()'s new trampoline.
+    RestoreExeDispatchHookBytes();
     // Mode-ctor originals were already restored before init(); local play
     // init(2,102) does not install hooks at 0x763E50/0x763F04, so the
     // originals are still in place.  No further action needed.
@@ -1936,6 +1992,7 @@ bool RestoreRenderContext()
                                    : (currentRenderCtx == g_savedRenderContext
                                           ? "unchanged"
                                           : "was different"));
+    g_renderContextSaved = false;
     return true;
 }
 
@@ -2605,6 +2662,81 @@ void RestoreExeFrameHookBytes()
              verify[0], verify[1], verify[2], verify[3], verify[4],
              verify[5], verify[6], verify[7], verify[8], verify[9]);
 }
+// ---------------------------------------------------------------------------
+// Save / restore 8 bytes at EXE address 0x401642 before and after every
+// init() call.  This is the REPLACEMENT hook site written by
+// EFZ_BufferProcess_WithSize (sub_1006EFB0).  Each init() call mallocs a
+// NEW 10‑byte trampoline and overwrites 0x401642 with E9 rel32 + 3 NOPs.
+// Without save/restore the old trampoline leaks and the JMP target changes
+// — which is benign per se, but accumulates memory and makes the hook
+// inconsistent across sessions.  Save/restore keeps the same JMP bytes as
+// session 1, eliminating any target-address drift.
+// ---------------------------------------------------------------------------
+static constexpr uintptr_t kExeDispatchHookAddr = 0x401642u;
+static constexpr size_t    kExeDispatchHookSize = 8u;
+static uint8_t g_exeDispatchHookSaved[kExeDispatchHookSize] = {};
+static bool    g_exeDispatchHookSavedValid = false;
+
+void SaveExeDispatchHookBytes()
+{
+    memcpy(g_exeDispatchHookSaved,
+           reinterpret_cast<const void*>(kExeDispatchHookAddr),
+           kExeDispatchHookSize);
+    g_exeDispatchHookSavedValid = true;
+    mod::Log("SaveExeDispatchHookBytes: saved %zu bytes at 0x%08lX "
+             "[%02X %02X %02X %02X %02X %02X %02X %02X]",
+             kExeDispatchHookSize,
+             static_cast<unsigned long>(kExeDispatchHookAddr),
+             g_exeDispatchHookSaved[0], g_exeDispatchHookSaved[1],
+             g_exeDispatchHookSaved[2], g_exeDispatchHookSaved[3],
+             g_exeDispatchHookSaved[4], g_exeDispatchHookSaved[5],
+             g_exeDispatchHookSaved[6], g_exeDispatchHookSaved[7]);
+}
+
+void RestoreExeDispatchHookBytes()
+{
+    if (!g_exeDispatchHookSavedValid)
+    {
+        mod::Log("RestoreExeDispatchHookBytes: no saved bytes — skipped");
+        return;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(kExeDispatchHookAddr),
+                        kExeDispatchHookSize,
+                        PAGE_EXECUTE_READWRITE,
+                        &oldProtect))
+    {
+        mod::Log("RestoreExeDispatchHookBytes: VirtualProtect failed err=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        return;
+    }
+
+    memcpy(reinterpret_cast<void*>(kExeDispatchHookAddr),
+           g_exeDispatchHookSaved,
+           kExeDispatchHookSize);
+
+    VirtualProtect(reinterpret_cast<void*>(kExeDispatchHookAddr),
+                   kExeDispatchHookSize,
+                   oldProtect,
+                   &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(),
+                          reinterpret_cast<void*>(kExeDispatchHookAddr),
+                          kExeDispatchHookSize);
+
+    g_exeDispatchHookSavedValid = false;
+
+    uint8_t verify[kExeDispatchHookSize] = {};
+    memcpy(verify,
+           reinterpret_cast<const void*>(kExeDispatchHookAddr),
+           kExeDispatchHookSize);
+    mod::Log("RestoreExeDispatchHookBytes: restored %zu bytes at 0x%08lX "
+             "[%02X %02X %02X %02X %02X %02X %02X %02X]",
+             kExeDispatchHookSize,
+             static_cast<unsigned long>(kExeDispatchHookAddr),
+             verify[0], verify[1], verify[2], verify[3],
+             verify[4], verify[5], verify[6], verify[7]);
+}
 
 // ---------------------------------------------------------------------------
 // Save / restore bytes at EXE addresses 0x763E50 (7 bytes) and 0x763F04
@@ -3129,6 +3261,51 @@ static PerFrameTickFn g_origPerFrameTick = nullptr;
 
 static uint32_t g_frameTick = 0;           // monotonic per-frame counter
 
+// --- Double-speed diagnostics -------------------------------------------
+// Wall-clock time tracking: measure actual FPS by comparing timeGetTime()
+// between heartbeats.
+static DWORD g_lastHeartbeatTimeMs = 0;
+static uint32_t g_lastHeartbeatFrameTick = 0;
+
+// Toggle tracking: gameSys+4968 toggles exactly once per EXE main loop
+// iteration.  If our hook sees the same toggle value on consecutive calls,
+// the hook is being invoked more than once per main loop frame.
+static uint32_t g_lastToggleValue = 0xFFFFFFFFu;
+static uint32_t g_toggleSameCount = 0;  // consecutive same-toggle detections
+static bool     g_toggleDiagLogged = false;
+
+// Session number: incremented each time ResetGameModeValidation is called
+// (i.e. each new session).  Logged in every SPEED_DIAG line so we can
+// immediately tell which session produced a given log entry.
+static uint32_t g_sessionNumber = 0;
+
+// Timer baseline snapshot: captured on the first SPEED_DIAG read of each
+// session.  If timerScalar or timerInterval change later, we log an alert.
+static double   g_baselineTimerScalar   = 0.0;
+static double   g_baselineTimerInterval = 0.0;
+static uintptr_t g_baselineTimerPtr     = 0;
+static bool     g_timerBaselineCaptured = false;
+
+// Init-once guard transition tracking: detect when the guard changes
+// between frames (should only happen once during first-time global init).
+static uint16_t g_lastInitOnceGuard     = 0;
+static bool     g_initOnceGuardTracked  = false;
+
+// Render context pointer tracking: detect if the EfzRender* global goes
+// NULL or changes unexpectedly between frames (H2 stale context).
+static uintptr_t g_lastRenderCtxPtr     = 0;
+static bool     g_renderCtxTracked      = false;
+
+// Session pointer tracking within a session: detect if dword_100A02CC
+// is silently replaced mid-session (H1 double-init / leaked session).
+static uintptr_t g_lastSessionPtrInTick = 0;
+static bool     g_sessionPtrTracked     = false;
+
+// Per-frame QPC delta for burst logging: log individual frame-to-frame
+// intervals during the first 30 ticks to detect doubled rate from tick 1.
+static LARGE_INTEGER g_prevFrameQpc     = {};
+static bool     g_prevFrameQpcValid     = false;
+
 // Read the raw session pointer from dword_100A02CC without heuristic
 // validation.  Used in the per-frame tick hot path.
 static uintptr_t ReadSessionPtrRaw()
@@ -3321,12 +3498,65 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     if (g_frameTick == 1
         || (g_frameTick % 600 == 0 && g_frameTick <= 6000))
     {
+        const DWORD nowMs = GetTickCount();
+        DWORD elapsedMs = 0;
+        double measuredFps = 0.0;
+        if (g_lastHeartbeatTimeMs != 0 && g_lastHeartbeatFrameTick != 0)
+        {
+            elapsedMs = nowMs - g_lastHeartbeatTimeMs;
+            const uint32_t elapsedFrames = g_frameTick - g_lastHeartbeatFrameTick;
+            if (elapsedMs > 0)
+                measuredFps = static_cast<double>(elapsedFrames) * 1000.0
+                              / static_cast<double>(elapsedMs);
+        }
+        g_lastHeartbeatTimeMs = nowMs;
+        g_lastHeartbeatFrameTick = g_frameTick;
+
         mod::Log(
-            "TICK_HOOK: heartbeat frameTick=%u session=0x%08lX exeECX=0x%08lX match=%d",
+            "TICK_HOOK: heartbeat S#%u frameTick=%u session=0x%08lX exeECX=0x%08lX match=%d "
+            "elapsed=%lums fps=%.1f toggleSame=%u",
+            g_sessionNumber,
             g_frameTick,
             static_cast<unsigned long>(currentSession),
             static_cast<unsigned long>(exeThisAddr),
-            (exeThisAddr == currentSession) ? 1 : 0);
+            (exeThisAddr == currentSession) ? 1 : 0,
+            static_cast<unsigned long>(elapsedMs),
+            measuredFps,
+            g_toggleSameCount);
+    }
+
+    // --- gameSys+4968 toggle double-tick detection --------------------------
+    // The EXE main loop toggles gameSys+4968 once per iteration.  If we see
+    // the same value on two consecutive calls, the per-frame tick hook is
+    // running more than once per main loop frame.
+    {
+        constexpr uintptr_t kGameSystemPtr = 0x0079010C;
+        uint32_t toggleVal = 0xFFFFFFFFu;
+        __try {
+            const uint32_t gameSys =
+                *reinterpret_cast<const volatile uint32_t*>(kGameSystemPtr);
+            if (gameSys != 0)
+                toggleVal =
+                    *reinterpret_cast<const volatile uint32_t*>(gameSys + 4968);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (toggleVal != 0xFFFFFFFFu
+            && g_lastToggleValue != 0xFFFFFFFFu
+            && toggleVal == g_lastToggleValue)
+        {
+            ++g_toggleSameCount;
+            if (!g_toggleDiagLogged)
+            {
+                g_toggleDiagLogged = true;
+                mod::Log(
+                    "TICK_HOOK: *** DOUBLE TICK DETECTED *** frameTick=%u "
+                    "toggleVal=%u — per-frame hook fired twice in same "
+                    "main loop iteration",
+                    g_frameTick,
+                    toggleVal);
+            }
+        }
+        g_lastToggleValue = toggleVal;
     }
 
     // ---- Pre-tick disconnect detection ------------------------------------
@@ -3451,8 +3681,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     {"Sync",      nullptr, nullptr},
                     {"Quit",      nullptr, nullptr},
                     {"LoadMatch", nullptr, nullptr},
+                    {"Init",      nullptr, nullptr},
+                    {"Net",       nullptr, nullptr},
                 };
-                constexpr int kMappingCount = 7;
+                constexpr int kMappingCount = 9;
 
                 for (int mi = 0; mi < kMappingCount; ++mi)
                 {
@@ -3516,13 +3748,554 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // a pre-tick disconnect was detected or spectator tick holdoff is
     // active, in which case we skip the DLL's tick entirely.
     int result = 0;
+    LARGE_INTEGER tickQpcBefore = {}, tickQpcAfter = {};
 
     if (!preTickDisconnect && !spectateTickHoldoff)
     {
         // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
         // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
         // during the DLL's session tick (vtable[2] → RollbackLoopTick).
+        QueryPerformanceCounter(&tickQpcBefore);
         result = RunPerFrameTickDispatch(fixedThis);
+        QueryPerformanceCounter(&tickQpcAfter);
+    }
+
+    // ====================================================================
+    // Comprehensive per-frame diagnostics (double-speed bug)
+    // ====================================================================
+    // Log EVERYTHING that could explain why the game runs at double FPS
+    // on the second (and subsequent) netplay sessions.
+    //
+    // Fires: every frame for first 30 ticks (burst), every 30 frames after
+    // (2x/sec at 60fps), and ALWAYS when result > 1 (multi-iteration).
+    // ====================================================================
+    if (g_activeRevival != nullptr
+        && currentSession != 0
+        && g_dllExitProcessPatchesSaved
+        && g_localRoleFlag != kLocalRoleLocalPlay)
+    {
+        const bool isBurst = (g_frameTick <= 30);
+        const bool isPeriodic = (g_frameTick % 30 == 0);
+        const bool isMultiIter = (result > 1);
+        if (isBurst || isPeriodic || isMultiIter)
+        {
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            const uintptr_t dllBase = revival
+                ? reinterpret_cast<uintptr_t>(revival) : 0;
+
+            // ---- 1. Session object fields ----
+            int inputDelay = -1, activePlayer = -1, queuePlayer = -1;
+            int currentFrame = -1, matchId = -1, initComplete = -1;
+            uint32_t pingStruct[4] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
+            uint8_t screenIdx = 0xFF;
+            // Fields at known fixed offsets relative to sessionOffsetGameModeSnapshot:
+            //   +716 = previousGameMode,  +720 = currentGameMode
+            //   +724 = matchStartFrame,   +728 = advanceCounter
+            //   +736 = syncFrameCounter
+            int prevGameMode = -1, curGameMode = -1, matchStartFrame = -1;
+            int advanceCounter = -1, syncFrameCounter = -1;
+            int windowBaseDelay = -1;  // +692 = prediction enabled / windowBaseDelayOffset
+            uint32_t sentinelVal = 0;
+            uintptr_t sessionVtable = 0;
+            // +1236 = highestFrameReached (DWORD[309])
+            int highestFrame = -1;
+
+            (void)SafeReadPtr(reinterpret_cast<const void*>(currentSession), &sessionVtable);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetInputDelay), &inputDelay);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetActivePlayer), &activePlayer);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetQueuePlayer), &queuePlayer);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetCurrentFrame), &currentFrame);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetMatchId), &matchId);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetInitComplete), &initComplete);
+            (void)SafeReadDword(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetSentinel), &sentinelVal);
+
+            // Game mode fields — always 4 bytes after sessionOffsetGameModeSnapshot.
+            const uintptr_t gmBase = currentSession + g_activeRevival->sessionOffsetGameModeSnapshot;
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase), &prevGameMode);       // +716
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 4), &curGameMode);    // +720
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 8), &matchStartFrame);// +724
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 12), &advanceCounter);// +728
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 20), &syncFrameCounter);// +736
+
+            // windowBaseDelayOffset = sessionOffsetInputDelay + 4 (byte offset +692)
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetInputDelay + 4), &windowBaseDelay);
+
+            // highestFrameReached = sentinel offset + 4 (byte offset +1236)
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetSentinel + 4), &highestFrame);
+
+            // Read the 4-DWORD ping struct (AdjustPrediction / WaitLoop fields).
+            const uintptr_t pingBase = currentSession + g_activeRevival->sessionOffsetPingStructBase;
+            for (int pi = 0; pi < 4; ++pi)
+            {
+                (void)SafeReadInt(
+                    reinterpret_cast<const void*>(pingBase + pi * 4),
+                    reinterpret_cast<int*>(&pingStruct[pi]));
+            }
+
+            __try {
+                screenIdx = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+            // ---- 2. DLL global variables ----
+            uint16_t initOnceGuard = 0;
+            uintptr_t timerPtr = 0, renderCtxPtr = 0, globalStatePtr = 0;
+            uintptr_t subStructBase = 0;
+            int initFlag = -1;
+            double timerScalar = 0.0;   // timerPtr+32: 1000.0/interval
+            double timerInterval = 0.0; // timerPtr+16: frame interval in ms
+
+            if (dllBase != 0)
+            {
+                (void)SafeReadWord(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->initOnceGuardOffset),
+                    &initOnceGuard);
+                (void)SafeReadPtr(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->timerPtrOffset),
+                    &timerPtr);
+                (void)SafeReadPtr(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextGlobalOffset),
+                    &renderCtxPtr);
+                (void)SafeReadPtr(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->globalStatePtrOffset),
+                    &globalStatePtr);
+                (void)SafeReadPtr(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextBaseOffset),
+                    &subStructBase);
+                (void)SafeReadInt(
+                    reinterpret_cast<const void*>(dllBase + g_activeRevival->initFlagOffset),
+                    &initFlag);
+
+                // Read timer context: [+16]=interval(double), [+32]=scalar(double)
+                if (timerPtr != 0)
+                {
+                    (void)SafeReadDouble(
+                        reinterpret_cast<const void*>(timerPtr + 16), &timerInterval);
+                    (void)SafeReadDouble(
+                        reinterpret_cast<const void*>(timerPtr + 32), &timerScalar);
+                }
+            }
+
+            // ---- 3. Compute what AdjustPrediction would compute ----
+            // Replicate the math so we can see the intermediate values:
+            //   halfPeriod = pingTicks / (2 * timerScalar)
+            //   threshold = floor(halfPeriod) - 1
+            // If (localFrames - remoteFrames) < threshold → "Add frame"
+            double halfPeriodFloat = 0.0;
+            int predThreshold = -9999;
+            if (timerScalar > 0.0)
+            {
+                halfPeriodFloat = static_cast<double>(pingStruct[0])
+                                  / (2.0 * timerScalar);
+                predThreshold = static_cast<int>(floor(halfPeriodFloat)) - 1;
+            }
+
+            // ---- 4. DLL tick timing ----
+            LARGE_INTEGER qpcFreq;
+            QueryPerformanceFrequency(&qpcFreq);
+            double tickDurationUs = 0.0;
+            if (tickQpcAfter.QuadPart > tickQpcBefore.QuadPart)
+            {
+                tickDurationUs = static_cast<double>(
+                    tickQpcAfter.QuadPart - tickQpcBefore.QuadPart)
+                    * 1000000.0 / static_cast<double>(qpcFreq.QuadPart);
+            }
+
+            // ---- 5. Vtable RVA for session type identification ----
+            uintptr_t vtableRva = (dllBase != 0 && sessionVtable >= dllBase)
+                ? (sessionVtable - dllBase) : 0;
+
+            // ---- LOG LINE 1: core session state ----
+            mod::Log(
+                "SPEED_DIAG[1]: S#%u tick=%u result=%d screen=%u role=%d "
+                "session=0x%08lX vtableRVA=0x%lX "
+                "frame=%d matchId=%d initComp=%d sentinel=0x%08lX "
+                "tickUs=%.0f%s",
+                g_sessionNumber, g_frameTick, result,
+                static_cast<unsigned>(screenIdx), g_localRoleFlag,
+                static_cast<unsigned long>(currentSession),
+                static_cast<unsigned long>(vtableRva),
+                currentFrame, matchId, initComplete,
+                static_cast<unsigned long>(sentinelVal),
+                tickDurationUs,
+                isMultiIter ? " *** MULTI-ITER ***" : "");
+
+            // ---- LOG LINE 2: game mode / timing fields ----
+            mod::Log(
+                "SPEED_DIAG[2]: prevMode=%d curMode=%d matchStart=%d "
+                "advCtr=%d syncFrame=%d highFrame=%d "
+                "inputDelay=%d wndBaseDelay=%d "
+                "active=%d queue=%d",
+                prevGameMode, curGameMode, matchStartFrame,
+                advanceCounter, syncFrameCounter, highestFrame,
+                inputDelay, windowBaseDelay,
+                activePlayer, queuePlayer);
+
+            // ---- LOG LINE 3: ping struct + prediction math ----
+            mod::Log(
+                "SPEED_DIAG[3]: ping[0]=%u [1]=%u [2]=%u [3]=%u "
+                "timerScalar=%.4f timerInterval=%.4f "
+                "halfPeriod=%.6f predThreshold=%d",
+                pingStruct[0], pingStruct[1], pingStruct[2], pingStruct[3],
+                timerScalar, timerInterval,
+                halfPeriodFloat, predThreshold);
+
+            // ---- LOG LINE 4: DLL globals ----
+            mod::Log(
+                "SPEED_DIAG[4]: initOnceGuard=0x%04X initFlag=%d "
+                "timerPtr=0x%08lX renderCtx=0x%08lX "
+                "globalState=0x%08lX subStructBase=0x%08lX",
+                static_cast<unsigned>(initOnceGuard), initFlag,
+                static_cast<unsigned long>(timerPtr),
+                static_cast<unsigned long>(renderCtxPtr),
+                static_cast<unsigned long>(globalStatePtr),
+                static_cast<unsigned long>(subStructBase));
+
+            // ---- LOG LINE 5: EXE hook bytes at 0x401582 and 0x401642 ----
+            // 0x401582 = frame-hook dispatcher (sub_1006E590 entry point)
+            // 0x401642 = per-frame tick (sub_1006E570 dispatch site)
+            if (isBurst || isMultiIter)
+            {
+                uint8_t exeHookA[12] = {}, exeHookB[12] = {};
+                __try {
+                    for (int bi = 0; bi < 12; ++bi)
+                    {
+                        exeHookA[bi] = reinterpret_cast<const volatile uint8_t*>(0x401582u)[bi];
+                        exeHookB[bi] = reinterpret_cast<const volatile uint8_t*>(0x401642u)[bi];
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                mod::Log(
+                    "SPEED_DIAG[5a]: EXE@0x401582: "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    exeHookA[0], exeHookA[1], exeHookA[2], exeHookA[3],
+                    exeHookA[4], exeHookA[5], exeHookA[6], exeHookA[7],
+                    exeHookA[8], exeHookA[9], exeHookA[10], exeHookA[11]);
+                mod::Log(
+                    "SPEED_DIAG[5b]: EXE@0x401642: "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    exeHookB[0], exeHookB[1], exeHookB[2], exeHookB[3],
+                    exeHookB[4], exeHookB[5], exeHookB[6], exeHookB[7],
+                    exeHookB[8], exeHookB[9], exeHookB[10], exeHookB[11]);
+
+                // Also dump DLL-side trampoline bytes (perFrameTickRva)
+                if (dllBase != 0)
+                {
+                    const uintptr_t hookAddr = dllBase + g_activeRevival->perFrameTickRva;
+                    uint8_t dllHook[12] = {};
+                    __try {
+                        for (int bi = 0; bi < 12; ++bi)
+                            dllHook[bi] = reinterpret_cast<const volatile uint8_t*>(hookAddr)[bi];
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                    mod::Log(
+                        "SPEED_DIAG[5c]: DLL perFrameTick @0x%08lX: "
+                        "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                        static_cast<unsigned long>(hookAddr),
+                        dllHook[0], dllHook[1], dllHook[2], dllHook[3],
+                        dllHook[4], dllHook[5], dllHook[6], dllHook[7],
+                        dllHook[8], dllHook[9], dllHook[10], dllHook[11]);
+
+                    // Also dump frameHookRva (sub_1006E590) to see if it's been
+                    // re-hooked or clobbered.
+                    const uintptr_t fhAddr = dllBase + g_activeRevival->frameHookRva;
+                    uint8_t fhHook[12] = {};
+                    __try {
+                        for (int bi = 0; bi < 12; ++bi)
+                            fhHook[bi] = reinterpret_cast<const volatile uint8_t*>(fhAddr)[bi];
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                    mod::Log(
+                        "SPEED_DIAG[5d]: DLL frameHook @0x%08lX: "
+                        "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                        static_cast<unsigned long>(fhAddr),
+                        fhHook[0], fhHook[1], fhHook[2], fhHook[3],
+                        fhHook[4], fhHook[5], fhHook[6], fhHook[7],
+                        fhHook[8], fhHook[9], fhHook[10], fhHook[11]);
+                }
+            }
+
+            // ---- LOG LINE 6: Ring buffer head/tail for InputP1/InputP2 ----
+            // These are shared-memory regions read by the DLL session.
+            // Head/tail at DWORD[0] and DWORD[1] of each mapping.
+            if (isBurst || isPeriodic || isMultiIter)
+            {
+                struct RingProbe {
+                    const char* name;
+                    DWORD head, tail;
+                    bool ok;
+                };
+                RingProbe probes[] = {
+                    {"InputP1", 0, 0, false},
+                    {"InputP2", 0, 0, false},
+                    {"Sync",    0, 0, false},
+                    {"Net",     0, 0, false},
+                };
+                constexpr int kProbeCount = 4;
+
+                for (int pi = 0; pi < kProbeCount; ++pi)
+                {
+                    HANDLE hMap = OpenFileMappingA(
+                        FILE_MAP_READ, FALSE, probes[pi].name);
+                    if (hMap != nullptr)
+                    {
+                        const volatile DWORD* view = static_cast<const volatile DWORD*>(
+                            MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 8));
+                        if (view != nullptr)
+                        {
+                            probes[pi].head = view[0];
+                            probes[pi].tail = view[1];
+                            probes[pi].ok = true;
+                            UnmapViewOfFile(const_cast<DWORD*>(view));
+                        }
+                        CloseHandle(hMap);
+                    }
+                }
+
+                mod::Log(
+                    "SPEED_DIAG[6]: ring InputP1(%s h=%lu t=%lu d=%ld) "
+                    "InputP2(%s h=%lu t=%lu d=%ld) "
+                    "Sync(%s h=%lu t=%lu) Net(%s h=%lu t=%lu)",
+                    probes[0].ok ? "ok" : "NO",
+                    static_cast<unsigned long>(probes[0].head),
+                    static_cast<unsigned long>(probes[0].tail),
+                    static_cast<long>(probes[0].tail - probes[0].head),
+                    probes[1].ok ? "ok" : "NO",
+                    static_cast<unsigned long>(probes[1].head),
+                    static_cast<unsigned long>(probes[1].tail),
+                    static_cast<long>(probes[1].tail - probes[1].head),
+                    probes[2].ok ? "ok" : "NO",
+                    static_cast<unsigned long>(probes[2].head),
+                    static_cast<unsigned long>(probes[2].tail),
+                    probes[3].ok ? "ok" : "NO",
+                    static_cast<unsigned long>(probes[3].head),
+                    static_cast<unsigned long>(probes[3].tail));
+            }
+
+            // ---- LOG LINE 7: gameSys state (mode bytes, toggle) ----
+            if (isBurst || isPeriodic)
+            {
+                uint32_t gameSys = 0;
+                uint8_t gameSysMode = 0xFF, gameSysMode2 = 0xFF;
+                uint32_t gameSysToggle = 0xFFFFFFFF;
+                __try {
+                    gameSys = *reinterpret_cast<const volatile uint32_t*>(0x0079010Cu);
+                    if (gameSys != 0)
+                    {
+                        gameSysMode = *reinterpret_cast<const volatile uint8_t*>(gameSys + 4964);
+                        gameSysMode2 = *reinterpret_cast<const volatile uint8_t*>(gameSys + 4965);
+                        gameSysToggle = *reinterpret_cast<const volatile uint32_t*>(gameSys + 4968);
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                mod::Log(
+                    "SPEED_DIAG[7]: gameSys=0x%08lX mode=%u/%u toggle=%u "
+                    "toggleSameCount=%u exeECX=0x%08lX dllSession=0x%08lX "
+                    "ecxMatch=%d",
+                    static_cast<unsigned long>(gameSys),
+                    static_cast<unsigned>(gameSysMode),
+                    static_cast<unsigned>(gameSysMode2),
+                    gameSysToggle,
+                    g_toggleSameCount,
+                    static_cast<unsigned long>(exeThisAddr),
+                    static_cast<unsigned long>(currentSession),
+                    (exeThisAddr == currentSession) ? 1 : 0);
+            }
+
+            // ---- QPC-based precise FPS measurement (every 30 frames) ----
+            if (isPeriodic)
+            {
+                static LARGE_INTEGER s_lastQpc = {};
+                static uint32_t s_lastQpcTick = 0;
+                LARGE_INTEGER qpcNow;
+                QueryPerformanceCounter(&qpcNow);
+                if (s_lastQpcTick != 0 && s_lastQpcTick < g_frameTick)
+                {
+                    const double elapsed =
+                        static_cast<double>(qpcNow.QuadPart - s_lastQpc.QuadPart)
+                        / static_cast<double>(qpcFreq.QuadPart);
+                    const uint32_t dFrames = g_frameTick - s_lastQpcTick;
+                    const double qpcFps = (elapsed > 0.0)
+                        ? static_cast<double>(dFrames) / elapsed : 0.0;
+                    mod::Log(
+                        "SPEED_DIAG[8]: QPC fps=%.2f elapsed=%.4fs frames=%u "
+                        "qpcFreq=%lld",
+                        qpcFps, elapsed, dFrames,
+                        static_cast<long long>(qpcFreq.QuadPart));
+                }
+                s_lastQpc = qpcNow;
+                s_lastQpcTick = g_frameTick;
+            }
+
+            // ---- LOG LINE 9: cross-frame change detection ----
+            // Detects silent changes to timer, init-once guard, render
+            // context, and session pointer between frames.  Fires every
+            // time the SPEED_DIAG block fires (burst + periodic + multi).
+            {
+                // 9a: Timer baseline capture and drift detection.
+                if (!g_timerBaselineCaptured && timerPtr != 0
+                    && timerScalar != 0.0)
+                {
+                    g_baselineTimerScalar   = timerScalar;
+                    g_baselineTimerInterval = timerInterval;
+                    g_baselineTimerPtr      = timerPtr;
+                    g_timerBaselineCaptured = true;
+                    mod::Log(
+                        "SPEED_DIAG[9a]: S#%u timer baseline captured "
+                        "ptr=0x%08lX scalar=%.4f interval=%.4f",
+                        g_sessionNumber,
+                        static_cast<unsigned long>(timerPtr),
+                        timerScalar, timerInterval);
+                }
+                else if (g_timerBaselineCaptured)
+                {
+                    const bool ptrChanged = (timerPtr != g_baselineTimerPtr);
+                    const bool scalarChanged =
+                        (fabs(timerScalar - g_baselineTimerScalar) > 0.001);
+                    const bool intervalChanged =
+                        (fabs(timerInterval - g_baselineTimerInterval) > 0.001);
+                    if (ptrChanged || scalarChanged || intervalChanged)
+                    {
+                        mod::Log(
+                            "SPEED_DIAG[9a]: S#%u *** TIMER CHANGED *** "
+                            "ptr 0x%08lX->0x%08lX "
+                            "scalar %.4f->%.4f interval %.4f->%.4f",
+                            g_sessionNumber,
+                            static_cast<unsigned long>(g_baselineTimerPtr),
+                            static_cast<unsigned long>(timerPtr),
+                            g_baselineTimerScalar, timerScalar,
+                            g_baselineTimerInterval, timerInterval);
+                        // Update baseline so we don't spam.
+                        g_baselineTimerScalar   = timerScalar;
+                        g_baselineTimerInterval = timerInterval;
+                        g_baselineTimerPtr      = timerPtr;
+                    }
+                }
+
+                // 9b: Init-once guard transition detection.
+                if (!g_initOnceGuardTracked)
+                {
+                    g_lastInitOnceGuard    = initOnceGuard;
+                    g_initOnceGuardTracked = true;
+                }
+                else if (initOnceGuard != g_lastInitOnceGuard)
+                {
+                    mod::Log(
+                        "SPEED_DIAG[9b]: S#%u *** INIT-ONCE GUARD CHANGED *** "
+                        "0x%04X -> 0x%04X (low byte: %s)",
+                        g_sessionNumber,
+                        static_cast<unsigned>(g_lastInitOnceGuard),
+                        static_cast<unsigned>(initOnceGuard),
+                        (initOnceGuard & 0xFF) != 0
+                            ? "SET — global init SKIPPED"
+                            : "CLEAR — global init WILL RUN");
+                    g_lastInitOnceGuard = initOnceGuard;
+                }
+
+                // 9c: Render context pointer change detection (H2).
+                if (!g_renderCtxTracked)
+                {
+                    g_lastRenderCtxPtr  = renderCtxPtr;
+                    g_renderCtxTracked  = true;
+                }
+                else if (renderCtxPtr != g_lastRenderCtxPtr)
+                {
+                    mod::Log(
+                        "SPEED_DIAG[9c]: S#%u *** RENDER CTX CHANGED *** "
+                        "0x%08lX -> 0x%08lX%s",
+                        g_sessionNumber,
+                        static_cast<unsigned long>(g_lastRenderCtxPtr),
+                        static_cast<unsigned long>(renderCtxPtr),
+                        renderCtxPtr == 0
+                            ? " — NOW NULL (H2 stale context!)"
+                            : "");
+                    g_lastRenderCtxPtr = renderCtxPtr;
+                }
+
+                // 9d: Session pointer change detection (H1 double-init).
+                if (!g_sessionPtrTracked)
+                {
+                    g_lastSessionPtrInTick = currentSession;
+                    g_sessionPtrTracked    = true;
+                }
+                else if (currentSession != g_lastSessionPtrInTick)
+                {
+                    mod::Log(
+                        "SPEED_DIAG[9d]: S#%u *** SESSION PTR CHANGED *** "
+                        "0x%08lX -> 0x%08lX (tick=%u)",
+                        g_sessionNumber,
+                        static_cast<unsigned long>(g_lastSessionPtrInTick),
+                        static_cast<unsigned long>(currentSession),
+                        g_frameTick);
+                    g_lastSessionPtrInTick = currentSession;
+                }
+            }
+
+            // ---- LOG LINE 10: per-frame QPC delta (burst only) ----
+            // During the first 30 ticks, log the exact wall-clock interval
+            // between consecutive frames.  At 64fps each delta should be
+            // ~15.6ms; at 128fps (double-speed bug) each delta is ~7.8ms.
+            if (isBurst)
+            {
+                LARGE_INTEGER qpcNow;
+                QueryPerformanceCounter(&qpcNow);
+                if (g_prevFrameQpcValid)
+                {
+                    const double deltaMs =
+                        static_cast<double>(
+                            qpcNow.QuadPart - g_prevFrameQpc.QuadPart)
+                        * 1000.0
+                        / static_cast<double>(qpcFreq.QuadPart);
+                    mod::Log(
+                        "SPEED_DIAG[10]: S#%u tick=%u frameDeltaMs=%.3f "
+                        "(expect ~15.6 at 64fps, ~7.8 at 128fps)",
+                        g_sessionNumber, g_frameTick, deltaMs);
+                }
+                g_prevFrameQpc = qpcNow;
+                g_prevFrameQpcValid = true;
+            }
+
+            // ---- LOG LINE 11: timer object deep dump (burst only) ----
+            // Read additional timer object fields beyond +16/+32 to
+            // capture the full timer state on session start.
+            if (isBurst && timerPtr != 0 && g_frameTick <= 5)
+            {
+                double timerField0 = 0.0, timerField8 = 0.0;
+                double timerField24 = 0.0, timerField40 = 0.0;
+                int32_t timerField48 = 0;
+                (void)SafeReadDouble(
+                    reinterpret_cast<const void*>(timerPtr + 0),
+                    &timerField0);
+                (void)SafeReadDouble(
+                    reinterpret_cast<const void*>(timerPtr + 8),
+                    &timerField8);
+                (void)SafeReadDouble(
+                    reinterpret_cast<const void*>(timerPtr + 24),
+                    &timerField24);
+                (void)SafeReadDouble(
+                    reinterpret_cast<const void*>(timerPtr + 40),
+                    &timerField40);
+                (void)SafeReadInt(
+                    reinterpret_cast<const void*>(timerPtr + 48),
+                    &timerField48);
+                mod::Log(
+                    "SPEED_DIAG[11]: S#%u timerDump "
+                    "+0=%.6f +8=%.6f +16=%.6f +24=%.6f "
+                    "+32=%.6f +40=%.6f +48=%d",
+                    g_sessionNumber,
+                    timerField0, timerField8, timerInterval,
+                    timerField24, timerScalar, timerField40,
+                    timerField48);
+            }
+        }
     }
 
     // ---- ExitProcess recovery path -----------------------------------------
@@ -4010,6 +4783,30 @@ void ResetGameModeValidation()
     g_spectateHoldoffLogged = false;
     g_spectateHoldoffWasActive = false;
 
+    // Reset double-speed diagnostic state for the new session.
+    g_lastHeartbeatTimeMs = 0;
+    g_lastHeartbeatFrameTick = 0;
+    g_lastToggleValue = 0xFFFFFFFFu;
+    g_toggleSameCount = 0;
+    g_toggleDiagLogged = false;
+
+    // Increment session number and reset cross-session change-detection state.
+    ++g_sessionNumber;
+    g_timerBaselineCaptured = false;
+    g_baselineTimerScalar   = 0.0;
+    g_baselineTimerInterval = 0.0;
+    g_baselineTimerPtr      = 0;
+    g_initOnceGuardTracked  = false;
+    g_lastInitOnceGuard     = 0;
+    g_renderCtxTracked      = false;
+    g_lastRenderCtxPtr      = 0;
+    g_sessionPtrTracked     = false;
+    g_lastSessionPtrInTick  = 0;
+    g_prevFrameQpcValid     = false;
+    memset(&g_prevFrameQpc, 0, sizeof(g_prevFrameQpc));
+
+    mod::Log("ResetGameModeValidation: session #%u starting", g_sessionNumber);
+
     // Clear stale deferred-cleanup flags from a previous session.
     // If g_deferredCancelCleanup persists into session 2, the first
     // frame tick would run ForceLocalPlayInit and destroy the new session.
@@ -4163,6 +4960,29 @@ bool InstallNetplayFrameHook()
     const uintptr_t base    = reinterpret_cast<uintptr_t>(revival);
     const uintptr_t frameHookRva = g_activeRevival->frameHookRva;
     uint8_t* const  target  = reinterpret_cast<uint8_t*>(base + frameHookRva);
+
+    // --- Dump bytes at EXE 0x401642 for double-speed investigation ----------
+    // Revival's init-time handler patches 8 bytes at 0x401642 in the EXE's
+    // main loop via a REPLACEMENT hook (sub_1006FAA0).  If these bytes are
+    // corrupted or restored to original, the main loop's screen update would
+    // run in addition to Revival's tick → doubled game speed.
+    {
+        constexpr uintptr_t kHookAddr = 0x00401642;
+        uint8_t hookBytes[16] = {};
+        __try {
+            memcpy(hookBytes, reinterpret_cast<const void*>(kHookAddr), 16);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            memset(hookBytes, 0xCC, sizeof(hookBytes));
+        }
+        mod::Log(
+            "InstallNetplayFrameHook: EXE 0x401642 bytes (16): "
+            "[%02X %02X %02X %02X %02X %02X %02X %02X "
+            " %02X %02X %02X %02X %02X %02X %02X %02X]",
+            hookBytes[0], hookBytes[1], hookBytes[2], hookBytes[3],
+            hookBytes[4], hookBytes[5], hookBytes[6], hookBytes[7],
+            hookBytes[8], hookBytes[9], hookBytes[10], hookBytes[11],
+            hookBytes[12], hookBytes[13], hookBytes[14], hookBytes[15]);
+    }
 
     // Sanity-check: expect push ebp (0x55) as the first byte.
     uint8_t firstByte = 0;
@@ -4712,9 +5532,10 @@ void LogSessionDiagnosticState(const char* context)
 
     // --- DLL patch state ---
     mod::Log(
-        "DIAG[%s]: dllExitPatchesSaved=%d tournamentPatchesSaved=%d "
+        "DIAG[%s]: S#%u dllExitPatchesSaved=%d tournamentPatchesSaved=%d "
         "renderContextSaved=%d savedRenderCtx=0x%08lX",
         ctx,
+        g_sessionNumber,
         g_dllExitProcessPatchesSaved ? 1 : 0,
         g_tournamentPatchesSaved ? 1 : 0,
         g_renderContextSaved ? 1 : 0,
@@ -4763,6 +5584,34 @@ void LogSessionDiagnosticState(const char* context)
             static_cast<unsigned long>(renderCtx),
             static_cast<unsigned long>(globalState));
 
+        // Init-once guard, timer pointer, timer scalar — persistent across sessions
+        uint16_t initOnceGuard = 0;
+        uintptr_t timerPtr = 0;
+        int initFlag = -1;
+        double timerScalar = 0.0, timerInterval = 0.0;
+
+        (void)SafeReadWord(
+            reinterpret_cast<const void*>(base + g_activeRevival->initOnceGuardOffset),
+            &initOnceGuard);
+        (void)SafeReadPtr(
+            reinterpret_cast<const void*>(base + g_activeRevival->timerPtrOffset),
+            &timerPtr);
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(base + g_activeRevival->initFlagOffset),
+            &initFlag);
+        if (timerPtr != 0)
+        {
+            (void)SafeReadDouble(reinterpret_cast<const void*>(timerPtr + 16), &timerInterval);
+            (void)SafeReadDouble(reinterpret_cast<const void*>(timerPtr + 32), &timerScalar);
+        }
+        mod::Log(
+            "DIAG[%s]: initOnceGuard=0x%04X initFlag=%d timerPtr=0x%08lX "
+            "timerScalar=%.4f timerInterval=%.4f",
+            ctx,
+            static_cast<unsigned>(initOnceGuard), initFlag,
+            static_cast<unsigned long>(timerPtr),
+            timerScalar, timerInterval);
+
         // Session vtable validation
         if (sessionPtr != 0 && sessionPtr >= 0x00100000u)
         {
@@ -4778,11 +5627,63 @@ void LogSessionDiagnosticState(const char* context)
                 &activePlayer);
 
             mod::Log(
-                "DIAG[%s]: session vtable=0x%08lX initComplete=%d activePlayer=%d",
+                "DIAG[%s]: session vtable=0x%08lX vtableRVA=0x%lX initComplete=%d activePlayer=%d",
                 ctx,
                 static_cast<unsigned long>(vtable),
+                (base != 0 && vtable >= base) ? static_cast<unsigned long>(vtable - base) : 0UL,
                 initComplete,
                 activePlayer);
+
+            // Game mode fields and sentinel
+            int prevGameMode = -1, curGameMode = -1, matchStartFrame = -1;
+            int advanceCounter = -1, syncFrameCounter = -1;
+            uint32_t sentinelVal = 0;
+            const uintptr_t gmBase = sessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot;
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase), &prevGameMode);
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 4), &curGameMode);
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 8), &matchStartFrame);
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 12), &advanceCounter);
+            (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 20), &syncFrameCounter);
+            (void)SafeReadDword(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetSentinel),
+                &sentinelVal);
+
+            mod::Log(
+                "DIAG[%s]: prevMode=%d curMode=%d matchStart=%d advCtr=%d syncFrame=%d "
+                "sentinel=0x%08lX",
+                ctx,
+                prevGameMode, curGameMode, matchStartFrame,
+                advanceCounter, syncFrameCounter,
+                static_cast<unsigned long>(sentinelVal));
+
+            // Ping struct + session fields relevant to double-speed bug.
+            int inputDelay = -1, queuePlayer = -1, currentFrame = -1, matchId = -1;
+            uint32_t pingStruct[4] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetInputDelay),
+                &inputDelay);
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetQueuePlayer),
+                &queuePlayer);
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetCurrentFrame),
+                &currentFrame);
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(sessionPtr + g_activeRevival->sessionOffsetMatchId),
+                &matchId);
+            const uintptr_t pingBase = sessionPtr + g_activeRevival->sessionOffsetPingStructBase;
+            for (int pi = 0; pi < 4; ++pi)
+            {
+                (void)SafeReadInt(
+                    reinterpret_cast<const void*>(pingBase + pi * 4),
+                    reinterpret_cast<int*>(&pingStruct[pi]));
+            }
+            mod::Log(
+                "DIAG[%s]: session frame=%d matchId=%d inputDelay=%d queuePlayer=%d "
+                "ping[0]=%u ping[1]=%u ping[2]=%u ping[3]=%u",
+                ctx,
+                currentFrame, matchId, inputDelay, queuePlayer,
+                pingStruct[0], pingStruct[1], pingStruct[2], pingStruct[3]);
         }
 
         // ExitProcess patch site byte values (verify actual DLL code state)
@@ -4951,10 +5852,11 @@ void LogInitWriteSnapshot(const char* context)
         &globalStatePtr);
 
     mod::Log(
-        "INIT_SNAP[%s]: roleFlag=%d sessionPtr=0x%08lX initFlag=%d initByte=0x%02X "
+        "INIT_SNAP[%s]: S#%u roleFlag=%d sessionPtr=0x%08lX initFlag=%d initByte=0x%02X "
         "renderCtx=0x%08lX renderCtxBase=0x%08lX initOnceGuard=0x%08X "
         "timerPtr=0x%08lX globalStatePtr=0x%08lX",
         ctx,
+        g_sessionNumber,
         roleFlag,
         static_cast<unsigned long>(sessionPtr),
         initFlag,
@@ -4964,6 +5866,22 @@ void LogInitWriteSnapshot(const char* context)
         static_cast<unsigned>(initOnceGuard),
         static_cast<unsigned long>(timerPtr),
         static_cast<unsigned long>(globalStatePtr));
+
+    // ---- Timer scalar/interval (critical for double-speed bug) ----
+    // If init() corrupts or re-initializes the timer, this before/after
+    // diff will show the change.
+    if (timerPtr != 0)
+    {
+        double snapInterval = 0.0, snapScalar = 0.0;
+        (void)SafeReadDouble(
+            reinterpret_cast<const void*>(timerPtr + 16), &snapInterval);
+        (void)SafeReadDouble(
+            reinterpret_cast<const void*>(timerPtr + 32), &snapScalar);
+        mod::Log(
+            "INIT_SNAP[%s]: S#%u timerScalar=%.6f timerInterval=%.6f "
+            "(expect ~64/~15.6 at 64fps)",
+            ctx, g_sessionNumber, snapScalar, snapInterval);
+    }
 
     // ---- Secondary role flag / session pointer globals (detect stale copies) ----
     for (size_t i = 1; i < g_activeRevival->roleFlagOffsetCount; ++i)

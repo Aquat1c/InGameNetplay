@@ -389,6 +389,23 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     ResetForceLocalPlayInitCount();
     ResetGameModeValidation();
 
+    // --- Session boundary cleanup logging ---
+    // Log EXE hook bytes at both hook sites for cross-session tracking.
+    {
+        uint8_t hookA[10] = {};
+        uint8_t hookB[8] = {};
+        memcpy(hookA, reinterpret_cast<const void*>(0x401582), 10);
+        memcpy(hookB, reinterpret_cast<const void*>(0x401642), 8);
+        mod::Log(
+            "StartSession: EXE hooks pre-session "
+            "0x401582=[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X] "
+            "0x401642=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+            hookA[0], hookA[1], hookA[2], hookA[3], hookA[4],
+            hookA[5], hookA[6], hookA[7], hookA[8], hookA[9],
+            hookB[0], hookB[1], hookB[2], hookB[3], hookB[4],
+            hookB[5], hookB[6], hookB[7]);
+    }
+
     // Clear stale exit-interception flags from a previous session.
     // If g_revivalExitIntercepted leaked from session 1 (e.g. ExitProcess
     // raced with CancelSession), ConsumeRevivalExitInterception would fire
@@ -412,6 +429,34 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
         SetPhase(ioStatus, NetbridgePhase::Failed, "IPC setup failed");
         return false;
     }
+
+    // Zero the entire shared block to prevent stale data from session 1
+    // leaking into session 2.  Re-populate the header fields that
+    // EnsureHostIpc wrote (magic, version, hostPid, hostRevivalBase)
+    // since StartSession's later code repopulates the rest.
+    if (g_hostBlock != nullptr)
+    {
+        mod::Log("StartSession: resetting SharedBlock (initSerial=%ld consoleSerial=%ld)",
+                 static_cast<long>(g_hostBlock->initSerial),
+                 static_cast<long>(g_hostBlock->consoleSerial));
+        const uint32_t savedMagic = g_hostBlock->magic;
+        const uint32_t savedVersion = g_hostBlock->version;
+        const uint32_t savedPid = g_hostBlock->hostPid;
+        const uint32_t savedBase = g_hostBlock->hostRevivalBase;
+        memset(g_hostBlock, 0, sizeof(SharedBlock));
+        g_hostBlock->magic = savedMagic;
+        g_hostBlock->version = savedVersion;
+        g_hostBlock->hostPid = savedPid;
+        g_hostBlock->hostRevivalBase = savedBase;
+        // Restore default values for delay prompt fields.
+        g_hostBlock->delayInputValue = -1;
+        g_hostBlock->delayAveragePingMs = -1;
+        g_hostBlock->delayMinPingMs = -1;
+        g_hostBlock->delayMaxPingMs = -1;
+        g_hostBlock->delayRecommended = -1;
+        g_hostBlock->delayRangeMax = 20;
+    }
+
     if (!EnsureLocalRevivalLoaded())
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
@@ -694,6 +739,7 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
         g_consolePendingOutputDebugStringW.clear();
         g_diskCapturePathHits.clear();
     }
+    CloseMirrorLogFiles();
     InterlockedIncrement(&g_hostBlock->initSerial);
 
     std::string primaryInput;
@@ -859,8 +905,12 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     // By flushing here (child still suspended), we clear only genuinely
     // stale data; once the child resumes and connects, every input frame
     // it writes is preserved for the DLL to consume.
+    //
+    // Extended to ALL roles (host/join/spectate): the named shared memory
+    // ring buffers persist as kernel objects as long as any process holds a
+    // handle.  The DLL in the host process survives across sessions, so
+    // stale ring buffer mappings can contaminate session 2 for any role.
     // -------------------------------------------------------------------
-    if (localRoleMode == kLocalRoleSpectate)
     {
         struct RingMapping {
             const char* name;
@@ -875,8 +925,10 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
             {"Sync",      nullptr, nullptr},
             {"Quit",      nullptr, nullptr},
             {"LoadMatch", nullptr, nullptr},
+            {"Init",      nullptr, nullptr},
+            {"Net",       nullptr, nullptr},
         };
-        constexpr int kMappingCount = 7;
+        constexpr int kMappingCount = 9;
 
         for (int mi = 0; mi < kMappingCount; ++mi)
         {
@@ -1038,10 +1090,25 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
     }
 
     *reinterpret_cast<int*>(delayAddress) = delayFrames;
+
+    // Also write the saved target prediction window (inputDelay + 8, i.e.
+    // +696 in 1.02e).  Between matches, BuildMatchInfoAndHUD restores
+    // the active inputDelay (+688) FROM the target window (+696).  If we
+    // only update +688 here, the target stays at 0 and all subsequent
+    // matches start with inputDelay=0, causing 2-3 iterations per frame
+    // (the ~1.5x speed-up bug).
+    void* const targetWindowAddress = reinterpret_cast<void*>(
+        sessionPtr + g_activeRevival->sessionOffsetInputDelay + 8);
+    if (IsWritableRange(targetWindowAddress, sizeof(int)))
+    {
+        *reinterpret_cast<int*>(targetWindowAddress) = delayFrames;
+    }
+
     mod::Log(
-        "Takeover: ApplyInputDelay applied value=%d session=0x%08lX",
+        "Takeover: ApplyInputDelay applied value=%d session=0x%08lX (+696=%d)",
         delayFrames,
-        static_cast<unsigned long>(sessionPtr));
+        static_cast<unsigned long>(sessionPtr),
+        delayFrames);
     RefreshRuntimeStatus(ioStatus);
     if (ioStatus != nullptr)
     {
@@ -1390,6 +1457,10 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[0],
                 static_cast<unsigned long>(oldSessionPtr));
             SaveExeFrameHookBytes();
+            // Save the 8 bytes at 0x401642 (per-frame dispatch replacement
+            // hook) so init()'s EFZ_BufferProcess_WithSize doesn't leak a
+            // new malloc'd trampoline on every session.
+            SaveExeDispatchHookBytes();
             // Restore original (pre-hook) bytes at mode-ctor hook sites
             // BEFORE init() so the new trampoline copies clean EXE bytes
             // instead of stale hooks from a previous session's mode.
@@ -1440,8 +1511,31 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     verify[5], verify[6], verify[7], verify[8], verify[9]);
             }
 
+            // Restore saved 0x401642 bytes to undo init()'s new trampoline.
+            RestoreExeDispatchHookBytes();
+
             // Fix up relative instructions in mode-constructor trampolines.
             FixupModeConstructorTrampolines("Tick_init_handshake");
+
+            // --- Dump bytes at 0x401642 (double-speed investigation) --------
+            // After init(), check that the REPLACEMENT hook at 0x401642 is
+            // still intact (first byte should be 0xE9 = JMP near).  If the
+            // hook was undone, the main loop's vtable[1] call AND Revival's
+            // sub_1006D0B0 both run the screen update → doubled game speed.
+            {
+                uint8_t hb[16] = {};
+                for (int i = 0; i < 16; ++i)
+                {
+                    if (!SafeReadByte(reinterpret_cast<const void*>(0x401642 + i), &hb[i]))
+                        hb[i] = 0xCC;
+                }
+                mod::Log(
+                    "Tick_init_handshake: 0x401642 post-init "
+                    "[%02X %02X %02X %02X %02X %02X %02X %02X "
+                    " %02X %02X %02X %02X %02X %02X %02X %02X]",
+                    hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
+                    hb[8], hb[9], hb[10], hb[11], hb[12], hb[13], hb[14], hb[15]);
+            }
 
             g_localRoleFlag = initParams[0];
             g_localInitAppliedForSession = true;
@@ -1749,6 +1843,42 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         (reason != nullptr) ? reason : "",
         GetForceLocalPlayInitCount());
 
+    // --- Session boundary cleanup logging ---
+    {
+        uint8_t hookA[10] = {};
+        uint8_t hookB[8] = {};
+        memcpy(hookA, reinterpret_cast<const void*>(0x401582), 10);
+        memcpy(hookB, reinterpret_cast<const void*>(0x401642), 8);
+        mod::Log(
+            "CancelSession: EXE hooks at teardown "
+            "0x401582=[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X] "
+            "0x401642=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+            hookA[0], hookA[1], hookA[2], hookA[3], hookA[4],
+            hookA[5], hookA[6], hookA[7], hookA[8], hookA[9],
+            hookB[0], hookB[1], hookB[2], hookB[3], hookB[4],
+            hookB[5], hookB[6], hookB[7]);
+    }
+    // Log init-once guard state at teardown.
+    if (g_activeRevival != nullptr)
+    {
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival != nullptr)
+        {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+            const uint16_t guardVal = *reinterpret_cast<const volatile uint16_t*>(
+                base + g_activeRevival->initOnceGuardOffset);
+            const uintptr_t timerPtr = *reinterpret_cast<const volatile uintptr_t*>(
+                base + g_activeRevival->timerPtrOffset);
+            const uintptr_t renderCtx = *reinterpret_cast<const volatile uintptr_t*>(
+                base + g_activeRevival->renderContextGlobalOffset);
+            mod::Log(
+                "CancelSession: DLL globals guard=0x%04X timer=0x%08lX renderCtx=0x%08lX",
+                static_cast<unsigned>(guardVal),
+                static_cast<unsigned long>(timerPtr),
+                static_cast<unsigned long>(renderCtx));
+        }
+    }
+
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
 
@@ -1826,6 +1956,24 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     }
     // ---- End additional cleanup ------------------------------------------------
 
+    // Clear per-session IAT hook tracking vectors to prevent unbounded
+    // growth across sessions (GAP 4 in cleanup audit).
+    {
+        std::lock_guard<std::mutex> ftLock(g_fakeThreadMutex);
+        const size_t oldFakeCount = g_fakeThreads.size();
+        // Unlock before calling ClearFakeThreads which takes the same lock,
+        // so log the count first then clear outside the lock.
+        mod::Log("Takeover: cancel cleanup — clearing g_fakeThreads (count=%zu)",
+                 oldFakeCount);
+    }
+    ClearFakeThreads();
+    {
+        std::lock_guard<std::mutex> raLock(g_redirectAllocMutex);
+        mod::Log("Takeover: cancel cleanup — clearing g_redirectAllocations (count=%zu)",
+                 g_redirectAllocations.size());
+    }
+    ClearRedirectAllocations();
+
     g_localInitAppliedForSession = false;
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
@@ -1881,6 +2029,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_consolePendingOutputDebugStringW.clear();
         g_diskCapturePathHits.clear();
     }
+    CloseMirrorLogFiles();
 
     if (ioStatus != nullptr)
     {

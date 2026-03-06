@@ -266,6 +266,7 @@ bool IsLikelyRevivalDiskLogPath(const std::string& path);
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length);
 void FlushPendingConsoleOutput(const char* reason);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
+void CloseMirrorLogFiles();
 void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord);
@@ -327,6 +328,12 @@ bool ForceGameModeToTitle();
 // trampolines whose unrelocated E9 displacement causes wild-EIP crashes.
 void SaveExeFrameHookBytes();
 void RestoreExeFrameHookBytes();
+
+// Save / restore the 8 bytes at EXE address 0x401642 before and after
+// every g_localInitFn() call.  Prevents init() from leaking malloc'd
+// trampolines and changing the JMP target between sessions.
+void SaveExeDispatchHookBytes();
+void RestoreExeDispatchHookBytes();
 
 // Save / restore the 7 bytes at EXE addresses 0x763E50 and 0x763F04
 // before and after every g_localInitFn() call.  Prevents trampoline

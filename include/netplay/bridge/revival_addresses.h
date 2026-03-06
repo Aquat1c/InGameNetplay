@@ -123,6 +123,16 @@ struct RevivalAddressProfile
     uintptr_t sessionOffsetInitComplete;
     uintptr_t sessionOffsetInputDelay;
     uintptr_t sessionOffsetPingMs;
+
+    // Base of the 4-DWORD ping struct used by AdjustPrediction / WaitLoop.
+    // Layout: [0]=AdjustPrediction threshold (init 1000000), [1]=unused?,
+    //         [2]=PingMs (same as sessionOffsetPingMs), [3]=WaitLoop ping.
+    // AdjustPrediction reads field[0] (this offset).
+    // WaitLoop reads field[3] (this offset + 12).
+    // Populated by EFZ_Rollback_DrainPingSamples from the "Net" shared-
+    // memory ring buffer, which is never written to by our mod.
+    uintptr_t sessionOffsetPingStructBase;
+
     uintptr_t sessionOffsetHelperHandle;
     uintptr_t sessionOffsetHelperPid;
     uintptr_t sessionOffsetActivePlayer;
@@ -257,6 +267,7 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     1220u,                                              // sessionOffsetInitComplete
     688u,                                               // sessionOffsetInputDelay
     936u,                                               // sessionOffsetPingMs
+    928u,                                               // sessionOffsetPingStructBase
     700u,                                               // sessionOffsetHelperHandle
     1216u,                                              // sessionOffsetHelperPid
     680u,                                               // sessionOffsetActivePlayer
@@ -318,6 +329,7 @@ constexpr RevivalAddressProfile kRevival_1_02f = {
     1220u,                                              // sessionOffsetInitComplete
     688u,                                               // sessionOffsetInputDelay
     936u,                                               // sessionOffsetPingMs
+    928u,                                               // sessionOffsetPingStructBase
     700u,                                               // sessionOffsetHelperHandle
     1216u,                                              // sessionOffsetHelperPid
     680u,                                               // sessionOffsetActivePlayer
@@ -380,6 +392,7 @@ constexpr RevivalAddressProfile kRevival_1_02g = {
     1220u,                                              // sessionOffsetInitComplete
     688u,                                               // sessionOffsetInputDelay
     936u,                                               // sessionOffsetPingMs
+    928u,                                               // sessionOffsetPingStructBase
     700u,                                               // sessionOffsetHelperHandle
     1216u,                                              // sessionOffsetHelperPid
     680u,                                               // sessionOffsetActivePlayer
@@ -444,6 +457,7 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
     1220u,                                              // sessionOffsetInitComplete
     688u,                                               // sessionOffsetInputDelay
     936u,                                               // sessionOffsetPingMs
+    928u,                                               // sessionOffsetPingStructBase
     700u,                                               // sessionOffsetHelperHandle
     1216u,                                              // sessionOffsetHelperPid
     680u,                                               // sessionOffsetActivePlayer
@@ -507,6 +521,7 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
     1228u,                                              // sessionOffsetInitComplete (+8)
     696u,                                               // sessionOffsetInputDelay (+8)
     944u,                                               // sessionOffsetPingMs (+8)
+    936u,                                               // sessionOffsetPingStructBase (+8)
     708u,                                               // sessionOffsetHelperHandle (+8)
     1224u,                                              // sessionOffsetHelperPid (+8)
     688u,                                               // sessionOffsetActivePlayer (+8)

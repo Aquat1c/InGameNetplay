@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <share.h>
 
 #include <windows.h>
 
@@ -796,6 +797,86 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
     flushOne("OutputDebugStringW", &g_consolePendingOutputDebugStringW);
 }
 
+// ---------------------------------------------------------------------------
+// logEfz mirror capture — saves a clean copy of Revival's disk log output.
+//
+// Revival's logEfz.txt can become corrupted with large NUL-byte blocks
+// (e.g. 786KB of 0x00 at offset 0) when the process is killed while the
+// DLL's std::ofstream still has unflushed data.  We intercept every
+// WriteFile call to the logEfz path and mirror the data (stripping NUL
+// bytes) to our own clean file in the logs/ directory.
+// ---------------------------------------------------------------------------
+static std::mutex g_mirrorMutex;
+static FILE* g_mirrorLogEfzFile = nullptr;
+static bool g_mirrorLogEfzAnnounced = false;
+
+static FILE* GetOrOpenMirrorLogEfz()
+{
+    if (g_mirrorLogEfzFile != nullptr)
+        return g_mirrorLogEfzFile;
+
+    // Place mirror file next to the DLL module (same dir as efz_netplay_mod.log).
+    char modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&GetOrOpenMirrorLogEfz),
+        &selfModule);
+    if (selfModule != nullptr)
+    {
+        GetModuleFileNameA(selfModule, modulePath, MAX_PATH);
+    }
+
+    std::string dir(modulePath);
+    const size_t slash = dir.find_last_of("\\/");
+    if (slash != std::string::npos)
+        dir.resize(slash + 1);
+    else
+        dir = ".\\";
+
+    // Create logs subdirectory if needed.
+    std::string logsDir = dir + "logs";
+    CreateDirectoryA(logsDir.c_str(), nullptr);
+
+    std::string mirrorPath = logsDir + "\\logEfz_mirror.txt";
+    g_mirrorLogEfzFile = _fsopen(mirrorPath.c_str(), "a", _SH_DENYNO);
+    if (g_mirrorLogEfzFile != nullptr && !g_mirrorLogEfzAnnounced)
+    {
+        g_mirrorLogEfzAnnounced = true;
+        mod::Log("MIRROR: opened logEfz mirror file '%s'", mirrorPath.c_str());
+    }
+    return g_mirrorLogEfzFile;
+}
+
+static void MirrorRevivalDiskWrite(const char* text, size_t length)
+{
+    std::lock_guard<std::mutex> lock(g_mirrorMutex);
+    FILE* f = GetOrOpenMirrorLogEfz();
+    if (f == nullptr)
+        return;
+
+    // Write data, stripping NUL bytes that cause the corruption pattern.
+    for (size_t i = 0; i < length; ++i)
+    {
+        if (text[i] != '\0')
+            fputc(text[i], f);
+    }
+    fflush(f);
+}
+
+void CloseMirrorLogFiles()
+{
+    std::lock_guard<std::mutex> lock(g_mirrorMutex);
+    if (g_mirrorLogEfzFile != nullptr)
+    {
+        fflush(g_mirrorLogEfzFile);
+        fclose(g_mirrorLogEfzFile);
+        g_mirrorLogEfzFile = nullptr;
+        mod::Log("MIRROR: closed logEfz mirror file");
+    }
+    g_mirrorLogEfzAnnounced = false;
+}
+
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
 {
     if (lpBuffer == nullptr || nBytes == 0)
@@ -866,6 +947,17 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
         }
         (void)announcePath;
         (void)pathHitCount;
+
+        // Mirror logEfz writes to a clean file (strips NUL corruption).
+        {
+            std::string lowerPath = pathText;
+            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lowerPath.find("logefz") != std::string::npos)
+            {
+                MirrorRevivalDiskWrite(text, textLen);
+            }
+        }
 
         LogConsoleTextChunk("WriteFileDisk", text, textLen);
         return;
