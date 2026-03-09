@@ -52,6 +52,11 @@ Runtime DLL mod that injects a `NETPLAY` entry into EFZ title menu and runs a cu
   - `system\\title_ob.dat`
 - BGM path remains vanilla:
   - `wave\\bgm\\bgm08.wav`
+- Linux / Wine / Proton note:
+  - `.dat` menu assets are resolved by this DLL and include mod-relative fallbacks like `mods\\efz_netplay_mod\\assets\\...`
+  - netplay BGM track `8` now probes for a mod-local `wave\\bgm\\bgm08.wav` under the DLL/mod folder and, if found, temporarily redirects the engine's relative load there for the `playBackgroundMusic()` call
+  - if no mod-local override is found, EFZ falls back to the normal game-relative path
+  - for mod-loader overlay setups, ship the BGM as `mods\\efz_netplay_mod\\wave\\bgm\\bgm08.wav`
 
 ## Source Layout
 - Hooks:

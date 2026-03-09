@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/assets/assets.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/input_utils.h"
@@ -59,6 +60,80 @@ constexpr int kRoleFlagSpectate = 1;            // matches kLocalRoleSpectate in
 constexpr int kScreenIndexCharSelect = 1;       // EFZ screen table index for character select
 constexpr int kScreenIndexReplay = 8;           // EFZ screen table index for replay (used by spectate)
 constexpr int8_t kMenuSelectionReplay = 4;      // title menu "Replay" entry index
+
+std::string GetCurrentDirectoryString()
+{
+    const DWORD required = GetCurrentDirectoryA(0, nullptr);
+    if (required == 0)
+    {
+        return {};
+    }
+
+    std::string path(static_cast<size_t>(required), '\0');
+    const DWORD written = GetCurrentDirectoryA(required, path.data());
+    if (written == 0 || written >= required)
+    {
+        return {};
+    }
+
+    path.resize(written);
+    return path;
+}
+
+void PlayNetplayBgm(uint32_t screenContext)
+{
+    auto const playBackgroundMusic =
+        reinterpret_cast<PlayBackgroundMusicFn>(RuntimeAddress(kVaPlayBackgroundMusic));
+    const int gameSystem = GetGameSystem(screenContext);
+
+    const std::string bgmBaseDirectory =
+        netplay::assets::ResolveNetplayBgmBaseDirectory(g_moduleDirectory);
+    if (bgmBaseDirectory.empty())
+    {
+        mod::Log("PlayNetplayBgm: using vanilla path 'wave\\bgm\\bgm08.wav'");
+        playBackgroundMusic(gameSystem, kNetplayBgmTrack);
+        return;
+    }
+
+    const std::string originalDirectory = GetCurrentDirectoryString();
+    if (originalDirectory.empty())
+    {
+        mod::Log(
+            "PlayNetplayBgm: failed to query current directory; falling back to vanilla path");
+        playBackgroundMusic(gameSystem, kNetplayBgmTrack);
+        return;
+    }
+
+    if (!SetCurrentDirectoryA(bgmBaseDirectory.c_str()))
+    {
+        mod::Log(
+            "PlayNetplayBgm: failed to switch cwd to '%s' error=%lu; falling back to vanilla path",
+            bgmBaseDirectory.c_str(),
+            static_cast<unsigned long>(GetLastError()));
+        playBackgroundMusic(gameSystem, kNetplayBgmTrack);
+        return;
+    }
+
+    mod::Log(
+        "PlayNetplayBgm: switched cwd '%s' -> '%s' for track %u override",
+        originalDirectory.c_str(),
+        bgmBaseDirectory.c_str(),
+        static_cast<unsigned>(kNetplayBgmTrack));
+
+    playBackgroundMusic(gameSystem, kNetplayBgmTrack);
+
+    if (!SetCurrentDirectoryA(originalDirectory.c_str()))
+    {
+        mod::Log(
+            "PlayNetplayBgm: WARNING — failed to restore cwd to '%s' error=%lu",
+            originalDirectory.c_str(),
+            static_cast<unsigned long>(GetLastError()));
+    }
+    else
+    {
+        mod::Log("PlayNetplayBgm: restored cwd to '%s'", originalDirectory.c_str());
+    }
+}
 
 void CopyBoundedText(char* dst, size_t dstSize, const char* src)
 {
@@ -992,8 +1067,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     SwitchToMenu(screenContext, targetMenu, -1);
     InstallNetplayWindowHook(screenContext);
 
-    auto const playBackgroundMusic = reinterpret_cast<PlayBackgroundMusicFn>(RuntimeAddress(kVaPlayBackgroundMusic));
-    playBackgroundMusic(GetGameSystem(screenContext), kNetplayBgmTrack);
+    PlayNetplayBgm(screenContext);
 
     if (skipFadeOut)
     {

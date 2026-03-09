@@ -257,6 +257,79 @@ std::string ResolveNetplayObjectsPath(const std::string& moduleDirectory)
     return "system\\title_ob.dat";
 }
 
+std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
+{
+    mod::Log("ResolveNetplayBgmBaseDirectory: searching for mod-local wave\\bgm\\bgm08.wav");
+
+    constexpr const char* kBgmRelativePath = "wave\\bgm\\bgm08.wav";
+    const std::string exeDirectory = BuildModuleDirectory(GetModuleHandleA(nullptr));
+
+    // --- Tier 1: DLL directory (e.g. mods\efz_netplay_mod\wave\bgm\bgm08.wav)
+    // Skip when moduleDirectory is "." to avoid falsely matching the vanilla
+    // game-root BGM via ".\\wave\\bgm\\bgm08.wav".
+    if (moduleDirectory != ".")
+    {
+        const std::string path = JoinPath(moduleDirectory, kBgmRelativePath);
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] probing '%s'", path.c_str());
+        if (FileExists(path))
+        {
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] FOUND — using base '%s'", moduleDirectory.c_str());
+            return moduleDirectory;
+        }
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] not found");
+    }
+    else
+    {
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.')");
+    }
+
+    // --- Tier 2: mods\<modname>\ relative to the executable directory
+    const std::string modsRelDir = DeriveModsRelativeDirectory(moduleDirectory);
+    if (!modsRelDir.empty())
+    {
+        const std::string absoluteModsDir =
+            (exeDirectory != "." && !exeDirectory.empty())
+                ? JoinPath(exeDirectory, modsRelDir.c_str())
+                : modsRelDir;
+        const std::string path = JoinPath(absoluteModsDir, kBgmRelativePath);
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] probing '%s'", path.c_str());
+        if (FileExists(path))
+        {
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] FOUND — using base '%s'", absoluteModsDir.c_str());
+            return absoluteModsDir;
+        }
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] not found");
+    }
+    else
+    {
+        mod::Log(
+            "ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] SKIPPED (could not derive mods dir from '%s')",
+            moduleDirectory.c_str());
+    }
+
+    // --- Tier 3: well-known mod path relative to the executable directory
+    {
+        constexpr const char* kWellKnownModDir = "mods\\efz_netplay_mod";
+        const std::string absoluteWellKnownDir =
+            (exeDirectory != "." && !exeDirectory.empty())
+                ? JoinPath(exeDirectory, kWellKnownModDir)
+                : std::string(kWellKnownModDir);
+        const std::string path = JoinPath(absoluteWellKnownDir, kBgmRelativePath);
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] probing '%s'", path.c_str());
+        if (FileExists(path))
+        {
+            mod::Log(
+                "ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] FOUND — using base '%s'",
+                absoluteWellKnownDir.c_str());
+            return absoluteWellKnownDir;
+        }
+        mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] not found");
+    }
+
+    mod::Log("ResolveNetplayBgmBaseDirectory: no mod-local override found; vanilla path will be used");
+    return {};
+}
+
 std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
 {
     mod::Log("ResolveTitleObjectsPath: searching for title_ob.dat override (moduleDirectory='%s')", moduleDirectory.c_str());
@@ -694,5 +767,4 @@ NetplayObjectProfile DetermineObjectProfile(const std::string& objectPath)
     return profile;
 }
 }
-
 

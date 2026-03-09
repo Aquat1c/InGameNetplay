@@ -35,6 +35,7 @@ std::string BuildModuleDirectory(HMODULE moduleHandle);
 std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory);
 std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory);
 std::string ResolveNetplayObjectsPath(const std::string& moduleDirectory);
+std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory);
 std::string ResolveTitleObjectsPath(const std::string& moduleDirectory);
 
 bool ParseEfzDatImage(const std::string& path, ParsedDatImage* outImage);
@@ -47,5 +48,4 @@ bool DeriveConfigStyleRowsFromDat(
 
 NetplayObjectProfile DetermineObjectProfile(const std::string& objectPath);
 }
-
 
