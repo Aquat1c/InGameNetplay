@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 namespace netplay::player_rooms
@@ -20,12 +23,23 @@ using NetplayMenuId = netplay::menu::NetplayMenuId;
 using NetplayMenuSpec = netplay::menu::NetplayMenuSpec;
 namespace hooks = netplay::hooks::internal;
 
-constexpr int kBrowserFixedActionCount = 5;
+constexpr int kMaxBrowserEntries = 7;
 constexpr int kBackRow = netplay::menu::RowToIndex(netplay::menu::NetplayObRow::Blank);
 constexpr DWORD kStatusDisplayMs = 2000;
 
+enum class BrowserView : uint8_t
+{
+    Root = 0,
+    Join = 1,
+    Create = 2,
+};
+
 struct State
 {
+    BrowserView view = BrowserView::Root;
+    int rootSelection = 0;
+    int joinSelection = 0;
+    int createSelection = 0;
     std::string roomCode;
     bool createPublic = false; // Concerto defaults to Private.
     int listScrollOffset = 0;
@@ -34,11 +48,48 @@ struct State
     DWORD statusExpireTick = 0;
     netplay::lobby::LobbyJoinedRoom pendingJoinedRoom = {};
     bool hasPendingJoinedRoom = false;
-    std::array<NetplayMenuEntry, kBrowserFixedActionCount + kVisiblePublicRoomSlots + 1> entries = {};
+    std::array<NetplayMenuEntry, kMaxBrowserEntries> entries = {};
     NetplayMenuSpec spec = {};
 };
 
 State g_state = {};
+std::mutex g_refreshMutex;
+std::atomic<bool> g_refreshInFlight{false};
+bool g_refreshResultReady = false;
+bool g_refreshResultShowStatus = false;
+bool g_refreshResultOk = false;
+std::vector<netplay::lobby::PublicRoomSummary> g_refreshResultRooms;
+std::string g_refreshResultError;
+
+int* GetSelectionStorage(BrowserView view)
+{
+    switch (view)
+    {
+    case BrowserView::Root:
+        return &g_state.rootSelection;
+    case BrowserView::Join:
+        return &g_state.joinSelection;
+    case BrowserView::Create:
+        return &g_state.createSelection;
+    default:
+        return &g_state.rootSelection;
+    }
+}
+
+const char* GetHeaderLabel()
+{
+    switch (g_state.view)
+    {
+    case BrowserView::Root:
+        return "PLAYER ROOMS";
+    case BrowserView::Join:
+        return "JOIN ROOM";
+    case BrowserView::Create:
+        return "CREATE ROOM";
+    default:
+        return "PLAYER ROOMS";
+    }
+}
 
 void EnsureSpecInitialized()
 {
@@ -48,7 +99,7 @@ void EnsureSpecInitialized()
     }
 
     g_state.spec.menuId = NetplayMenuId::PlayerRooms;
-    g_state.spec.headerLabel = "PLAYER ROOMS";
+    g_state.spec.headerLabel = GetHeaderLabel();
     g_state.spec.entries = g_state.entries.data();
     g_state.spec.entryCount = 1;
     g_state.spec.defaultSelection = 0;
@@ -97,13 +148,13 @@ int GetMaxListScroll()
     return (std::max)(0, GetTotalPublicRoomCount() - kVisiblePublicRoomSlots);
 }
 
-int GetRoomSlotBaseIndex()
-{
-    return kBrowserFixedActionCount;
-}
-
 int GetRoomSlotCountForMenu()
 {
+    if (g_state.view != BrowserView::Join)
+    {
+        return 0;
+    }
+
     return GetVisiblePublicRoomCount();
 }
 
@@ -145,37 +196,111 @@ std::string BuildRoomCodeDisplay(bool includePlaceholder)
     return includePlaceholder ? "<enter code>" : std::string();
 }
 
+int ClampSelectionForCurrentSpec(int selection)
+{
+    if (g_state.spec.entryCount <= 0)
+    {
+        return 0;
+    }
+    if (selection < 0)
+    {
+        return 0;
+    }
+    if (selection >= g_state.spec.entryCount)
+    {
+        return g_state.spec.entryCount - 1;
+    }
+    return selection;
+}
+
+void ApplySelectionToScreen(uint32_t screenContext, int selection)
+{
+    if (screenContext == 0)
+    {
+        return;
+    }
+
+    *reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection) =
+        static_cast<int8_t>(selection);
+    *reinterpret_cast<uint16_t*>(screenContext + netplay::constants::kOffsetMenuAnimCounter) = 0;
+    *reinterpret_cast<uint8_t*>(screenContext + netplay::constants::kOffsetInputLatchP1) = 0;
+    *reinterpret_cast<uint8_t*>(screenContext + netplay::constants::kOffsetInputLatchP2) = 0;
+    *reinterpret_cast<uint32_t*>(screenContext + netplay::constants::kOffsetInactivityCounter) = 0;
+    hooks::g_lastLoggedSelection = static_cast<int8_t>(selection);
+}
+
+void PersistCurrentSelection(uint32_t screenContext)
+{
+    if (screenContext == 0)
+    {
+        return;
+    }
+
+    const int selection =
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection));
+    *GetSelectionStorage(g_state.view) = ClampSelectionForCurrentSpec(selection);
+}
+
 void RebuildMenuEntries()
 {
     EnsureSpecInitialized();
 
-    const int roomSlotCount = GetRoomSlotCountForMenu();
     int entryIndex = 0;
-    g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsRefresh, kBackRow, "ROOMS_REFRESH"};
-    g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsJoin, kBackRow, "ROOMS_JOIN"};
-    g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsEditCode, kBackRow, "ROOMS_EDIT_CODE"};
-    g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsCreate, kBackRow, "ROOMS_CREATE"};
-    g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsRoomType, kBackRow, "ROOMS_TYPE"};
-
-    for (int slot = 0; slot < roomSlotCount; ++slot)
+    switch (g_state.view)
     {
-        g_state.entries[entryIndex++] = {
-            netplay::menu::PlayerRoomsSlotAction(slot),
-            kBackRow,
-            "ROOMS_SLOT",
-        };
+    case BrowserView::Root:
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsOpenJoin, kBackRow, "ROOMS_OPEN_JOIN"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsOpenCreate, kBackRow, "ROOMS_OPEN_CREATE"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsRefresh, kBackRow, "ROOMS_REFRESH"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::BackToMain, kBackRow, "BACK"};
+        break;
+
+    case BrowserView::Join:
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsJoin, kBackRow, "ROOMS_JOIN"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsEditCode, kBackRow, "ROOMS_EDIT_CODE"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsRefresh, kBackRow, "ROOMS_REFRESH"};
+        for (int slot = 0; slot < GetRoomSlotCountForMenu(); ++slot)
+        {
+            g_state.entries[entryIndex++] = {
+                netplay::menu::PlayerRoomsSlotAction(slot),
+                kBackRow,
+                "ROOMS_SLOT",
+            };
+        }
+        g_state.entries[entryIndex++] = {NetplayMenuAction::BackToMain, kBackRow, "BACK"};
+        break;
+
+    case BrowserView::Create:
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsCreate, kBackRow, "ROOMS_CREATE"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::PlayerRoomsRoomType, kBackRow, "ROOMS_TYPE"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::BackToMain, kBackRow, "BACK"};
+        break;
     }
 
-    g_state.entries[entryIndex++] = {NetplayMenuAction::BackToMain, kBackRow, "BACK"};
-
     g_state.spec.menuId = NetplayMenuId::PlayerRooms;
-    g_state.spec.headerLabel = "PLAYER ROOMS";
+    g_state.spec.headerLabel = GetHeaderLabel();
     g_state.spec.entries = g_state.entries.data();
     g_state.spec.entryCount = entryIndex;
-    g_state.spec.defaultSelection = 0;
+    g_state.spec.defaultSelection = ClampSelectionForCurrentSpec(*GetSelectionStorage(g_state.view));
 
     hooks::g_netplayMenuState.optionCount = g_state.spec.entryCount;
     hooks::g_netplayMenuState.backIndex = g_state.spec.entryCount > 0 ? (g_state.spec.entryCount - 1) : 0;
+}
+
+void SwitchView(uint32_t screenContext, BrowserView newView, int selection = -1)
+{
+    PersistCurrentSelection(screenContext);
+    g_state.view = newView;
+    RebuildMenuEntries();
+
+    int nextSelection = selection;
+    if (nextSelection < 0)
+    {
+        nextSelection = *GetSelectionStorage(newView);
+    }
+    nextSelection = ClampSelectionForCurrentSpec(nextSelection);
+    *GetSelectionStorage(newView) = nextSelection;
+    ApplySelectionToScreen(screenContext, nextSelection);
 }
 
 bool RefreshPublicRooms(bool showStatusMessage)
@@ -214,6 +339,117 @@ bool RefreshPublicRooms(bool showStatusMessage)
 
     RebuildMenuEntries();
     return ok;
+}
+
+bool IsRefreshInFlight()
+{
+    return g_refreshInFlight.load(std::memory_order_acquire);
+}
+
+void PumpRefreshResult()
+{
+    bool ready = false;
+    bool showStatusMessage = false;
+    bool ok = false;
+    std::vector<netplay::lobby::PublicRoomSummary> rooms;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_refreshMutex);
+        ready = g_refreshResultReady;
+        if (!ready)
+        {
+            return;
+        }
+
+        showStatusMessage = g_refreshResultShowStatus;
+        ok = g_refreshResultOk;
+        rooms = std::move(g_refreshResultRooms);
+        error = std::move(g_refreshResultError);
+        g_refreshResultRooms.clear();
+        g_refreshResultError.clear();
+        g_refreshResultReady = false;
+        g_refreshResultShowStatus = false;
+        g_refreshResultOk = false;
+    }
+
+    g_refreshInFlight.store(false, std::memory_order_release);
+
+    if (ok)
+    {
+        g_state.publicRooms = std::move(rooms);
+        if (g_state.listScrollOffset > GetMaxListScroll())
+        {
+            g_state.listScrollOffset = GetMaxListScroll();
+        }
+        if (showStatusMessage)
+        {
+            if (g_state.publicRooms.empty())
+            {
+                SetStatusMessage("No public rooms found.");
+            }
+            else
+            {
+                SetStatusMessage("Public room list refreshed.");
+            }
+        }
+    }
+    else
+    {
+        if (g_state.publicRooms.empty())
+        {
+            g_state.listScrollOffset = 0;
+        }
+        if (showStatusMessage)
+        {
+            SetStatusMessage(error.empty() ? "Public room list request failed." : error.c_str());
+        }
+    }
+
+    RebuildMenuEntries();
+}
+
+bool StartAsyncRefresh(bool showStatusMessage)
+{
+    PumpRefreshResult();
+    if (IsRefreshInFlight())
+    {
+        if (showStatusMessage)
+        {
+            SetStatusMessage("Public room list is already refreshing.");
+        }
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_refreshMutex);
+        g_refreshResultReady = false;
+        g_refreshResultShowStatus = false;
+        g_refreshResultOk = false;
+        g_refreshResultRooms.clear();
+        g_refreshResultError.clear();
+    }
+    g_refreshInFlight.store(true, std::memory_order_release);
+
+    if (showStatusMessage)
+    {
+        SetStatusMessage("Refreshing public room list...");
+    }
+
+    std::thread([showStatusMessage]() {
+        std::vector<netplay::lobby::PublicRoomSummary> rooms;
+        std::string error;
+        const bool ok = netplay::lobby::ListPublicRooms(&rooms, &error);
+        {
+            std::lock_guard<std::mutex> lock(g_refreshMutex);
+            g_refreshResultReady = true;
+            g_refreshResultShowStatus = showStatusMessage;
+            g_refreshResultOk = ok;
+            g_refreshResultRooms = std::move(rooms);
+            g_refreshResultError = std::move(error);
+        }
+    }).detach();
+
+    return true;
 }
 
 void ToggleRoomType()
@@ -282,24 +518,36 @@ void ResetState()
 bool EnterMenu()
 {
     EnsureSpecInitialized();
+    PumpRefreshResult();
     if (g_state.roomCode.empty())
     {
         g_state.roomCode.clear();
     }
-    const bool ok = RefreshPublicRooms(false);
+    (void)StartAsyncRefresh(false);
     RebuildMenuEntries();
-    return ok;
+    return true;
 }
 
 void LeaveMenu()
 {
+    PumpRefreshResult();
+    g_state.view = BrowserView::Root;
+    g_state.rootSelection = 0;
+    g_state.joinSelection = 0;
+    g_state.createSelection = 0;
+    RebuildMenuEntries();
     ClearStatusMessage();
 }
 
 std::string BuildRowPrimaryText(NetplayMenuAction action)
 {
+    PumpRefreshResult();
     switch (action)
     {
+    case NetplayMenuAction::PlayerRoomsOpenJoin:
+        return "Join Room";
+    case NetplayMenuAction::PlayerRoomsOpenCreate:
+        return "Create Room";
     case NetplayMenuAction::PlayerRoomsRefresh:
         return "Refresh Rooms";
     case NetplayMenuAction::PlayerRoomsJoin:
@@ -330,8 +578,17 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
 
 std::string BuildRowSecondaryText(NetplayMenuAction action)
 {
+    PumpRefreshResult();
     switch (action)
     {
+    case NetplayMenuAction::PlayerRoomsOpenJoin:
+        if (!g_state.publicRooms.empty())
+        {
+            return std::to_string(static_cast<int>(g_state.publicRooms.size())) + " listed";
+        }
+        return {};
+    case NetplayMenuAction::PlayerRoomsOpenCreate:
+        return GetRoomTypeLabel();
     case NetplayMenuAction::PlayerRoomsEditCode:
         if (hooks::g_inlineEditState.active
             && hooks::g_inlineEditState.action == NetplayMenuAction::PlayerRoomsEditCode)
@@ -379,13 +636,27 @@ std::string BuildRowLabel(NetplayMenuAction action)
 
 std::string BuildFooterText(NetplayMenuAction selectedAction)
 {
+    PumpRefreshResult();
     if (HasStatusMessage())
     {
         return g_state.statusMessage;
     }
 
+    if (IsRefreshInFlight())
+    {
+        if (g_state.publicRooms.empty())
+        {
+            return "Loading public room list...";
+        }
+        return "Refreshing public room list...";
+    }
+
     switch (selectedAction)
     {
+    case NetplayMenuAction::PlayerRoomsOpenJoin:
+        return "Browse public rooms or join by room code.";
+    case NetplayMenuAction::PlayerRoomsOpenCreate:
+        return "Open room creation settings.";
     case NetplayMenuAction::PlayerRoomsRefresh:
         return "Refresh the public room list.";
     case NetplayMenuAction::PlayerRoomsJoin:
@@ -415,7 +686,11 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         return "Join the highlighted public room.";
     }
     case NetplayMenuAction::BackToMain:
-        return "Return to the netplay main menu.";
+        if (g_state.view == BrowserView::Root)
+        {
+            return "Return to the netplay main menu.";
+        }
+        return "Return to the Player Rooms menu.";
     default:
         return {};
     }
@@ -431,6 +706,7 @@ bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelec
 
 bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
 {
+    PumpRefreshResult();
     if (inputBytes == nullptr)
     {
         return false;
@@ -462,12 +738,13 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
         }
 
         bool handled = false;
-        if (entry->action == NetplayMenuAction::PlayerRoomsRoomType)
+        if (g_state.view == BrowserView::Create
+            && entry->action == NetplayMenuAction::PlayerRoomsRoomType)
         {
             ToggleRoomType();
             handled = true;
         }
-        else if (IsRoomSlotAction(entry->action))
+        else if (g_state.view == BrowserView::Join && IsRoomSlotAction(entry->action))
         {
             const int maxScroll = GetMaxListScroll();
             if (horizontal > 0 && g_state.listScrollOffset < maxScroll)
@@ -497,12 +774,31 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
     return false;
 }
 
+bool HandleCancel(uint32_t screenContext)
+{
+    PumpRefreshResult();
+    if (g_state.view == BrowserView::Root)
+    {
+        return false;
+    }
+
+    SwitchView(screenContext, BrowserView::Root);
+    return true;
+}
+
 bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 {
+    PumpRefreshResult();
     switch (action)
     {
+    case NetplayMenuAction::PlayerRoomsOpenJoin:
+        SwitchView(screenContext, BrowserView::Join);
+        return true;
+    case NetplayMenuAction::PlayerRoomsOpenCreate:
+        SwitchView(screenContext, BrowserView::Create);
+        return true;
     case NetplayMenuAction::PlayerRoomsRefresh:
-        RefreshPublicRooms(true);
+        StartAsyncRefresh(true);
         return true;
     case NetplayMenuAction::PlayerRoomsJoin:
         if (!netplay::validation::IsValidLobbyRoomCode(g_state.roomCode))
@@ -543,6 +839,13 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         }
         return true;
     }
+    case NetplayMenuAction::BackToMain:
+        if (g_state.view != BrowserView::Root)
+        {
+            SwitchView(screenContext, BrowserView::Root);
+            return true;
+        }
+        return false;
     default:
         return false;
     }

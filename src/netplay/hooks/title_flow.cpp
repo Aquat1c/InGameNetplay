@@ -2723,6 +2723,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             LeaveNetplayMenu(screenContext);
         }
+        else if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
+            && netplay::player_rooms::HandleCancel(screenContext))
+        {
+        }
         else
         {
             const NetplayMenuId targetMenu = ResolveCancelTargetMenu();
@@ -2853,6 +2857,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
             if (g_netplayMenuState.menuId == NetplayMenuId::Main)
             {
                 LeaveNetplayMenu(screenContext);
+            }
+            else if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
+                && netplay::player_rooms::HandleCancel(screenContext))
+            {
             }
             else
             {

@@ -177,6 +177,10 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "JoinEditPort";
     case NetplayMenuAction::NicknameEdit:
         return "NicknameEdit";
+    case NetplayMenuAction::PlayerRoomsOpenJoin:
+        return "PlayerRoomsOpenJoin";
+    case NetplayMenuAction::PlayerRoomsOpenCreate:
+        return "PlayerRoomsOpenCreate";
     case NetplayMenuAction::PlayerRoomsRefresh:
         return "PlayerRoomsRefresh";
     case NetplayMenuAction::PlayerRoomsJoin:

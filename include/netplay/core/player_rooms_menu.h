@@ -23,6 +23,7 @@ std::string BuildFooterText(netplay::menu::NetplayMenuAction selectedAction);
 
 bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelection);
 bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter);
+bool HandleCancel(uint32_t screenContext);
 bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action);
 
 bool GetInlineEditDisplayValue(
