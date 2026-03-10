@@ -1,6 +1,7 @@
 #include "netplay/core/battle_log_menu.h"
 
 #include "logger.h"
+#include "netplay/assets/assets.h"
 #include "netplay/core/constants.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/text_utils.h"
@@ -13,9 +14,12 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <d3d9.h>
 #include <fstream>
+#include <gdiplus.h>
 #include <iterator>
 #include <map>
+#include <MinHook.h>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -108,6 +112,81 @@ struct State
 
 State g_state = {};
 
+struct SpriteBitmap
+{
+    std::string path;
+    Gdiplus::Bitmap* bitmap = nullptr;
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<uint8_t> bgraPixels;
+    IDirect3DTexture9* d3dTexture = nullptr;
+};
+
+struct RenderAssetState
+{
+    std::string resolvedSpriteDirectory;
+    bool spriteDirectoryResolved = false;
+    bool loadAttempted = false;
+    bool iconsReady = false;
+    bool firstSpriteBlitLogged = false;
+    bool gdiplusStarted = false;
+    ULONG_PTR gdiplusToken = 0;
+    std::map<std::string, SpriteBitmap> sprites;
+};
+
+RenderAssetState g_renderAssets = {};
+
+using EndSceneFn = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
+
+struct D3dOverlayState
+{
+    bool hookAttempted = false;
+    bool hookInstalled = false;
+    bool minhookInitialized = false;
+    bool endSceneObserved = false;
+    bool firstD3dSpriteBlitLogged = false;
+    void* endSceneTarget = nullptr;
+    EndSceneFn originalEndScene = nullptr;
+    IDirect3DDevice9* textureDevice = nullptr;
+};
+
+D3dOverlayState g_d3dOverlay = {};
+
+constexpr int kBrowserIconSlotSize = 10;
+constexpr int kBrowserIconGap = 2;
+
+struct CharacterSpriteFile
+{
+    const char* canonicalName;
+    const char* fileName;
+};
+
+constexpr std::array<CharacterSpriteFile, 23> kCharacterSpriteFiles = {{
+    {"Akane", "akane.png"},
+    {"Akiko", "akiko.png"},
+    {"Ayu", "ayu.png"},
+    {"Doppel", "doppel.png"},
+    {"Ikumi", "ikumi.png"},
+    {"Kanna", "kanna.png"},
+    {"Kano", "kano.png"},
+    {"Kaori", "kaori.png"},
+    {"Mai", "mai.png"},
+    {"Makoto", "makoto.png"},
+    {"Mayu", "mayu.png"},
+    {"Minagi", "minagi.png"},
+    {"Mio", "mio.png"},
+    {"Misaki", "misaki.png"},
+    {"Mishio", "mishio.png"},
+    {"Misuzu", "misuzu.png"},
+    {"Nagamori", "nagamori.png"},
+    {"Nayuki A", "nayuki_awake.png"},
+    {"Nayuki S", "nayuki_sleepy.png"},
+    {"Rumi", "rumi.png"},
+    {"Sayuri", "sayuri.png"},
+    {"Shiori", "shiori.png"},
+    {"Unknown", "unknown.png"},
+}};
+
 // Parsing and document helpers.
 std::wstring TrimWide(std::wstring_view value);
 std::string WideToUtf8(const std::wstring& wide);
@@ -117,6 +196,8 @@ bool DecodeAnsi(const std::vector<uint8_t>& bytes, size_t offset, std::wstring* 
 bool ReadWideTextFile(const std::string& path, std::wstring* outText, FileEncoding* outEncoding);
 std::vector<std::wstring> SplitLines(const std::wstring& text);
 bool IsAbsolutePath(const std::string& path);
+bool DirectoryExists(const std::string& path);
+std::wstring AnsiPathToWide(const std::string& path);
 std::string GetExecutableDirectory();
 std::string ResolveRevivalIniPath();
 std::string ResolveBattleLogPathFromIni(bool* outSaveEnabled);
@@ -125,6 +206,29 @@ bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRi
 bool ParseTwoInts(std::string_view text, int* outLeft, int* outRight);
 bool ParseDurationField(std::string_view text, int* outTotalSeconds);
 bool LooksLikeMatchRow(std::string_view line);
+std::string ResolveBattleLogSpriteDirectory();
+void PrimeRenderAssetDiagnostics();
+bool EnsureGdiplusStarted();
+bool EnsureRenderAssetsLoaded(uint32_t screenContext);
+bool EnsureD3d9OverlayHookInstalled();
+void ShutdownD3d9OverlayHook();
+void ResetRenderAssetFrameState();
+void ReleaseRenderAssets();
+void ReleaseD3dTextures();
+std::string CanonicalizeCharacterNameForSpriteLookup(std::string name);
+const SpriteBitmap* FindCharacterSprite(const std::string& name);
+bool EnsureD3dTexturesReady(LPDIRECT3DDEVICE9 device);
+bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device);
+HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device);
+void DrawScaledSpriteToSurface(
+    const netplay::font::IndexedSurfaceView& surface,
+    uint32_t screenContext,
+    const SpriteBitmap& sprite,
+    int slotX,
+    int slotY,
+    int slotW,
+    int slotH,
+    std::map<uint32_t, uint8_t>* paletteCache);
 std::string FormatDateTime(const std::string& date, const std::string& time);
 std::string FormatDurationShort(int totalSeconds);
 std::string FormatResultPair(int left, int right);
@@ -157,6 +261,7 @@ void SetSelection(uint32_t screenContext, int selection);
 int GetBrowserResultCount();
 int GetBrowserPageCount();
 int GetDetailPageCount();
+const BattleLogSession* GetSessionByIndex(int sessionIndex);
 void NormalizeFilter(BattleLogFilter* filter);
 bool HasCharacterOption(const std::string& value);
 void SanitizeFilterCharacters(BattleLogFilter* filter);
@@ -210,7 +315,7 @@ void DrawFiltersPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t 
 void DrawDetailPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t warnColor);
 void DrawScreenTitleBar(const netplay::font::IndexedSurfaceView& surface, uint8_t fillColor, uint8_t frameColor, uint8_t titleColor, uint8_t dimColor);
 void DrawSummaryRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText);
-void DrawBrowserRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText, uint8_t warnColor);
+void DrawBrowserRows(const netplay::font::IndexedSurfaceView& surface, uint32_t screenContext, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText, uint8_t warnColor);
 void DrawFilterRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t dimText);
 void DrawDetailRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText);
 
@@ -385,6 +490,34 @@ bool IsAbsolutePath(const std::string& path)
     return !path.empty() && (path[0] == '\\' || path[0] == '/');
 }
 
+bool DirectoryExists(const std::string& path)
+{
+    const DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+std::wstring AnsiPathToWide(const std::string& path)
+{
+    if (path.empty())
+    {
+        return {};
+    }
+
+    const int required = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+    if (required <= 0)
+    {
+        return {};
+    }
+
+    std::wstring wide(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wide.data(), required) <= 0)
+    {
+        return {};
+    }
+    wide.resize(static_cast<size_t>(required - 1));
+    return wide;
+}
+
 std::string GetExecutableDirectory()
 {
     char exePath[MAX_PATH] = {};
@@ -472,6 +605,931 @@ std::string ResolveBattleLogPathFromIni(bool* outSaveEnabled)
         return logPath;
     }
     return GetExecutableDirectory() + "\\" + logPath;
+}
+
+std::string ResolveBattleLogSpriteDirectory()
+{
+    mod::Log("BattleLog::ResolveSpriteDirectory: searching for assets\\sprites");
+
+    const std::string moduleDir = hooks::g_moduleDirectory;
+    if (!moduleDir.empty())
+    {
+        const std::string candidate = netplay::assets::JoinPath(moduleDir, "assets\\sprites");
+        mod::Log("BattleLog::ResolveSpriteDirectory: [DLL dir] probing '%s'", candidate.c_str());
+        if (DirectoryExists(candidate))
+        {
+            mod::Log("BattleLog::ResolveSpriteDirectory: using '%s'", candidate.c_str());
+            return candidate;
+        }
+    }
+
+    const std::string exeDir = GetExecutableDirectory();
+    if (!exeDir.empty())
+    {
+        const std::string modsCandidate = exeDir + "\\mods\\efz_netplay_mod\\assets\\sprites";
+        mod::Log("BattleLog::ResolveSpriteDirectory: [EXE mods dir] probing '%s'", modsCandidate.c_str());
+        if (DirectoryExists(modsCandidate))
+        {
+            mod::Log("BattleLog::ResolveSpriteDirectory: using '%s'", modsCandidate.c_str());
+            return modsCandidate;
+        }
+
+        const std::string assetsCandidate = exeDir + "\\assets\\sprites";
+        mod::Log("BattleLog::ResolveSpriteDirectory: [EXE assets dir] probing '%s'", assetsCandidate.c_str());
+        if (DirectoryExists(assetsCandidate))
+        {
+            mod::Log("BattleLog::ResolveSpriteDirectory: using '%s'", assetsCandidate.c_str());
+            return assetsCandidate;
+        }
+    }
+
+    mod::Log("BattleLog::ResolveSpriteDirectory: no sprite directory found");
+    return {};
+}
+
+std::string CanonicalizeCharacterNameForSpriteLookup(std::string name)
+{
+    name = NormalizeCharacterToken(std::move(name));
+    name = netplay::text::TrimAscii(std::move(name));
+    if (_stricmp(name.c_str(), "BossUnknown") == 0 || _stricmp(name.c_str(), "UNKNOWN") == 0)
+    {
+        return "Unknown";
+    }
+    return name;
+}
+
+void PrimeRenderAssetDiagnostics()
+{
+    ReleaseRenderAssets();
+    g_renderAssets.resolvedSpriteDirectory = ResolveBattleLogSpriteDirectory();
+    g_renderAssets.spriteDirectoryResolved = !g_renderAssets.resolvedSpriteDirectory.empty();
+    g_renderAssets.loadAttempted = false;
+    g_renderAssets.iconsReady = false;
+    g_renderAssets.firstSpriteBlitLogged = false;
+    if (!g_renderAssets.spriteDirectoryResolved)
+    {
+        mod::Log("BattleLog::PrimeRenderAssetDiagnostics: sprite directory unavailable");
+        return;
+    }
+
+    int foundFiles = 0;
+    for (const auto& entry : kCharacterSpriteFiles)
+    {
+        const std::string candidate =
+            netplay::assets::JoinPath(g_renderAssets.resolvedSpriteDirectory, entry.fileName);
+        if (netplay::assets::FileExists(candidate))
+        {
+            ++foundFiles;
+        }
+    }
+
+    mod::Log(
+        "BattleLog::PrimeRenderAssetDiagnostics: spriteDir='%s' found=%d/%zu",
+        g_renderAssets.resolvedSpriteDirectory.c_str(),
+        foundFiles,
+        kCharacterSpriteFiles.size());
+}
+
+bool EnsureGdiplusStarted()
+{
+    if (g_renderAssets.gdiplusStarted)
+    {
+        return true;
+    }
+
+    Gdiplus::GdiplusStartupInput startupInput;
+    const Gdiplus::Status status = Gdiplus::GdiplusStartup(
+        &g_renderAssets.gdiplusToken,
+        &startupInput,
+        nullptr);
+    if (status != Gdiplus::Ok)
+    {
+        mod::Log("BattleLog::EnsureGdiplusStarted: startup failed status=%d", static_cast<int>(status));
+        g_renderAssets.gdiplusToken = 0;
+        return false;
+    }
+
+    g_renderAssets.gdiplusStarted = true;
+    mod::Log("BattleLog::EnsureGdiplusStarted: startup OK token=%p", reinterpret_cast<void*>(g_renderAssets.gdiplusToken));
+    return true;
+}
+
+const SpriteBitmap* FindCharacterSprite(const std::string& name)
+{
+    const std::string canonical = CanonicalizeCharacterNameForSpriteLookup(name);
+    const auto it = g_renderAssets.sprites.find(canonical);
+    if (it == g_renderAssets.sprites.end())
+    {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+bool EnsureRenderAssetsLoaded(uint32_t screenContext)
+{
+    (void)screenContext;
+
+    if (!g_renderAssets.spriteDirectoryResolved)
+    {
+        if (!g_renderAssets.loadAttempted)
+        {
+            g_renderAssets.loadAttempted = true;
+            mod::Log("BattleLog::EnsureRenderAssetsLoaded: skipped spriteDirectoryResolved=0");
+        }
+        return false;
+    }
+
+    if (g_renderAssets.iconsReady)
+    {
+        return true;
+    }
+
+    if (g_renderAssets.loadAttempted)
+    {
+        return false;
+    }
+    g_renderAssets.loadAttempted = true;
+
+    if (!EnsureGdiplusStarted())
+    {
+        return false;
+    }
+
+    int loadedCount = 0;
+    for (const auto& entry : kCharacterSpriteFiles)
+    {
+        const std::string path =
+            netplay::assets::JoinPath(g_renderAssets.resolvedSpriteDirectory, entry.fileName);
+        if (!netplay::assets::FileExists(path))
+        {
+            continue;
+        }
+
+        const std::wstring widePath = AnsiPathToWide(path);
+        if (widePath.empty())
+        {
+            mod::Log(
+                "BattleLog::EnsureRenderAssetsLoaded: failed to widen path '%s'",
+                path.c_str());
+            continue;
+        }
+
+        Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromFile(widePath.c_str(), FALSE);
+        if (bitmap == nullptr)
+        {
+            mod::Log(
+                "BattleLog::EnsureRenderAssetsLoaded: Bitmap::FromFile failed path='%s'",
+                path.c_str());
+            continue;
+        }
+
+        const Gdiplus::Status status = bitmap->GetLastStatus();
+        if (status != Gdiplus::Ok || bitmap->GetWidth() == 0 || bitmap->GetHeight() == 0)
+        {
+            mod::Log(
+                "BattleLog::EnsureRenderAssetsLoaded: invalid bitmap path='%s' status=%d size=%ux%u",
+                path.c_str(),
+                static_cast<int>(status),
+                bitmap->GetWidth(),
+                bitmap->GetHeight());
+            delete bitmap;
+            continue;
+        }
+
+        SpriteBitmap sprite = {};
+        sprite.path = path;
+        sprite.bitmap = bitmap;
+        sprite.width = bitmap->GetWidth();
+        sprite.height = bitmap->GetHeight();
+
+        Gdiplus::Rect lockRect(0, 0, static_cast<INT>(sprite.width), static_cast<INT>(sprite.height));
+        Gdiplus::BitmapData bitmapData = {};
+        const Gdiplus::Status lockStatus = bitmap->LockBits(
+            &lockRect,
+            Gdiplus::ImageLockModeRead,
+            PixelFormat32bppARGB,
+            &bitmapData);
+        if (lockStatus != Gdiplus::Ok || bitmapData.Scan0 == nullptr)
+        {
+            mod::Log(
+                "BattleLog::EnsureRenderAssetsLoaded: LockBits failed path='%s' status=%d",
+                path.c_str(),
+                static_cast<int>(lockStatus));
+            delete bitmap;
+            continue;
+        }
+
+        sprite.bgraPixels.resize(static_cast<size_t>(sprite.width) * static_cast<size_t>(sprite.height) * 4u);
+        const int srcStride = bitmapData.Stride;
+        const uint8_t* srcBase = static_cast<const uint8_t*>(bitmapData.Scan0);
+        for (UINT y = 0; y < sprite.height; ++y)
+        {
+            const uint8_t* srcRow = srcStride >= 0
+                ? (srcBase + static_cast<size_t>(y) * static_cast<size_t>(srcStride))
+                : (srcBase + static_cast<size_t>(sprite.height - 1u - y) * static_cast<size_t>(-srcStride));
+            uint8_t* dstRow = sprite.bgraPixels.data() + static_cast<size_t>(y) * static_cast<size_t>(sprite.width) * 4u;
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(sprite.width) * 4u);
+        }
+        bitmap->UnlockBits(&bitmapData);
+
+        g_renderAssets.sprites.emplace(entry.canonicalName, sprite);
+        ++loadedCount;
+    }
+
+    g_renderAssets.iconsReady = loadedCount > 0;
+    mod::Log(
+        "BattleLog::EnsureRenderAssetsLoaded: using PNG sprite path loaded=%d/%zu dir='%s'",
+        loadedCount,
+        kCharacterSpriteFiles.size(),
+        g_renderAssets.resolvedSpriteDirectory.c_str());
+    if (g_renderAssets.iconsReady)
+    {
+        (void)EnsureD3d9OverlayHookInstalled();
+    }
+    return g_renderAssets.iconsReady;
+}
+
+void ResetRenderAssetFrameState()
+{
+    g_renderAssets.firstSpriteBlitLogged = false;
+    g_d3dOverlay.firstD3dSpriteBlitLogged = false;
+}
+
+void ReleaseRenderAssets()
+{
+    for (auto& entry : g_renderAssets.sprites)
+    {
+        if (entry.second.d3dTexture != nullptr)
+        {
+            entry.second.d3dTexture->Release();
+            entry.second.d3dTexture = nullptr;
+        }
+        delete entry.second.bitmap;
+        entry.second.bitmap = nullptr;
+    }
+    g_renderAssets.sprites.clear();
+    g_d3dOverlay.textureDevice = nullptr;
+
+    if (g_renderAssets.gdiplusStarted)
+    {
+        Gdiplus::GdiplusShutdown(g_renderAssets.gdiplusToken);
+    }
+
+    g_renderAssets.gdiplusStarted = false;
+    g_renderAssets.gdiplusToken = 0;
+    g_renderAssets.iconsReady = false;
+    g_renderAssets.loadAttempted = false;
+}
+
+void ReleaseD3dTextures()
+{
+    for (auto& entry : g_renderAssets.sprites)
+    {
+        if (entry.second.d3dTexture != nullptr)
+        {
+            entry.second.d3dTexture->Release();
+            entry.second.d3dTexture = nullptr;
+        }
+    }
+    g_d3dOverlay.textureDevice = nullptr;
+    g_d3dOverlay.firstD3dSpriteBlitLogged = false;
+}
+
+bool EnsureD3dTexturesReady(LPDIRECT3DDEVICE9 device)
+{
+    if (device == nullptr || !g_renderAssets.iconsReady)
+    {
+        return false;
+    }
+
+    if (g_d3dOverlay.textureDevice != device)
+    {
+        ReleaseD3dTextures();
+        g_d3dOverlay.textureDevice = device;
+    }
+
+    bool ready = false;
+    for (auto& entry : g_renderAssets.sprites)
+    {
+        SpriteBitmap& sprite = entry.second;
+        if (sprite.width == 0 || sprite.height == 0 || sprite.bgraPixels.empty())
+        {
+            continue;
+        }
+
+        if (sprite.d3dTexture == nullptr)
+        {
+            IDirect3DTexture9* texture = nullptr;
+            const HRESULT createHr = device->CreateTexture(
+                sprite.width,
+                sprite.height,
+                1,
+                0,
+                D3DFMT_A8R8G8B8,
+                D3DPOOL_MANAGED,
+                &texture,
+                nullptr);
+            if (FAILED(createHr) || texture == nullptr)
+            {
+                mod::Log(
+                    "BattleLog::EnsureD3dTexturesReady: CreateTexture failed path='%s' hr=0x%08X",
+                    sprite.path.c_str(),
+                    static_cast<unsigned>(createHr));
+                continue;
+            }
+
+            D3DLOCKED_RECT lockedRect = {};
+            const HRESULT lockHr = texture->LockRect(0, &lockedRect, nullptr, 0);
+            if (FAILED(lockHr) || lockedRect.pBits == nullptr)
+            {
+                mod::Log(
+                    "BattleLog::EnsureD3dTexturesReady: LockRect failed path='%s' hr=0x%08X",
+                    sprite.path.c_str(),
+                    static_cast<unsigned>(lockHr));
+                texture->Release();
+                continue;
+            }
+
+            for (UINT y = 0; y < sprite.height; ++y)
+            {
+                const uint8_t* srcRow = sprite.bgraPixels.data()
+                    + static_cast<size_t>(y) * static_cast<size_t>(sprite.width) * 4u;
+                uint8_t* dstRow = static_cast<uint8_t*>(lockedRect.pBits)
+                    + static_cast<size_t>(y) * static_cast<size_t>(lockedRect.Pitch);
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(sprite.width) * 4u);
+            }
+
+            texture->UnlockRect(0);
+            sprite.d3dTexture = texture;
+        }
+
+        ready = ready || (sprite.d3dTexture != nullptr);
+    }
+
+    return ready;
+}
+
+bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
+{
+    if (device == nullptr
+        || !hooks::g_netplayMenuState.active
+        || hooks::g_netplayMenuState.menuId != NetplayMenuId::BattleLog
+        || g_state.view != View::Browser
+        || !g_renderAssets.iconsReady)
+    {
+        return false;
+    }
+
+    if (!EnsureD3dTexturesReady(device))
+    {
+        return false;
+    }
+
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || stateBlock == nullptr)
+    {
+        return false;
+    }
+    stateBlock->Capture();
+
+    D3DVIEWPORT9 viewport = {};
+    if (FAILED(device->GetViewport(&viewport)))
+    {
+        stateBlock->Release();
+        return false;
+    }
+
+    const int targetW = static_cast<int>(viewport.Width);
+    const int targetH = static_cast<int>(viewport.Height);
+    if (targetW <= 0 || targetH <= 0)
+    {
+        stateBlock->Apply();
+        stateBlock->Release();
+        return false;
+    }
+
+    int viewportW = targetW;
+    int viewportH = (viewportW * 240) / 320;
+    if (viewportH > targetH)
+    {
+        viewportH = targetH;
+        viewportW = (viewportH * 320) / 240;
+    }
+    const int viewportX = static_cast<int>(viewport.X) + (targetW - viewportW) / 2;
+    const int viewportY = static_cast<int>(viewport.Y) + (targetH - viewportH) / 2;
+
+    struct TexturedVertex
+    {
+        float x;
+        float y;
+        float z;
+        float rhw;
+        DWORD color;
+        float u;
+        float v;
+    };
+    constexpr DWORD kTexturedFvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    device->SetFVF(kTexturedFvf);
+
+    for (int slot = 0; slot < netplay::menu::kBattleLogVisibleSessionRows; ++slot)
+    {
+        const BattleLogSession* session = GetSessionByIndex(GetSessionIndexForVisibleSlot(slot));
+        if (session == nullptr || session->matches.empty())
+        {
+            continue;
+        }
+
+        const SpriteBitmap* p1Sprite = FindCharacterSprite(session->finalP1Character);
+        const SpriteBitmap* p2Sprite = FindCharacterSprite(session->finalP2Character);
+        if (p1Sprite == nullptr || p2Sprite == nullptr
+            || p1Sprite->d3dTexture == nullptr || p2Sprite->d3dTexture == nullptr)
+        {
+            continue;
+        }
+
+        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
+        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
+        const int p2X = kRowX + kRowW - 6 - kBrowserIconSlotSize;
+        const int p1X = p2X - kBrowserIconGap - kBrowserIconSlotSize;
+
+        const std::array<std::pair<const SpriteBitmap*, int>, 2> icons = {{
+            {p1Sprite, p1X},
+            {p2Sprite, p2X},
+        }};
+
+        for (const auto& icon : icons)
+        {
+            const SpriteBitmap* sprite = icon.first;
+            const int logicalX = icon.second;
+            const int logicalY = iconY;
+            const int slotLeft = viewportX + (logicalX * viewportW) / 320;
+            const int slotTop = viewportY + (logicalY * viewportH) / 240;
+            const int slotRight = viewportX + ((logicalX + kBrowserIconSlotSize) * viewportW) / 320;
+            const int slotBottom = viewportY + ((logicalY + kBrowserIconSlotSize) * viewportH) / 240;
+            const int slotW = (std::max)(1, slotRight - slotLeft);
+            const int slotH = (std::max)(1, slotBottom - slotTop);
+            const double scale = (std::min)(
+                static_cast<double>(slotW) / static_cast<double>(sprite->width),
+                static_cast<double>(slotH) / static_cast<double>(sprite->height));
+            const int drawW = (std::max)(1, static_cast<int>(sprite->width * scale + 0.5));
+            const int drawH = (std::max)(1, static_cast<int>(sprite->height * scale + 0.5));
+            const int drawX = slotLeft + (slotW - drawW) / 2;
+            const int drawY = slotTop + (slotH - drawH) / 2;
+
+            const float left = static_cast<float>(drawX) - 0.5f;
+            const float top = static_cast<float>(drawY) - 0.5f;
+            const float right = static_cast<float>(drawX + drawW) - 0.5f;
+            const float bottom = static_cast<float>(drawY + drawH) - 0.5f;
+
+            const TexturedVertex vertices[4] = {
+                {left,  top,    0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f},
+                {right, top,    0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 0.0f},
+                {left,  bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 1.0f},
+                {right, bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 1.0f},
+            };
+
+            device->SetTexture(0, sprite->d3dTexture);
+            (void)device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(TexturedVertex));
+        }
+
+        if (!g_d3dOverlay.firstD3dSpriteBlitLogged)
+        {
+            mod::Log(
+                "BattleLog::DrawBrowserIconsD3d9: viewport=(%d,%d %dx%d) slot=%d session=%d p1='%s' sprite='%s' p2='%s' sprite='%s'",
+                viewportX,
+                viewportY,
+                viewportW,
+                viewportH,
+                slot,
+                session->sessionIndex,
+                session->finalP1Character.c_str(),
+                p1Sprite->path.c_str(),
+                session->finalP2Character.c_str(),
+                p2Sprite->path.c_str());
+            g_d3dOverlay.firstD3dSpriteBlitLogged = true;
+        }
+    }
+
+    device->SetTexture(0, nullptr);
+    stateBlock->Apply();
+    stateBlock->Release();
+    return true;
+}
+
+HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
+{
+    if (!g_d3dOverlay.endSceneObserved)
+    {
+        g_d3dOverlay.endSceneObserved = true;
+        mod::Log("BattleLog::HookedBattleLogEndScene: first EndScene observed device=%p", device);
+    }
+
+    if (device != nullptr)
+    {
+        (void)RenderBrowserIconsD3d9(device);
+    }
+
+    if (g_d3dOverlay.originalEndScene == nullptr)
+    {
+        return D3D_OK;
+    }
+    return g_d3dOverlay.originalEndScene(device);
+}
+
+bool EnsureD3d9OverlayHookInstalled()
+{
+    if (g_d3dOverlay.hookInstalled)
+    {
+        return true;
+    }
+    if (g_d3dOverlay.hookAttempted)
+    {
+        return false;
+    }
+    g_d3dOverlay.hookAttempted = true;
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: MH_Initialize failed status=%d", static_cast<int>(initStatus));
+        return false;
+    }
+    g_d3dOverlay.minhookInitialized = true;
+
+    HMODULE d3d9Module = GetModuleHandleA("d3d9.dll");
+    if (d3d9Module == nullptr)
+    {
+        d3d9Module = LoadLibraryA("d3d9.dll");
+    }
+    if (d3d9Module == nullptr)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: d3d9.dll unavailable");
+        return false;
+    }
+
+    auto direct3dCreate9 = reinterpret_cast<LPDIRECT3D9(WINAPI*)(UINT)>(
+        GetProcAddress(d3d9Module, "Direct3DCreate9"));
+    if (direct3dCreate9 == nullptr)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: Direct3DCreate9 unavailable");
+        return false;
+    }
+
+    const LPDIRECT3D9 d3d9 = direct3dCreate9(D3D_SDK_VERSION);
+    if (d3d9 == nullptr)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: Direct3DCreate9 failed");
+        return false;
+    }
+
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = DefWindowProcA;
+    windowClass.hInstance = GetModuleHandleA(nullptr);
+    windowClass.lpszClassName = "EFZ_NETPLAY_D3D9_DUMMY";
+    (void)RegisterClassA(&windowClass);
+    const HWND dummyWindow = CreateWindowExA(
+        0,
+        windowClass.lpszClassName,
+        "efz_netplay_dummy",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        64,
+        64,
+        nullptr,
+        nullptr,
+        windowClass.hInstance,
+        nullptr);
+    if (dummyWindow == nullptr)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: dummy window creation failed");
+        d3d9->Release();
+        return false;
+    }
+
+    D3DPRESENT_PARAMETERS presentParameters = {};
+    presentParameters.Windowed = TRUE;
+    presentParameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    presentParameters.BackBufferFormat = D3DFMT_UNKNOWN;
+    presentParameters.BackBufferWidth = 2;
+    presentParameters.BackBufferHeight = 2;
+    presentParameters.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    presentParameters.hDeviceWindow = dummyWindow;
+
+    LPDIRECT3DDEVICE9 tempDevice = nullptr;
+    const HRESULT createDeviceHr = d3d9->CreateDevice(
+        D3DADAPTER_DEFAULT,
+        D3DDEVTYPE_HAL,
+        dummyWindow,
+        D3DCREATE_SOFTWARE_VERTEXPROCESSING,
+        &presentParameters,
+        &tempDevice);
+    if (FAILED(createDeviceHr) || tempDevice == nullptr)
+    {
+        mod::Log(
+            "BattleLog::EnsureD3d9OverlayHookInstalled: CreateDevice failed hr=0x%08X",
+            static_cast<unsigned>(createDeviceHr));
+        DestroyWindow(dummyWindow);
+        UnregisterClassA(windowClass.lpszClassName, windowClass.hInstance);
+        d3d9->Release();
+        return false;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(tempDevice);
+    g_d3dOverlay.endSceneTarget = (vtable != nullptr) ? vtable[42] : nullptr;
+    tempDevice->Release();
+    d3d9->Release();
+    DestroyWindow(dummyWindow);
+    UnregisterClassA(windowClass.lpszClassName, windowClass.hInstance);
+
+    if (g_d3dOverlay.endSceneTarget == nullptr)
+    {
+        mod::Log("BattleLog::EnsureD3d9OverlayHookInstalled: EndScene target unavailable");
+        return false;
+    }
+
+    const MH_STATUS createHookStatus = MH_CreateHook(
+        g_d3dOverlay.endSceneTarget,
+        reinterpret_cast<LPVOID>(&HookedBattleLogEndScene),
+        reinterpret_cast<LPVOID*>(&g_d3dOverlay.originalEndScene));
+    if (createHookStatus != MH_OK)
+    {
+        mod::Log(
+            "BattleLog::EnsureD3d9OverlayHookInstalled: MH_CreateHook failed status=%d target=%p",
+            static_cast<int>(createHookStatus),
+            g_d3dOverlay.endSceneTarget);
+        return false;
+    }
+
+    const MH_STATUS enableHookStatus = MH_EnableHook(g_d3dOverlay.endSceneTarget);
+    if (enableHookStatus != MH_OK)
+    {
+        mod::Log(
+            "BattleLog::EnsureD3d9OverlayHookInstalled: MH_EnableHook failed status=%d target=%p",
+            static_cast<int>(enableHookStatus),
+            g_d3dOverlay.endSceneTarget);
+        (void)MH_RemoveHook(g_d3dOverlay.endSceneTarget);
+        g_d3dOverlay.endSceneTarget = nullptr;
+        g_d3dOverlay.originalEndScene = nullptr;
+        return false;
+    }
+
+    g_d3dOverlay.hookInstalled = true;
+    mod::Log(
+        "BattleLog::EnsureD3d9OverlayHookInstalled: installed target=%p original=%p",
+        g_d3dOverlay.endSceneTarget,
+        reinterpret_cast<void*>(g_d3dOverlay.originalEndScene));
+    return true;
+}
+
+void ShutdownD3d9OverlayHook()
+{
+    ReleaseD3dTextures();
+
+    if (g_d3dOverlay.hookInstalled && g_d3dOverlay.endSceneTarget != nullptr)
+    {
+        (void)MH_DisableHook(g_d3dOverlay.endSceneTarget);
+        (void)MH_RemoveHook(g_d3dOverlay.endSceneTarget);
+    }
+
+    if (g_d3dOverlay.minhookInitialized)
+    {
+        (void)MH_Uninitialize();
+    }
+
+    g_d3dOverlay = {};
+}
+
+bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
+{
+    if (g_state.view != View::Browser || !g_renderAssets.iconsReady)
+    {
+        return false;
+    }
+
+    HDC dc = nullptr;
+    void* surface = nullptr;
+    HWND window = nullptr;
+    const bool acquired =
+        allowWindowDc
+            ? netplay::draw::AcquirePresentedMenuDrawDc(screenContext, &dc, &surface, &window, true)
+            : netplay::draw::AcquireMenuDrawDc(screenContext, &dc, &surface, &window, false);
+    if (!acquired)
+    {
+        return false;
+    }
+
+    RECT bounds = {};
+    (void)GetClipBox(dc, &bounds);
+    if (bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+    {
+        if (window != nullptr && IsWindow(window))
+        {
+            (void)GetClientRect(window, &bounds);
+        }
+    }
+
+    const int targetW = bounds.right - bounds.left;
+    const int targetH = bounds.bottom - bounds.top;
+    if (targetW <= 0 || targetH <= 0)
+    {
+        netplay::draw::ReleaseMenuDrawDc(dc, surface, window);
+        return false;
+    }
+
+    int viewportW = targetW;
+    int viewportH = (viewportW * 240) / 320;
+    if (viewportH > targetH)
+    {
+        viewportH = targetH;
+        viewportW = (viewportH * 320) / 240;
+    }
+    const int viewportX = bounds.left + (targetW - viewportW) / 2;
+    const int viewportY = bounds.top + (targetH - viewportH) / 2;
+
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+
+    for (int slot = 0; slot < netplay::menu::kBattleLogVisibleSessionRows; ++slot)
+    {
+        const BattleLogSession* session = GetSessionByIndex(GetSessionIndexForVisibleSlot(slot));
+        if (session == nullptr || session->matches.empty())
+        {
+            continue;
+        }
+
+        const SpriteBitmap* p1Sprite = FindCharacterSprite(session->finalP1Character);
+        const SpriteBitmap* p2Sprite = FindCharacterSprite(session->finalP2Character);
+        if (p1Sprite == nullptr || p2Sprite == nullptr || p1Sprite->bitmap == nullptr || p2Sprite->bitmap == nullptr)
+        {
+            continue;
+        }
+
+        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
+        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
+        const int p2X = kRowX + kRowW - 6 - kBrowserIconSlotSize;
+        const int p1X = p2X - kBrowserIconGap - kBrowserIconSlotSize;
+
+        const std::array<std::pair<const SpriteBitmap*, int>, 2> icons = {{
+            {p1Sprite, p1X},
+            {p2Sprite, p2X},
+        }};
+
+        for (const auto& icon : icons)
+        {
+            const SpriteBitmap* sprite = icon.first;
+            const int logicalX = icon.second;
+            const int logicalY = iconY;
+            const int slotLeft = viewportX + (logicalX * viewportW) / 320;
+            const int slotTop = viewportY + (logicalY * viewportH) / 240;
+            const int slotRight = viewportX + ((logicalX + kBrowserIconSlotSize) * viewportW) / 320;
+            const int slotBottom = viewportY + ((logicalY + kBrowserIconSlotSize) * viewportH) / 240;
+            const int slotW = (std::max)(1, slotRight - slotLeft);
+            const int slotH = (std::max)(1, slotBottom - slotTop);
+            const double scale = (std::min)(
+                static_cast<double>(slotW) / static_cast<double>(sprite->width),
+                static_cast<double>(slotH) / static_cast<double>(sprite->height));
+            const int drawW = (std::max)(1, static_cast<int>(sprite->width * scale + 0.5));
+            const int drawH = (std::max)(1, static_cast<int>(sprite->height * scale + 0.5));
+            const int drawX = slotLeft + (slotW - drawW) / 2;
+            const int drawY = slotTop + (slotH - drawH) / 2;
+
+            graphics.DrawImage(
+                sprite->bitmap,
+                Gdiplus::Rect(drawX, drawY, drawW, drawH),
+                0,
+                0,
+                static_cast<INT>(sprite->width),
+                static_cast<INT>(sprite->height),
+                Gdiplus::UnitPixel);
+        }
+
+        if (!g_renderAssets.firstSpriteBlitLogged)
+        {
+            mod::Log(
+                "BattleLog::DrawBrowserIcons%s: viewport=(%d,%d %dx%d) slot=%d session=%d p1='%s' sprite='%s' p2='%s' sprite='%s'",
+                allowWindowDc ? "Presented" : "Backbuffer",
+                viewportX,
+                viewportY,
+                viewportW,
+                viewportH,
+                slot,
+                session->sessionIndex,
+                session->finalP1Character.c_str(),
+                p1Sprite->path.c_str(),
+                session->finalP2Character.c_str(),
+                p2Sprite->path.c_str());
+            g_renderAssets.firstSpriteBlitLogged = true;
+        }
+    }
+
+    netplay::draw::ReleaseMenuDrawDc(dc, surface, window);
+    return true;
+}
+
+void PutSurfacePixelClamped(const netplay::font::IndexedSurfaceView& surface, int x, int y, uint8_t color)
+{
+    if (surface.pixels == nullptr || x < 0 || y < 0 || x >= surface.width || y >= surface.height)
+    {
+        return;
+    }
+    surface.pixels[y * surface.pitch + x] = color;
+}
+
+uint8_t ResolveSpritePaletteColor(
+    uint32_t screenContext,
+    std::map<uint32_t, uint8_t>* paletteCache,
+    int r,
+    int g,
+    int b)
+{
+    const uint32_t key =
+        (static_cast<uint32_t>(r & 0xFF) << 16)
+        | (static_cast<uint32_t>(g & 0xFF) << 8)
+        | static_cast<uint32_t>(b & 0xFF);
+
+    if (paletteCache != nullptr)
+    {
+        const auto it = paletteCache->find(key);
+        if (it != paletteCache->end())
+        {
+            return it->second;
+        }
+    }
+
+    const uint8_t color = netplay::draw::ResolveBestPaletteColor(screenContext, r, g, b);
+    if (paletteCache != nullptr)
+    {
+        paletteCache->emplace(key, color);
+    }
+    return color;
+}
+
+void DrawScaledSpriteToSurface(
+    const netplay::font::IndexedSurfaceView& surface,
+    uint32_t screenContext,
+    const SpriteBitmap& sprite,
+    int slotX,
+    int slotY,
+    int slotW,
+    int slotH,
+    std::map<uint32_t, uint8_t>* paletteCache)
+{
+    if (sprite.width == 0 || sprite.height == 0 || sprite.bgraPixels.empty() || slotW <= 0 || slotH <= 0)
+    {
+        return;
+    }
+
+    const double scale = (std::min)(
+        static_cast<double>(slotW) / static_cast<double>(sprite.width),
+        static_cast<double>(slotH) / static_cast<double>(sprite.height));
+    const int drawW = (std::max)(1, static_cast<int>(sprite.width * scale + 0.5));
+    const int drawH = (std::max)(1, static_cast<int>(sprite.height * scale + 0.5));
+    const int drawX = slotX + (slotW - drawW) / 2;
+    const int drawY = slotY + (slotH - drawH) / 2;
+
+    for (int y = 0; y < drawH; ++y)
+    {
+        const UINT srcY = static_cast<UINT>((static_cast<uint64_t>(y) * sprite.height) / static_cast<uint64_t>(drawH));
+        const uint8_t* srcRow = sprite.bgraPixels.data() + static_cast<size_t>(srcY) * static_cast<size_t>(sprite.width) * 4u;
+        for (int x = 0; x < drawW; ++x)
+        {
+            const UINT srcX = static_cast<UINT>((static_cast<uint64_t>(x) * sprite.width) / static_cast<uint64_t>(drawW));
+            const uint8_t* src = srcRow + static_cast<size_t>(srcX) * 4u;
+            const uint8_t alpha = src[3];
+            if (alpha < 32)
+            {
+                continue;
+            }
+
+            const int b = src[0];
+            const int g = src[1];
+            const int r = src[2];
+            const uint8_t color = ResolveSpritePaletteColor(screenContext, paletteCache, r, g, b);
+            PutSurfacePixelClamped(surface, drawX + x, drawY + y, color);
+        }
+    }
 }
 
 bool ParseLeadingDateTime(std::string_view line, std::string* outDate, std::string* outTime, size_t* outTailOffset)
@@ -704,6 +1762,10 @@ std::string NormalizeCharacterToken(std::string token)
     if (token == "NayukiS")
     {
         return "Nayuki S";
+    }
+    if (token == "BossUnknown")
+    {
+        return "Unknown";
     }
     return token;
 }
@@ -2380,6 +3442,7 @@ void DrawSummaryRows(
 
 void DrawBrowserRows(
     const netplay::font::IndexedSurfaceView& surface,
+    uint32_t screenContext,
     int selection,
     uint8_t rowFill,
     uint8_t rowFrame,
@@ -2392,6 +3455,8 @@ void DrawBrowserRows(
     uint8_t dimText,
     uint8_t warnColor)
 {
+    (void)screenContext;
+
     for (int slot = 0; slot < netplay::menu::kBattleLogVisibleSessionRows; ++slot)
     {
         const bool isSelected = slot == selection;
@@ -2448,26 +3513,34 @@ void DrawBrowserRows(
             1,
             1,
             isSelected ? selectedText : normalText);
-        int chipX = 220;
-        chipX = DrawChip(
-            surface,
-            AbbreviateForDisplay(hasGames ? session->finalP1Character : std::string("--"), 4),
-            chipX,
-            rowY + 1,
-            chipFill,
-            chipFrame,
-            chipText,
-            session->p1SwitchedCharacter);
-        chipX += 2;
-        (void)DrawChip(
-            surface,
-            AbbreviateForDisplay(hasGames ? session->finalP2Character : std::string("--"), 4),
-            chipX,
-            rowY + 1,
-            chipFill,
-            chipFrame,
-            chipText,
-            session->p2SwitchedCharacter);
+        const bool useIcons =
+            hasGames
+            && g_renderAssets.iconsReady
+            && FindCharacterSprite(session->finalP1Character) != nullptr
+            && FindCharacterSprite(session->finalP2Character) != nullptr;
+        if (!useIcons)
+        {
+            int chipX = 220;
+            chipX = DrawChip(
+                surface,
+                AbbreviateForDisplay(hasGames ? session->finalP1Character : std::string("--"), 4),
+                chipX,
+                rowY + 1,
+                chipFill,
+                chipFrame,
+                chipText,
+                session->p1SwitchedCharacter);
+            chipX += 2;
+            (void)DrawChip(
+                surface,
+                AbbreviateForDisplay(hasGames ? session->finalP2Character : std::string("--"), 4),
+                chipX,
+                rowY + 1,
+                chipFill,
+                chipFrame,
+                chipText,
+                session->p2SwitchedCharacter);
+        }
         if (session->warningCount > 0)
         {
             netplay::font::DrawTextRight5x7(
@@ -2651,6 +3724,11 @@ void DrawDetailRows(
 }
 } // namespace
 
+void ShutdownRenderOverlay()
+{
+    ShutdownD3d9OverlayHook();
+}
+
 const NetplayMenuSpec* GetMenuSpec()
 {
     EnsureSpecInitialized();
@@ -2675,6 +3753,8 @@ bool EnterMenu()
     g_state.activeFilter.playerName = g_state.currentNickname;
     g_state.draftFilter = g_state.activeFilter;
     RefreshParsedDocument();
+    PrimeRenderAssetDiagnostics();
+    ResetRenderAssetFrameState();
     g_state.view = View::Summary;
     RebuildMenuEntries();
     return true;
@@ -2682,6 +3762,8 @@ bool EnterMenu()
 
 void LeaveMenu()
 {
+    ReleaseRenderAssets();
+    ResetRenderAssetFrameState();
     ResetState();
 }
 
@@ -2939,6 +4021,8 @@ bool HandleCancel(uint32_t screenContext)
     switch (g_state.view)
     {
     case View::Summary:
+        mod::Log("BattleLog::HandleCancel: leaving summary, restoring netplay assets");
+        (void)hooks::LoadNetplayAssets(screenContext);
         hooks::StartMenuSlideTransition(
             screenContext,
             NetplayMenuId::Main,
@@ -2975,6 +4059,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             SetStatusMessage("No sets matched your nickname.");
         }
+        (void)EnsureRenderAssetsLoaded(screenContext);
         SwitchView(screenContext, View::Browser, 0);
         return true;
 
@@ -2992,6 +4077,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         g_state.draftFilter = g_state.activeFilter;
         g_state.browserPage = 0;
         RebuildFilteredSessionIndices();
+        (void)EnsureRenderAssetsLoaded(screenContext);
         SwitchView(screenContext, View::Browser, 0);
         return true;
 
@@ -3026,6 +4112,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             SetStatusMessage("No sets matched the current filter.");
         }
+        (void)EnsureRenderAssetsLoaded(screenContext);
         SwitchView(screenContext, View::Browser, 0);
         return true;
 
@@ -3117,9 +4204,12 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
 bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 {
+    (void)((g_state.view == View::Browser) && EnsureRenderAssetsLoaded(screenContext));
+
     netplay::draw::LockedMenuSurface lockedSurface;
     if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
     {
+        mod::Log("BattleLog::DrawOverlayGdi: failed to lock draw surface");
         return false;
     }
 
@@ -3159,7 +4249,7 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         break;
     case View::Browser:
         DrawBrowserPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, warnColor);
-        DrawBrowserRows(surface, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor, warnColor);
+        DrawBrowserRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor, warnColor);
         break;
     case View::Filters:
         DrawFiltersPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor);
@@ -3173,5 +4263,25 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;
+}
+
+bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc)
+{
+    if (g_state.view != View::Browser)
+    {
+        return false;
+    }
+
+    if (!EnsureRenderAssetsLoaded(screenContext))
+    {
+        return false;
+    }
+
+    if (EnsureD3d9OverlayHookInstalled())
+    {
+        return true;
+    }
+
+    return DrawBrowserIconsGdi(screenContext, allowWindowDc);
 }
 } // namespace netplay::battle_log

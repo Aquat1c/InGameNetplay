@@ -380,6 +380,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     {
         DrawNetplayBackgroundOnly(screenContext);
         (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
         (void)DrawFooterTooltipOverlayGdi(screenContext, false);
         (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
         (void)DrawDelaySetupOverlayGdi(screenContext, false);
@@ -387,7 +388,12 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawJoiningOverlayGdi(screenContext, false);
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawDebugOverlay(screenContext);
-        return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
     }
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
@@ -415,6 +421,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     {
         DrawNetplayBackgroundOnly(screenContext);
         (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
         (void)DrawFooterTooltipOverlayGdi(screenContext, false);
         (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
         (void)DrawDelaySetupOverlayGdi(screenContext, false);
@@ -422,7 +429,12 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
         (void)DrawJoiningOverlayGdi(screenContext, false);
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawDebugOverlay(screenContext);
-        return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
     }
     DrawAnimatedCompactMenuLayer(screenContext);
     (void)DrawDynamicFieldValuesGdi(screenContext, false);

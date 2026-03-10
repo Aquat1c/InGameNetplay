@@ -17,6 +17,7 @@ struct LockedMenuSurface
 };
 
 bool AcquireMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HWND* outWindow, bool allowWindowDc);
+bool AcquirePresentedMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HWND* outWindow, bool allowWindowDc);
 void ReleaseMenuDrawDc(HDC dc, void* surface, HWND window);
 
 bool AcquireMenuDrawSurfaceLock(uint32_t screenContext, LockedMenuSurface* outSurface);
@@ -35,4 +36,3 @@ uint8_t ResolveBestPaletteColor(
     int targetG,
     int targetB);
 }
-

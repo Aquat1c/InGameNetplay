@@ -309,6 +309,60 @@ bool AcquireMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HW
     return false;
 }
 
+bool AcquirePresentedMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HWND* outWindow, bool allowWindowDc)
+{
+    if (outDc == nullptr || outSurface == nullptr || outWindow == nullptr)
+    {
+        return false;
+    }
+
+    *outDc = nullptr;
+    *outSurface = nullptr;
+    *outWindow = nullptr;
+
+    const HWND hwnd = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+    if (hwnd != nullptr && IsWindow(hwnd))
+    {
+        *outWindow = hwnd;
+    }
+
+    const uint32_t graphicsContext = *reinterpret_cast<uint32_t*>(screenContext + kOffsetGraphicsContext);
+    if (graphicsContext != 0)
+    {
+        void* primarySurface = *reinterpret_cast<void**>(graphicsContext + kOffsetGraphicsPrimarySurface);
+        if (TryAcquireSurfaceDc(primarySurface, "primary", outDc))
+        {
+            *outSurface = primarySurface;
+            return true;
+        }
+    }
+
+    if (allowWindowDc)
+    {
+        if (*outWindow != nullptr)
+        {
+            HDC windowDc = GetDC(*outWindow);
+            if (windowDc != nullptr)
+            {
+                if (!g_drawLogState.windowDcFallback)
+                {
+                    mod::Log("AcquirePresentedMenuDrawDc: using window DC fallback");
+                    g_drawLogState.windowDcFallback = true;
+                }
+                *outDc = windowDc;
+                return true;
+            }
+        }
+    }
+
+    if (!g_drawLogState.surfaceDcUnavailable)
+    {
+        mod::Log("AcquirePresentedMenuDrawDc: no usable presented surface DC");
+        g_drawLogState.surfaceDcUnavailable = true;
+    }
+    return false;
+}
+
 void ReleaseMenuDrawDc(HDC dc, void* surface, HWND window)
 {
     if (dc == nullptr)
@@ -529,5 +583,3 @@ uint8_t ResolveBestPaletteColor(
     return static_cast<uint8_t>(bestIndex);
 }
 }
-
-

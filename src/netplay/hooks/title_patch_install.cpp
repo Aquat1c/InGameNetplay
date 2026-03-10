@@ -2,6 +2,7 @@
 
 #include "logger.h"
 #include "netplay/assets/assets.h"
+#include "netplay/core/battle_log_menu.h"
 
 namespace netplay
 {
@@ -200,6 +201,7 @@ void RemoveHooks()
     g_replaySelectionGuardFramesRemaining = 0;
     g_replaySelectionRestoreTarget = -1;
     g_replayCaseDispatchAddress = 0;
+    netplay::battle_log::ShutdownRenderOverlay();
     RemoveNetplayWindowHook();
     RestorePatches();
     g_hooksInstalled.store(false);

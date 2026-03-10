@@ -585,6 +585,8 @@ bool ParseEfzDatImage(const std::string& path, ParsedDatImage* outImage)
 
     outImage->width = width;
     outImage->height = height;
+    outImage->paletteEntryCount = 0;
+    outImage->palette = {};
     outImage->pixelsTopDown.resize(pixelCount);
 
     const uint8_t* srcPixels = bytes.data() + pixelOffset;
@@ -640,6 +642,8 @@ bool ParseEfzDatImage(const std::string& path, ParsedDatImage* outImage)
         const uint8_t b = bytes[base];
         const uint8_t g = bytes[base + 1u];
         const uint8_t r = bytes[base + 2u];
+        outImage->palette[i] = netplay::assets::ParsedDatImage::PaletteColor{r, g, b, true};
+        outImage->paletteEntryCount = i + 1u;
         if (r == 255u && g == 0u && b == 255u)
         {
             exactMagenta.push_back(static_cast<uint8_t>(i));

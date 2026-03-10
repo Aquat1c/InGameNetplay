@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,10 +23,20 @@ struct NetplayObjectProfile
 
 struct ParsedDatImage
 {
+    struct PaletteColor
+    {
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        bool present = false;
+    };
+
     int width = 0;
     int height = 0;
     uint8_t transparentIndex = 0;
     bool hasTransparentIndex = false;
+    size_t paletteEntryCount = 0;
+    std::array<PaletteColor, 256> palette = {};
     std::vector<uint8_t> pixelsTopDown;
 };
 

@@ -88,6 +88,7 @@ const netplay::menu::NetplayMenuSpec* GetMenuSpec();
 void ResetState();
 bool EnterMenu();
 void LeaveMenu();
+void ShutdownRenderOverlay();
 
 std::string BuildRowLabel(netplay::menu::NetplayMenuAction action);
 std::string BuildRowPrimaryText(netplay::menu::NetplayMenuAction action);
@@ -100,4 +101,5 @@ bool HandleCancel(uint32_t screenContext);
 bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action);
 
 bool DrawOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 }
