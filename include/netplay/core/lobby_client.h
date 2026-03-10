@@ -198,6 +198,8 @@ private:
     bool DoPreAccept(int challengerPlayerId);
     bool DoAccept(int challengerPlayerId);
     bool DoEnd();
+    bool TryRejoinIfNeeded();
+    bool HandleServerRemovalFailure(const char* operation, const std::string& body);
 
     // Discover our public IP address via an external service.
     void DiscoverPublicIp();
@@ -265,6 +267,7 @@ private:
 
     std::atomic<bool> m_shouldStop{false};
     std::atomic<bool> m_refreshRequested{false};
+    std::atomic<bool> m_rejoinRequested{false};
     std::atomic<bool> m_inBattle{false};
     std::atomic<bool> m_returningFromMatch{false};
     // true when we initiated the lobby match (sent the challenge);

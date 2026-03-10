@@ -1240,6 +1240,12 @@ bool IsJsonStatusOk(const std::string& json)
         || json.find("\"OK\"") != std::string::npos;
 }
 
+bool IsMissingLobbyFailure(const std::string& json)
+{
+    return json.find("Not in lobby") != std::string::npos
+        || json.find("No lobby found") != std::string::npos;
+}
+
 bool ExtractJsonStringValue(const std::string& json, const char* key, std::string* out)
 {
     if (key == nullptr || out == nullptr)
@@ -1736,6 +1742,15 @@ void LobbySession::RequestRefresh()
             m_status.inBattle = false;
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_status.pollState == PollState::Error)
+        {
+            m_status.pollState = PollState::Joining;
+            m_status.statusMessage = "Rejoining lobby...";
+            m_rejoinRequested.store(true);
+        }
+    }
     m_refreshRequested.store(true);
     if (m_wakeEvent != nullptr)
     {
@@ -1837,6 +1852,84 @@ void LobbySession::NotifyEndMatch()
     }
 }
 
+bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::string& body)
+{
+    if (IsJsonStatusOk(body) || !IsMissingLobbyFailure(body))
+    {
+        return false;
+    }
+
+    const std::string message = ExtractJsonMessage(body, "Lobby session expired");
+    mod::Log(
+        "%s: stale lobby session detected msg='%s' roomCode='%s' roomId=%d playerId=%d origin=%d -- scheduling rejoin",
+        operation != nullptr ? operation : "LobbySession",
+        message.c_str(),
+        m_joinedRoom.roomCode.c_str(),
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        static_cast<int>(m_joinedRoom.origin));
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::Joining;
+        m_status.statusMessage = "Rejoining lobby...";
+        m_status.idlePlayers.clear();
+        m_status.challenges.clear();
+        m_status.displayEntries.clear();
+        m_status.playing.clear();
+        m_status.inBattle = false;
+    }
+
+    m_pendingAcceptTargetId = 0;
+    m_rejoinRequested.store(true);
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+    return true;
+}
+
+bool LobbySession::TryRejoinIfNeeded()
+{
+    if (!m_rejoinRequested.exchange(false))
+    {
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::Joining;
+        if (m_status.statusMessage.empty())
+        {
+            m_status.statusMessage = "Rejoining lobby...";
+        }
+    }
+
+    mod::Log(
+        "LobbySession::TryRejoinIfNeeded: rejoining roomCode='%s' roomId=%d playerId=%d origin=%d",
+        m_joinedRoom.roomCode.c_str(),
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        static_cast<int>(m_joinedRoom.origin));
+
+    if (!DoJoin())
+    {
+        mod::Log(
+            "LobbySession::TryRejoinIfNeeded: rejoin failed roomCode='%s' origin=%d",
+            m_joinedRoom.roomCode.c_str(),
+            static_cast<int>(m_joinedRoom.origin));
+        return false;
+    }
+
+    mod::Log(
+        "LobbySession::TryRejoinIfNeeded: rejoined lobby id=%d playerId=%d roomCode='%s' origin=%d",
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.roomCode.c_str(),
+        static_cast<int>(m_joinedRoom.origin));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Background thread
 // ---------------------------------------------------------------------------
@@ -1892,15 +1985,43 @@ void LobbySession::PollThreadEntry()
 
         // Process any queued challenge/accept actions before polling.
         ProcessPendingActions();
+        if (m_shouldStop.load())
+        {
+            break;
+        }
+
+        if (!TryRejoinIfNeeded())
+        {
+            if (m_wakeEvent != nullptr)
+            {
+                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
+            }
+            else
+            {
+                Sleep(kPollIntervalMs);
+            }
+            continue;
+        }
 
         // CLIENT in an active match: skip polling to avoid "posting"
         // our presence to the lobby — only the host maintains lobby
         // visibility during a match.  We still process pending actions
         // above (e.g. ConfirmAccept, End) so the server is notified.
-        const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
-        if (!skipPoll)
+        bool allowPoll = true;
         {
-            DoPollStatus();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            allowPoll = (m_status.pollState != PollState::Error);
+        }
+        const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
+        if (!skipPoll && allowPoll)
+        {
+            if (!DoPollStatus() && m_rejoinRequested.load())
+            {
+                if (TryRejoinIfNeeded())
+                {
+                    (void)DoPollStatus();
+                }
+            }
         }
 
         // Wait for kPollIntervalMs or until woken early.
@@ -2031,6 +2152,19 @@ bool LobbySession::DoPollStatus()
     }
 
     mod::Log("LobbySession::DoPollStatus: response='%s'", body.c_str());
+
+    if (!IsJsonStatusOk(body))
+    {
+        if (HandleServerRemovalFailure("LobbySession::DoPollStatus", body))
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::Error;
+        m_status.statusMessage = ExtractJsonMessage(body, "Lobby status rejected by server");
+        return false;
+    }
 
     std::vector<LobbyPlayer> idlePlayers;
     ParseIdlePlayers(body, &idlePlayers);
@@ -2701,7 +2835,25 @@ bool LobbySession::DoEnd()
     const std::string body = DoHttpGet(path);
     mod::Log("LobbySession::DoEnd: response='%s'", body.c_str());
 
-    return !body.empty();
+    if (body.empty())
+    {
+        return false;
+    }
+
+    if (HandleServerRemovalFailure("LobbySession::DoEnd", body))
+    {
+        return false;
+    }
+
+    if (!IsJsonStatusOk(body))
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::Error;
+        m_status.statusMessage = ExtractJsonMessage(body, "End rejected by server");
+        return false;
+    }
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
