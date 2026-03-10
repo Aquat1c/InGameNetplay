@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/core/battle_log_menu.h"
 #include "netplay/core/options_menu.h"
 
 #include <cctype>
@@ -283,6 +284,15 @@ void DrawAnimatedCompactMenuLayer(uint32_t screenContext)
     DrawCompactMenuRows(screenContext, g_netplayMenuState.menuId, logicalSelection, 0);
 }
 
+void DrawNetplayBackgroundOnly(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
+
+    (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
+}
+
 void DrawNetplayBaseLayer(uint32_t screenContext)
 {
     auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
@@ -366,6 +376,19 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
 BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawDebugOverlay(screenContext);
+        return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    }
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
     // All overlays now draw via surface lock + pixel writes before present,
@@ -388,6 +411,19 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawDebugOverlay(screenContext);
+        return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    }
     DrawAnimatedCompactMenuLayer(screenContext);
     (void)DrawDynamicFieldValuesGdi(screenContext, false);
     (void)DrawFooterTooltipOverlayGdi(screenContext, false);

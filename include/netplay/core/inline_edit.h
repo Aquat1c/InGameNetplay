@@ -23,6 +23,7 @@ struct State
     bool active = false;
     netplay::menu::NetplayMenuAction action = netplay::menu::NetplayMenuAction::LeaveNetplay;
     std::string buffer;
+    size_t caretByteOffset = 0;
     std::array<uint8_t, 256> keyDown = {};
     bool caretVisible = true;
     DWORD lastCaretTick = 0;

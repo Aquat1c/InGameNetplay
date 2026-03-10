@@ -50,6 +50,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/core/text_utils.cpp
     src/netplay/core/validation.cpp
     src/netplay/hooks/menu_hooks.cpp
+    src/netplay/hooks/battle_log_menu.cpp
     src/netplay/hooks/options_menu.cpp
     src/netplay/hooks/player_rooms_menu.cpp
     src/netplay/hooks/title_assets.cpp

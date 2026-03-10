@@ -1,4 +1,5 @@
 #include "netplay/core/menu_model.h"
+#include "netplay/core/battle_log_menu.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
 
@@ -77,6 +78,8 @@ const char* MenuIdToString(NetplayMenuId menuId)
         return "Options";
     case NetplayMenuId::Lobby:
         return "Lobby";
+    case NetplayMenuId::BattleLog:
+        return "BattleLog";
     default:
         return "Unknown";
     }
@@ -122,6 +125,10 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
     if (menuId == NetplayMenuId::PlayerRooms)
     {
         return netplay::player_rooms::GetMenuSpec();
+    }
+    if (menuId == NetplayMenuId::BattleLog)
+    {
+        return netplay::battle_log::GetMenuSpec();
     }
 
     static const std::array<NetplayMenuSpec, 4> specs = {{
@@ -227,6 +234,60 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "OptionRow6";
     case NetplayMenuAction::OptionRow7:
         return "OptionRow7";
+    case NetplayMenuAction::BattleLogBrowseMine:
+        return "BattleLogBrowseMine";
+    case NetplayMenuAction::BattleLogSearchFilters:
+        return "BattleLogSearchFilters";
+    case NetplayMenuAction::BattleLogBrowseAll:
+        return "BattleLogBrowseAll";
+    case NetplayMenuAction::BattleLogRefresh:
+        return "BattleLogRefresh";
+    case NetplayMenuAction::BattleLogSession0:
+        return "BattleLogSession0";
+    case NetplayMenuAction::BattleLogSession1:
+        return "BattleLogSession1";
+    case NetplayMenuAction::BattleLogSession2:
+        return "BattleLogSession2";
+    case NetplayMenuAction::BattleLogSession3:
+        return "BattleLogSession3";
+    case NetplayMenuAction::BattleLogSession4:
+        return "BattleLogSession4";
+    case NetplayMenuAction::BattleLogSession5:
+        return "BattleLogSession5";
+    case NetplayMenuAction::BattleLogEditPlayerName:
+        return "BattleLogEditPlayerName";
+    case NetplayMenuAction::BattleLogEditOpponentName:
+        return "BattleLogEditOpponentName";
+    case NetplayMenuAction::BattleLogPlayerCharacter:
+        return "BattleLogPlayerCharacter";
+    case NetplayMenuAction::BattleLogOpponentCharacter:
+        return "BattleLogOpponentCharacter";
+    case NetplayMenuAction::BattleLogApplyFilters:
+        return "BattleLogApplyFilters";
+    case NetplayMenuAction::BattleLogResetFilters:
+        return "BattleLogResetFilters";
+    case NetplayMenuAction::BattleLogBrowserPrevPage:
+        return "BattleLogBrowserPrevPage";
+    case NetplayMenuAction::BattleLogBrowserNextPage:
+        return "BattleLogBrowserNextPage";
+    case NetplayMenuAction::BattleLogBrowserFilters:
+        return "BattleLogBrowserFilters";
+    case NetplayMenuAction::BattleLogGame0:
+        return "BattleLogGame0";
+    case NetplayMenuAction::BattleLogGame1:
+        return "BattleLogGame1";
+    case NetplayMenuAction::BattleLogGame2:
+        return "BattleLogGame2";
+    case NetplayMenuAction::BattleLogGame3:
+        return "BattleLogGame3";
+    case NetplayMenuAction::BattleLogGame4:
+        return "BattleLogGame4";
+    case NetplayMenuAction::BattleLogDetailPrevPage:
+        return "BattleLogDetailPrevPage";
+    case NetplayMenuAction::BattleLogDetailNextPage:
+        return "BattleLogDetailNextPage";
+    case NetplayMenuAction::BattleLogBack:
+        return "BattleLogBack";
     default:
         return "Unknown";
     }
@@ -263,13 +324,14 @@ int GetDefaultSelectionForMenu(NetplayMenuId menuId)
 
 bool ValidateMenuSpecs()
 {
-    constexpr std::array<NetplayMenuId, 6> kMenus = {
+    constexpr std::array<NetplayMenuId, 7> kMenus = {
         NetplayMenuId::Main,
         NetplayMenuId::Host,
         NetplayMenuId::Join,
         NetplayMenuId::PlayerRooms,
         NetplayMenuId::Options,
         NetplayMenuId::Lobby,
+        NetplayMenuId::BattleLog,
     };
 
     for (NetplayMenuId menuId : kMenus)
@@ -287,6 +349,10 @@ bool ValidateMenuSpecs()
         else if (menuId == NetplayMenuId::Options)
         {
             netplay::options::ResetState();
+        }
+        else if (menuId == NetplayMenuId::BattleLog)
+        {
+            netplay::battle_log::ResetState();
         }
 
         const NetplayMenuSpec* spec = GetMenuSpec(menuId);

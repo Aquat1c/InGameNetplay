@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/core/battle_log_menu.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
 #include "netplay/render/draw_surface.h"
@@ -44,6 +45,11 @@ std::string BuildMenuHeaderText()
 
 std::string BuildRowLabel(const NetplayMenuEntry& entry)
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        return netplay::battle_log::BuildRowLabel(entry.action);
+    }
+
     std::string value;
     switch (entry.action)
     {
@@ -188,6 +194,10 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
 
 std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        return netplay::battle_log::BuildRowPrimaryText(entry.action);
+    }
     if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms)
     {
         return netplay::player_rooms::BuildRowPrimaryText(entry.action);
@@ -201,6 +211,10 @@ std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
 
 std::string BuildRowSecondaryText(const NetplayMenuEntry& entry)
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        return netplay::battle_log::BuildRowSecondaryText(entry.action);
+    }
     if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms)
     {
         return netplay::player_rooms::BuildRowSecondaryText(entry.action);
@@ -449,6 +463,19 @@ std::string BuildFooterText()
         const NetplayMenuAction action =
             entry != nullptr ? entry->action : NetplayMenuAction::BackToMain;
         const std::string footer = netplay::options::BuildFooterText(action);
+        if (!footer.empty())
+        {
+            return footer;
+        }
+    }
+
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        const NetplayMenuEntry* entry = GetCurrentMenuEntry(
+            ClampSelectionToCurrentMenu(static_cast<int>(g_lastLoggedSelection >= 0 ? g_lastLoggedSelection : 0)));
+        const NetplayMenuAction action =
+            entry != nullptr ? entry->action : NetplayMenuAction::BattleLogBack;
+        const std::string footer = netplay::battle_log::BuildFooterText(action);
         if (!footer.empty())
         {
             return footer;

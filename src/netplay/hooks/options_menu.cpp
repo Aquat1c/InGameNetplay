@@ -74,6 +74,7 @@ struct EditState
     bool active = false;
     int itemIndex = -1;
     std::string buffer;
+    size_t caretByteOffset = 0;
     std::array<uint8_t, 256> keyDown = {};
     bool caretVisible = true;
     DWORD lastCaretTick = 0;
@@ -1601,6 +1602,95 @@ void EraseLastUtf8Codepoint(std::string& text)
     text.erase(i);
 }
 
+size_t ClampCaretOffset(const std::string& text, size_t offset)
+{
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t PrevUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset == 0)
+    {
+        return 0;
+    }
+    --offset;
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t NextUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    ++offset;
+    while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        ++offset;
+    }
+    return offset;
+}
+
+void TouchEditCaret()
+{
+    g_state.edit.caretVisible = true;
+    g_state.edit.lastCaretTick = GetTickCount();
+}
+
+void InsertEditBytes(const std::string& bytes)
+{
+    if (!g_state.edit.active || bytes.empty())
+    {
+        return;
+    }
+    const size_t caret = ClampCaretOffset(g_state.edit.buffer, g_state.edit.caretByteOffset);
+    g_state.edit.buffer.insert(caret, bytes);
+    g_state.edit.caretByteOffset = caret + bytes.size();
+    TouchEditCaret();
+}
+
+bool EraseCodepointBeforeCaret()
+{
+    const size_t caret = ClampCaretOffset(g_state.edit.buffer, g_state.edit.caretByteOffset);
+    if (caret == 0)
+    {
+        return false;
+    }
+    const size_t start = PrevUtf8Boundary(g_state.edit.buffer, caret);
+    g_state.edit.buffer.erase(start, caret - start);
+    g_state.edit.caretByteOffset = start;
+    TouchEditCaret();
+    return true;
+}
+
+bool EraseCodepointAtCaret()
+{
+    const size_t caret = ClampCaretOffset(g_state.edit.buffer, g_state.edit.caretByteOffset);
+    if (caret >= g_state.edit.buffer.size())
+    {
+        return false;
+    }
+    const size_t end = NextUtf8Boundary(g_state.edit.buffer, caret);
+    g_state.edit.buffer.erase(caret, end - caret);
+    g_state.edit.caretByteOffset = caret;
+    TouchEditCaret();
+    return true;
+}
+
 bool IsAllowedEditChar(const Item& item, char c)
 {
     const unsigned char uc = static_cast<unsigned char>(c);
@@ -1624,9 +1714,7 @@ void AppendEditChar(const Item& item, char c)
         return;
     }
 
-    g_state.edit.buffer.push_back(c);
-    g_state.edit.caretVisible = true;
-    g_state.edit.lastCaretTick = GetTickCount();
+    InsertEditBytes(std::string(1, c));
     ClearEditError();
 }
 
@@ -1706,6 +1794,7 @@ void BeginEdit(int itemIndex)
     g_state.edit.active = true;
     g_state.edit.itemIndex = itemIndex;
     g_state.edit.buffer = item.currentValue;
+    g_state.edit.caretByteOffset = g_state.edit.buffer.size();
     g_state.edit.caretVisible = true;
     g_state.edit.lastCaretTick = GetTickCount();
     PrimeEditKeys();
@@ -1838,13 +1927,18 @@ void ToggleValue(Item& item)
 std::string GetEditedDisplayValue(const Item& item)
 {
     std::string value = g_state.edit.buffer;
+    size_t caret = g_state.edit.caretByteOffset;
     if (value.empty())
     {
         value = item.kind == ItemKind::Integer ? "0" : "";
+        if (item.kind == ItemKind::Integer)
+        {
+            caret = value.size();
+        }
     }
     if (g_state.edit.caretVisible)
     {
-        value.push_back('_');
+        value.insert(ClampCaretOffset(value, caret), 1, '_');
     }
     return value;
 }
@@ -1860,6 +1954,7 @@ bool HandleEditInput(uint32_t screenContext, const uint8_t* inputBytes, bool* es
     {
         *escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     }
+    (void)inputBytes;
 
     const int itemIndex = g_state.edit.itemIndex;
     if (itemIndex < 0 || itemIndex >= static_cast<int>(g_state.items.size()))
@@ -1870,28 +1965,6 @@ bool HandleEditInput(uint32_t screenContext, const uint8_t* inputBytes, bool* es
 
     const Item& item = g_state.items[static_cast<size_t>(itemIndex)];
     UpdateCaretBlink();
-
-    for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
-    {
-        if (inputBytes[playerIndex + 18] == 1)
-        {
-            hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
-            CancelEdit();
-            return true;
-        }
-        if (inputBytes[playerIndex + 16] == 1)
-        {
-            if (CommitEdit())
-            {
-                hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
-            }
-            else
-            {
-                hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
-            }
-            return true;
-        }
-    }
 
     if (ConsumeEditKeyEdge(VK_ESCAPE))
     {
@@ -1914,20 +1987,39 @@ bool HandleEditInput(uint32_t screenContext, const uint8_t* inputBytes, bool* es
     }
 
     bool changed = false;
-    if (ConsumeEditKeyEdge(VK_BACK) || ConsumeEditKeyEdge(VK_DELETE))
+    if (ConsumeEditKeyEdge(VK_LEFT))
     {
-        if (!g_state.edit.buffer.empty())
+        g_state.edit.caretByteOffset = PrevUtf8Boundary(g_state.edit.buffer, g_state.edit.caretByteOffset);
+        TouchEditCaret();
+    }
+    if (ConsumeEditKeyEdge(VK_RIGHT))
+    {
+        g_state.edit.caretByteOffset = NextUtf8Boundary(g_state.edit.buffer, g_state.edit.caretByteOffset);
+        TouchEditCaret();
+    }
+    if (ConsumeEditKeyEdge(VK_HOME))
+    {
+        g_state.edit.caretByteOffset = 0;
+        TouchEditCaret();
+    }
+    if (ConsumeEditKeyEdge(VK_END))
+    {
+        g_state.edit.caretByteOffset = g_state.edit.buffer.size();
+        TouchEditCaret();
+    }
+
+    if (ConsumeEditKeyEdge(VK_BACK))
+    {
+        if (EraseCodepointBeforeCaret())
         {
-            if (item.kind == ItemKind::Integer)
-            {
-                g_state.edit.buffer.pop_back();
-            }
-            else
-            {
-                EraseLastUtf8Codepoint(g_state.edit.buffer);
-            }
-            g_state.edit.caretVisible = true;
-            g_state.edit.lastCaretTick = GetTickCount();
+            ClearEditError();
+            changed = true;
+        }
+    }
+    if (ConsumeEditKeyEdge(VK_DELETE))
+    {
+        if (EraseCodepointAtCaret())
+        {
             ClearEditError();
             changed = true;
         }

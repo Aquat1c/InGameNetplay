@@ -151,7 +151,26 @@ void StartMenuSlideTransition(uint32_t screenContext, NetplayMenuId targetMenu, 
 
     const int currentSelection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
     const int resolvedTargetSelection = (targetSelection < 0) ? GetDefaultSelectionForMenu(targetMenu) : targetSelection;
+    const bool bypassNativeSlide =
+        (g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+            || targetMenu == NetplayMenuId::BattleLog);
     auto const performSlide = reinterpret_cast<int(__thiscall*)(void*, unsigned char)>(RuntimeAddress(kVaPerformSlideAnimation));
+
+    if (bypassNativeSlide)
+    {
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        *reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter) = 0;
+        *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY) = 0;
+        mod::Log(
+            "NetplaySlide(native): bypass from=%s(%d) to=%s(%d)",
+            MenuIdToString(g_netplayMenuState.menuId),
+            currentSelection,
+            MenuIdToString(targetMenu),
+            resolvedTargetSelection);
+        SwitchToMenu(screenContext, targetMenu, resolvedTargetSelection);
+        return;
+    }
 
     g_menuSlideTransition.active = true;
     g_menuSlideTransition.fromMenu = g_netplayMenuState.menuId;

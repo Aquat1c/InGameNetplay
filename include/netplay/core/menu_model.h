@@ -33,6 +33,7 @@ enum class NetplayMenuId : uint8_t
     PlayerRooms = 3,
     Options = 4,
     Lobby = 5,
+    BattleLog = 6,
 };
 
 enum class NetplayMenuAction : uint8_t
@@ -79,6 +80,34 @@ enum class NetplayMenuAction : uint8_t
     OptionRow5 = 36,
     OptionRow6 = 37,
     OptionRow7 = 38,
+    // Battle Log summary/browser/filter/detail rows.
+    BattleLogBrowseMine = 39,
+    BattleLogSearchFilters = 40,
+    BattleLogBrowseAll = 41,
+    BattleLogRefresh = 42,
+    BattleLogSession0 = 43,
+    BattleLogSession1 = 44,
+    BattleLogSession2 = 45,
+    BattleLogSession3 = 46,
+    BattleLogSession4 = 47,
+    BattleLogSession5 = 48,
+    BattleLogEditPlayerName = 49,
+    BattleLogEditOpponentName = 50,
+    BattleLogPlayerCharacter = 51,
+    BattleLogOpponentCharacter = 52,
+    BattleLogApplyFilters = 53,
+    BattleLogResetFilters = 54,
+    BattleLogBrowserPrevPage = 55,
+    BattleLogBrowserNextPage = 56,
+    BattleLogBrowserFilters = 57,
+    BattleLogGame0 = 58,
+    BattleLogGame1 = 59,
+    BattleLogGame2 = 60,
+    BattleLogGame3 = 61,
+    BattleLogGame4 = 62,
+    BattleLogDetailPrevPage = 63,
+    BattleLogDetailNextPage = 64,
+    BattleLogBack = 65,
 };
 
 constexpr NetplayMenuAction PlayerRoomsSlotAction(int slot)
@@ -98,8 +127,22 @@ constexpr NetplayMenuAction OptionVisibleAction(int slot)
     return static_cast<NetplayMenuAction>(static_cast<int>(NetplayMenuAction::OptionRow0) + slot);
 }
 
+constexpr NetplayMenuAction BattleLogSessionAction(int slot)
+{
+    return static_cast<NetplayMenuAction>(
+        static_cast<int>(NetplayMenuAction::BattleLogSession0) + slot);
+}
+
+constexpr NetplayMenuAction BattleLogGameAction(int slot)
+{
+    return static_cast<NetplayMenuAction>(
+        static_cast<int>(NetplayMenuAction::BattleLogGame0) + slot);
+}
+
 constexpr int kLobbyMaxDisplayPlayers = 6;
 constexpr int kLobbyMaxPlayingPairs   = 1;
+constexpr int kBattleLogVisibleSessionRows = 6;
+constexpr int kBattleLogVisibleGameRows = 5;
 
 struct NetplayMenuEntry
 {

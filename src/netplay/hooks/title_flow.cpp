@@ -2,6 +2,7 @@
 #include "netplay/assets/assets.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/battle_log_menu.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
@@ -1511,6 +1512,10 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         netplay::options::LeaveMenu();
     }
+    if (previousMenu == NetplayMenuId::BattleLog && menuId != NetplayMenuId::BattleLog)
+    {
+        netplay::battle_log::LeaveMenu();
+    }
     if (previousMenu == NetplayMenuId::PlayerRooms
         && menuId != NetplayMenuId::PlayerRooms
         && menuId != NetplayMenuId::Lobby)
@@ -1538,6 +1543,11 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         const bool loaded = netplay::options::EnterMenu();
         mod::Log("SwitchToMenu: entering Options loaded=%d", loaded ? 1 : 0);
+    }
+    if (menuId == NetplayMenuId::BattleLog)
+    {
+        const bool loaded = netplay::battle_log::EnterMenu();
+        mod::Log("SwitchToMenu: entering BattleLog loaded=%d", loaded ? 1 : 0);
     }
     if (menuId == NetplayMenuId::PlayerRooms)
     {
@@ -1645,6 +1655,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
         return;
     }
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+        && netplay::battle_log::ExecuteAction(screenContext, action))
+    {
+        return;
+    }
     if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
         && netplay::player_rooms::ExecuteAction(screenContext, action))
     {
@@ -1671,7 +1686,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         break;
     case NetplayMenuAction::OpenBattleLog:
         g_netplayMenuState.mainSelection = logicalSelection;
-        ShowStubActionMessage(owner, "Battle Log UI is not implemented yet.");
+        StartMenuSlideTransition(screenContext, NetplayMenuId::BattleLog, -1, +1);
         break;
     case NetplayMenuAction::OpenOptions:
         g_netplayMenuState.mainSelection = logicalSelection;
@@ -2178,6 +2193,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if (windowFocused
         && g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
         && netplay::player_rooms::HandleInput(screenContext, inputBytes, inactivityCounter))
+    {
+        return 0;
+    }
+
+    if (windowFocused
+        && g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+        && netplay::battle_log::HandleInput(screenContext, inputBytes, inactivityCounter))
     {
         return 0;
     }
@@ -2723,6 +2745,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             LeaveNetplayMenu(screenContext);
         }
+        else if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+            && netplay::battle_log::HandleCancel(screenContext))
+        {
+        }
         else if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
             && netplay::player_rooms::HandleCancel(screenContext))
         {
@@ -2857,6 +2883,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
             if (g_netplayMenuState.menuId == NetplayMenuId::Main)
             {
                 LeaveNetplayMenu(screenContext);
+            }
+            else if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+                && netplay::battle_log::HandleCancel(screenContext))
+            {
             }
             else if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
                 && netplay::player_rooms::HandleCancel(screenContext))

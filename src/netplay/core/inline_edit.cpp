@@ -78,6 +78,107 @@ void EraseLastUtf8Codepoint(std::string& s)
     s.erase(i);
 }
 
+size_t ClampCaretOffset(const std::string& text, size_t offset)
+{
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t PrevUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset == 0)
+    {
+        return 0;
+    }
+    --offset;
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t NextUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    ++offset;
+    while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        ++offset;
+    }
+    return offset;
+}
+
+void TouchCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return;
+    }
+    state->caretVisible = true;
+    state->lastCaretTick = GetTickCount();
+}
+
+void InsertBytesAtCaret(netplay::inline_edit::State* state, const std::string& bytes)
+{
+    if (state == nullptr || bytes.empty())
+    {
+        return;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    state->buffer.insert(caret, bytes);
+    state->caretByteOffset = caret + bytes.size();
+    TouchCaret(state);
+}
+
+bool EraseCodepointBeforeCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return false;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    if (caret == 0)
+    {
+        return false;
+    }
+    const size_t start = PrevUtf8Boundary(state->buffer, caret);
+    state->buffer.erase(start, caret - start);
+    state->caretByteOffset = start;
+    TouchCaret(state);
+    return true;
+}
+
+bool EraseCodepointAtCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return false;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    if (caret >= state->buffer.size())
+    {
+        return false;
+    }
+    const size_t end = NextUtf8Boundary(state->buffer, caret);
+    state->buffer.erase(caret, end - caret);
+    state->caretByteOffset = caret;
+    TouchCaret(state);
+    return true;
+}
+
 // Append a UTF-8 string to the edit buffer, respecting per-byte and per-action checks.
 void TryAppendUtf8String(netplay::inline_edit::State* state, const std::string& utf8)
 {
@@ -97,10 +198,8 @@ void TryAppendUtf8String(netplay::inline_edit::State* state, const std::string& 
         {
             break;
         }
-        state->buffer.push_back(c);
+        InsertBytesAtCaret(state, std::string(1, c));
     }
-    state->caretVisible = true;
-    state->lastCaretTick = GetTickCount();
 }
 
 // Convert a wchar_t (from WM_CHAR) to UTF-8.
@@ -286,9 +385,7 @@ void TryAppendChar(netplay::inline_edit::State* state, char c)
         return;
     }
 
-    state->buffer.push_back(c);
-    state->caretVisible = true;
-    state->lastCaretTick = GetTickCount();
+    InsertBytesAtCaret(state, std::string(1, c));
     ClearError(state);
 }
 
@@ -429,6 +526,7 @@ void BeginEdit(State* state, NetplayMenuAction action, const Values& values)
     state->active = true;
     state->action = action;
     state->buffer = initialValue;
+    state->caretByteOffset = state->buffer.size();
     state->caretVisible = true;
     state->lastCaretTick = GetTickCount();
     ClearError(state);
@@ -465,7 +563,8 @@ bool GetDisplayValue(
         *outValue = state.buffer;
         if (includeCaret && state.caretVisible)
         {
-            outValue->push_back('_');
+            const size_t caret = ClampCaretOffset(*outValue, state.caretByteOffset);
+            outValue->insert(caret, 1, '_');
         }
     }
     return true;
@@ -505,20 +604,39 @@ InputResult HandleInput(
     }
 
     bool changed = false;
-    if (ConsumeKeyEdge(state, VK_BACK) || ConsumeKeyEdge(state, VK_DELETE))
+    if (ConsumeKeyEdge(state, VK_LEFT))
     {
-        if (!state->buffer.empty())
+        state->caretByteOffset = PrevUtf8Boundary(state->buffer, state->caretByteOffset);
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_RIGHT))
+    {
+        state->caretByteOffset = NextUtf8Boundary(state->buffer, state->caretByteOffset);
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_HOME))
+    {
+        state->caretByteOffset = 0;
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_END))
+    {
+        state->caretByteOffset = state->buffer.size();
+        TouchCaret(state);
+    }
+
+    if (ConsumeKeyEdge(state, VK_BACK))
+    {
+        if (EraseCodepointBeforeCaret(state))
         {
-            if (state->action == NetplayMenuAction::NicknameEdit)
-            {
-                EraseLastUtf8Codepoint(state->buffer);
-            }
-            else
-            {
-                state->buffer.pop_back();
-            }
-            state->caretVisible = true;
-            state->lastCaretTick = GetTickCount();
+            ClearError(state);
+            changed = true;
+        }
+    }
+    if (ConsumeKeyEdge(state, VK_DELETE))
+    {
+        if (EraseCodepointAtCaret(state))
+        {
             ClearError(state);
             changed = true;
         }
@@ -612,4 +730,3 @@ InputResult HandleInput(
     return InputResult::Consumed;
 }
 }
-
