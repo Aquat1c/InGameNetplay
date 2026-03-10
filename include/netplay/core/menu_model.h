@@ -4,18 +4,20 @@
 
 namespace netplay::menu
 {
-constexpr int kConfigOptionCount = 8;
+constexpr int kConfigOptionCount = 10;
 
 enum class NetplayObRow : uint8_t
 {
     Host = 0,
     Join = 1,
-    Nickname = 2,
-    Address = 3,
-    Port = 4,
-    Reserved5 = 5,
-    Reserved6 = 6,
-    ReturnToTitle = 7,
+    PlayerRooms = 2,
+    Lobby = 3,
+    BattleLog = 4,
+    Options = 5,
+    Address = 6,
+    Port = 7,
+    Blank = 8,
+    ReturnToTitle = 9,
 };
 
 constexpr int RowToIndex(NetplayObRow row)
@@ -28,7 +30,7 @@ enum class NetplayMenuId : uint8_t
     Main = 0,
     Host = 1,
     Join = 2,
-    Nickname = 3,
+    Options = 3,
     Lobby = 4,
 };
 
@@ -36,24 +38,26 @@ enum class NetplayMenuAction : uint8_t
 {
     OpenHost = 0,
     OpenJoin = 1,
-    OpenNickname = 2,
-    LeaveNetplay = 3,
-    HostStart = 4,
-    HostEditPort = 5,
-    BackToMain = 6,
-    JoinConnect = 7,
-    JoinEditAddress = 8,
-    JoinEditPort = 9,
-    NicknameEdit = 10,
+    OpenPlayerRooms = 2,
+    OpenLobby = 3,
+    OpenBattleLog = 4,
+    OpenOptions = 5,
+    LeaveNetplay = 6,
+    HostStart = 7,
+    HostEditPort = 8,
+    BackToMain = 9,
+    JoinConnect = 10,
+    JoinEditAddress = 11,
+    JoinEditPort = 12,
+    NicknameEdit = 13,
     // Lobby browser
-    OpenLobby = 11,
-    LobbySlot0 = 12,
-    LobbySlot1 = 13,
-    LobbySlot2 = 14,
-    LobbySlot3 = 15,
-    LobbySlot4 = 16,
-    LobbySlot5 = 17,
-    LobbyPlaying0 = 18, // playing-pair display row (non-interactive)
+    LobbySlot0 = 14,
+    LobbySlot1 = 15,
+    LobbySlot2 = 16,
+    LobbySlot3 = 17,
+    LobbySlot4 = 18,
+    LobbySlot5 = 19,
+    LobbyPlaying0 = 20, // playing-pair display row (non-interactive)
 };
 
 // Returns the LobbySlotN action for a given zero-based slot index [0, kLobbyMaxDisplayPlayers).
@@ -99,4 +103,3 @@ bool ValidateMenuSpecs();
 // only included in the entry list when this is greater than zero.
 void RebuildLobbyMenuEntries(int idleCount, int playingCount);
 }
-

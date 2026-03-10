@@ -35,8 +35,14 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
         return "HOST";
     case NetplayMenuAction::OpenJoin:
         return "JOIN";
-    case NetplayMenuAction::OpenNickname:
-        return "CHANGE NICKNAME";
+    case NetplayMenuAction::OpenPlayerRooms:
+        return "PLAYER ROOMS";
+    case NetplayMenuAction::OpenLobby:
+        return "LOBBY";
+    case NetplayMenuAction::OpenBattleLog:
+        return "BATTLE LOG";
+    case NetplayMenuAction::OpenOptions:
+        return "OPTIONS";
     case NetplayMenuAction::LeaveNetplay:
         return "RETURN TO TITLE";
     case NetplayMenuAction::HostStart:
@@ -69,8 +75,6 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
             return "NAME: " + value;
         }
         return "NAME";
-    case NetplayMenuAction::OpenLobby:
-        return "LOBBY";
     case NetplayMenuAction::LobbyPlaying0:
     {
         // Show the playing pair at index 0 in a compact VS format.
@@ -148,85 +152,238 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     }
 }
 
+namespace
+{
+std::string BuildActionTooltip(NetplayMenuAction action)
+{
+    switch (action)
+    {
+    case NetplayMenuAction::OpenHost:
+        return "Host a direct match.";
+    case NetplayMenuAction::OpenJoin:
+        return "Configure a direct host connection.\nPress C to paste IP:PORT.";
+    case NetplayMenuAction::OpenPlayerRooms:
+        return "Browse public and private player rooms.";
+    case NetplayMenuAction::OpenLobby:
+        return "Enter the global lobby player list.";
+    case NetplayMenuAction::OpenBattleLog:
+        return "Browse and search BattleLog.txt.";
+    case NetplayMenuAction::OpenOptions:
+        return "Adjust netplay settings.\nSaved in EfzRevival.ini.";
+    case NetplayMenuAction::LeaveNetplay:
+        return "Return to the title screen.";
+    case NetplayMenuAction::HostStart:
+        return "Begin hosting on the selected port.";
+    case NetplayMenuAction::HostEditPort:
+        return "Set the port other players will use.";
+    case NetplayMenuAction::JoinConnect:
+        return "Connect to the host using the settings below.\nPress C to paste IP:PORT.";
+    case NetplayMenuAction::JoinEditAddress:
+        return "Set the host address.\nPress C to paste IP:PORT.";
+    case NetplayMenuAction::JoinEditPort:
+        return "Set the host port.\nPress C to paste IP:PORT.";
+    case NetplayMenuAction::NicknameEdit:
+        return "Update the nickname shown in lobbies and online matches.";
+    case NetplayMenuAction::BackToMain:
+        return "Return to the netplay main menu.";
+    case NetplayMenuAction::LobbyPlaying0:
+        return "Spectate the highlighted live match.";
+    case NetplayMenuAction::LobbySlot0:
+    case NetplayMenuAction::LobbySlot1:
+    case NetplayMenuAction::LobbySlot2:
+    case NetplayMenuAction::LobbySlot3:
+    case NetplayMenuAction::LobbySlot4:
+    case NetplayMenuAction::LobbySlot5:
+        return "Inspect this lobby entry.";
+    default:
+        return {};
+    }
+}
+
+bool IsLobbySlotAction(NetplayMenuAction action)
+{
+    return action >= NetplayMenuAction::LobbySlot0
+        && action <= NetplayMenuAction::LobbySlot5;
+}
+
+std::string BuildLobbyRowTooltip(const NetplayMenuEntry& entry)
+{
+    if (entry.action == NetplayMenuAction::LobbyPlaying0)
+    {
+        return "Spectate the highlighted live match.";
+    }
+
+    if (!IsLobbySlotAction(entry.action))
+    {
+        return {};
+    }
+
+    if (!g_lobbySession)
+    {
+        return "Refreshing lobby status.";
+    }
+
+    const auto status = g_lobbySession->GetStatus();
+    const int visSlot =
+        static_cast<int>(entry.action) - static_cast<int>(NetplayMenuAction::LobbySlot0);
+    const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
+    if (realSlot < 0 || realSlot >= static_cast<int>(status.displayEntries.size()))
+    {
+        return "Refreshing lobby status.";
+    }
+
+    const auto& displayEntry = status.displayEntries[realSlot];
+    if (displayEntry.isSelf)
+    {
+        return "This is your current lobby entry.";
+    }
+    if (displayEntry.isChallenge)
+    {
+        return "Accept this player's challenge.";
+    }
+    if (displayEntry.isPlaying)
+    {
+        return "Spectate this player's live match.";
+    }
+    return "Challenge this idle player to a match.";
+}
+
+std::string BuildEntryTooltip(const NetplayMenuEntry& entry)
+{
+    if (const std::string dynamicTooltip = BuildLobbyRowTooltip(entry);
+        !dynamicTooltip.empty())
+    {
+        return dynamicTooltip;
+    }
+    return BuildActionTooltip(entry.action);
+}
+
+void DrawTooltipTextLines(
+    const netplay::font::IndexedSurfaceView& surface,
+    const std::string& text,
+    int left,
+    int right,
+    int panelTop,
+    uint8_t color)
+{
+    const size_t newline = text.find('\n');
+    if (newline == std::string::npos)
+    {
+        netplay::font::DrawTextLeft5x7(
+            surface,
+            text,
+            left,
+            right,
+            panelTop + ((netplay::constants::kNetplayFooterPanelHeight - 7) / 2),
+            1,
+            1,
+            color);
+        return;
+    }
+
+    const std::string line1 = text.substr(0, newline);
+    const std::string line2 = text.substr(newline + 1);
+    netplay::font::DrawTextLeft5x7(surface, line1, left, right, panelTop + 3, 1, 1, color);
+    netplay::font::DrawTextLeft5x7(surface, line2, left, right, panelTop + 10, 1, 1, color);
+}
+}
+
 std::string BuildFooterText()
 {
     if (g_inlineEditState.active)
     {
         if (!g_inlineEditState.errorMessage.empty() && GetTickCount() < g_inlineEditState.errorExpireTick)
         {
-            return g_inlineEditState.errorMessage + "  ENTER=SAVE ESC=CANCEL";
+            return g_inlineEditState.errorMessage + "  Enter=Save Esc=Cancel";
         }
 
         switch (g_inlineEditState.action)
         {
         case NetplayMenuAction::HostEditPort:
-            return "EDIT HOST PORT  ENTER=SAVE ESC=CANCEL";
+            return "Edit host port\nEnter=Save Esc=Cancel";
         case NetplayMenuAction::JoinEditAddress:
-            return "EDIT JOIN ADDRESS  ENTER=SAVE ESC=CANCEL";
+            return "Edit host address\nEnter=Save Esc=Cancel Ctrl+V=Paste";
         case NetplayMenuAction::JoinEditPort:
-            return "EDIT JOIN PORT  ENTER=SAVE ESC=CANCEL";
+            return "Edit host port\nEnter=Save Esc=Cancel Ctrl+V=Paste";
         case NetplayMenuAction::NicknameEdit:
-            return "EDIT NICKNAME  ENTER=SAVE ESC=CANCEL";
+            return "Edit nickname\nEnter=Save Esc=Cancel Ctrl+V=Paste";
         default:
-            return "ENTER=SAVE ESC=CANCEL";
+            return "Enter=Save Esc=Cancel";
         }
     }
 
-    char buffer[256] = {};
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const auto bridgePhase = static_cast<netplay::bridge::NetbridgePhase>(bridgeStatus.phase);
-    if (bridgePhase != netplay::bridge::NetbridgePhase::Idle)
+    if (bridgePhase != netplay::bridge::NetbridgePhase::Idle
+        || g_delaySetupOverlay.active
+        || g_spectateConfirmOverlay.active
+        || g_hostingOverlay.active
+        || g_joiningOverlay.active)
     {
-        netplay::bridge::BuildStatusLine(bridgeStatus, buffer, sizeof(buffer));
-        return buffer;
+        return {};
     }
 
-    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby)
+    if (const NetplayMenuEntry* entry = GetCurrentMenuEntry(
+            ClampSelectionToCurrentMenu(static_cast<int>(g_lastLoggedSelection >= 0 ? g_lastLoggedSelection : 0)));
+        entry != nullptr)
     {
-        if (!g_lobbySession)
+        const std::string tip = BuildEntryTooltip(*entry);
+        if (!tip.empty())
         {
-            return "Not connected";
-        }
-        const auto status = g_lobbySession->GetStatus();
-        switch (status.pollState)
-        {
-        case netplay::lobby::PollState::Joining:
-            return "Connecting to lobby...";
-        case netplay::lobby::PollState::Polling:
-        {
-            const int challengeCount = static_cast<int>(status.challenges.size());
-            const int idleCount = static_cast<int>(status.idlePlayers.size());
-            const int matchCount = static_cast<int>(status.playing.size());
-            if (challengeCount > 0)
-            {
-                snprintf(buffer, sizeof(buffer),
-                    "%d idle  %d challenge  %d match  R=REFRESH  ESC=BACK",
-                    idleCount, challengeCount, matchCount);
-            }
-            else
-            {
-                snprintf(buffer, sizeof(buffer),
-                    "%d idle  %d match  R=REFRESH  CONFIRM=Challenge  ESC=BACK",
-                    idleCount, matchCount);
-            }
-            return buffer;
-        }
-        case netplay::lobby::PollState::Error:
-            snprintf(buffer, sizeof(buffer), "Lobby error: %s", status.statusMessage.c_str());
-            return buffer;
-        default:
-            return "Idle";
+            return tip;
         }
     }
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "Nick: %s   Host:%u   Join:%s:%u",
-        g_netplayMenuState.nickname.c_str(),
-        static_cast<unsigned>(g_netplayMenuState.hostPort),
-        g_netplayMenuState.joinAddress.c_str(),
-        static_cast<unsigned>(g_netplayMenuState.joinPort));
-    return buffer;
+    return {};
+}
+
+bool DrawFooterTooltipOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
+{
+    if (!g_netplayMenuState.active)
+    {
+        return false;
+    }
+
+    const std::string tooltip = BuildFooterText();
+    if (tooltip.empty())
+    {
+        return false;
+    }
+
+    netplay::draw::LockedMenuSurface lockedSurface;
+    if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
+    {
+        return false;
+    }
+
+    const netplay::font::IndexedSurfaceView sv = {
+        lockedSurface.pixels,
+        lockedSurface.width,
+        lockedSurface.height,
+        lockedSurface.pitch,
+    };
+
+    const uint8_t bgColor = netplay::draw::ResolveBestPaletteColor(screenContext, 0, 0, 0);
+    const uint8_t frameColor = netplay::draw::ResolveBestPaletteColor(screenContext, 220, 220, 220);
+    const uint8_t textColor = netplay::draw::ResolveBestPaletteColor(screenContext, 208, 208, 208);
+
+    const int panelX = netplay::constants::kNetplayFooterTextLeft - 6;
+    const int panelY = netplay::constants::kNetplayFooterPanelTopY;
+    const int panelW =
+        (netplay::constants::kNetplayFooterTextRight - netplay::constants::kNetplayFooterTextLeft) + 12;
+    const int panelH = netplay::constants::kNetplayFooterPanelHeight;
+
+    netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
+    netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+    DrawTooltipTextLines(
+        sv,
+        tooltip,
+        netplay::constants::kNetplayFooterTextLeft,
+        netplay::constants::kNetplayFooterTextRight,
+        panelY,
+        textColor);
+
+    netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
+    return true;
 }
 
 HFONT GetMenuOverlayFont()

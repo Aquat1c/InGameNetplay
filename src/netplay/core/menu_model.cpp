@@ -7,11 +7,13 @@
 
 namespace netplay::menu
 {
-constexpr std::array<NetplayMenuEntry, 5> kMainMenuEntries = {{
+constexpr std::array<NetplayMenuEntry, 7> kMainMenuEntries = {{
     {NetplayMenuAction::OpenHost,     RowToIndex(NetplayObRow::Host),         "HOST"},
     {NetplayMenuAction::OpenJoin,     RowToIndex(NetplayObRow::Join),         "JOIN"},
-    {NetplayMenuAction::OpenLobby,    RowToIndex(NetplayObRow::Reserved5),    "LOBBY"},
-    {NetplayMenuAction::OpenNickname, RowToIndex(NetplayObRow::Nickname),     "CHANGE_NICKNAME"},
+    {NetplayMenuAction::OpenPlayerRooms, RowToIndex(NetplayObRow::PlayerRooms), "PLAYER_ROOMS"},
+    {NetplayMenuAction::OpenLobby,    RowToIndex(NetplayObRow::Lobby),        "LOBBY"},
+    {NetplayMenuAction::OpenBattleLog, RowToIndex(NetplayObRow::BattleLog),   "BATTLE_LOG"},
+    {NetplayMenuAction::OpenOptions,  RowToIndex(NetplayObRow::Options),      "OPTIONS"},
     {NetplayMenuAction::LeaveNetplay, RowToIndex(NetplayObRow::ReturnToTitle),"RETURN_TO_TITLE"},
 }};
 
@@ -28,8 +30,8 @@ constexpr std::array<NetplayMenuEntry, 4> kJoinMenuEntries = {{
     {NetplayMenuAction::BackToMain, RowToIndex(NetplayObRow::ReturnToTitle), "BACK"},
 }};
 
-constexpr std::array<NetplayMenuEntry, 2> kNicknameMenuEntries = {{
-    {NetplayMenuAction::NicknameEdit, RowToIndex(NetplayObRow::Nickname), "NICKNAME_EDIT"},
+constexpr std::array<NetplayMenuEntry, 2> kOptionsMenuEntries = {{
+    {NetplayMenuAction::NicknameEdit, RowToIndex(NetplayObRow::Options), "OPTIONS_NAME"},
     {NetplayMenuAction::BackToMain, RowToIndex(NetplayObRow::ReturnToTitle), "BACK"},
 }};
 
@@ -43,10 +45,10 @@ static NetplayMenuSpec  s_lobbyDynSpec = {
 void RebuildLobbyMenuEntries(int idleCount, int playingCount)
 {
     const int visSlots = std::min(idleCount, kLobbyMaxDisplayPlayers);
-    // All player/playing rows use Reserved6 (blank bar from the sprite sheet).
+    // All player/playing rows use the dedicated blank bar from the sprite sheet.
     // The actual label text is drawn on top by DrawDynamicFieldValuesGdi.
     // BackToMain uses ReturnToTitle so the "RETURN TO TITLE" bar is shown.
-    constexpr int kBlankRow  = RowToIndex(NetplayObRow::Reserved6);
+    constexpr int kBlankRow  = RowToIndex(NetplayObRow::Blank);
     constexpr int kBackRow   = RowToIndex(NetplayObRow::ReturnToTitle);
     int idx = 0;
     for (int s = 0; s < visSlots; ++s)
@@ -72,8 +74,8 @@ const char* MenuIdToString(NetplayMenuId menuId)
         return "Host";
     case NetplayMenuId::Join:
         return "Join";
-    case NetplayMenuId::Nickname:
-        return "Nickname";
+    case NetplayMenuId::Options:
+        return "Options";
     case NetplayMenuId::Lobby:
         return "Lobby";
     default:
@@ -89,16 +91,20 @@ const char* RowIndexToString(int rowIndex)
         return "ROW_HOST";
     case RowToIndex(NetplayObRow::Join):
         return "ROW_JOIN";
-    case RowToIndex(NetplayObRow::Nickname):
-        return "ROW_NICKNAME";
+    case RowToIndex(NetplayObRow::PlayerRooms):
+        return "ROW_PLAYER_ROOMS";
+    case RowToIndex(NetplayObRow::Lobby):
+        return "ROW_LOBBY";
+    case RowToIndex(NetplayObRow::BattleLog):
+        return "ROW_BATTLE_LOG";
+    case RowToIndex(NetplayObRow::Options):
+        return "ROW_OPTIONS";
     case RowToIndex(NetplayObRow::Address):
         return "ROW_ADDRESS";
     case RowToIndex(NetplayObRow::Port):
         return "ROW_PORT";
-    case RowToIndex(NetplayObRow::Reserved5):
-        return "ROW_RESERVED5";
-    case RowToIndex(NetplayObRow::Reserved6):
-        return "ROW_RESERVED6";
+    case RowToIndex(NetplayObRow::Blank):
+        return "ROW_BLANK";
     case RowToIndex(NetplayObRow::ReturnToTitle):
         return "ROW_RETURN";
     default:
@@ -119,7 +125,7 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
         {NetplayMenuId::Main,     "NETPLAY SETTINGS", kMainMenuEntries.data(),     static_cast<int>(kMainMenuEntries.size()),     0},
         {NetplayMenuId::Host,     "HOST SETTINGS",    kHostMenuEntries.data(),     static_cast<int>(kHostMenuEntries.size()),     0},
         {NetplayMenuId::Join,     "JOIN SETTINGS",    kJoinMenuEntries.data(),     static_cast<int>(kJoinMenuEntries.size()),     0},
-        {NetplayMenuId::Nickname, "NICKNAME",         kNicknameMenuEntries.data(), static_cast<int>(kNicknameMenuEntries.size()), 0},
+        {NetplayMenuId::Options,  "OPTIONS",          kOptionsMenuEntries.data(),  static_cast<int>(kOptionsMenuEntries.size()),  0},
     }};
 
     for (const NetplayMenuSpec& spec : specs)
@@ -140,8 +146,14 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "OpenHost";
     case NetplayMenuAction::OpenJoin:
         return "OpenJoin";
-    case NetplayMenuAction::OpenNickname:
-        return "OpenNickname";
+    case NetplayMenuAction::OpenPlayerRooms:
+        return "OpenPlayerRooms";
+    case NetplayMenuAction::OpenLobby:
+        return "OpenLobby";
+    case NetplayMenuAction::OpenBattleLog:
+        return "OpenBattleLog";
+    case NetplayMenuAction::OpenOptions:
+        return "OpenOptions";
     case NetplayMenuAction::LeaveNetplay:
         return "LeaveNetplay";
     case NetplayMenuAction::HostStart:
@@ -158,8 +170,6 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "JoinEditPort";
     case NetplayMenuAction::NicknameEdit:
         return "NicknameEdit";
-    case NetplayMenuAction::OpenLobby:
-        return "OpenLobby";
     case NetplayMenuAction::LobbySlot0:
         return "LobbySlot0";
     case NetplayMenuAction::LobbySlot1:
@@ -214,7 +224,7 @@ bool ValidateMenuSpecs()
         NetplayMenuId::Main,
         NetplayMenuId::Host,
         NetplayMenuId::Join,
-        NetplayMenuId::Nickname,
+        NetplayMenuId::Options,
         NetplayMenuId::Lobby,
     };
 
@@ -277,6 +287,4 @@ bool ValidateMenuSpecs()
     return true;
 }
 }
-
-
 

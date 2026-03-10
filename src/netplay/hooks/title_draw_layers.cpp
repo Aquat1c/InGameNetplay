@@ -94,12 +94,11 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
 
     const int panelLeft = 152;
     const int panelRight = 316;
-    const int titleY = 58;
+    const int titleY = 18;
     const int rowTextOffsetY = 1;
 
     DrawSpriteText(screenContext, panelLeft, titleY, BuildMenuHeaderText(), panelRight - panelLeft, true);
 
-    const int selection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
     int count = 0;
     const NetplayMenuEntry* entries = GetMenuEntries(g_netplayMenuState.menuId, &count);
     if (entries != nullptr && count > 0)
@@ -135,28 +134,6 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
         }
     }
 
-    std::string footer = BuildFooterText();
-    if (!g_inlineEditState.active && selection >= 0 && selection < count)
-    {
-        const NetplayMenuEntry& selected = entries[selection];
-        if (selected.action == NetplayMenuAction::HostEditPort)
-        {
-            footer = "CONFIRM TO EDIT HOST PORT";
-        }
-        else if (selected.action == NetplayMenuAction::JoinEditAddress)
-        {
-            footer = "CONFIRM TO EDIT SERVER ADDRESS";
-        }
-        else if (selected.action == NetplayMenuAction::JoinEditPort)
-        {
-            footer = "CONFIRM TO EDIT SERVER PORT";
-        }
-        else if (selected.action == NetplayMenuAction::NicknameEdit)
-        {
-            footer = "CONFIRM TO EDIT NICKNAME";
-        }
-    }
-    DrawSpriteText(screenContext, panelLeft, 224, footer, panelRight - panelLeft, false);
 }
 
 void BlitMenuRowClipped(
@@ -320,9 +297,9 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
     {
         // Always stamp unused sprite-sheet rows with a blank black bar so
         // labels from other menus (ADDRESS, PORT, etc.) don't bleed through.
-        // Reserved6 (row 6) is intentionally blank in the sheet; never use
-        // Reserved5 here because that row carries the "LOBBY" label.
-        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Reserved6);
+        // Blank is intentionally label-free in the sheet and is used as the
+        // shared filler row for unused slots and lobby display lines.
+        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Blank);
         if (kBlankRowIndex >= 0 && kBlankRowIndex < kNetplayConfigOptionCount)
         {
             const int blankSrcY = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(kBlankRowIndex)];
@@ -397,6 +374,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     {
         (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);
@@ -410,6 +388,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
     DrawAnimatedCompactMenuLayer(screenContext);
     (void)DrawDynamicFieldValuesGdi(screenContext, false);
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);

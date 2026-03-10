@@ -20,7 +20,7 @@ bool DrawRuntimeTextOverlayGdi(
         return false;
     }
     if (!callbacks.clampSelectionToCurrentMenu || !callbacks.getMenuEntries || !callbacks.buildMenuHeaderText
-        || !callbacks.buildRowLabel || !callbacks.buildFooterText || !callbacks.getMenuOverlayFont)
+        || !callbacks.buildRowLabel || !callbacks.getMenuOverlayFont)
     {
         return false;
     }
@@ -43,16 +43,15 @@ bool DrawRuntimeTextOverlayGdi(
     const uint8_t selectedTextColor = netplay::draw::ResolveBestPaletteColor(screenContext, 8, 8, 8);
     const uint8_t normalTextColor = netplay::draw::ResolveBestPaletteColor(screenContext, 108, 108, 108);
     const uint8_t highlightColor = netplay::draw::ResolveBestPaletteColor(screenContext, 110, 225, 214);
-    const uint8_t footerColor = netplay::draw::ResolveBestPaletteColor(screenContext, 90, 90, 90);
 
     constexpr int panelLeft = 150;
     constexpr int panelRight = 314;
-    constexpr int rowHeight = 16;
-    constexpr int rowStep = 18;
+    constexpr int rowHeight = netplay::constants::kNetplayDefaultHighlightHeight;
+    constexpr int rowStep = netplay::constants::kNetplayCompactMenuRowStep;
 
     // Header
     const std::string header = callbacks.buildMenuHeaderText();
-    netplay::font::DrawTextLeft5x7(sv, header, panelLeft, panelRight, 60, 1, 1, headerColor);
+    netplay::font::DrawTextLeft5x7(sv, header, panelLeft, panelRight, 18, 1, 1, headerColor);
 
     // Rows
     const int selection =
@@ -61,7 +60,7 @@ bool DrawRuntimeTextOverlayGdi(
     const netplay::menu::NetplayMenuEntry* entries = callbacks.getMenuEntries(state.menuId, &count);
     if (entries != nullptr && count > 0)
     {
-        constexpr int panelTop = 78;
+        constexpr int panelTop = netplay::constants::kNetplayCompactMenuTopY;
         for (int i = 0; i < count; ++i)
         {
             const int rowY = panelTop + i * rowStep;
@@ -77,10 +76,6 @@ bool DrawRuntimeTextOverlayGdi(
             netplay::font::DrawTextLeft5x7(sv, label, panelLeft + 2, panelRight - 2, textY, 1, 1, color);
         }
     }
-
-    // Footer
-    const std::string footer = callbacks.buildFooterText();
-    netplay::font::DrawTextLeft5x7(sv, footer, panelLeft, panelRight, 226, 1, 1, footerColor);
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;
@@ -243,4 +238,3 @@ bool DrawDynamicFieldValuesGdi(
     return false;
 }
 }
-

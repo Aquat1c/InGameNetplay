@@ -61,23 +61,60 @@ constexpr int kScreenIndexCharSelect = 1;       // EFZ screen table index for ch
 constexpr int kScreenIndexReplay = 8;           // EFZ screen table index for replay (used by spectate)
 constexpr int8_t kMenuSelectionReplay = 4;      // title menu "Replay" entry index
 
-std::string GetCurrentDirectoryString()
+bool PlayBackgroundMusicFromAbsolutePath(
+    int gameSystem,
+    const std::string& bgmPath,
+    unsigned short trackNumber)
 {
-    const DWORD required = GetCurrentDirectoryA(0, nullptr);
-    if (required == 0)
+    auto const stopSoundBuffer =
+        reinterpret_cast<StopSoundBufferFn>(RuntimeAddress(kVaStopSoundBuffer));
+    auto const playSoundBuffer =
+        reinterpret_cast<PlaySoundBufferFn>(RuntimeAddress(kVaPlaySoundBuffer));
+    auto const releaseSoundBufferAndMemory =
+        reinterpret_cast<ReleaseSoundBufferAndMemoryFn>(RuntimeAddress(kVaReleaseSoundBufferAndMemory));
+    auto const loadWaveFile =
+        reinterpret_cast<LoadWaveFileFn>(RuntimeAddress(kVaLoadWaveFile));
+    auto const loadAudioTimingData =
+        reinterpret_cast<LoadAudioTimingDataFn>(RuntimeAddress(kVaLoadAudioTimingData));
+
+    auto* const soundManager =
+        *reinterpret_cast<uint32_t**>(gameSystem + kOffsetWindowHandle);
+    auto* const bgmBufferIndex =
+        reinterpret_cast<uint16_t*>(gameSystem + 3878);
+    if (soundManager == nullptr || bgmBufferIndex == nullptr)
     {
-        return {};
+        mod::Log("PlayNetplayBgm: absolute load aborted (soundManager unavailable)");
+        return false;
     }
 
-    std::string path(static_cast<size_t>(required), '\0');
-    const DWORD written = GetCurrentDirectoryA(required, path.data());
-    if (written == 0 || written >= required)
+    if (*bgmBufferIndex != 150)
     {
-        return {};
+        stopSoundBuffer(soundManager, *bgmBufferIndex);
+        releaseSoundBufferAndMemory(soundManager, *bgmBufferIndex);
+        *bgmBufferIndex = 150;
     }
 
-    path.resize(written);
-    return path;
+    char* const mutablePath = const_cast<char*>(bgmPath.c_str());
+    *bgmBufferIndex = loadWaveFile(soundManager, mutablePath);
+    loadAudioTimingData(soundManager, bgmPath.c_str());
+
+    if (*bgmBufferIndex == 150)
+    {
+        mod::Log("PlayNetplayBgm: absolute load FAILED path='%s'", bgmPath.c_str());
+        return false;
+    }
+
+    const bool isNonLoopingTrack =
+        trackNumber == 2 || trackNumber == 3 || trackNumber == 4 || trackNumber == 9;
+    playSoundBuffer(soundManager, *bgmBufferIndex, isNonLoopingTrack ? 0 : 1);
+
+    const unsigned long dataBytes = static_cast<unsigned long>(soundManager[*bgmBufferIndex + 154]);
+    mod::Log(
+        "PlayNetplayBgm: absolute load OK path='%s' buffer=%u dataBytes=%lu",
+        bgmPath.c_str(),
+        static_cast<unsigned>(*bgmBufferIndex),
+        dataBytes);
+    return true;
 }
 
 void PlayNetplayBgm(uint32_t screenContext)
@@ -95,43 +132,13 @@ void PlayNetplayBgm(uint32_t screenContext)
         return;
     }
 
-    const std::string originalDirectory = GetCurrentDirectoryString();
-    if (originalDirectory.empty())
+    const std::string bgmPath =
+        netplay::assets::JoinPath(bgmBaseDirectory, "wave\\bgm\\bgm08.wav");
+    mod::Log("PlayNetplayBgm: override file '%s'", bgmPath.c_str());
+    if (!PlayBackgroundMusicFromAbsolutePath(gameSystem, bgmPath, kNetplayBgmTrack))
     {
-        mod::Log(
-            "PlayNetplayBgm: failed to query current directory; falling back to vanilla path");
+        mod::Log("PlayNetplayBgm: absolute override failed; falling back to vanilla path");
         playBackgroundMusic(gameSystem, kNetplayBgmTrack);
-        return;
-    }
-
-    if (!SetCurrentDirectoryA(bgmBaseDirectory.c_str()))
-    {
-        mod::Log(
-            "PlayNetplayBgm: failed to switch cwd to '%s' error=%lu; falling back to vanilla path",
-            bgmBaseDirectory.c_str(),
-            static_cast<unsigned long>(GetLastError()));
-        playBackgroundMusic(gameSystem, kNetplayBgmTrack);
-        return;
-    }
-
-    mod::Log(
-        "PlayNetplayBgm: switched cwd '%s' -> '%s' for track %u override",
-        originalDirectory.c_str(),
-        bgmBaseDirectory.c_str(),
-        static_cast<unsigned>(kNetplayBgmTrack));
-
-    playBackgroundMusic(gameSystem, kNetplayBgmTrack);
-
-    if (!SetCurrentDirectoryA(originalDirectory.c_str()))
-    {
-        mod::Log(
-            "PlayNetplayBgm: WARNING — failed to restore cwd to '%s' error=%lu",
-            originalDirectory.c_str(),
-            static_cast<unsigned long>(GetLastError()));
-    }
-    else
-    {
-        mod::Log("PlayNetplayBgm: restored cwd to '%s'", originalDirectory.c_str());
     }
 }
 
@@ -1384,13 +1391,21 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::Join, -1, +1);
         break;
-    case NetplayMenuAction::OpenNickname:
+    case NetplayMenuAction::OpenPlayerRooms:
         g_netplayMenuState.mainSelection = logicalSelection;
-        StartMenuSlideTransition(screenContext, NetplayMenuId::Nickname, -1, +1);
+        ShowStubActionMessage(owner, "Player Rooms UI is not implemented yet.");
         break;
     case NetplayMenuAction::OpenLobby:
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
+        break;
+    case NetplayMenuAction::OpenBattleLog:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        ShowStubActionMessage(owner, "Battle Log UI is not implemented yet.");
+        break;
+    case NetplayMenuAction::OpenOptions:
+        g_netplayMenuState.mainSelection = logicalSelection;
+        StartMenuSlideTransition(screenContext, NetplayMenuId::Options, -1, +1);
         break;
     case NetplayMenuAction::BackToMain:
         StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);

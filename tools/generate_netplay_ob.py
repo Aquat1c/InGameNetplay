@@ -10,11 +10,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 320
 HEIGHT = 480
-ROW_Y = (95, 113, 131, 149, 167, 185, 203, 221)
-SELECTED_BLOCK_OFFSET_Y = 166
+ROW_Y = (76, 90, 104, 118, 132, 146, 160, 174, 188, 202)
+SELECTED_BLOCK_OFFSET_Y = 240
 ROW_H = 14
 TITLE_BAR_H = 14
 TRANSPARENT_INDEX = 31
+ROW_TEXT_Y_BIAS = 0
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -49,6 +50,7 @@ def draw_centered_text(
     y0: int,
     x1: int,
     y1: int,
+    y_bias: int = 0,
 ) -> None:
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     text_w = right - left
@@ -56,7 +58,7 @@ def draw_centered_text(
     box_w = (x1 - x0) + 1
     box_h = (y1 - y0) + 1
     x = x0 + ((box_w - text_w) // 2) - left
-    y = y0 + ((box_h - text_h) // 2) - top
+    y = y0 + ((box_h - text_h) // 2) - top + y_bias
     draw.text((x, y), text, font=font, fill=fill)
 
 
@@ -84,6 +86,32 @@ def create_palette() -> list[int]:
     return palette
 
 
+def draw_menu_bar(
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    label: str,
+    selected: bool,
+    font: ImageFont.ImageFont,
+) -> None:
+    border = 1 if selected else 2
+    text = 1 if selected else 2
+    draw.rectangle((0, y, WIDTH - 1, y + ROW_H - 1), fill=0)
+    draw.line((0, y, WIDTH - 1, y), fill=border)
+    draw.line((0, y + ROW_H - 1, WIDTH - 1, y + ROW_H - 1), fill=border)
+    if label:
+        draw_centered_text(
+            draw,
+            label,
+            font,
+            text,
+            0,
+            y,
+            WIDTH - 1,
+            y + ROW_H - 1,
+            y_bias=ROW_TEXT_Y_BIAS,
+        )
+
+
 def draw_rows(
     image: Image.Image,
     labels: Sequence[str],
@@ -100,13 +128,8 @@ def draw_rows(
 
     for row_index, row_y in enumerate(ROW_Y):
         label = labels[row_index]
-
-        draw.rectangle((0, row_y, WIDTH - 1, row_y + ROW_H - 1), fill=0)
-        draw_centered_text(draw, label, row_font, 2, 0, row_y, WIDTH - 1, row_y + ROW_H - 1)
-
-        selected_y = row_y + SELECTED_BLOCK_OFFSET_Y
-        draw.rectangle((0, selected_y, WIDTH - 1, selected_y + ROW_H - 1), fill=0)
-        draw_centered_text(draw, label, row_font, 1, 0, selected_y, WIDTH - 1, selected_y + ROW_H - 1)
+        draw_menu_bar(draw, row_y, label, False, row_font)
+        draw_menu_bar(draw, row_y + SELECTED_BLOCK_OFFSET_Y, label, True, row_font)
 
 
 def encode_dat(image: Image.Image) -> bytes:
@@ -145,26 +168,23 @@ def encode_dat(image: Image.Image) -> bytes:
 
 def parse_labels(raw: str | None) -> list[str]:
     default_labels = [
-        "HOST",           # row 0 – Main→HOST, Lobby→idle slot 0
-        "JOIN",           # row 1 – Main→JOIN, Lobby→idle slot 1
-        "CHANGE NICKNAME",# row 2 – Main→NICKNAME, Lobby→idle slot 2
-        "ADDRESS",        # row 3 – Join→ADDRESS, Lobby→idle slot 3
-        "PORT",           # row 4 – Host/Join→PORT, Lobby→idle slot 4
-        "LOBBY",          # row 5 – Main→LOBBY (Reserved5).  Text visible in
-                          #          config-style mode; GDI overlays in runtime
-                          #          text mode.
-        "",               # row 6 – Reserved6: intentionally blank black bar.
-                          #          Used as the empty-row blit template to hide
-                          #          unused lobby slots.  Actual content (playing
-                          #          pair etc.) is rendered by GDI above this.
-        "RETURN TO TITLE",# row 7 – all menus→BACK / RETURN
+        "HOST",            # row 0 – Host / Start Host
+        "JOIN",            # row 1 – Join / Connect
+        "PLAYER ROOMS",    # row 2 – main menu player-room entry
+        "LOBBY",           # row 3 – main menu global-lobby entry
+        "BATTLE LOG",      # row 4 – main menu battle-log entry
+        "OPTIONS",         # row 5 – main menu / options submenu
+        "ADDRESS",         # row 6 – Join submenu
+        "PORT",            # row 7 – Host / Join submenu
+        "",                # row 8 – shared blank row for dynamic lobby entries
+        "RETURN TO TITLE", # row 9 – back / return
     ]
     if not raw:
         return default_labels
 
     labels = [entry.strip().upper() for entry in raw.split(",") if entry.strip()]
-    if len(labels) != 8:
-        raise ValueError("Expected exactly 8 comma-separated labels.")
+    if len(labels) != len(default_labels):
+        raise ValueError(f"Expected exactly {len(default_labels)} comma-separated labels.")
     return labels
 
 
@@ -188,7 +208,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--labels",
         default=None,
-        help="Comma-separated list of 8 menu labels. Default: HOST,JOIN,...",
+        help="Comma-separated list of 10 menu labels. Default: HOST,JOIN,...",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 

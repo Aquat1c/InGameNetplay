@@ -121,6 +121,11 @@ struct DebugOverlayState
 using PlaySoundEffectFn = int(__thiscall*)(void* gameSystem, unsigned short soundIndex);
 using PlayBackgroundMusicFn = void(__thiscall*)(int gameSystem, unsigned short trackNumber);
 using StopBackgroundMusicFn = int(__thiscall*)(int gameSystem);
+using StopSoundBufferFn = int(__thiscall*)(uint32_t* soundManager, unsigned short bufferIndex);
+using PlaySoundBufferFn = int(__thiscall*)(void* soundManager, unsigned short bufferIndex, int loopFlag);
+using ReleaseSoundBufferAndMemoryFn = int(__thiscall*)(void* soundManager, unsigned short bufferIndex);
+using LoadWaveFileFn = unsigned short(__thiscall*)(void* soundManager, char* fileName);
+using LoadAudioTimingDataFn = void(__thiscall*)(uint32_t* timingPtr, const char* fileName);
 using ProcessPlayerInputFn = void(__thiscall*)(int* inputManager);
 using LoadCompressedImageFileFn =
     void(__thiscall*)(void*** graphicsManager, uint32_t* destSurface, const char* fileName, unsigned char colorOffset1, unsigned char colorOffset2);
@@ -247,6 +252,7 @@ HFONT GetMenuOverlayFont();
 const netplay::render::OverlayCallbacks& GetOverlayCallbacks();
 bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc);
+bool DrawFooterTooltipOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawHostingOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawJoiningOverlayGdi(uint32_t screenContext, bool allowWindowDc);

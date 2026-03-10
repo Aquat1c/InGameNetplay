@@ -122,10 +122,10 @@ enum EFZNetplayEndReason
 // ---------------------------------------------------------------------------
 enum EFZNetplayMenuScreen
 {
-    EFZ_MENU_MAIN     = 0,  // Top-level: Host / Join / Nickname / Lobby / Back
+    EFZ_MENU_MAIN     = 0,  // Top-level: Host / Join / Player Rooms / Lobby / Battle Log / Options / Back
     EFZ_MENU_HOST     = 1,  // Host settings sub-menu
     EFZ_MENU_JOIN     = 2,  // Join settings sub-menu
-    EFZ_MENU_NICKNAME = 3,  // Nickname edit sub-menu
+    EFZ_MENU_NICKNAME = 3,  // Options sub-menu (legacy enum name retained for ABI)
     EFZ_MENU_LOBBY    = 4,  // Lobby browser
 };
 
