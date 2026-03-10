@@ -277,6 +277,12 @@ void ObserveOfflineSelectionConfirm(uint32_t screenContext)
     const int gameSystem = GetGameSystem(screenContext);
     const auto* const inputBytes = reinterpret_cast<const uint8_t*>(gameSystem);
     const bool confirmDown = (inputBytes[16] == 1) || (inputBytes[17] == 1);
+    if (!IsScreenWindowFocused(screenContext))
+    {
+        g_titleConfirmDown = confirmDown;
+        return;
+    }
+
     const bool confirmEdge = confirmDown && !g_titleConfirmDown;
     g_titleConfirmDown = confirmDown;
 

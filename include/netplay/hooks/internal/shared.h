@@ -210,6 +210,8 @@ void ActivateJoiningOverlay(const char* address, uint16_t port);
 void ResetJoiningOverlayState();
 void InstallNetplayWindowHook(uint32_t screenContext);
 void RemoveNetplayWindowHook();
+bool IsWindowFocused(HWND hwnd);
+bool IsScreenWindowFocused(uint32_t screenContext);
 bool ConsumeNetplayEscapeEdge();
 bool EnsureCharSelectEntryHoldHook();
 void ArmCharSelectEntryHold();

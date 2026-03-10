@@ -330,6 +330,55 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
     return {};
 }
 
+std::string ResolveChallengeAlertPath(const std::string& moduleDirectory)
+{
+    mod::Log("ResolveChallengeAlertPath: searching for res_alert.wav");
+
+    const std::array<const char*, 2> assetCandidates = {
+        "assets\\res_alert.wav",
+        "res_alert.wav",
+    };
+
+    for (const char* candidate : assetCandidates)
+    {
+        const std::string path = JoinPath(moduleDirectory, candidate);
+        mod::Log("ResolveChallengeAlertPath: [DLL dir] probing '%s'", path.c_str());
+        if (FileExists(path))
+        {
+            mod::Log("ResolveChallengeAlertPath: using '%s'", path.c_str());
+            return path;
+        }
+    }
+
+    const std::string modsRelDir = DeriveModsRelativeDirectory(moduleDirectory);
+    if (!modsRelDir.empty())
+    {
+        for (const char* candidate : assetCandidates)
+        {
+            const std::string path = JoinPath(modsRelDir, candidate);
+            mod::Log("ResolveChallengeAlertPath: [mods dir] probing '%s'", path.c_str());
+            if (FileExists(path))
+            {
+                mod::Log("ResolveChallengeAlertPath: using '%s'", path.c_str());
+                return path;
+            }
+        }
+    }
+
+    for (const char* candidate : assetCandidates)
+    {
+        mod::Log("ResolveChallengeAlertPath: [cwd] probing '%s'", candidate);
+        if (FileExists(candidate))
+        {
+            mod::Log("ResolveChallengeAlertPath: using '%s'", candidate);
+            return candidate;
+        }
+    }
+
+    mod::Log("ResolveChallengeAlertPath: no candidate found");
+    return {};
+}
+
 std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
 {
     mod::Log("ResolveTitleObjectsPath: searching for title_ob.dat override (moduleDirectory='%s')", moduleDirectory.c_str());
@@ -767,4 +816,3 @@ NetplayObjectProfile DetermineObjectProfile(const std::string& objectPath)
     return profile;
 }
 }
-

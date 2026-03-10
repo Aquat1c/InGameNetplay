@@ -628,6 +628,7 @@ const uint8_t* GetGlyph5x7(char c)
     case '[': { static const uint8_t g[7] = {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}; return g; }
     case ']': { static const uint8_t g[7] = {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}; return g; }
     case '+': { static const uint8_t g[7] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}; return g; }
+    case '\x7F': { static const uint8_t g[7] = {0x00, 0x0E, 0x11, 0x15, 0x11, 0x0E, 0x00}; return g; }
     case ' ': { static const uint8_t g[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; return g; }
     default:
         return nullptr;
@@ -910,5 +911,4 @@ void DrawIndexedSurfaceFrame(
     FillIndexedSurfaceRect(surface, x + w - 1, y, 1, h, color);
 }
 }
-
 

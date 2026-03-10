@@ -361,10 +361,37 @@ void RemoveNetplayWindowHook()
     g_originalWindowProc = nullptr;
 }
 
+bool IsWindowFocused(HWND hwnd)
+{
+    if (hwnd == nullptr || !IsWindow(hwnd))
+    {
+        return false;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr || !IsWindow(foreground))
+    {
+        return false;
+    }
+
+    const HWND hwndRoot = GetAncestor(hwnd, GA_ROOTOWNER);
+    const HWND foregroundRoot = GetAncestor(foreground, GA_ROOTOWNER);
+    const HWND resolvedHwndRoot = hwndRoot != nullptr ? hwndRoot : hwnd;
+    const HWND resolvedForegroundRoot = foregroundRoot != nullptr ? foregroundRoot : foreground;
+    return resolvedHwndRoot == resolvedForegroundRoot;
+}
+
+bool IsScreenWindowFocused(uint32_t screenContext)
+{
+    const HWND hwnd = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+    return IsWindowFocused(hwnd);
+}
+
 bool ConsumeNetplayEscapeEdge()
 {
     const bool down = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-    const bool pressed = down && !g_netplayEscapeDown;
+    const bool focused = IsWindowFocused(g_hookedWindow);
+    const bool pressed = focused && down && !g_netplayEscapeDown;
     g_netplayEscapeDown = down;
     return pressed;
 }

@@ -16,6 +16,7 @@ using NetplayMenuSpec = netplay::menu::NetplayMenuSpec;
 using NetplayMenuAction = netplay::menu::NetplayMenuAction;
 using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
 using netplay::menu::GetMenuSpec;
+constexpr char kLobbyPlayingEyeGlyph = '\x7F';
 
 std::string BuildMenuHeaderText()
 {
@@ -122,7 +123,7 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
                 const int visSlots  = std::min(displayCount, netplay::menu::kLobbyMaxDisplayPlayers);
                 // Prefix names with status indicators:
                 //   [!]  = incoming challenge
-                //   [O]  = player is in a match
+                //   [eye] = player is in a match
                 //   [YOU] = our own entry
                 // All prefixes are padded to 6 chars so names align.
                 std::string name;
@@ -136,7 +137,7 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
                 }
                 else if (de.isPlaying)
                 {
-                    name = " [O]  " + de.name;
+                    name = std::string(" [") + kLobbyPlayingEyeGlyph + "]  " + de.name;
                 }
                 else
                 {

@@ -217,6 +217,8 @@ std::string BuildSettingLabel(const Item& item);
 bool HandleEditInput(uint32_t screenContext, const uint8_t* inputBytes, bool* escapeDown);
 bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter, bool* escapeDown);
 bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter, bool* escapeDown);
+int FindCategoryIndexBySectionName(const char* sectionName);
+int FindItemIndexBySectionAndKey(const char* sectionName, const char* keyName);
 } // namespace
 
 const NetplayMenuSpec* GetMenuSpec()
@@ -1315,11 +1317,35 @@ bool LoadItemsFromIni()
 
 void AppendSyntheticItems()
 {
-    Category category;
-    category.sectionName = "Others";
-    category.tooltipSummary = "Mod-only settings and placeholders.";
-    g_state.categories.push_back(std::move(category));
-    const int categoryIndex = static_cast<int>(g_state.categories.size()) - 1;
+    int categoryIndex = FindCategoryIndexBySectionName("Others");
+    if (categoryIndex < 0)
+    {
+        Category category;
+        category.sectionName = "Others";
+        category.tooltipSummary = "Mod-only settings used by efz_netplay_mod.";
+        g_state.categories.push_back(std::move(category));
+        categoryIndex = static_cast<int>(g_state.categories.size()) - 1;
+    }
+
+    const int existingItemIndex = FindItemIndexBySectionAndKey("Others", "OfflineVsHumanMode");
+    if (existingItemIndex >= 0)
+    {
+        Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+        item.kind = ItemKind::Choice;
+        item.choiceValues = {"Tournament", "VS Human"};
+        item.tooltipSummary =
+            "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.";
+        if (std::find(item.choiceValues.begin(), item.choiceValues.end(), item.currentValue) == item.choiceValues.end())
+        {
+            item.currentValue = g_otherOfflineVsMode;
+            item.originalValue = g_otherOfflineVsMode;
+        }
+        else
+        {
+            g_otherOfflineVsMode = item.currentValue;
+        }
+        return;
+    }
 
     Item item;
     item.kind = ItemKind::Choice;
@@ -1329,8 +1355,7 @@ void AppendSyntheticItems()
     item.currentValue = g_otherOfflineVsMode;
     item.originalValue = g_otherOfflineVsMode;
     item.tooltipSummary =
-        "Choose whether offline VS Human should use tournament mode or regular VS Human. "
-        "This is a placeholder for now and is not wired to gameplay yet.";
+        "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.";
     item.choiceValues = {"Tournament", "VS Human"};
     item.lineIndex = -1;
 
@@ -1372,13 +1397,24 @@ bool SaveItemsToDisk()
     }
 
     std::vector<std::wstring> updatedLines = g_state.lines;
-    for (const Item& item : g_state.items)
+    for (Item& item : g_state.items)
     {
-        if (item.lineIndex < 0 || item.lineIndex >= static_cast<int>(updatedLines.size()))
+        if (item.lineIndex >= 0 && item.lineIndex < static_cast<int>(updatedLines.size()))
         {
+            updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
             continue;
         }
-        updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
+
+        if (item.sectionName == "Others" && item.keyName == "OfflineVsHumanMode")
+        {
+            if (!updatedLines.empty() && !TrimWide(updatedLines.back()).empty())
+            {
+                updatedLines.push_back(L"");
+            }
+            updatedLines.push_back(L"[Others]");
+            item.lineIndex = static_cast<int>(updatedLines.size());
+            updatedLines.push_back(item.rawKeyName + L"=" + Utf8ToWide(item.currentValue));
+        }
     }
 
     const std::wstring joined = JoinLines(updatedLines);
@@ -1401,6 +1437,43 @@ bool SaveItemsToDisk()
     SetStatusMessage("Settings saved.");
     mod::Log("OptionsMenu: saved '%s'", g_state.iniPath.c_str());
     return true;
+}
+
+int FindCategoryIndexBySectionName(const char* sectionName)
+{
+    if (sectionName == nullptr)
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < g_state.categories.size(); ++i)
+    {
+        if (g_state.categories[i].sectionName == sectionName)
+        {
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1;
+}
+
+int FindItemIndexBySectionAndKey(const char* sectionName, const char* keyName)
+{
+    if (sectionName == nullptr || keyName == nullptr)
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < g_state.items.size(); ++i)
+    {
+        const Item& item = g_state.items[i];
+        if (item.sectionName == sectionName && item.keyName == keyName)
+        {
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1;
 }
 
 std::string FormatDisplayValue(const Item& item)
@@ -2671,5 +2744,10 @@ bool IsSaveOverlayActive()
 bool IsBusy()
 {
     return g_state.edit.active || g_state.modal.active;
+}
+
+bool UseTournamentModeForOfflineVsHuman()
+{
+    return g_otherOfflineVsMode != "VS Human";
 }
 } // namespace netplay::options

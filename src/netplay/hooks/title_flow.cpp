@@ -9,11 +9,13 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace netplay::hooks::internal
 {
@@ -61,6 +63,116 @@ constexpr int kRoleFlagSpectate = 1;            // matches kLocalRoleSpectate in
 constexpr int kScreenIndexCharSelect = 1;       // EFZ screen table index for character select
 constexpr int kScreenIndexReplay = 8;           // EFZ screen table index for replay (used by spectate)
 constexpr int8_t kMenuSelectionReplay = 4;      // title menu "Replay" entry index
+constexpr unsigned short kInvalidSoundBufferIndex = 150;
+constexpr int kMenuInputFirstOffset = 12;
+constexpr int kMenuInputLastOffset = 23;
+constexpr size_t kFilteredMenuInputBytes = 24;
+std::vector<int> g_seenLobbyChallengeIds;
+unsigned short g_lobbyChallengeAlertBufferIndex = kInvalidSoundBufferIndex;
+std::array<uint8_t, kFilteredMenuInputBytes> g_filteredMenuInputs = {};
+std::array<uint8_t, kFilteredMenuInputBytes> g_unfocusedHeldMenuInputs = {};
+std::array<uint8_t, 256> g_netplayHotkeyDown = {};
+
+void PlayLobbyChallengeAlert(uint32_t screenContext);
+
+void ResetWindowFocusInputSuppression()
+{
+    g_filteredMenuInputs.fill(0);
+    g_unfocusedHeldMenuInputs.fill(0);
+    g_netplayHotkeyDown.fill(0);
+}
+
+const uint8_t* FilterMenuInputsForWindowFocus(const uint8_t* rawInputBytes, bool windowFocused)
+{
+    g_filteredMenuInputs.fill(0);
+    if (rawInputBytes == nullptr)
+    {
+        return g_filteredMenuInputs.data();
+    }
+
+    if (!windowFocused)
+    {
+        for (int offset = kMenuInputFirstOffset; offset <= kMenuInputLastOffset; ++offset)
+        {
+            if (rawInputBytes[offset] != 0)
+            {
+                g_unfocusedHeldMenuInputs[static_cast<size_t>(offset)] = 1;
+            }
+        }
+        return g_filteredMenuInputs.data();
+    }
+
+    std::memcpy(g_filteredMenuInputs.data(), rawInputBytes, kFilteredMenuInputBytes);
+    for (int offset = kMenuInputFirstOffset; offset <= kMenuInputLastOffset; ++offset)
+    {
+        const size_t index = static_cast<size_t>(offset);
+        if (g_unfocusedHeldMenuInputs[index] == 0)
+        {
+            continue;
+        }
+        if (rawInputBytes[offset] == 0)
+        {
+            g_unfocusedHeldMenuInputs[index] = 0;
+            continue;
+        }
+        g_filteredMenuInputs[index] = 0;
+    }
+
+    return g_filteredMenuInputs.data();
+}
+
+bool ConsumeWindowFocusedHotkeyEdge(bool windowFocused, int virtualKey)
+{
+    if (virtualKey < 0 || virtualKey >= 256)
+    {
+        return false;
+    }
+
+    const bool down = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    const size_t index = static_cast<size_t>(virtualKey);
+    const bool pressed = windowFocused && down && g_netplayHotkeyDown[index] == 0;
+    g_netplayHotkeyDown[index] = down ? 1u : 0u;
+    return pressed;
+}
+
+void ResetLobbyChallengeNotificationState()
+{
+    g_seenLobbyChallengeIds.clear();
+}
+
+void UpdateLobbyChallengeNotificationState(
+    uint32_t screenContext,
+    const netplay::lobby::LobbyStatus& status)
+{
+    std::vector<int> currentIds;
+    currentIds.reserve(status.challenges.size());
+    bool hasNewChallenge = false;
+
+    for (const auto& challenge : status.challenges)
+    {
+        if (challenge.playerId == 0)
+        {
+            continue;
+        }
+
+        currentIds.push_back(challenge.playerId);
+        if (std::find(g_seenLobbyChallengeIds.begin(), g_seenLobbyChallengeIds.end(), challenge.playerId)
+            == g_seenLobbyChallengeIds.end())
+        {
+            hasNewChallenge = true;
+        }
+    }
+
+    if (hasNewChallenge)
+    {
+        PlayLobbyChallengeAlert(screenContext);
+        mod::Log(
+            "LobbyChallengeNotify: played alert for %zu incoming challenge(s)",
+            status.challenges.size());
+    }
+
+    g_seenLobbyChallengeIds = std::move(currentIds);
+}
 
 bool PlayBackgroundMusicFromAbsolutePath(
     int gameSystem,
@@ -116,6 +228,90 @@ bool PlayBackgroundMusicFromAbsolutePath(
         static_cast<unsigned>(*bgmBufferIndex),
         dataBytes);
     return true;
+}
+
+void ReleaseLoadedSoundBuffer(
+    int gameSystem,
+    unsigned short* ioBufferIndex,
+    const char* reason)
+{
+    if (ioBufferIndex == nullptr || *ioBufferIndex == kInvalidSoundBufferIndex)
+    {
+        return;
+    }
+
+    auto const stopSoundBuffer =
+        reinterpret_cast<StopSoundBufferFn>(RuntimeAddress(kVaStopSoundBuffer));
+    auto const releaseSoundBufferAndMemory =
+        reinterpret_cast<ReleaseSoundBufferAndMemoryFn>(RuntimeAddress(kVaReleaseSoundBufferAndMemory));
+
+    auto* const soundManager =
+        *reinterpret_cast<uint32_t**>(gameSystem + kOffsetWindowHandle);
+    if (soundManager != nullptr)
+    {
+        stopSoundBuffer(soundManager, *ioBufferIndex);
+        releaseSoundBufferAndMemory(soundManager, *ioBufferIndex);
+        mod::Log(
+            "ReleaseLoadedSoundBuffer: released buffer=%u reason=%s",
+            static_cast<unsigned>(*ioBufferIndex),
+            reason != nullptr ? reason : "");
+    }
+
+    *ioBufferIndex = kInvalidSoundBufferIndex;
+}
+
+bool PlayOneShotWaveFromAbsolutePath(
+    int gameSystem,
+    const std::string& wavePath,
+    unsigned short* ioBufferIndex)
+{
+    auto const playSoundBuffer =
+        reinterpret_cast<PlaySoundBufferFn>(RuntimeAddress(kVaPlaySoundBuffer));
+    auto const loadWaveFile =
+        reinterpret_cast<LoadWaveFileFn>(RuntimeAddress(kVaLoadWaveFile));
+
+    auto* const soundManager =
+        *reinterpret_cast<uint32_t**>(gameSystem + kOffsetWindowHandle);
+    if (soundManager == nullptr || ioBufferIndex == nullptr)
+    {
+        mod::Log("PlayOneShotWaveFromAbsolutePath: aborted (soundManager unavailable)");
+        return false;
+    }
+
+    ReleaseLoadedSoundBuffer(gameSystem, ioBufferIndex, "reload_one_shot");
+
+    char* const mutablePath = const_cast<char*>(wavePath.c_str());
+    *ioBufferIndex = loadWaveFile(soundManager, mutablePath);
+    if (*ioBufferIndex == kInvalidSoundBufferIndex)
+    {
+        mod::Log("PlayOneShotWaveFromAbsolutePath: load FAILED path='%s'", wavePath.c_str());
+        return false;
+    }
+
+    playSoundBuffer(soundManager, *ioBufferIndex, 0);
+    mod::Log(
+        "PlayOneShotWaveFromAbsolutePath: load OK path='%s' buffer=%u",
+        wavePath.c_str(),
+        static_cast<unsigned>(*ioBufferIndex));
+    return true;
+}
+
+void PlayLobbyChallengeAlert(uint32_t screenContext)
+{
+    const int gameSystem = GetGameSystem(screenContext);
+    const std::string alertPath =
+        netplay::assets::ResolveChallengeAlertPath(g_moduleDirectory);
+    if (!alertPath.empty()
+        && PlayOneShotWaveFromAbsolutePath(
+            gameSystem,
+            alertPath,
+            &g_lobbyChallengeAlertBufferIndex))
+    {
+        return;
+    }
+
+    mod::Log("PlayLobbyChallengeAlert: using fallback UI SFX");
+    PlayUiSound(screenContext, kSfxConfirm);
 }
 
 void PlayNetplayBgm(uint32_t screenContext)
@@ -1062,6 +1258,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_lastNetplayFrameLogTick = 0;
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    ResetWindowFocusInputSuppression();
     g_pendingVsHumanAutoConfirm = false;
     g_pendingVsHumanAutoConfirmTick = 0;
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
@@ -1071,6 +1268,11 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ResetLobbyChallengeNotificationState();
+    ReleaseLoadedSoundBuffer(
+        GetGameSystem(screenContext),
+        &g_lobbyChallengeAlertBufferIndex,
+        "enter_netplay");
     const NetplayMenuId targetMenu = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     SwitchToMenu(screenContext, targetMenu, -1);
     InstallNetplayWindowHook(screenContext);
@@ -1126,6 +1328,10 @@ void LeaveNetplayMenu(uint32_t screenContext)
     {
         StopCurrentBgm(screenContext, "leave_netplay");
     }
+    ReleaseLoadedSoundBuffer(
+        GetGameSystem(screenContext),
+        &g_lobbyChallengeAlertBufferIndex,
+        "leave_netplay");
 
     netplay::bridge::CancelSession("leave_menu");
 
@@ -1154,6 +1360,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     ResetInlineEditState();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
+    ResetWindowFocusInputSuppression();
     g_pendingVsHumanAutoConfirm = false;
     g_pendingVsHumanAutoConfirmTick = 0;
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
@@ -1164,6 +1371,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ResetLobbyChallengeNotificationState();
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -1316,6 +1524,7 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
             }).detach();
         }
         g_netplayMenuState.lobbyScrollOffset = 0;
+        ResetLobbyChallengeNotificationState();
     }
     g_netplayMenuState.menuId = menuId;
     if (menuId == NetplayMenuId::Options)
@@ -1775,7 +1984,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
     const int gameSystem = GetGameSystem(screenContext);
     processInput(reinterpret_cast<int*>(gameSystem));
     netplay::bridge::Tick();
-    auto* const inputBytes = reinterpret_cast<uint8_t*>(gameSystem);
+    auto* const rawInputBytes = reinterpret_cast<uint8_t*>(gameSystem);
+    const bool windowFocused = IsScreenWindowFocused(screenContext);
+    const uint8_t* const inputBytes = FilterMenuInputsForWindowFocus(rawInputBytes, windowFocused);
     InputSnapshot currentSnapshot = {
         static_cast<int8_t>(inputBytes[12]),
         static_cast<int8_t>(inputBytes[14]),
@@ -1849,7 +2060,16 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 displayCount = static_cast<int>(lobSt.displayEntries.size());
                 playingCount = static_cast<int>(lobSt.playing.size());
+                UpdateLobbyChallengeNotificationState(screenContext, lobSt);
             }
+            else
+            {
+                ResetLobbyChallengeNotificationState();
+            }
+        }
+        else
+        {
+            ResetLobbyChallengeNotificationState();
         }
         RebuildLobbyMenuEntries(displayCount, playingCount);
 
@@ -1875,7 +2095,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     // Lobby: allow R key to trigger an immediate poll refresh.
     if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
         && g_lobbySession
-        && (GetAsyncKeyState('R') & 0x0001) != 0)
+        && ConsumeWindowFocusedHotkeyEdge(windowFocused, 'R'))
     {
         g_lobbySession->RequestRefresh();
     }
@@ -1887,7 +2107,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
-    if (HandleInlineEditInput(screenContext, inputBytes))
+    if (windowFocused && HandleInlineEditInput(screenContext, inputBytes))
     {
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
@@ -1895,14 +2115,17 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
-    if (g_netplayMenuState.menuId == NetplayMenuId::Options
+    if (windowFocused
+        && g_netplayMenuState.menuId == NetplayMenuId::Options
         && netplay::options::HandleInput(screenContext, inputBytes, inactivityCounter, &g_netplayEscapeDown))
     {
         return 0;
     }
 
     // --- Join menu: C button = paste IP:port from clipboard ---
-    if (g_netplayMenuState.menuId == NetplayMenuId::Join && !g_inlineEditState.active)
+    if (windowFocused
+        && g_netplayMenuState.menuId == NetplayMenuId::Join
+        && !g_inlineEditState.active)
     {
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
@@ -1951,7 +2174,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
     // --- Debug overlay (D key) ---
     // Always poll the D key toggle; if the overlay is open, consume input.
-    if (HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
+    if (windowFocused && HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
     {
         // Don't clear input latches — the debug overlay manages them internally
         // to prevent axis repeat.

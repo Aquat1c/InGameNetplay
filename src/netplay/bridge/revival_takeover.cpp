@@ -3,6 +3,7 @@
 
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/options_menu.h"
 
 #include "crash_handler.h"
 #include "logger.h"
@@ -349,23 +350,33 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
 
     if (selection == 2)
     {
-        // VS Human: create a real tournament session via init(3,102).
-        // This gives us win counters, player nicknames, match result
-        // logging, and the EXE patches that tournament mode applies.
-        // Save the original EXE bytes first so we can restore them when
-        // the tournament exits, then neutralize the auto-navigation
-        // input queue so the 22-entry button sequence doesn't cause
-        // phantom inputs during character select.
-        //
-        // The DLL call-site patches must be applied BEFORE init(3,102)
-        // returns, because the tournament session's tick function runs
-        // on the very next frame and would call ExitProcess immediately
-        // (mode is still 0 = title screen).
-        (void)SaveRenderContext();
-        (void)SaveTournamentExePatches();
-        (void)SaveAndApplyDllExitProcessPatches();
-        (void)SetLocalRoleFlag(kLocalRoleTournament, "title_vs_human");
-        (void)NeutralizeTournamentAutoNav();
+        if (netplay::options::UseTournamentModeForOfflineVsHuman())
+        {
+            // VS Human: create a real tournament session via init(3,102).
+            // This gives us win counters, player nicknames, match result
+            // logging, and the EXE patches that tournament mode applies.
+            // Save the original EXE bytes first so we can restore them when
+            // the tournament exits, then neutralize the auto-navigation
+            // input queue so the 22-entry button sequence doesn't cause
+            // phantom inputs during character select.
+            //
+            // The DLL call-site patches must be applied BEFORE init(3,102)
+            // returns, because the tournament session's tick function runs
+            // on the very next frame and would call ExitProcess immediately
+            // (mode is still 0 = title screen).
+            (void)SaveRenderContext();
+            (void)SaveTournamentExePatches();
+            (void)SaveAndApplyDllExitProcessPatches();
+            (void)SetLocalRoleFlag(kLocalRoleTournament, "title_vs_human_tournament");
+            (void)NeutralizeTournamentAutoNav();
+        }
+        else
+        {
+            // Regular VS Human: keep Revival in its local-play role and let
+            // the native EFZ title flow proceed without tournament-only hooks.
+            (void)SetRoleFlagDirect(kLocalRoleLocalPlay, "title_vs_human_local");
+            mod::Log("Takeover: offline VS Human configured for regular local VS");
+        }
     }
     else
     {
