@@ -58,12 +58,26 @@ enum class NetplayMenuAction : uint8_t
     LobbySlot4 = 18,
     LobbySlot5 = 19,
     LobbyPlaying0 = 20, // playing-pair display row (non-interactive)
+    // Dynamic options browser rows.
+    OptionRow0 = 21,
+    OptionRow1 = 22,
+    OptionRow2 = 23,
+    OptionRow3 = 24,
+    OptionRow4 = 25,
+    OptionRow5 = 26,
+    OptionRow6 = 27,
+    OptionRow7 = 28,
 };
 
 // Returns the LobbySlotN action for a given zero-based slot index [0, kLobbyMaxDisplayPlayers).
 constexpr NetplayMenuAction LobbySlotAction(int slot)
 {
     return static_cast<NetplayMenuAction>(static_cast<int>(NetplayMenuAction::LobbySlot0) + slot);
+}
+
+constexpr NetplayMenuAction OptionVisibleAction(int slot)
+{
+    return static_cast<NetplayMenuAction>(static_cast<int>(NetplayMenuAction::OptionRow0) + slot);
 }
 
 constexpr int kLobbyMaxDisplayPlayers = 6;

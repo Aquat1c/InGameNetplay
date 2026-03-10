@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/core/options_menu.h"
 #include "netplay/render/draw_surface.h"
 #include "netplay/render/software_font.h"
 #include "logger.h"
@@ -75,6 +76,15 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
             return "NAME: " + value;
         }
         return "NAME";
+    case NetplayMenuAction::OptionRow0:
+    case NetplayMenuAction::OptionRow1:
+    case NetplayMenuAction::OptionRow2:
+    case NetplayMenuAction::OptionRow3:
+    case NetplayMenuAction::OptionRow4:
+    case NetplayMenuAction::OptionRow5:
+    case NetplayMenuAction::OptionRow6:
+    case NetplayMenuAction::OptionRow7:
+        return netplay::options::BuildRowLabel(entry.action);
     case NetplayMenuAction::LobbyPlaying0:
     {
         // Show the playing pair at index 0 in a compact VS format.
@@ -150,6 +160,24 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     default:
         return entry.debugLabel;
     }
+}
+
+std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
+{
+    if (g_netplayMenuState.menuId == NetplayMenuId::Options)
+    {
+        return netplay::options::BuildRowPrimaryText(entry.action);
+    }
+    return BuildRowLabel(entry);
+}
+
+std::string BuildRowSecondaryText(const NetplayMenuEntry& entry)
+{
+    if (g_netplayMenuState.menuId == NetplayMenuId::Options)
+    {
+        return netplay::options::BuildRowSecondaryText(entry.action);
+    }
+    return {};
 }
 
 namespace
@@ -266,25 +294,53 @@ void DrawTooltipTextLines(
     int panelTop,
     uint8_t color)
 {
+    auto drawTooltipLine = [&](const std::string& line, int y)
+    {
+        const int availableWidth = right - left;
+        if (availableWidth <= 0)
+        {
+            return;
+        }
+
+        const int textWidth = netplay::font::MeasureText5x7Width(line, 1);
+        bool hasNonAscii = false;
+        for (unsigned char c : line)
+        {
+            if ((c & 0x80u) != 0)
+            {
+                hasNonAscii = true;
+                break;
+            }
+        }
+
+        if (textWidth <= availableWidth || hasNonAscii)
+        {
+            netplay::font::DrawTextLeft5x7(surface, line, left, right, y, 1, 1, color);
+            return;
+        }
+
+        constexpr DWORD kScrollStepMs = 180;
+        constexpr size_t kPadChars = 6;
+        const size_t visibleChars = (std::max)(static_cast<size_t>(1), static_cast<size_t>(availableWidth / 6));
+        const std::string spacer(kPadChars, ' ');
+        const std::string marquee = line + spacer + line + spacer;
+        const size_t cycle = line.size() + spacer.size();
+        const size_t start = (GetTickCount() / kScrollStepMs) % cycle;
+        const std::string window = marquee.substr(start, (std::min)(visibleChars + 2, marquee.size() - start));
+        netplay::font::DrawTextLeft5x7(surface, window, left, right, y, 1, 1, color);
+    };
+
     const size_t newline = text.find('\n');
     if (newline == std::string::npos)
     {
-        netplay::font::DrawTextLeft5x7(
-            surface,
-            text,
-            left,
-            right,
-            panelTop + ((netplay::constants::kNetplayFooterPanelHeight - 7) / 2),
-            1,
-            1,
-            color);
+        drawTooltipLine(text, panelTop + ((netplay::constants::kNetplayFooterPanelHeight - 7) / 2));
         return;
     }
 
     const std::string line1 = text.substr(0, newline);
     const std::string line2 = text.substr(newline + 1);
-    netplay::font::DrawTextLeft5x7(surface, line1, left, right, panelTop + 3, 1, 1, color);
-    netplay::font::DrawTextLeft5x7(surface, line2, left, right, panelTop + 10, 1, 1, color);
+    drawTooltipLine(line1, panelTop + 4);
+    drawTooltipLine(line2, panelTop + 13);
 }
 }
 
@@ -309,6 +365,24 @@ std::string BuildFooterText()
             return "Edit nickname\nEnter=Save Esc=Cancel Ctrl+V=Paste";
         default:
             return "Enter=Save Esc=Cancel";
+        }
+    }
+
+    if (g_netplayMenuState.menuId == NetplayMenuId::Options)
+    {
+        if (netplay::options::IsSaveOverlayActive())
+        {
+            return {};
+        }
+
+        const NetplayMenuEntry* entry = GetCurrentMenuEntry(
+            ClampSelectionToCurrentMenu(static_cast<int>(g_lastLoggedSelection >= 0 ? g_lastLoggedSelection : 0)));
+        const NetplayMenuAction action =
+            entry != nullptr ? entry->action : NetplayMenuAction::BackToMain;
+        const std::string footer = netplay::options::BuildFooterText(action);
+        if (!footer.empty())
+        {
+            return footer;
         }
     }
 
@@ -443,6 +517,8 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks()
         [](NetplayMenuId menuId, int* count) -> const NetplayMenuEntry* { return netplay::menu::GetMenuEntries(menuId, count); },
         []() -> std::string { return BuildMenuHeaderText(); },
         [](const NetplayMenuEntry& entry) -> std::string { return BuildRowLabel(entry); },
+        [](const NetplayMenuEntry& entry) -> std::string { return BuildRowPrimaryText(entry); },
+        [](const NetplayMenuEntry& entry) -> std::string { return BuildRowSecondaryText(entry); },
         []() -> std::string { return BuildFooterText(); },
         []() -> HFONT { return GetMenuOverlayFont(); },
         [](NetplayMenuAction action) -> bool { return IsInlineEditableAction(action); },

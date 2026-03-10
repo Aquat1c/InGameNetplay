@@ -44,11 +44,13 @@ add_library(efz_netplay_mod SHARED
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
+    src/netplay/core/options_keybinds.cpp
     src/netplay/core/patch_utils.cpp
     src/netplay/core/tls_http_client.cpp
     src/netplay/core/text_utils.cpp
     src/netplay/core/validation.cpp
     src/netplay/hooks/menu_hooks.cpp
+    src/netplay/hooks/options_menu.cpp
     src/netplay/hooks/title_assets.cpp
     src/netplay/hooks/title_core.cpp
     src/netplay/hooks/title_draw_layers.cpp
@@ -69,6 +71,10 @@ target_compile_definitions(efz_netplay_mod PRIVATE NOMINMAX)
 if(EFZ_EMBEDDED_TLS)
     target_compile_definitions(efz_netplay_mod PRIVATE EFZ_EMBEDDED_TLS=1)
     target_link_libraries(efz_netplay_mod PRIVATE mbedtls mbedx509 mbedcrypto)
+endif()
+
+if(WIN32)
+    target_link_libraries(efz_netplay_mod PRIVATE winmm)
 endif()
 
 if(MSVC)

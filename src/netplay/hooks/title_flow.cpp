@@ -3,6 +3,7 @@
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/input_utils.h"
+#include "netplay/core/options_menu.h"
 #include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
@@ -1292,12 +1293,17 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
 
 void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
 {
+    const NetplayMenuId previousMenu = g_netplayMenuState.menuId;
     if (g_inlineEditState.active)
     {
         CancelInlineEdit();
     }
+    if (previousMenu == NetplayMenuId::Options && menuId != NetplayMenuId::Options)
+    {
+        netplay::options::LeaveMenu();
+    }
     // Lobby session lifecycle: destroy when navigating away, create when entering.
-    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
+    if (previousMenu == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
     {
         if (g_lobbySession)
         {
@@ -1312,6 +1318,11 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
         g_netplayMenuState.lobbyScrollOffset = 0;
     }
     g_netplayMenuState.menuId = menuId;
+    if (menuId == NetplayMenuId::Options)
+    {
+        const bool loaded = netplay::options::EnterMenu();
+        mod::Log("SwitchToMenu: entering Options loaded=%d", loaded ? 1 : 0);
+    }
     if (menuId == NetplayMenuId::Lobby && !g_lobbySession)
     {
         // Seed the dynamic entry list with 0 idle players before any spec
@@ -1380,6 +1391,12 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         selectedRow,
         RowIndexToString(selectedRow),
         MenuActionToString(action));
+
+    if (g_netplayMenuState.menuId == NetplayMenuId::Options
+        && netplay::options::ExecuteAction(screenContext, action))
+    {
+        return;
+    }
 
     switch (action)
     {
@@ -1875,6 +1892,12 @@ char UpdateNetplayMenu(uint32_t screenContext)
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         *inactivityCounter = 0;
+        return 0;
+    }
+
+    if (g_netplayMenuState.menuId == NetplayMenuId::Options
+        && netplay::options::HandleInput(screenContext, inputBytes, inactivityCounter, &g_netplayEscapeDown))
+    {
         return 0;
     }
 
@@ -2441,6 +2464,15 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 const int current = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
                 const int delta = vertical > 0 ? 1 : -1;
                 int next = (current + delta + entryCount) % entryCount;
+
+                if (g_netplayMenuState.menuId == NetplayMenuId::Options)
+                {
+                    int optionsNext = next;
+                    if (netplay::options::HandleVerticalNavigation(current, delta, &optionsNext))
+                    {
+                        next = optionsNext;
+                    }
+                }
 
                 // Lobby: intercept boundary movement to scroll the display list
                 // instead of wrapping when more entries exist off-screen.

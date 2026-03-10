@@ -16,6 +16,8 @@ struct OverlayCallbacks
     std::function<const netplay::menu::NetplayMenuEntry*(netplay::menu::NetplayMenuId, int*)> getMenuEntries;
     std::function<std::string()> buildMenuHeaderText;
     std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowLabel;
+    std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowPrimaryText;
+    std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowSecondaryText;
     std::function<std::string()> buildFooterText;
     std::function<HFONT()> getMenuOverlayFont;
     std::function<bool(netplay::menu::NetplayMenuAction)> isInlineEditableAction;
@@ -56,5 +58,4 @@ bool DrawDynamicFieldValuesGdi(
     uint32_t screenContext,
     bool allowWindowDc);
 }
-
 

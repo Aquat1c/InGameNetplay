@@ -1,4 +1,5 @@
 #include "netplay/core/menu_model.h"
+#include "netplay/core/options_menu.h"
 
 #include "logger.h"
 
@@ -27,11 +28,6 @@ constexpr std::array<NetplayMenuEntry, 4> kJoinMenuEntries = {{
     {NetplayMenuAction::JoinConnect, RowToIndex(NetplayObRow::Join), "JOIN_CONNECT"},
     {NetplayMenuAction::JoinEditAddress, RowToIndex(NetplayObRow::Address), "JOIN_ADDRESS"},
     {NetplayMenuAction::JoinEditPort, RowToIndex(NetplayObRow::Port), "JOIN_PORT"},
-    {NetplayMenuAction::BackToMain, RowToIndex(NetplayObRow::ReturnToTitle), "BACK"},
-}};
-
-constexpr std::array<NetplayMenuEntry, 2> kOptionsMenuEntries = {{
-    {NetplayMenuAction::NicknameEdit, RowToIndex(NetplayObRow::Options), "OPTIONS_NAME"},
     {NetplayMenuAction::BackToMain, RowToIndex(NetplayObRow::ReturnToTitle), "BACK"},
 }};
 
@@ -125,13 +121,17 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
         {NetplayMenuId::Main,     "NETPLAY SETTINGS", kMainMenuEntries.data(),     static_cast<int>(kMainMenuEntries.size()),     0},
         {NetplayMenuId::Host,     "HOST SETTINGS",    kHostMenuEntries.data(),     static_cast<int>(kHostMenuEntries.size()),     0},
         {NetplayMenuId::Join,     "JOIN SETTINGS",    kJoinMenuEntries.data(),     static_cast<int>(kJoinMenuEntries.size()),     0},
-        {NetplayMenuId::Options,  "OPTIONS",          kOptionsMenuEntries.data(),  static_cast<int>(kOptionsMenuEntries.size()),  0},
+        {NetplayMenuId::Options,  "OPTIONS",          nullptr,                      0,                                              0},
     }};
 
     for (const NetplayMenuSpec& spec : specs)
     {
         if (spec.menuId == menuId)
         {
+            if (menuId == NetplayMenuId::Options)
+            {
+                return netplay::options::GetMenuSpec();
+            }
             return &spec;
         }
     }
@@ -184,6 +184,22 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "LobbySlot5";
     case NetplayMenuAction::LobbyPlaying0:
         return "LobbyPlaying0";
+    case NetplayMenuAction::OptionRow0:
+        return "OptionRow0";
+    case NetplayMenuAction::OptionRow1:
+        return "OptionRow1";
+    case NetplayMenuAction::OptionRow2:
+        return "OptionRow2";
+    case NetplayMenuAction::OptionRow3:
+        return "OptionRow3";
+    case NetplayMenuAction::OptionRow4:
+        return "OptionRow4";
+    case NetplayMenuAction::OptionRow5:
+        return "OptionRow5";
+    case NetplayMenuAction::OptionRow6:
+        return "OptionRow6";
+    case NetplayMenuAction::OptionRow7:
+        return "OptionRow7";
     default:
         return "Unknown";
     }
@@ -236,6 +252,10 @@ bool ValidateMenuSpecs()
         {
             RebuildLobbyMenuEntries(0, 0);
         }
+        else if (menuId == NetplayMenuId::Options)
+        {
+            netplay::options::ResetState();
+        }
 
         const NetplayMenuSpec* spec = GetMenuSpec(menuId);
         if (spec == nullptr || spec->entries == nullptr || spec->entryCount <= 0)
@@ -287,4 +307,3 @@ bool ValidateMenuSpecs()
     return true;
 }
 }
-

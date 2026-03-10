@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/core/options_menu.h"
 
 #include <cctype>
 #include <string>
@@ -375,6 +376,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }
     (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);
@@ -389,6 +391,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     DrawAnimatedCompactMenuLayer(screenContext);
     (void)DrawDynamicFieldValuesGdi(screenContext, false);
     (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
     (void)DrawDelaySetupOverlayGdi(screenContext, false);
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);

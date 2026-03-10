@@ -9,6 +9,47 @@
 
 namespace netplay::render
 {
+namespace
+{
+constexpr int kOptionsTextLeft = 8;
+constexpr int kOptionsTextRight = 314;
+
+void DrawSplitRowText(
+    const OverlayCallbacks& callbacks,
+    const netplay::font::IndexedSurfaceView& surface,
+    const netplay::menu::NetplayMenuEntry& entry,
+    int leftX,
+    int rightX,
+    int y,
+    int scaleX,
+    int scaleY,
+    uint8_t color)
+{
+    const std::string primary =
+        callbacks.buildRowPrimaryText
+        ? callbacks.buildRowPrimaryText(entry)
+        : callbacks.buildRowLabel(entry);
+    const std::string secondary =
+        callbacks.buildRowSecondaryText
+        ? callbacks.buildRowSecondaryText(entry)
+        : std::string();
+    if (secondary.empty())
+    {
+        netplay::font::DrawTextLeft5x7(surface, primary, leftX, rightX, y, scaleX, scaleY, color);
+        return;
+    }
+
+    constexpr int kColumnGap = 8;
+    constexpr int kMinPrimaryWidth = 86;
+    const int secondaryWidth = netplay::font::MeasureText5x7Width(secondary, scaleX);
+    const int secondaryLeft = (std::max)(leftX + kMinPrimaryWidth, rightX - secondaryWidth);
+    const int primaryRight = (std::max)(leftX, secondaryLeft - kColumnGap);
+
+    netplay::font::DrawTextLeft5x7(surface, primary, leftX, primaryRight, y, scaleX, scaleY, color);
+    netplay::font::DrawTextRight5x7(surface, secondary, secondaryLeft, rightX, y, scaleX, scaleY, color);
+}
+} // namespace
+
 bool DrawRuntimeTextOverlayGdi(
     const OverlayCallbacks& callbacks,
     const RuntimeOverlayState& state,
@@ -44,8 +85,8 @@ bool DrawRuntimeTextOverlayGdi(
     const uint8_t normalTextColor = netplay::draw::ResolveBestPaletteColor(screenContext, 108, 108, 108);
     const uint8_t highlightColor = netplay::draw::ResolveBestPaletteColor(screenContext, 110, 225, 214);
 
-    constexpr int panelLeft = 150;
-    constexpr int panelRight = 314;
+    const int panelLeft = (state.menuId == netplay::menu::NetplayMenuId::Options) ? kOptionsTextLeft : 150;
+    const int panelRight = (state.menuId == netplay::menu::NetplayMenuId::Options) ? kOptionsTextRight : 314;
     constexpr int rowHeight = netplay::constants::kNetplayDefaultHighlightHeight;
     constexpr int rowStep = netplay::constants::kNetplayCompactMenuRowStep;
 
@@ -70,10 +111,17 @@ bool DrawRuntimeTextOverlayGdi(
                 netplay::font::FillIndexedSurfaceRect(sv, panelLeft, rowY, panelRight - panelLeft, rowHeight, highlightColor);
             }
 
-            const std::string label = callbacks.buildRowLabel(entries[i]);
             const int textY = rowY + (rowHeight - 7) / 2; // center 5x7 glyph in row
             const uint8_t color = isSelected ? selectedTextColor : normalTextColor;
-            netplay::font::DrawTextLeft5x7(sv, label, panelLeft + 2, panelRight - 2, textY, 1, 1, color);
+            if (state.menuId == netplay::menu::NetplayMenuId::Options)
+            {
+                DrawSplitRowText(callbacks, sv, entries[i], panelLeft + 2, panelRight - 2, textY, 1, 1, color);
+            }
+            else
+            {
+                const std::string label = callbacks.buildRowLabel(entries[i]);
+                netplay::font::DrawTextLeft5x7(sv, label, panelLeft + 2, panelRight - 2, textY, 1, 1, color);
+            }
         }
     }
 
@@ -123,7 +171,8 @@ bool DrawDynamicFieldValuesGdi(
     }
     // Lobby rows all carry dynamic GDI labels (player names, playing pair, Back).
     const bool isLobby = (state.menuId == netplay::menu::NetplayMenuId::Lobby);
-    if (!hasDynamicField && !isLobby)
+    const bool isOptions = (state.menuId == netplay::menu::NetplayMenuId::Options);
+    if (!hasDynamicField && !isLobby && !isOptions)
     {
         return true;
     }
@@ -151,16 +200,16 @@ bool DrawDynamicFieldValuesGdi(
             {
                 std::string value;
                 bool drawAsLabel = false;
-                if (isLobby)
+                if (isLobby || isOptions)
                 {
-                    // BackToMain uses the ReturnToTitle sprite row which already
-                    // has "RETURN TO TITLE" baked into the sprite sheet — skip it.
-                    if (entries[i].action == netplay::menu::NetplayMenuAction::BackToMain)
+                    // Lobby's Back row uses the native return sprite; Options is
+                    // fully dynamic, including its Back row.
+                    if (isLobby && entries[i].action == netplay::menu::NetplayMenuAction::BackToMain)
                     {
                         continue;
                     }
-                    // For the lobby, every other row gets a centered label from
-                    // buildRowLabel (player name, "vs", etc.).
+                    // For the lobby/options menus, rows get their label from
+                    // buildRowLabel (player names, setting names, values, etc.).
                     if (!callbacks.buildRowLabel)
                     {
                         continue;
@@ -183,10 +232,13 @@ bool DrawDynamicFieldValuesGdi(
                 const int slideY = callbacks.getScaledNativeSlideY(screenContext);
                 const int rowTop = netplay::constants::kNetplayCompactMenuTopY + i * netplay::constants::kNetplayCompactMenuRowStep + slideY;
                 const int rowBottom = rowTop + state.highlightHeight;
+                const bool drawLeftAligned = isLobby || isOptions || drawAsLabel;
+                const int leftBase = isOptions ? kOptionsTextLeft : (isLobby ? 8 : (drawLeftAligned ? 152 : 182));
                 const int leftX = highResSurface
-                    ? (isLobby ? 8 : (drawAsLabel ? 152 : 182))
-                    : MulDiv(isLobby ? 8 : (drawAsLabel ? 152 : 182), lockedSurface.width, 320);
-                const int rightX = highResSurface ? 314 : MulDiv(314, lockedSurface.width, 320);
+                    ? leftBase
+                    : MulDiv(leftBase, lockedSurface.width, 320);
+                const int rightBase = isOptions ? kOptionsTextRight : 314;
+                const int rightX = highResSurface ? rightBase : MulDiv(rightBase, lockedSurface.width, 320);
                 const int topY = highResSurface ? rowTop : MulDiv(rowTop, lockedSurface.height, 240);
                 const int bottomY = highResSurface ? rowBottom : MulDiv(rowBottom, lockedSurface.height, 240);
                 const int rowHeight = bottomY - topY;
@@ -199,7 +251,20 @@ bool DrawDynamicFieldValuesGdi(
                     lockedSurface.pitch,
                 };
 
-                if (isLobby || drawAsLabel)
+                if (isOptions)
+                {
+                    DrawSplitRowText(
+                        callbacks,
+                        surfaceView,
+                        entries[i],
+                        leftX,
+                        rightX - fontScaleX,
+                        textY,
+                        fontScaleX,
+                        fontScaleY,
+                        color);
+                }
+                else if (drawLeftAligned)
                 {
                     netplay::font::DrawTextLeft5x7(
                         surfaceView,
