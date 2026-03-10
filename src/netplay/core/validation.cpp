@@ -107,7 +107,28 @@ bool IsValidNickname(const std::string& nickname)
 
     return codepoints > 0 && codepoints <= 20;
 }
-}
 
+bool IsValidLobbyRoomCode(const std::string& roomCode)
+{
+    if (roomCode.empty() || roomCode.size() > 63)
+    {
+        return false;
+    }
+
+    for (char c : roomCode)
+    {
+        const bool ok =
+            std::isalnum(static_cast<unsigned char>(c)) != 0
+            || c == '.'
+            || c == '-'
+            || c == '_';
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+}
 
 

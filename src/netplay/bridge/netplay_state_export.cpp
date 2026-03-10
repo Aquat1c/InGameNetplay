@@ -579,9 +579,21 @@ void Update(const NetbridgeStatus& status)
     // Netplay menu state (v2)
     {
         const auto& menu = netplay::hooks::internal::g_netplayMenuState;
+        const uint8_t exportedMenuScreen = [&]() -> uint8_t
+        {
+            switch (menu.menuId)
+            {
+            case netplay::menu::NetplayMenuId::PlayerRooms:
+                // Preserve the existing public ABI by folding the new
+                // Player Rooms browser into the old "Lobby" exported slot.
+                return EFZ_MENU_LOBBY;
+            default:
+                return static_cast<uint8_t>(menu.menuId);
+            }
+        }();
         s.inNetplayMenu = menu.active ? 1 : 0;
         s.netplayMenuScreen = menu.active
-            ? static_cast<uint8_t>(menu.menuId)
+            ? exportedMenuScreen
             : 0;
         if (s.inNetplayMenu)
             caps |= EFZ_CAP_MENU;

@@ -17,6 +17,30 @@ constexpr int kMaxDisplayPlayers = 6;
 // Maximum number of playing pairs tracked from the server.
 constexpr int kMaxPlayingPairs = 8;
 
+enum class RoomOrigin : uint8_t
+{
+    GlobalLobby = 0,
+    PlayerRooms = 1,
+};
+
+struct PublicRoomSummary
+{
+    std::string roomCode;
+    int playerCount = 0;
+};
+
+struct LobbyJoinedRoom
+{
+    int lobbyNumericId = 0;
+    int playerId = 0;
+    int secret = 0;
+    std::string roomType;
+    std::string roomAlias;
+    std::string roomCode;
+    RoomOrigin origin = RoomOrigin::GlobalLobby;
+    bool isGlobalRoom = false;
+};
+
 struct LobbyPlayer
 {
     std::string name;
@@ -71,9 +95,32 @@ struct LobbyStatus
     std::vector<LobbyPlayingPair> playing;        // up to kMaxPlayingPairs
     std::string statusMessage; // human-readable status or error text
     std::string publicIp;      // our discovered public IP (empty until resolved)
+    std::string roomType;
+    std::string roomAlias;
+    std::string roomCode;
+    RoomOrigin roomOrigin = RoomOrigin::GlobalLobby;
+    bool isGlobalRoom = false;
     DWORD lastPollTick = 0;
     bool inBattle = false;     // true while we are in an active match
 };
+
+// Browser-side helpers used by the public/private room directory UI.
+// These calls are synchronous and do not create a background poll thread.
+bool ListPublicRooms(std::vector<PublicRoomSummary>* outRooms, std::string* outError);
+bool JoinRoom(
+    const std::string& nickname,
+    const std::string& roomCode,
+    uint16_t hostPort,
+    RoomOrigin origin,
+    LobbyJoinedRoom* outJoinedRoom,
+    std::string* outError);
+bool CreateRoom(
+    const std::string& nickname,
+    const std::string& roomType,
+    uint16_t hostPort,
+    RoomOrigin origin,
+    LobbyJoinedRoom* outJoinedRoom,
+    std::string* outError);
 
 // Manages a single Concerto lobby session for the EFZ lobby (alias "EFZ").
 // The join/poll/leave cycle runs on an internal background thread.
@@ -84,7 +131,10 @@ public:
     // |nickname| is the player's display name; |hostPort| is the port they are
     // hosting on (0 if not hosting), advertised in the join request so other
     // players can initiate P2P connections.
-    explicit LobbySession(std::string nickname, uint16_t hostPort = 0);
+    explicit LobbySession(
+        std::string nickname,
+        uint16_t hostPort = 0,
+        const LobbyJoinedRoom* joinedRoom = nullptr);
     ~LobbySession();
 
     // Non-copyable, non-movable.
@@ -105,6 +155,11 @@ public:
 
     // Returns our player ID assigned by the server (0 if not yet joined).
     int GetPlayerId() const;
+    RoomOrigin GetOrigin() const { return m_joinedRoom.origin; }
+    bool IsGlobalRoom() const { return m_joinedRoom.isGlobalRoom; }
+    const std::string& GetRoomType() const { return m_joinedRoom.roomType; }
+    const std::string& GetRoomAlias() const { return m_joinedRoom.roomAlias; }
+    const std::string& GetRoomCode() const { return m_joinedRoom.roomCode; }
 
     // Queue a challenge request for |targetPlayerId|.  |ipPort| is our
     // public ip:port string (e.g. "1.2.3.4:10800").  Processed on the
@@ -187,9 +242,8 @@ private:
     uint16_t m_hostPort = 0;
 
     // Lobby session credentials set by DoJoin.
-    int m_lobbyNumericId = 0;
-    int m_playerId = 0;
-    int m_secret = 0;
+    LobbyJoinedRoom m_joinedRoom = {};
+    bool m_hasPrejoinedRoom = false;
 
     // Discovered public IP (empty until resolved).
     std::string m_publicIp;

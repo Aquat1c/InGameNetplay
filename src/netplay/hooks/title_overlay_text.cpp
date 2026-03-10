@@ -1,6 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/options_menu.h"
+#include "netplay/core/player_rooms_menu.h"
 #include "netplay/render/draw_surface.h"
 #include "netplay/render/software_font.h"
 #include "logger.h"
@@ -20,6 +21,19 @@ constexpr char kLobbyPlayingEyeGlyph = '\x7F';
 
 std::string BuildMenuHeaderText()
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby && g_lobbySession)
+    {
+        if (g_lobbySession->GetOrigin() == netplay::lobby::RoomOrigin::PlayerRooms)
+        {
+            if (!g_lobbySession->GetRoomAlias().empty())
+            {
+                return g_lobbySession->GetRoomAlias();
+            }
+            return "PLAYER ROOM";
+        }
+        return "LOBBY";
+    }
+
     const NetplayMenuSpec* spec = GetMenuSpec(g_netplayMenuState.menuId);
     if (spec == nullptr || spec->headerLabel == nullptr)
     {
@@ -45,6 +59,15 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
         return "BATTLE LOG";
     case NetplayMenuAction::OpenOptions:
         return "OPTIONS";
+    case NetplayMenuAction::PlayerRoomsRefresh:
+    case NetplayMenuAction::PlayerRoomsJoin:
+    case NetplayMenuAction::PlayerRoomsEditCode:
+    case NetplayMenuAction::PlayerRoomsCreate:
+    case NetplayMenuAction::PlayerRoomsRoomType:
+    case NetplayMenuAction::PlayerRoomsSlot0:
+    case NetplayMenuAction::PlayerRoomsSlot1:
+    case NetplayMenuAction::PlayerRoomsSlot2:
+        return netplay::player_rooms::BuildRowLabel(entry.action);
     case NetplayMenuAction::LeaveNetplay:
         return "RETURN TO TITLE";
     case NetplayMenuAction::HostStart:
@@ -165,6 +188,10 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
 
 std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms)
+    {
+        return netplay::player_rooms::BuildRowPrimaryText(entry.action);
+    }
     if (g_netplayMenuState.menuId == NetplayMenuId::Options)
     {
         return netplay::options::BuildRowPrimaryText(entry.action);
@@ -174,6 +201,10 @@ std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
 
 std::string BuildRowSecondaryText(const NetplayMenuEntry& entry)
 {
+    if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms)
+    {
+        return netplay::player_rooms::BuildRowSecondaryText(entry.action);
+    }
     if (g_netplayMenuState.menuId == NetplayMenuId::Options)
     {
         return netplay::options::BuildRowSecondaryText(entry.action);
@@ -183,6 +214,29 @@ std::string BuildRowSecondaryText(const NetplayMenuEntry& entry)
 
 namespace
 {
+std::string AppendPlayerRoomCodeFooter(std::string footer)
+{
+    if (g_netplayMenuState.menuId != NetplayMenuId::Lobby || !g_lobbySession)
+    {
+        return footer;
+    }
+    if (g_lobbySession->GetOrigin() != netplay::lobby::RoomOrigin::PlayerRooms)
+    {
+        return footer;
+    }
+    if (g_lobbySession->GetRoomCode().empty())
+    {
+        return footer;
+    }
+
+    const std::string codeLine = "Room Code: " + g_lobbySession->GetRoomCode();
+    if (footer.empty())
+    {
+        return codeLine;
+    }
+    return footer + "\n" + codeLine;
+}
+
 std::string BuildActionTooltip(NetplayMenuAction action)
 {
     switch (action)
@@ -199,6 +253,20 @@ std::string BuildActionTooltip(NetplayMenuAction action)
         return "Browse and search BattleLog.txt.";
     case NetplayMenuAction::OpenOptions:
         return "Adjust netplay settings.\nSaved in EfzRevival.ini.";
+    case NetplayMenuAction::PlayerRoomsRefresh:
+        return "Refresh the public room list.";
+    case NetplayMenuAction::PlayerRoomsJoin:
+        return "Join the room code shown below.";
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return "Set the room code or alias to join.";
+    case NetplayMenuAction::PlayerRoomsCreate:
+        return "Create a room using the selected visibility.";
+    case NetplayMenuAction::PlayerRoomsRoomType:
+        return "Choose whether new rooms are Private or Public.";
+    case NetplayMenuAction::PlayerRoomsSlot0:
+    case NetplayMenuAction::PlayerRoomsSlot1:
+    case NetplayMenuAction::PlayerRoomsSlot2:
+        return "Join the highlighted public room.";
     case NetplayMenuAction::LeaveNetplay:
         return "Return to the title screen.";
     case NetplayMenuAction::HostStart:
@@ -387,6 +455,19 @@ std::string BuildFooterText()
         }
     }
 
+    if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms)
+    {
+        const NetplayMenuEntry* entry = GetCurrentMenuEntry(
+            ClampSelectionToCurrentMenu(static_cast<int>(g_lastLoggedSelection >= 0 ? g_lastLoggedSelection : 0)));
+        const NetplayMenuAction action =
+            entry != nullptr ? entry->action : NetplayMenuAction::BackToMain;
+        const std::string footer = netplay::player_rooms::BuildFooterText(action);
+        if (!footer.empty())
+        {
+            return footer;
+        }
+    }
+
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const auto bridgePhase = static_cast<netplay::bridge::NetbridgePhase>(bridgeStatus.phase);
     if (bridgePhase != netplay::bridge::NetbridgePhase::Idle
@@ -405,10 +486,10 @@ std::string BuildFooterText()
         const std::string tip = BuildEntryTooltip(*entry);
         if (!tip.empty())
         {
-            return tip;
+            return AppendPlayerRoomCodeFooter(tip);
         }
     }
-    return {};
+    return AppendPlayerRoomCodeFooter({});
 }
 
 bool DrawFooterTooltipOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)

@@ -4,6 +4,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/options_menu.h"
+#include "netplay/core/player_rooms_menu.h"
 #include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
@@ -1510,6 +1511,12 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         netplay::options::LeaveMenu();
     }
+    if (previousMenu == NetplayMenuId::PlayerRooms
+        && menuId != NetplayMenuId::PlayerRooms
+        && menuId != NetplayMenuId::Lobby)
+    {
+        netplay::player_rooms::LeaveMenu();
+    }
     // Lobby session lifecycle: destroy when navigating away, create when entering.
     if (previousMenu == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
     {
@@ -1532,18 +1539,39 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
         const bool loaded = netplay::options::EnterMenu();
         mod::Log("SwitchToMenu: entering Options loaded=%d", loaded ? 1 : 0);
     }
+    if (menuId == NetplayMenuId::PlayerRooms)
+    {
+        const bool loaded = netplay::player_rooms::EnterMenu();
+        mod::Log("SwitchToMenu: entering PlayerRooms loaded=%d", loaded ? 1 : 0);
+    }
     if (menuId == NetplayMenuId::Lobby && !g_lobbySession)
     {
         // Seed the dynamic entry list with 0 idle players before any spec
         // queries so that GetCurrentMenuEntryCount() returns a valid count.
         RebuildLobbyMenuEntries(0, 0);
         g_netplayMenuState.lobbyScrollOffset = 0;
-        mod::Log("SwitchToMenu: entering Lobby, creating session for '%s' port=%u",
-            g_netplayMenuState.nickname.c_str(),
-            static_cast<unsigned>(g_netplayMenuState.hostPort));
-        g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
-            g_netplayMenuState.nickname,
-            g_netplayMenuState.hostPort);
+        netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+        if (netplay::player_rooms::ConsumePendingJoinedRoom(&joinedRoom))
+        {
+            mod::Log(
+                "SwitchToMenu: entering Lobby from PlayerRooms roomCode='%s' roomId=%d type='%s'",
+                joinedRoom.roomCode.c_str(),
+                joinedRoom.lobbyNumericId,
+                joinedRoom.roomType.c_str());
+            g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
+                g_netplayMenuState.nickname,
+                g_netplayMenuState.hostPort,
+                &joinedRoom);
+        }
+        else
+        {
+            mod::Log("SwitchToMenu: entering Lobby, creating global session for '%s' port=%u",
+                g_netplayMenuState.nickname.c_str(),
+                static_cast<unsigned>(g_netplayMenuState.hostPort));
+            g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
+                g_netplayMenuState.nickname,
+                g_netplayMenuState.hostPort);
+        }
     }
     else if (menuId == NetplayMenuId::Lobby && g_lobbySession)
     {
@@ -1589,6 +1617,17 @@ void ShowStubActionMessage(HWND owner, const std::string& message)
     MessageBoxA(owner, message.c_str(), "Netplay", MB_OK | MB_ICONINFORMATION);
 }
 
+NetplayMenuId ResolveCancelTargetMenu()
+{
+    if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
+        && g_lobbySession
+        && g_lobbySession->GetOrigin() == netplay::lobby::RoomOrigin::PlayerRooms)
+    {
+        return NetplayMenuId::PlayerRooms;
+    }
+    return NetplayMenuId::Main;
+}
+
 void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int logicalSelection)
 {
     const HWND owner = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
@@ -1606,6 +1645,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
         return;
     }
+    if (g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
+        && netplay::player_rooms::ExecuteAction(screenContext, action))
+    {
+        return;
+    }
 
     switch (action)
     {
@@ -1619,7 +1663,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         break;
     case NetplayMenuAction::OpenPlayerRooms:
         g_netplayMenuState.mainSelection = logicalSelection;
-        ShowStubActionMessage(owner, "Player Rooms UI is not implemented yet.");
+        StartMenuSlideTransition(screenContext, NetplayMenuId::PlayerRooms, -1, +1);
         break;
     case NetplayMenuAction::OpenLobby:
         g_netplayMenuState.mainSelection = logicalSelection;
@@ -1634,7 +1678,16 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         StartMenuSlideTransition(screenContext, NetplayMenuId::Options, -1, +1);
         break;
     case NetplayMenuAction::BackToMain:
-        StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+        if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
+            && g_lobbySession
+            && g_lobbySession->GetOrigin() == netplay::lobby::RoomOrigin::PlayerRooms)
+        {
+            StartMenuSlideTransition(screenContext, NetplayMenuId::PlayerRooms, -1, -1);
+        }
+        else
+        {
+            StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+        }
         break;
     case NetplayMenuAction::LeaveNetplay:
         LeaveNetplayMenu(screenContext);
@@ -2118,6 +2171,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if (windowFocused
         && g_netplayMenuState.menuId == NetplayMenuId::Options
         && netplay::options::HandleInput(screenContext, inputBytes, inactivityCounter, &g_netplayEscapeDown))
+    {
+        return 0;
+    }
+
+    if (windowFocused
+        && g_netplayMenuState.menuId == NetplayMenuId::PlayerRooms
+        && netplay::player_rooms::HandleInput(screenContext, inputBytes, inactivityCounter))
     {
         return 0;
     }
@@ -2665,7 +2725,15 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
         else
         {
-            StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+            const NetplayMenuId targetMenu = ResolveCancelTargetMenu();
+            if (targetMenu == NetplayMenuId::PlayerRooms)
+            {
+                StartMenuSlideTransition(screenContext, targetMenu, -1, -1);
+            }
+            else
+            {
+                StartMenuSlideTransition(screenContext, targetMenu, g_netplayMenuState.mainSelection, -1);
+            }
         }
         return 0;
     }
@@ -2788,7 +2856,15 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
             else
             {
-                StartMenuSlideTransition(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection, -1);
+                const NetplayMenuId targetMenu = ResolveCancelTargetMenu();
+                if (targetMenu == NetplayMenuId::PlayerRooms)
+                {
+                    StartMenuSlideTransition(screenContext, targetMenu, -1, -1);
+                }
+                else
+                {
+                    StartMenuSlideTransition(screenContext, targetMenu, g_netplayMenuState.mainSelection, -1);
+                }
             }
             return 0;
         }

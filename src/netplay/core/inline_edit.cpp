@@ -27,6 +27,8 @@ size_t GetMaxLength(NetplayMenuAction action)
         return kInlineEditMaxPortLength;
     case NetplayMenuAction::JoinEditAddress:
         return kInlineEditMaxJoinAddressLength;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return kInlineEditMaxRoomCodeLength;
     case NetplayMenuAction::NicknameEdit:
         return kInlineEditMaxNicknameLength;
     default:
@@ -44,6 +46,8 @@ bool IsCharacterAllowed(NetplayMenuAction action, char c)
         return c >= '0' && c <= '9';
     case NetplayMenuAction::JoinEditAddress:
         return std::isalnum(uc) != 0 || c == '.' || c == ':' || c == '-' || c == '_';
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return std::isalnum(uc) != 0 || c == '.' || c == '-' || c == '_';
     case NetplayMenuAction::NicknameEdit:
         // Allow printable ASCII (32-126) and non-ASCII bytes (UTF-8 lead/continuation)
         return (c >= 32 && c <= 126) || uc >= 0x80u;
@@ -190,6 +194,9 @@ bool GetCommittedValue(NetplayMenuAction action, const netplay::inline_edit::Val
         return true;
     case NetplayMenuAction::NicknameEdit:
         *outValue = values.nickname;
+        return true;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        *outValue = values.playerRoomsRoomCode;
         return true;
     default:
         return false;
@@ -364,6 +371,15 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
         }
         values->nickname = value;
         break;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        if (!netplay::validation::IsValidLobbyRoomCode(value))
+        {
+            SetError(state, "INVALID ROOM CODE");
+            mod::Log("InlineEdit: invalid room code '%s'", value.c_str());
+            return false;
+        }
+        values->playerRoomsRoomCode = value;
+        break;
     default:
         return false;
     }
@@ -384,6 +400,7 @@ bool IsInlineEditableAction(NetplayMenuAction action)
     case NetplayMenuAction::JoinEditAddress:
     case NetplayMenuAction::JoinEditPort:
     case NetplayMenuAction::NicknameEdit:
+    case NetplayMenuAction::PlayerRoomsEditCode:
         return true;
     default:
         return false;
@@ -595,5 +612,4 @@ InputResult HandleInput(
     return InputResult::Consumed;
 }
 }
-
 

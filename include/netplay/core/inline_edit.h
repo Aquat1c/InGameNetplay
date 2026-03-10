@@ -15,6 +15,7 @@ struct Values
     std::string joinAddress = "127.0.0.1";
     uint16_t joinPort = 7500;
     std::string nickname = "Player";
+    std::string playerRoomsRoomCode;
 };
 
 struct State

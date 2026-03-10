@@ -30,8 +30,9 @@ enum class NetplayMenuId : uint8_t
     Main = 0,
     Host = 1,
     Join = 2,
-    Options = 3,
-    Lobby = 4,
+    PlayerRooms = 3,
+    Options = 4,
+    Lobby = 5,
 };
 
 enum class NetplayMenuAction : uint8_t
@@ -50,24 +51,39 @@ enum class NetplayMenuAction : uint8_t
     JoinEditAddress = 11,
     JoinEditPort = 12,
     NicknameEdit = 13,
-    // Lobby browser
-    LobbySlot0 = 14,
-    LobbySlot1 = 15,
-    LobbySlot2 = 16,
-    LobbySlot3 = 17,
-    LobbySlot4 = 18,
-    LobbySlot5 = 19,
-    LobbyPlaying0 = 20, // playing-pair display row (non-interactive)
+    // Player Rooms browser
+    PlayerRoomsRefresh = 14,
+    PlayerRoomsJoin = 15,
+    PlayerRoomsEditCode = 16,
+    PlayerRoomsCreate = 17,
+    PlayerRoomsRoomType = 18,
+    PlayerRoomsSlot0 = 19,
+    PlayerRoomsSlot1 = 20,
+    PlayerRoomsSlot2 = 21,
+    // Active room browser
+    LobbySlot0 = 22,
+    LobbySlot1 = 23,
+    LobbySlot2 = 24,
+    LobbySlot3 = 25,
+    LobbySlot4 = 26,
+    LobbySlot5 = 27,
+    LobbyPlaying0 = 28, // playing-pair display row (non-interactive)
     // Dynamic options browser rows.
-    OptionRow0 = 21,
-    OptionRow1 = 22,
-    OptionRow2 = 23,
-    OptionRow3 = 24,
-    OptionRow4 = 25,
-    OptionRow5 = 26,
-    OptionRow6 = 27,
-    OptionRow7 = 28,
+    OptionRow0 = 29,
+    OptionRow1 = 30,
+    OptionRow2 = 31,
+    OptionRow3 = 32,
+    OptionRow4 = 33,
+    OptionRow5 = 34,
+    OptionRow6 = 35,
+    OptionRow7 = 36,
 };
+
+constexpr NetplayMenuAction PlayerRoomsSlotAction(int slot)
+{
+    return static_cast<NetplayMenuAction>(
+        static_cast<int>(NetplayMenuAction::PlayerRoomsSlot0) + slot);
+}
 
 // Returns the LobbySlotN action for a given zero-based slot index [0, kLobbyMaxDisplayPlayers).
 constexpr NetplayMenuAction LobbySlotAction(int slot)

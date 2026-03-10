@@ -124,6 +124,7 @@ inline constexpr uint32_t kInlineEditCaretBlinkMs = 350;
 inline constexpr uint32_t kInlineEditErrorDisplayMs = 1800;
 inline constexpr size_t kInlineEditMaxPortLength = 5;
 inline constexpr size_t kInlineEditMaxJoinAddressLength = 63;
+inline constexpr size_t kInlineEditMaxRoomCodeLength = 63;
 inline constexpr size_t kInlineEditMaxNicknameLength = 60;
 
 inline constexpr std::array<int, kNetplayConfigOptionCount> kDefaultHighlightSourceY = {316, 330, 344, 358, 372, 386, 400, 414, 428, 442};

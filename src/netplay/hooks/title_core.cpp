@@ -1,6 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 
 #include "logger.h"
+#include "netplay/core/player_rooms_menu.h"
 
 #include <cstring>
 
@@ -199,6 +200,7 @@ InlineEditValues GetInlineEditValuesSnapshot()
     values.joinAddress = g_netplayMenuState.joinAddress;
     values.joinPort = g_netplayMenuState.joinPort;
     values.nickname = g_netplayMenuState.nickname;
+    values.playerRoomsRoomCode = netplay::player_rooms::GetRoomCode();
     return values;
 }
 
@@ -208,6 +210,7 @@ void ApplyInlineEditValues(const InlineEditValues& values)
     g_netplayMenuState.joinAddress = values.joinAddress;
     g_netplayMenuState.joinPort = values.joinPort;
     g_netplayMenuState.nickname = values.nickname;
+    netplay::player_rooms::SetRoomCode(values.playerRoomsRoomCode);
 }
 
 bool IsInlineEditableAction(NetplayMenuAction action)

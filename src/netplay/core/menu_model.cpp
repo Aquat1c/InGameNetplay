@@ -1,5 +1,6 @@
 #include "netplay/core/menu_model.h"
 #include "netplay/core/options_menu.h"
+#include "netplay/core/player_rooms_menu.h"
 
 #include "logger.h"
 
@@ -45,7 +46,7 @@ void RebuildLobbyMenuEntries(int idleCount, int playingCount)
     // The actual label text is drawn on top by DrawDynamicFieldValuesGdi.
     // BackToMain uses ReturnToTitle so the "RETURN TO TITLE" bar is shown.
     constexpr int kBlankRow  = RowToIndex(NetplayObRow::Blank);
-    constexpr int kBackRow   = RowToIndex(NetplayObRow::ReturnToTitle);
+    constexpr int kBackRow   = RowToIndex(NetplayObRow::Blank);
     int idx = 0;
     for (int s = 0; s < visSlots; ++s)
     {
@@ -70,6 +71,8 @@ const char* MenuIdToString(NetplayMenuId menuId)
         return "Host";
     case NetplayMenuId::Join:
         return "Join";
+    case NetplayMenuId::PlayerRooms:
+        return "PlayerRooms";
     case NetplayMenuId::Options:
         return "Options";
     case NetplayMenuId::Lobby:
@@ -115,6 +118,10 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
     if (menuId == NetplayMenuId::Lobby)
     {
         return &s_lobbyDynSpec;
+    }
+    if (menuId == NetplayMenuId::PlayerRooms)
+    {
+        return netplay::player_rooms::GetMenuSpec();
     }
 
     static const std::array<NetplayMenuSpec, 4> specs = {{
@@ -170,6 +177,22 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "JoinEditPort";
     case NetplayMenuAction::NicknameEdit:
         return "NicknameEdit";
+    case NetplayMenuAction::PlayerRoomsRefresh:
+        return "PlayerRoomsRefresh";
+    case NetplayMenuAction::PlayerRoomsJoin:
+        return "PlayerRoomsJoin";
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return "PlayerRoomsEditCode";
+    case NetplayMenuAction::PlayerRoomsCreate:
+        return "PlayerRoomsCreate";
+    case NetplayMenuAction::PlayerRoomsRoomType:
+        return "PlayerRoomsRoomType";
+    case NetplayMenuAction::PlayerRoomsSlot0:
+        return "PlayerRoomsSlot0";
+    case NetplayMenuAction::PlayerRoomsSlot1:
+        return "PlayerRoomsSlot1";
+    case NetplayMenuAction::PlayerRoomsSlot2:
+        return "PlayerRoomsSlot2";
     case NetplayMenuAction::LobbySlot0:
         return "LobbySlot0";
     case NetplayMenuAction::LobbySlot1:
@@ -236,10 +259,11 @@ int GetDefaultSelectionForMenu(NetplayMenuId menuId)
 
 bool ValidateMenuSpecs()
 {
-    constexpr std::array<NetplayMenuId, 5> kMenus = {
+    constexpr std::array<NetplayMenuId, 6> kMenus = {
         NetplayMenuId::Main,
         NetplayMenuId::Host,
         NetplayMenuId::Join,
+        NetplayMenuId::PlayerRooms,
         NetplayMenuId::Options,
         NetplayMenuId::Lobby,
     };
@@ -251,6 +275,10 @@ bool ValidateMenuSpecs()
         if (menuId == NetplayMenuId::Lobby)
         {
             RebuildLobbyMenuEntries(0, 0);
+        }
+        else if (menuId == NetplayMenuId::PlayerRooms)
+        {
+            netplay::player_rooms::ResetState();
         }
         else if (menuId == NetplayMenuId::Options)
         {

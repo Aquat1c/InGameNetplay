@@ -1180,16 +1180,474 @@ std::string UrlEncode(const std::string& s)
     }
     return out;
 }
+
+std::string DoLobbyHttpGetPath(const std::string& path)
+{
+    const LobbyEndpointConfig& endpointConfig = GetLobbyEndpointConfig();
+    const std::string primaryUrl = BuildLobbyRequestUrl(path);
+    std::string proxyUrl = BuildLobbyProxyRequestUrl(path);
+    if (!proxyUrl.empty() && proxyUrl == primaryUrl)
+    {
+        proxyUrl.clear();
+    }
+
+    int backend = 0;
+    const bool allowPrimaryWinHttp = !endpointConfig.hasBaseUrlOverride;
+    std::string body = TryHttpGetForEndpoint(
+        endpointConfig,
+        "primary",
+        primaryUrl,
+        path,
+        allowPrimaryWinHttp,
+        &backend);
+    if (!body.empty())
+    {
+        LogBackendTransition(endpointConfig, backend, "primary");
+        return body;
+    }
+
+    if (!proxyUrl.empty())
+    {
+        mod::Log(
+            "LobbySession::DoHttpGet: primary endpoint failed; retrying proxy endpoint url='%s'",
+            proxyUrl.c_str());
+
+        body = TryHttpGetForEndpoint(
+            endpointConfig,
+            "proxy",
+            proxyUrl,
+            path,
+            false,
+            &backend);
+        if (!body.empty())
+        {
+            LogBackendTransition(endpointConfig, backend, "proxy");
+            return body;
+        }
+    }
+
+    if (backend == 0)
+    {
+        mod::Log("LobbySession::DoHttpGet: no available HTTP backend");
+    }
+    return std::string();
+}
+
+bool IsJsonStatusOk(const std::string& json)
+{
+    return json.find("\"status\":\"OK\"") != std::string::npos
+        || json.find("\"msg\":\"OK\"") != std::string::npos
+        || json.find("\"OK\"") != std::string::npos;
+}
+
+bool ExtractJsonStringValue(const std::string& json, const char* key, std::string* out)
+{
+    if (key == nullptr || out == nullptr)
+    {
+        return false;
+    }
+
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t keyPos = json.find(needle);
+    if (keyPos == std::string::npos)
+    {
+        return false;
+    }
+
+    const size_t colonPos = json.find(':', keyPos + needle.size());
+    if (colonPos == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t cursor = colonPos + 1;
+    while (cursor < json.size() && std::isspace(static_cast<unsigned char>(json[cursor])) != 0)
+    {
+        ++cursor;
+    }
+    if (cursor >= json.size() || json[cursor] != '"')
+    {
+        return false;
+    }
+
+    ++cursor;
+    ReadJsonStringBody(json, cursor, out);
+    return true;
+}
+
+bool ExtractJsonIntValue(const std::string& json, const char* key, int* out)
+{
+    if (key == nullptr || out == nullptr)
+    {
+        return false;
+    }
+
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t keyPos = json.find(needle);
+    if (keyPos == std::string::npos)
+    {
+        return false;
+    }
+
+    const size_t colonPos = json.find(':', keyPos + needle.size());
+    if (colonPos == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t valuePos = colonPos + 1;
+    while (valuePos < json.size()
+        && std::isspace(static_cast<unsigned char>(json[valuePos])) != 0)
+    {
+        ++valuePos;
+    }
+
+    if (valuePos >= json.size()
+        || !std::isdigit(static_cast<unsigned char>(json[valuePos])))
+    {
+        return false;
+    }
+
+    char* endPtr = nullptr;
+    *out = static_cast<int>(std::strtol(json.c_str() + valuePos, &endPtr, 10));
+    return (endPtr != json.c_str() + valuePos);
+}
+
+std::string ExtractJsonMessage(const std::string& json, const char* fallback)
+{
+    std::string message;
+    if (ExtractJsonStringValue(json, "msg", &message) && !message.empty())
+    {
+        return message;
+    }
+    return fallback != nullptr ? std::string(fallback) : std::string();
+}
+
+void ApplyJoinedRoomFromResponse(
+    const std::string& body,
+    const std::string& roomCode,
+    RoomOrigin origin,
+    bool isGlobalRoom,
+    LobbyJoinedRoom* outJoinedRoom)
+{
+    if (outJoinedRoom == nullptr)
+    {
+        return;
+    }
+
+    int numericId = 0;
+    int playerId = 0;
+    int secret = 0;
+    (void)ExtractJsonIntValue(body, "id", &numericId);
+    (void)ExtractJsonIntValue(body, "msg", &playerId);
+    (void)ExtractJsonIntValue(body, "secret", &secret);
+
+    outJoinedRoom->lobbyNumericId = numericId;
+    outJoinedRoom->playerId = playerId;
+    outJoinedRoom->secret = secret;
+    outJoinedRoom->roomCode = roomCode;
+    outJoinedRoom->origin = origin;
+    outJoinedRoom->isGlobalRoom = isGlobalRoom;
+    (void)ExtractJsonStringValue(body, "type", &outJoinedRoom->roomType);
+    (void)ExtractJsonStringValue(body, "alias", &outJoinedRoom->roomAlias);
+    if (outJoinedRoom->roomCode.empty() && outJoinedRoom->lobbyNumericId > 0)
+    {
+        outJoinedRoom->roomCode = std::to_string(outJoinedRoom->lobbyNumericId);
+    }
+}
+
+void ParsePublicRoomSummaries(const std::string& json, std::vector<PublicRoomSummary>* outRooms)
+{
+    if (outRooms == nullptr)
+    {
+        return;
+    }
+    outRooms->clear();
+
+    const size_t tagPos = json.find("\"lobbies\":");
+    if (tagPos == std::string::npos)
+    {
+        return;
+    }
+
+    size_t cursor = json.find('[', tagPos);
+    if (cursor == std::string::npos)
+    {
+        return;
+    }
+    ++cursor;
+
+    auto skipSeparators = [&]()
+    {
+        while (cursor < json.size()
+            && (json[cursor] == ' ' || json[cursor] == '\n' || json[cursor] == '\r' || json[cursor] == ','))
+        {
+            ++cursor;
+        }
+    };
+
+    while (cursor < json.size())
+    {
+        skipSeparators();
+        if (cursor >= json.size() || json[cursor] == ']')
+        {
+            break;
+        }
+        if (json[cursor] != '[')
+        {
+            break;
+        }
+        ++cursor;
+        skipSeparators();
+
+        std::string roomCode;
+        if (cursor < json.size() && json[cursor] == '"')
+        {
+            ++cursor;
+            ReadJsonStringBody(json, cursor, &roomCode);
+        }
+        else
+        {
+            const size_t start = cursor;
+            while (cursor < json.size()
+                && (std::isdigit(static_cast<unsigned char>(json[cursor])) != 0 || json[cursor] == '-'))
+            {
+                ++cursor;
+            }
+            roomCode.assign(json, start, cursor - start);
+        }
+
+        skipSeparators();
+        if (cursor < json.size() && json[cursor] == ',')
+        {
+            ++cursor;
+        }
+        skipSeparators();
+
+        int playerCount = 0;
+        if (cursor < json.size() && std::isdigit(static_cast<unsigned char>(json[cursor])) != 0)
+        {
+            char* endPtr = nullptr;
+            playerCount = static_cast<int>(std::strtol(json.c_str() + cursor, &endPtr, 10));
+            cursor = static_cast<size_t>(endPtr - json.c_str());
+        }
+
+        while (cursor < json.size() && json[cursor] != ']')
+        {
+            ++cursor;
+        }
+        if (cursor < json.size())
+        {
+            ++cursor;
+        }
+
+        if (!roomCode.empty())
+        {
+            PublicRoomSummary room;
+            room.roomCode = std::move(roomCode);
+            room.playerCount = playerCount;
+            outRooms->push_back(std::move(room));
+        }
+    }
+}
 } // namespace
+
+bool ListPublicRooms(std::vector<PublicRoomSummary>* outRooms, std::string* outError)
+{
+    if (outRooms == nullptr)
+    {
+        return false;
+    }
+
+    const std::string body = DoLobbyHttpGetPath("/l?action=list&game=efz");
+    if (body.empty())
+    {
+        if (outError != nullptr)
+        {
+            *outError = "Public room list request failed";
+        }
+        outRooms->clear();
+        return false;
+    }
+
+    ParsePublicRoomSummaries(body, outRooms);
+    if (outError != nullptr)
+    {
+        outError->clear();
+    }
+    mod::Log("PlayerRooms::ListPublicRooms: count=%zu response='%s'", outRooms->size(), body.c_str());
+    return true;
+}
+
+bool JoinRoom(
+    const std::string& nickname,
+    const std::string& roomCode,
+    uint16_t hostPort,
+    RoomOrigin origin,
+    LobbyJoinedRoom* outJoinedRoom,
+    std::string* outError)
+{
+    if (outJoinedRoom == nullptr)
+    {
+        return false;
+    }
+
+    char path[512];
+    if (hostPort != 0)
+    {
+        std::snprintf(
+            path,
+            sizeof(path),
+            "/l?action=join&id=%s&game=efz&name=%s&port=%u",
+            UrlEncode(roomCode).c_str(),
+            UrlEncode(nickname).c_str(),
+            static_cast<unsigned>(hostPort));
+    }
+    else
+    {
+        std::snprintf(
+            path,
+            sizeof(path),
+            "/l?action=join&id=%s&game=efz&name=%s",
+            UrlEncode(roomCode).c_str(),
+            UrlEncode(nickname).c_str());
+    }
+
+    const std::string body = DoLobbyHttpGetPath(path);
+    if (body.empty())
+    {
+        if (outError != nullptr)
+        {
+            *outError = "Join request failed";
+        }
+        return false;
+    }
+
+    mod::Log("PlayerRooms::JoinRoom: code='%s' response='%s'", roomCode.c_str(), body.c_str());
+    if (!IsJsonStatusOk(body))
+    {
+        if (outError != nullptr)
+        {
+            *outError = ExtractJsonMessage(body, "Join rejected by server");
+        }
+        return false;
+    }
+
+    ApplyJoinedRoomFromResponse(body, roomCode, origin, roomCode == "EFZ", outJoinedRoom);
+    if (outJoinedRoom->lobbyNumericId == 0 || outJoinedRoom->playerId == 0 || outJoinedRoom->secret == 0)
+    {
+        if (outError != nullptr)
+        {
+            *outError = "Failed to parse join response";
+        }
+        return false;
+    }
+
+    if (outError != nullptr)
+    {
+        outError->clear();
+    }
+    return true;
+}
+
+bool CreateRoom(
+    const std::string& nickname,
+    const std::string& roomType,
+    uint16_t hostPort,
+    RoomOrigin origin,
+    LobbyJoinedRoom* outJoinedRoom,
+    std::string* outError)
+{
+    if (outJoinedRoom == nullptr)
+    {
+        return false;
+    }
+
+    char path[512];
+    if (hostPort != 0)
+    {
+        std::snprintf(
+            path,
+            sizeof(path),
+            "/l?action=create&name=%s&type=%s&game=efz&port=%u",
+            UrlEncode(nickname).c_str(),
+            UrlEncode(roomType).c_str(),
+            static_cast<unsigned>(hostPort));
+    }
+    else
+    {
+        std::snprintf(
+            path,
+            sizeof(path),
+            "/l?action=create&name=%s&type=%s&game=efz",
+            UrlEncode(nickname).c_str(),
+            UrlEncode(roomType).c_str());
+    }
+
+    const std::string body = DoLobbyHttpGetPath(path);
+    if (body.empty())
+    {
+        if (outError != nullptr)
+        {
+            *outError = "Create room request failed";
+        }
+        return false;
+    }
+
+    mod::Log("PlayerRooms::CreateRoom: type='%s' response='%s'", roomType.c_str(), body.c_str());
+    if (!IsJsonStatusOk(body))
+    {
+        if (outError != nullptr)
+        {
+            *outError = ExtractJsonMessage(body, "Create room rejected by server");
+        }
+        return false;
+    }
+
+    ApplyJoinedRoomFromResponse(body, std::string(), origin, false, outJoinedRoom);
+    if (outJoinedRoom->lobbyNumericId == 0 || outJoinedRoom->playerId == 0 || outJoinedRoom->secret == 0)
+    {
+        if (outError != nullptr)
+        {
+            *outError = "Failed to parse create response";
+        }
+        return false;
+    }
+
+    if (outJoinedRoom->roomType.empty())
+    {
+        outJoinedRoom->roomType = roomType;
+    }
+    if (outError != nullptr)
+    {
+        outError->clear();
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Construction / destruction
 // ---------------------------------------------------------------------------
 
-LobbySession::LobbySession(std::string nickname, uint16_t hostPort)
+LobbySession::LobbySession(
+    std::string nickname,
+    uint16_t hostPort,
+    const LobbyJoinedRoom* joinedRoom)
     : m_nickname(std::move(nickname))
     , m_hostPort(hostPort)
 {
+    if (joinedRoom != nullptr)
+    {
+        m_joinedRoom = *joinedRoom;
+        m_hasPrejoinedRoom = true;
+    }
+    else
+    {
+        m_joinedRoom.roomCode = "EFZ";
+        m_joinedRoom.origin = RoomOrigin::GlobalLobby;
+        m_joinedRoom.isGlobalRoom = true;
+    }
+
     m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (m_wakeEvent == nullptr)
     {
@@ -1197,8 +1655,18 @@ LobbySession::LobbySession(std::string nickname, uint16_t hostPort)
     }
 
     m_status.pollState = PollState::NotJoined;
+    m_status.roomType = m_joinedRoom.roomType;
+    m_status.roomAlias = m_joinedRoom.roomAlias;
+    m_status.roomCode = m_joinedRoom.roomCode;
+    m_status.roomOrigin = m_joinedRoom.origin;
+    m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
     m_pollThread = std::thread(&LobbySession::PollThreadEntry, this);
-    mod::Log("LobbySession: started for nickname='%s'", m_nickname.c_str());
+    mod::Log(
+        "LobbySession: started for nickname='%s' prejoined=%d roomCode='%s' origin=%d",
+        m_nickname.c_str(),
+        m_hasPrejoinedRoom ? 1 : 0,
+        m_joinedRoom.roomCode.c_str(),
+        static_cast<int>(m_joinedRoom.origin));
 }
 
 LobbySession::~LobbySession()
@@ -1235,7 +1703,7 @@ LobbyStatus LobbySession::GetStatus() const
 int LobbySession::GetPlayerId() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_playerId;
+    return m_joinedRoom.playerId;
 }
 
 bool LobbySession::IsInBattle() const
@@ -1390,13 +1858,29 @@ void LobbySession::PollThreadEntry()
         return;
     }
 
-    if (!DoJoin())
+    if (m_hasPrejoinedRoom)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::Polling;
+        m_status.statusMessage.clear();
+        m_status.roomType = m_joinedRoom.roomType;
+        m_status.roomAlias = m_joinedRoom.roomAlias;
+        m_status.roomCode = m_joinedRoom.roomCode;
+        m_status.roomOrigin = m_joinedRoom.origin;
+        m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
+    }
+    else if (!DoJoin())
     {
         mod::Log("LobbySession::PollThread: join failed, exiting");
         return;
     }
 
-    mod::Log("LobbySession::PollThread: joined lobby id=%d playerId=%d", m_lobbyNumericId, m_playerId);
+    mod::Log(
+        "LobbySession::PollThread: joined lobby id=%d playerId=%d roomCode='%s' origin=%d",
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.roomCode.c_str(),
+        static_cast<int>(m_joinedRoom.origin));
 
     // Discover public IP in the background after joining.
     DiscoverPublicIp();
@@ -1452,7 +1936,8 @@ bool LobbySession::DoJoin()
         std::snprintf(
             path,
             sizeof(path),
-            "/l?action=join&id=EFZ&game=efz&name=%s&port=%u",
+            "/l?action=join&id=%s&game=efz&name=%s&port=%u",
+            UrlEncode(m_joinedRoom.roomCode).c_str(),
             UrlEncode(m_nickname).c_str(),
             static_cast<unsigned>(m_hostPort));
     }
@@ -1461,7 +1946,8 @@ bool LobbySession::DoJoin()
         std::snprintf(
             path,
             sizeof(path),
-            "/l?action=join&id=EFZ&game=efz&name=%s",
+            "/l?action=join&id=%s&game=efz&name=%s",
+            UrlEncode(m_joinedRoom.roomCode).c_str(),
             UrlEncode(m_nickname).c_str());
     }
 
@@ -1476,21 +1962,22 @@ bool LobbySession::DoJoin()
 
     mod::Log("LobbySession::DoJoin: response='%s'", body.c_str());
 
-    // Expect {"status":"OK","id":N,"msg":N,"secret":N}
-    if (body.find("\"OK\"") == std::string::npos)
+    if (!IsJsonStatusOk(body))
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.pollState = PollState::Error;
-        m_status.statusMessage = "Join rejected by server";
+        m_status.statusMessage = ExtractJsonMessage(body, "Join rejected by server");
         return false;
     }
 
-    int numericId = 0;
-    int playerId = 0;
-    int secret = 0;
-    if (!ExtractJsonInt(body, "id", &numericId)
-        || !ExtractJsonInt(body, "msg", &playerId)
-        || !ExtractJsonInt(body, "secret", &secret))
+    LobbyJoinedRoom joinedRoom = {};
+    ApplyJoinedRoomFromResponse(
+        body,
+        m_joinedRoom.roomCode,
+        m_joinedRoom.origin,
+        m_joinedRoom.roomCode == "EFZ",
+        &joinedRoom);
+    if (joinedRoom.lobbyNumericId == 0 || joinedRoom.playerId == 0 || joinedRoom.secret == 0)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.pollState = PollState::Error;
@@ -1498,12 +1985,26 @@ bool LobbySession::DoJoin()
         return false;
     }
 
-    m_lobbyNumericId = numericId;
-    m_playerId = playerId;
-    m_secret = secret;
+    m_joinedRoom.lobbyNumericId = joinedRoom.lobbyNumericId;
+    m_joinedRoom.playerId = joinedRoom.playerId;
+    m_joinedRoom.secret = joinedRoom.secret;
+    if (!joinedRoom.roomType.empty())
+    {
+        m_joinedRoom.roomType = joinedRoom.roomType;
+    }
+    if (!joinedRoom.roomAlias.empty())
+    {
+        m_joinedRoom.roomAlias = joinedRoom.roomAlias;
+    }
+    m_joinedRoom.isGlobalRoom = joinedRoom.isGlobalRoom;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_status.pollState = PollState::Polling;
+    m_status.roomType = m_joinedRoom.roomType;
+    m_status.roomAlias = m_joinedRoom.roomAlias;
+    m_status.roomCode = m_joinedRoom.roomCode;
+    m_status.roomOrigin = m_joinedRoom.origin;
+    m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
     m_status.statusMessage.clear();
     return true;
 }
@@ -1515,9 +2016,9 @@ bool LobbySession::DoPollStatus()
         path,
         sizeof(path),
         "/l?action=status&id=%d&p=%d&secret=%d",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret);
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret);
 
     const std::string body = DoHttpGet(path);
     if (body.empty())
@@ -1543,7 +2044,13 @@ bool LobbySession::DoPollStatus()
     std::vector<LobbyDisplayEntry> displayEntries;
     const bool inBattle = m_inBattle.load();
     const bool suppressChallenges = inBattle || m_returningFromMatch.load();
-    BuildDisplayEntries(challenges, idlePlayers, playingPairs, m_playerId, suppressChallenges, &displayEntries);
+    BuildDisplayEntries(
+        challenges,
+        idlePlayers,
+        playingPairs,
+        m_joinedRoom.playerId,
+        suppressChallenges,
+        &displayEntries);
 
     if (suppressChallenges && !challenges.empty())
     {
@@ -1558,6 +2065,11 @@ bool LobbySession::DoPollStatus()
     m_status.displayEntries = std::move(displayEntries);
     m_status.playing = std::move(playingPairs);
     m_status.publicIp = m_publicIp;
+    m_status.roomType = m_joinedRoom.roomType;
+    m_status.roomAlias = m_joinedRoom.roomAlias;
+    m_status.roomCode = m_joinedRoom.roomCode;
+    m_status.roomOrigin = m_joinedRoom.origin;
+    m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
     m_status.statusMessage.clear();
     m_status.lastPollTick = GetTickCount();
     m_status.inBattle = suppressChallenges;
@@ -1566,7 +2078,7 @@ bool LobbySession::DoPollStatus()
 
 void LobbySession::DoLeave()
 {
-    if (m_lobbyNumericId == 0)
+    if (m_joinedRoom.lobbyNumericId == 0)
     {
         return;
     }
@@ -1576,9 +2088,9 @@ void LobbySession::DoLeave()
         path,
         sizeof(path),
         "/l?action=leave&id=%d&p=%d&secret=%d",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret);
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret);
 
     const std::string body = DoHttpGet(path);
     mod::Log("LobbySession::DoLeave: response='%s'", body.c_str());
@@ -1590,56 +2102,7 @@ void LobbySession::DoLeave()
 
 std::string LobbySession::DoHttpGet(const std::string& path)
 {
-    const LobbyEndpointConfig& endpointConfig = GetLobbyEndpointConfig();
-    const std::string primaryUrl = BuildLobbyRequestUrl(path);
-    std::string proxyUrl = BuildLobbyProxyRequestUrl(path);
-    if (!proxyUrl.empty() && proxyUrl == primaryUrl)
-    {
-        proxyUrl.clear();
-    }
-
-    int backend = 0;
-    const bool allowPrimaryWinHttp = !endpointConfig.hasBaseUrlOverride;
-    std::string body = TryHttpGetForEndpoint(
-        endpointConfig,
-        "primary",
-        primaryUrl,
-        path,
-        allowPrimaryWinHttp,
-        &backend);
-    if (!body.empty())
-    {
-        LogBackendTransition(endpointConfig, backend, "primary");
-        return body;
-    }
-
-    if (!proxyUrl.empty())
-    {
-        mod::Log(
-            "LobbySession::DoHttpGet: primary endpoint failed; retrying proxy endpoint url='%s'",
-            proxyUrl.c_str());
-
-        body = TryHttpGetForEndpoint(
-            endpointConfig,
-            "proxy",
-            proxyUrl,
-            path,
-            false,
-            &backend);
-        if (!body.empty())
-        {
-            LogBackendTransition(endpointConfig, backend, "proxy");
-            return body;
-        }
-    }
-
-    const int previous = g_lobbyHttpBackend.exchange(0);
-    if (previous != 0)
-    {
-        mod::Log("LobbySession::DoHttpGet: no available HTTP backend");
-    }
-
-    return std::string();
+    return DoLobbyHttpGetPath(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -2173,9 +2636,9 @@ bool LobbySession::DoChallenge(int targetPlayerId, const std::string& ipPort)
         path,
         sizeof(path),
         "/l?action=challenge&id=%d&p=%d&secret=%d&t=%d&ip=%s",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret,
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret,
         targetPlayerId,
         UrlEncode(ipPort).c_str());
 
@@ -2193,9 +2656,9 @@ bool LobbySession::DoPreAccept(int challengerPlayerId)
         path,
         sizeof(path),
         "/l?action=pre_accept&id=%d&p=%d&secret=%d&t=%d",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret,
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret,
         challengerPlayerId);
 
     const std::string body = DoHttpGet(path);
@@ -2212,9 +2675,9 @@ bool LobbySession::DoAccept(int challengerPlayerId)
         path,
         sizeof(path),
         "/l?action=accept&id=%d&p=%d&secret=%d&t=%d",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret,
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret,
         challengerPlayerId);
 
     const std::string body = DoHttpGet(path);
@@ -2231,9 +2694,9 @@ bool LobbySession::DoEnd()
         path,
         sizeof(path),
         "/l?action=end&id=%d&p=%d&secret=%d",
-        m_lobbyNumericId,
-        m_playerId,
-        m_secret);
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        m_joinedRoom.secret);
 
     const std::string body = DoHttpGet(path);
     mod::Log("LobbySession::DoEnd: response='%s'", body.c_str());
