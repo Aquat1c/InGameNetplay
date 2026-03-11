@@ -145,6 +145,24 @@ struct D3dOverlayState
     bool minhookInitialized = false;
     bool endSceneObserved = false;
     bool firstD3dSpriteBlitLogged = false;
+    bool firstAcceptedRenderTargetLogged = false;
+    bool firstRejectedRenderTargetLogged = false;
+    bool firstNullDeviceLogged = false;
+    bool firstInactiveMenuSkipLogged = false;
+    bool firstWrongMenuSkipLogged = false;
+    bool firstWrongViewSkipLogged = false;
+    bool firstIconsNotReadySkipLogged = false;
+    bool firstGetRenderTargetFailureLogged = false;
+    bool firstGetRenderTargetDescFailureLogged = false;
+    bool firstTextureReadyFailureLogged = false;
+    bool firstStateBlockFailureLogged = false;
+    bool firstNoDrawableIconsLogged = false;
+    bool firstMissingSessionSpriteLogged = false;
+    bool firstHookUnavailableLogged = false;
+    bool firstGetViewportFailureLogged = false;
+    bool firstGetSwapChainFailureLogged = false;
+    bool firstGetPresentParametersFailureLogged = false;
+    uint32_t targetTraceLogsRemaining = 24;
     void* endSceneTarget = nullptr;
     EndSceneFn originalEndScene = nullptr;
     IDirect3DDevice9* textureDevice = nullptr;
@@ -154,6 +172,8 @@ D3dOverlayState g_d3dOverlay = {};
 
 constexpr int kBrowserIconSlotSize = 10;
 constexpr int kBrowserIconGap = 2;
+constexpr int kBrowserIconSlotsPerPlayer = 3;
+constexpr int kBrowserPlayerIconGroupGap = 4;
 
 struct CharacterSpriteFile
 {
@@ -217,6 +237,7 @@ void ReleaseRenderAssets();
 void ReleaseD3dTextures();
 std::string CanonicalizeCharacterNameForSpriteLookup(std::string name);
 const SpriteBitmap* FindCharacterSprite(const std::string& name);
+std::vector<std::string> BuildSessionIconCharacters(const BattleLogSession& session, bool playerOne);
 bool EnsureD3dTexturesReady(LPDIRECT3DDEVICE9 device);
 bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device);
 HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device);
@@ -229,6 +250,7 @@ void DrawScaledSpriteToSurface(
     int slotW,
     int slotH,
     std::map<uint32_t, uint8_t>* paletteCache);
+void GetBrowserIconSlotLayout(int* outP1GroupX, int* outP2GroupX, int* outGroupWidth);
 std::string FormatDateTime(const std::string& date, const std::string& time);
 std::string FormatDurationShort(int totalSeconds);
 std::string FormatResultPair(int left, int right);
@@ -725,6 +747,87 @@ const SpriteBitmap* FindCharacterSprite(const std::string& name)
     return &it->second;
 }
 
+std::vector<std::string> BuildSessionIconCharacters(const BattleLogSession& session, bool playerOne)
+{
+    struct CharacterCount
+    {
+        std::string character;
+        int matchCount = 0;
+        int lastSeenIndex = -1;
+    };
+
+    std::map<std::string, CharacterCount> counts;
+    for (size_t index = 0; index < session.matches.size(); ++index)
+    {
+        const BattleLogMatch& match = session.matches[index];
+        const std::string character = playerOne ? match.p1CharacterDisplay : match.p2CharacterDisplay;
+        if (character.empty())
+        {
+            continue;
+        }
+
+        CharacterCount& entry = counts[character];
+        entry.character = character;
+        ++entry.matchCount;
+        entry.lastSeenIndex = static_cast<int>(index);
+    }
+
+    std::vector<CharacterCount> ordered;
+    ordered.reserve(counts.size());
+    for (const auto& [_, value] : counts)
+    {
+        ordered.push_back(value);
+    }
+
+    std::sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const CharacterCount& left, const CharacterCount& right)
+        {
+            if (left.matchCount != right.matchCount)
+            {
+                return left.matchCount > right.matchCount;
+            }
+            if (left.lastSeenIndex != right.lastSeenIndex)
+            {
+                return left.lastSeenIndex > right.lastSeenIndex;
+            }
+            return _stricmp(left.character.c_str(), right.character.c_str()) < 0;
+        });
+
+    std::vector<std::string> result;
+    result.reserve((std::min)(ordered.size(), static_cast<size_t>(kBrowserIconSlotsPerPlayer)));
+    for (size_t index = 0; index < ordered.size() && index < static_cast<size_t>(kBrowserIconSlotsPerPlayer); ++index)
+    {
+        result.push_back(ordered[index].character);
+    }
+    return result;
+}
+
+void GetBrowserIconSlotLayout(int* outP1GroupX, int* outP2GroupX, int* outGroupWidth)
+{
+    const int groupWidth =
+        kBrowserIconSlotsPerPlayer * kBrowserIconSlotSize
+        + (kBrowserIconSlotsPerPlayer - 1) * kBrowserIconGap;
+    const int totalWidth = groupWidth * 2 + kBrowserPlayerIconGroupGap;
+    const int iconAreaRight = kRowX + kRowW - 6;
+    const int p1GroupX = iconAreaRight - totalWidth;
+    const int p2GroupX = p1GroupX + groupWidth + kBrowserPlayerIconGroupGap;
+
+    if (outP1GroupX != nullptr)
+    {
+        *outP1GroupX = p1GroupX;
+    }
+    if (outP2GroupX != nullptr)
+    {
+        *outP2GroupX = p2GroupX;
+    }
+    if (outGroupWidth != nullptr)
+    {
+        *outGroupWidth = groupWidth;
+    }
+}
+
 bool EnsureRenderAssetsLoaded(uint32_t screenContext)
 {
     (void)screenContext;
@@ -853,6 +956,24 @@ void ResetRenderAssetFrameState()
 {
     g_renderAssets.firstSpriteBlitLogged = false;
     g_d3dOverlay.firstD3dSpriteBlitLogged = false;
+    g_d3dOverlay.firstAcceptedRenderTargetLogged = false;
+    g_d3dOverlay.firstRejectedRenderTargetLogged = false;
+    g_d3dOverlay.firstNullDeviceLogged = false;
+    g_d3dOverlay.firstInactiveMenuSkipLogged = false;
+    g_d3dOverlay.firstWrongMenuSkipLogged = false;
+    g_d3dOverlay.firstWrongViewSkipLogged = false;
+    g_d3dOverlay.firstIconsNotReadySkipLogged = false;
+    g_d3dOverlay.firstGetRenderTargetFailureLogged = false;
+    g_d3dOverlay.firstGetRenderTargetDescFailureLogged = false;
+    g_d3dOverlay.firstTextureReadyFailureLogged = false;
+    g_d3dOverlay.firstStateBlockFailureLogged = false;
+    g_d3dOverlay.firstNoDrawableIconsLogged = false;
+    g_d3dOverlay.firstMissingSessionSpriteLogged = false;
+    g_d3dOverlay.firstHookUnavailableLogged = false;
+    g_d3dOverlay.firstGetViewportFailureLogged = false;
+    g_d3dOverlay.firstGetSwapChainFailureLogged = false;
+    g_d3dOverlay.firstGetPresentParametersFailureLogged = false;
+    g_d3dOverlay.targetTraceLogsRemaining = 24;
 }
 
 void ReleaseRenderAssets()
@@ -971,43 +1092,289 @@ bool EnsureD3dTexturesReady(LPDIRECT3DDEVICE9 device)
 
 bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
 {
-    if (device == nullptr
-        || !hooks::g_netplayMenuState.active
-        || hooks::g_netplayMenuState.menuId != NetplayMenuId::BattleLog
-        || g_state.view != View::Browser
-        || !g_renderAssets.iconsReady)
+    if (device == nullptr)
     {
+        if (!g_d3dOverlay.firstNullDeviceLogged)
+        {
+            mod::Log("BattleLog::RenderBrowserIconsD3d9: skipped because device=null");
+            g_d3dOverlay.firstNullDeviceLogged = true;
+        }
         return false;
     }
 
+    if (!hooks::g_netplayMenuState.active)
+    {
+        if (!g_d3dOverlay.firstInactiveMenuSkipLogged)
+        {
+            mod::Log("BattleLog::RenderBrowserIconsD3d9: skipped because netplay menu inactive");
+            g_d3dOverlay.firstInactiveMenuSkipLogged = true;
+        }
+        return false;
+    }
+
+    if (hooks::g_netplayMenuState.menuId != NetplayMenuId::BattleLog)
+    {
+        if (!g_d3dOverlay.firstWrongMenuSkipLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: skipped because menuId=%d not BattleLog",
+                static_cast<int>(hooks::g_netplayMenuState.menuId));
+            g_d3dOverlay.firstWrongMenuSkipLogged = true;
+        }
+        return false;
+    }
+
+    if (g_state.view != View::Browser)
+    {
+        if (!g_d3dOverlay.firstWrongViewSkipLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: skipped because view=%d not Browser",
+                static_cast<int>(g_state.view));
+            g_d3dOverlay.firstWrongViewSkipLogged = true;
+        }
+        return false;
+    }
+
+    if (!g_renderAssets.iconsReady)
+    {
+        if (!g_d3dOverlay.firstIconsNotReadySkipLogged)
+        {
+            mod::Log("BattleLog::RenderBrowserIconsD3d9: skipped because iconsReady=0");
+            g_d3dOverlay.firstIconsNotReadySkipLogged = true;
+        }
+        return false;
+    }
+
+    IDirect3DSurface9* renderTarget = nullptr;
+    if (FAILED(device->GetRenderTarget(0, &renderTarget)) || renderTarget == nullptr)
+    {
+        if (!g_d3dOverlay.firstGetRenderTargetFailureLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: GetRenderTarget failed device=%p rt=%p",
+                device,
+                renderTarget);
+            g_d3dOverlay.firstGetRenderTargetFailureLogged = true;
+        }
+        return false;
+    }
+
+    D3DSURFACE_DESC renderTargetDesc = {};
+    const HRESULT renderTargetDescHr = renderTarget->GetDesc(&renderTargetDesc);
+    if (FAILED(renderTargetDescHr))
+    {
+        if (!g_d3dOverlay.firstGetRenderTargetDescFailureLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: GetDesc failed rt=%p hr=0x%08X",
+                renderTarget,
+                static_cast<unsigned>(renderTargetDescHr));
+            g_d3dOverlay.firstGetRenderTargetDescFailureLogged = true;
+        }
+        renderTarget->Release();
+        return false;
+    }
+
+    IDirect3DSurface9* backBuffer = nullptr;
+    const HRESULT backBufferHr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
+    D3DSURFACE_DESC backBufferDesc = {};
+    bool backBufferDescReady = false;
+    if (SUCCEEDED(backBufferHr) && backBuffer != nullptr)
+    {
+        backBufferDescReady = SUCCEEDED(backBuffer->GetDesc(&backBufferDesc));
+    }
+
+    bool matchesBackBuffer = false;
+    IUnknown* renderTargetIdentity = nullptr;
+    IUnknown* backBufferIdentity = nullptr;
+    if (SUCCEEDED(backBufferHr)
+        && backBuffer != nullptr
+        && SUCCEEDED(renderTarget->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&renderTargetIdentity)))
+        && SUCCEEDED(backBuffer->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&backBufferIdentity))))
+    {
+        matchesBackBuffer = (renderTargetIdentity == backBufferIdentity);
+    }
+
+    if (renderTargetIdentity != nullptr)
+    {
+        renderTargetIdentity->Release();
+    }
+    if (backBufferIdentity != nullptr)
+    {
+        backBufferIdentity->Release();
+    }
+
+    D3DVIEWPORT9 viewport = {};
+    bool viewportReady = false;
+    const HRESULT viewportHr = device->GetViewport(&viewport);
+    if (SUCCEEDED(viewportHr))
+    {
+        viewportReady = true;
+    }
+    else if (!g_d3dOverlay.firstGetViewportFailureLogged)
+    {
+        mod::Log(
+            "BattleLog::RenderBrowserIconsD3d9: GetViewport failed device=%p hr=0x%08X",
+            device,
+            static_cast<unsigned>(viewportHr));
+        g_d3dOverlay.firstGetViewportFailureLogged = true;
+    }
+
+    IDirect3DSwapChain9* swapChain = nullptr;
+    D3DPRESENT_PARAMETERS presentParameters = {};
+    bool presentParametersReady = false;
+    const HRESULT swapChainHr = device->GetSwapChain(0, &swapChain);
+    if (SUCCEEDED(swapChainHr) && swapChain != nullptr)
+    {
+        const HRESULT presentParametersHr = swapChain->GetPresentParameters(&presentParameters);
+        if (SUCCEEDED(presentParametersHr))
+        {
+            presentParametersReady = true;
+        }
+        else if (!g_d3dOverlay.firstGetPresentParametersFailureLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: GetPresentParameters failed swapChain=%p hr=0x%08X",
+                swapChain,
+                static_cast<unsigned>(presentParametersHr));
+            g_d3dOverlay.firstGetPresentParametersFailureLogged = true;
+        }
+    }
+    else if (!g_d3dOverlay.firstGetSwapChainFailureLogged)
+    {
+        mod::Log(
+            "BattleLog::RenderBrowserIconsD3d9: GetSwapChain failed device=%p hr=0x%08X swapChain=%p",
+            device,
+            static_cast<unsigned>(swapChainHr),
+            swapChain);
+        g_d3dOverlay.firstGetSwapChainFailureLogged = true;
+    }
+
+    RECT clientRect = {};
+    bool clientRectReady = false;
+    if (presentParametersReady
+        && presentParameters.hDeviceWindow != nullptr
+        && GetClientRect(presentParameters.hDeviceWindow, &clientRect))
+    {
+        clientRectReady = true;
+    }
+
+    if (g_d3dOverlay.targetTraceLogsRemaining > 0)
+    {
+        mod::Log(
+            "BattleLog::EndSceneTrace[%u]: device=%p rt=%p rtSize=%ux%u bb=%p bbSize=%ux%u matchesBB=%d viewport=%u,%u %ux%u swapChain=%p pp=%ux%u windowed=%d hwnd=%p client=%ldx%ld",
+            25u - g_d3dOverlay.targetTraceLogsRemaining,
+            device,
+            renderTarget,
+            static_cast<unsigned>(renderTargetDesc.Width),
+            static_cast<unsigned>(renderTargetDesc.Height),
+            backBuffer,
+            backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Width) : 0u,
+            backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Height) : 0u,
+            matchesBackBuffer ? 1 : 0,
+            viewportReady ? viewport.X : 0u,
+            viewportReady ? viewport.Y : 0u,
+            viewportReady ? viewport.Width : 0u,
+            viewportReady ? viewport.Height : 0u,
+            swapChain,
+            presentParametersReady ? presentParameters.BackBufferWidth : 0u,
+            presentParametersReady ? presentParameters.BackBufferHeight : 0u,
+            presentParametersReady ? (presentParameters.Windowed ? 1 : 0) : -1,
+            presentParametersReady ? presentParameters.hDeviceWindow : nullptr,
+            clientRectReady ? static_cast<long>(clientRect.right - clientRect.left) : 0l,
+            clientRectReady ? static_cast<long>(clientRect.bottom - clientRect.top) : 0l);
+        --g_d3dOverlay.targetTraceLogsRemaining;
+    }
+
+    const bool correctGameTarget =
+        renderTargetDesc.Width == 640
+        && renderTargetDesc.Height == 480;
+
+    if (!correctGameTarget)
+    {
+        if (!g_d3dOverlay.firstRejectedRenderTargetLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: skipping rt=%p bb=%p size=%ux%u bbSize=%ux%u matchesBackBuffer=%d viewport=%u,%u %ux%u",
+                renderTarget,
+                backBuffer,
+                static_cast<unsigned>(renderTargetDesc.Width),
+                static_cast<unsigned>(renderTargetDesc.Height),
+                backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Width) : 0u,
+                backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Height) : 0u,
+                matchesBackBuffer ? 1 : 0,
+                viewportReady ? viewport.X : 0u,
+                viewportReady ? viewport.Y : 0u,
+                viewportReady ? viewport.Width : 0u,
+                viewportReady ? viewport.Height : 0u);
+            g_d3dOverlay.firstRejectedRenderTargetLogged = true;
+        }
+        if (swapChain != nullptr)
+        {
+            swapChain->Release();
+        }
+        if (backBuffer != nullptr)
+        {
+            backBuffer->Release();
+        }
+        renderTarget->Release();
+        return false;
+    }
+
+    if (!g_d3dOverlay.firstAcceptedRenderTargetLogged)
+    {
+        mod::Log(
+            "BattleLog::RenderBrowserIconsD3d9: using render target rt=%p bb=%p size=%ux%u bbSize=%ux%u viewport=%u,%u %ux%u",
+            renderTarget,
+            backBuffer,
+            static_cast<unsigned>(renderTargetDesc.Width),
+            static_cast<unsigned>(renderTargetDesc.Height),
+            backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Width) : 0u,
+            backBufferDescReady ? static_cast<unsigned>(backBufferDesc.Height) : 0u,
+            viewportReady ? viewport.X : 0u,
+            viewportReady ? viewport.Y : 0u,
+            viewportReady ? viewport.Width : 0u,
+            viewportReady ? viewport.Height : 0u);
+        g_d3dOverlay.firstAcceptedRenderTargetLogged = true;
+    }
+
+    if (swapChain != nullptr)
+    {
+        swapChain->Release();
+    }
+    if (backBuffer != nullptr)
+    {
+        backBuffer->Release();
+    }
+    renderTarget->Release();
+
     if (!EnsureD3dTexturesReady(device))
     {
+        if (!g_d3dOverlay.firstTextureReadyFailureLogged)
+        {
+            mod::Log("BattleLog::RenderBrowserIconsD3d9: skipped because EnsureD3dTexturesReady returned false");
+            g_d3dOverlay.firstTextureReadyFailureLogged = true;
+        }
         return false;
     }
 
     IDirect3DStateBlock9* stateBlock = nullptr;
     if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || stateBlock == nullptr)
     {
+        if (!g_d3dOverlay.firstStateBlockFailureLogged)
+        {
+            mod::Log(
+                "BattleLog::RenderBrowserIconsD3d9: CreateStateBlock failed device=%p",
+                device);
+            g_d3dOverlay.firstStateBlockFailureLogged = true;
+        }
         return false;
     }
     stateBlock->Capture();
 
-    D3DVIEWPORT9 viewport = {};
-    if (FAILED(device->GetViewport(&viewport)))
-    {
-        stateBlock->Release();
-        return false;
-    }
-
-    const int targetW = static_cast<int>(viewport.Width);
-    const int targetH = static_cast<int>(viewport.Height);
-    if (targetW <= 0 || targetH <= 0)
-    {
-        stateBlock->Apply();
-        stateBlock->Release();
-        return false;
-    }
-
+    const int targetW = static_cast<int>(renderTargetDesc.Width);
+    const int targetH = static_cast<int>(renderTargetDesc.Height);
     int viewportW = targetW;
     int viewportH = (viewportW * 240) / 320;
     if (viewportH > targetH)
@@ -1015,8 +1382,8 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
         viewportH = targetH;
         viewportW = (viewportH * 320) / 240;
     }
-    const int viewportX = static_cast<int>(viewport.X) + (targetW - viewportW) / 2;
-    const int viewportY = static_cast<int>(viewport.Y) + (targetH - viewportH) / 2;
+    const int viewportX = (targetW - viewportW) / 2;
+    const int viewportY = (targetH - viewportH) / 2;
 
     struct TexturedVertex
     {
@@ -1048,6 +1415,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
     device->SetFVF(kTexturedFvf);
 
+    int drawnIconCount = 0;
     for (int slot = 0; slot < netplay::menu::kBattleLogVisibleSessionRows; ++slot)
     {
         const BattleLogSession* session = GetSessionByIndex(GetSessionIndexForVisibleSlot(slot));
@@ -1056,28 +1424,83 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             continue;
         }
 
-        const SpriteBitmap* p1Sprite = FindCharacterSprite(session->finalP1Character);
-        const SpriteBitmap* p2Sprite = FindCharacterSprite(session->finalP2Character);
-        if (p1Sprite == nullptr || p2Sprite == nullptr
-            || p1Sprite->d3dTexture == nullptr || p2Sprite->d3dTexture == nullptr)
+        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
+        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
+        int p1GroupX = 0;
+        int p2GroupX = 0;
+        int groupWidth = 0;
+        GetBrowserIconSlotLayout(&p1GroupX, &p2GroupX, &groupWidth);
+        (void)groupWidth;
+
+        struct IconDrawRequest
+        {
+            const SpriteBitmap* sprite = nullptr;
+            const char* character = nullptr;
+            int logicalX = 0;
+            bool flipHorizontal = false;
+        };
+
+        std::vector<IconDrawRequest> icons;
+        icons.reserve(static_cast<size_t>(kBrowserIconSlotsPerPlayer * 2));
+
+        for (size_t index = 0; index < session->p1IconCharacters.size() && index < static_cast<size_t>(kBrowserIconSlotsPerPlayer); ++index)
+        {
+            const SpriteBitmap* sprite = FindCharacterSprite(session->p1IconCharacters[index]);
+            if (sprite == nullptr || sprite->d3dTexture == nullptr)
+            {
+                if (!g_d3dOverlay.firstMissingSessionSpriteLogged)
+                {
+                    mod::Log(
+                        "BattleLog::RenderBrowserIconsD3d9: missing P1 sprite/texture session=%d char='%s' sprite=%p texture=%p",
+                        session->sessionIndex,
+                        session->p1IconCharacters[index].c_str(),
+                        sprite,
+                        sprite != nullptr ? sprite->d3dTexture : nullptr);
+                    g_d3dOverlay.firstMissingSessionSpriteLogged = true;
+                }
+                continue;
+            }
+            icons.push_back({
+                sprite,
+                session->p1IconCharacters[index].c_str(),
+                p1GroupX + static_cast<int>(index) * (kBrowserIconSlotSize + kBrowserIconGap),
+                false,
+            });
+        }
+        for (size_t index = 0; index < session->p2IconCharacters.size() && index < static_cast<size_t>(kBrowserIconSlotsPerPlayer); ++index)
+        {
+            const SpriteBitmap* sprite = FindCharacterSprite(session->p2IconCharacters[index]);
+            if (sprite == nullptr || sprite->d3dTexture == nullptr)
+            {
+                if (!g_d3dOverlay.firstMissingSessionSpriteLogged)
+                {
+                    mod::Log(
+                        "BattleLog::RenderBrowserIconsD3d9: missing P2 sprite/texture session=%d char='%s' sprite=%p texture=%p",
+                        session->sessionIndex,
+                        session->p2IconCharacters[index].c_str(),
+                        sprite,
+                        sprite != nullptr ? sprite->d3dTexture : nullptr);
+                    g_d3dOverlay.firstMissingSessionSpriteLogged = true;
+                }
+                continue;
+            }
+            icons.push_back({
+                sprite,
+                session->p2IconCharacters[index].c_str(),
+                p2GroupX + static_cast<int>(index) * (kBrowserIconSlotSize + kBrowserIconGap),
+                true,
+            });
+        }
+
+        if (icons.empty())
         {
             continue;
         }
 
-        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
-        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
-        const int p2X = kRowX + kRowW - 6 - kBrowserIconSlotSize;
-        const int p1X = p2X - kBrowserIconGap - kBrowserIconSlotSize;
-
-        const std::array<std::pair<const SpriteBitmap*, int>, 2> icons = {{
-            {p1Sprite, p1X},
-            {p2Sprite, p2X},
-        }};
-
-        for (const auto& icon : icons)
+        for (const IconDrawRequest& icon : icons)
         {
-            const SpriteBitmap* sprite = icon.first;
-            const int logicalX = icon.second;
+            const SpriteBitmap* sprite = icon.sprite;
+            const int logicalX = icon.logicalX;
             const int logicalY = iconY;
             const int slotLeft = viewportX + (logicalX * viewportW) / 320;
             const int slotTop = viewportY + (logicalY * viewportH) / 240;
@@ -1098,31 +1521,32 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             const float right = static_cast<float>(drawX + drawW) - 0.5f;
             const float bottom = static_cast<float>(drawY + drawH) - 0.5f;
 
+            const float uLeft = icon.flipHorizontal ? 1.0f : 0.0f;
+            const float uRight = icon.flipHorizontal ? 0.0f : 1.0f;
             const TexturedVertex vertices[4] = {
-                {left,  top,    0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f},
-                {right, top,    0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 0.0f},
-                {left,  bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 1.0f},
-                {right, bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 1.0f},
+                {left,  top,    0.0f, 1.0f, 0xFFFFFFFFu, uLeft,  0.0f},
+                {right, top,    0.0f, 1.0f, 0xFFFFFFFFu, uRight, 0.0f},
+                {left,  bottom, 0.0f, 1.0f, 0xFFFFFFFFu, uLeft,  1.0f},
+                {right, bottom, 0.0f, 1.0f, 0xFFFFFFFFu, uRight, 1.0f},
             };
 
             device->SetTexture(0, sprite->d3dTexture);
             (void)device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(TexturedVertex));
+            ++drawnIconCount;
         }
 
         if (!g_d3dOverlay.firstD3dSpriteBlitLogged)
         {
             mod::Log(
-                "BattleLog::DrawBrowserIconsD3d9: viewport=(%d,%d %dx%d) slot=%d session=%d p1='%s' sprite='%s' p2='%s' sprite='%s'",
+                "BattleLog::DrawBrowserIconsD3d9: viewport=(%d,%d %dx%d) slot=%d session=%d p1Count=%zu p2Count=%zu",
                 viewportX,
                 viewportY,
                 viewportW,
                 viewportH,
                 slot,
                 session->sessionIndex,
-                session->finalP1Character.c_str(),
-                p1Sprite->path.c_str(),
-                session->finalP2Character.c_str(),
-                p2Sprite->path.c_str());
+                session->p1IconCharacters.size(),
+                session->p2IconCharacters.size());
             g_d3dOverlay.firstD3dSpriteBlitLogged = true;
         }
     }
@@ -1130,6 +1554,15 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     device->SetTexture(0, nullptr);
     stateBlock->Apply();
     stateBlock->Release();
+    if (drawnIconCount == 0 && !g_d3dOverlay.firstNoDrawableIconsLogged)
+    {
+        mod::Log(
+            "BattleLog::RenderBrowserIconsD3d9: no drawable icons for current page browserPage=%d results=%d visibleRows=%d",
+            g_state.browserPage,
+            GetBrowserResultCount(),
+            netplay::menu::kBattleLogVisibleSessionRows);
+        g_d3dOverlay.firstNoDrawableIconsLogged = true;
+    }
     return true;
 }
 
@@ -1379,27 +1812,63 @@ bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
             continue;
         }
 
-        const SpriteBitmap* p1Sprite = FindCharacterSprite(session->finalP1Character);
-        const SpriteBitmap* p2Sprite = FindCharacterSprite(session->finalP2Character);
-        if (p1Sprite == nullptr || p2Sprite == nullptr || p1Sprite->bitmap == nullptr || p2Sprite->bitmap == nullptr)
+        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
+        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
+        int p1GroupX = 0;
+        int p2GroupX = 0;
+        int groupWidth = 0;
+        GetBrowserIconSlotLayout(&p1GroupX, &p2GroupX, &groupWidth);
+        (void)groupWidth;
+
+        struct IconDrawRequest
+        {
+            const SpriteBitmap* sprite = nullptr;
+            const char* character = nullptr;
+            int logicalX = 0;
+            bool flipHorizontal = false;
+        };
+
+        std::vector<IconDrawRequest> icons;
+        icons.reserve(static_cast<size_t>(kBrowserIconSlotsPerPlayer * 2));
+
+        for (size_t index = 0; index < session->p1IconCharacters.size() && index < static_cast<size_t>(kBrowserIconSlotsPerPlayer); ++index)
+        {
+            const SpriteBitmap* sprite = FindCharacterSprite(session->p1IconCharacters[index]);
+            if (sprite == nullptr || sprite->bitmap == nullptr)
+            {
+                continue;
+            }
+            icons.push_back({
+                sprite,
+                session->p1IconCharacters[index].c_str(),
+                p1GroupX + static_cast<int>(index) * (kBrowserIconSlotSize + kBrowserIconGap),
+                false,
+            });
+        }
+        for (size_t index = 0; index < session->p2IconCharacters.size() && index < static_cast<size_t>(kBrowserIconSlotsPerPlayer); ++index)
+        {
+            const SpriteBitmap* sprite = FindCharacterSprite(session->p2IconCharacters[index]);
+            if (sprite == nullptr || sprite->bitmap == nullptr)
+            {
+                continue;
+            }
+            icons.push_back({
+                sprite,
+                session->p2IconCharacters[index].c_str(),
+                p2GroupX + static_cast<int>(index) * (kBrowserIconSlotSize + kBrowserIconGap),
+                true,
+            });
+        }
+
+        if (icons.empty())
         {
             continue;
         }
 
-        const int rowY = kBrowserRowY[static_cast<size_t>(slot)];
-        const int iconY = rowY + (kBrowserRowH - kBrowserIconSlotSize) / 2;
-        const int p2X = kRowX + kRowW - 6 - kBrowserIconSlotSize;
-        const int p1X = p2X - kBrowserIconGap - kBrowserIconSlotSize;
-
-        const std::array<std::pair<const SpriteBitmap*, int>, 2> icons = {{
-            {p1Sprite, p1X},
-            {p2Sprite, p2X},
-        }};
-
-        for (const auto& icon : icons)
+        for (const IconDrawRequest& icon : icons)
         {
-            const SpriteBitmap* sprite = icon.first;
-            const int logicalX = icon.second;
+            const SpriteBitmap* sprite = icon.sprite;
+            const int logicalX = icon.logicalX;
             const int logicalY = iconY;
             const int slotLeft = viewportX + (logicalX * viewportW) / 320;
             const int slotTop = viewportY + (logicalY * viewportH) / 240;
@@ -1415,20 +1884,40 @@ bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
             const int drawX = slotLeft + (slotW - drawW) / 2;
             const int drawY = slotTop + (slotH - drawH) / 2;
 
-            graphics.DrawImage(
-                sprite->bitmap,
-                Gdiplus::Rect(drawX, drawY, drawW, drawH),
-                0,
-                0,
-                static_cast<INT>(sprite->width),
-                static_cast<INT>(sprite->height),
-                Gdiplus::UnitPixel);
+            if (icon.flipHorizontal)
+            {
+                const Gdiplus::Point destPoints[3] = {
+                    Gdiplus::Point(drawX + drawW, drawY),
+                    Gdiplus::Point(drawX, drawY),
+                    Gdiplus::Point(drawX + drawW, drawY + drawH),
+                };
+                graphics.DrawImage(
+                    sprite->bitmap,
+                    destPoints,
+                    3,
+                    0,
+                    0,
+                    static_cast<INT>(sprite->width),
+                    static_cast<INT>(sprite->height),
+                    Gdiplus::UnitPixel);
+            }
+            else
+            {
+                graphics.DrawImage(
+                    sprite->bitmap,
+                    Gdiplus::Rect(drawX, drawY, drawW, drawH),
+                    0,
+                    0,
+                    static_cast<INT>(sprite->width),
+                    static_cast<INT>(sprite->height),
+                    Gdiplus::UnitPixel);
+            }
         }
 
         if (!g_renderAssets.firstSpriteBlitLogged)
         {
             mod::Log(
-                "BattleLog::DrawBrowserIcons%s: viewport=(%d,%d %dx%d) slot=%d session=%d p1='%s' sprite='%s' p2='%s' sprite='%s'",
+                "BattleLog::DrawBrowserIcons%s: viewport=(%d,%d %dx%d) slot=%d session=%d p1Count=%zu p2Count=%zu",
                 allowWindowDc ? "Presented" : "Backbuffer",
                 viewportX,
                 viewportY,
@@ -1436,10 +1925,8 @@ bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
                 viewportH,
                 slot,
                 session->sessionIndex,
-                session->finalP1Character.c_str(),
-                p1Sprite->path.c_str(),
-                session->finalP2Character.c_str(),
-                p2Sprite->path.c_str());
+                session->p1IconCharacters.size(),
+                session->p2IconCharacters.size());
             g_renderAssets.firstSpriteBlitLogged = true;
         }
     }
@@ -2037,6 +2524,8 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
             p1Chars.insert(match.p1CharacterDisplay);
             p2Chars.insert(match.p2CharacterDisplay);
         }
+        session.p1IconCharacters = BuildSessionIconCharacters(session, true);
+        session.p2IconCharacters = BuildSessionIconCharacters(session, false);
         session.p1SwitchedCharacter = p1Chars.size() > 1;
         session.p2SwitchedCharacter = p2Chars.size() > 1;
     }
@@ -3513,11 +4002,28 @@ void DrawBrowserRows(
             1,
             1,
             isSelected ? selectedText : normalText);
-        const bool useIcons =
-            hasGames
-            && g_renderAssets.iconsReady
-            && FindCharacterSprite(session->finalP1Character) != nullptr
-            && FindCharacterSprite(session->finalP2Character) != nullptr;
+        bool hasP1Icons = false;
+        bool hasP2Icons = false;
+        if (hasGames && g_renderAssets.iconsReady)
+        {
+            for (const std::string& character : session->p1IconCharacters)
+            {
+                if (FindCharacterSprite(character) != nullptr)
+                {
+                    hasP1Icons = true;
+                    break;
+                }
+            }
+            for (const std::string& character : session->p2IconCharacters)
+            {
+                if (FindCharacterSprite(character) != nullptr)
+                {
+                    hasP2Icons = true;
+                    break;
+                }
+            }
+        }
+        const bool useIcons = hasP1Icons || hasP2Icons;
         if (!useIcons)
         {
             int chipX = 220;
@@ -4280,6 +4786,17 @@ bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc)
     if (EnsureD3d9OverlayHookInstalled())
     {
         return true;
+    }
+
+    if (!g_d3dOverlay.firstHookUnavailableLogged)
+    {
+        mod::Log(
+            "BattleLog::DrawImageOverlayGdi: D3D9 hook unavailable, falling back allowWindowDc=%d hookAttempted=%d hookInstalled=%d endSceneObserved=%d",
+            allowWindowDc ? 1 : 0,
+            g_d3dOverlay.hookAttempted ? 1 : 0,
+            g_d3dOverlay.hookInstalled ? 1 : 0,
+            g_d3dOverlay.endSceneObserved ? 1 : 0);
+        g_d3dOverlay.firstHookUnavailableLogged = true;
     }
 
     return DrawBrowserIconsGdi(screenContext, allowWindowDc);

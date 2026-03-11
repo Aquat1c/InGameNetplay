@@ -42,6 +42,8 @@ struct BattleLogSession
     std::vector<BattleLogMatch> matches;
     std::string finalP1Character;
     std::string finalP2Character;
+    std::vector<std::string> p1IconCharacters;
+    std::vector<std::string> p2IconCharacters;
     bool p1SwitchedCharacter = false;
     bool p2SwitchedCharacter = false;
     int totalDurationSeconds = 0;
