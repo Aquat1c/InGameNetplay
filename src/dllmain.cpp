@@ -4,6 +4,7 @@
 
 #include "crash_handler.h"
 #include "logger.h"
+#include "netplay/core/mod_settings.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
@@ -13,7 +14,11 @@ namespace
 DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
 {
     const auto moduleHandle = static_cast<HMODULE>(moduleHandleRaw);
-    mod::InitializeLogger(moduleHandle);
+    netplay::mod_settings::Reload();
+    mod::InitializeLogger(
+        moduleHandle,
+        netplay::mod_settings::IsConsoleEnabled(),
+        netplay::mod_settings::IsFileLoggingEnabled());
     mod::InstallCrashHandlers(moduleHandle, false);
     mod::Log("Module attached at %p", moduleHandle);
 
@@ -33,7 +38,11 @@ DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
 DWORD WINAPI InitializeInjectedThread(LPVOID moduleHandleRaw)
 {
     const auto moduleHandle = static_cast<HMODULE>(moduleHandleRaw);
-    mod::InitializeLogger(moduleHandle, false);
+    netplay::mod_settings::Reload();
+    mod::InitializeLogger(
+        moduleHandle,
+        false,
+        netplay::mod_settings::IsFileLoggingEnabled());
     mod::InstallCrashHandlers(moduleHandle, true);
     mod::Log("Module attached in EfzRevival.exe (injected takeover mode)");
     netplay::bridge::InitializeInjectedProcess();

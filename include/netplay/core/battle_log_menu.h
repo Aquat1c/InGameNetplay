@@ -57,21 +57,33 @@ struct BattleLogFilter
     std::string opponentName;
     std::string playerCharacter;
     std::string opponentCharacter;
+    std::string setStatus;
+    std::string gameCount;
+    std::string characterSwitches;
 };
 
 struct BattleLogSummary
 {
     std::string nickname;
+    std::string secondaryNickname;
     int matchingSessions = 0;
+    int totalSessions = 0;
+    int completedSessions = 0;
+    int emptySessions = 0;
     int setWins = 0;
     int setLosses = 0;
     int gameWins = 0;
     int gameLosses = 0;
+    int totalGames = 0;
     int totalDurationSeconds = 0;
+    int warningSessions = 0;
     std::string mostUsedCharacter;
+    std::string mostUsedMatchup;
     std::string recentOpponent;
     std::string recentTimestamp;
     bool hasSessions = false;
+    bool hasPerspective = false;
+    bool isHeadToHead = false;
 };
 
 struct BattleLogDocument

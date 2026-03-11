@@ -208,6 +208,7 @@ void ActivateHostingOverlay(uint16_t port);
 void ResetHostingOverlayState();
 void ActivateJoiningOverlay(const char* address, uint16_t port);
 void ResetJoiningOverlayState();
+bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage);
 void InstallNetplayWindowHook(uint32_t screenContext);
 void RemoveNetplayWindowHook();
 bool IsWindowFocused(HWND hwnd);

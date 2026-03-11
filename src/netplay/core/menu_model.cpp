@@ -262,6 +262,12 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "BattleLogPlayerCharacter";
     case NetplayMenuAction::BattleLogOpponentCharacter:
         return "BattleLogOpponentCharacter";
+    case NetplayMenuAction::BattleLogSetStatus:
+        return "BattleLogSetStatus";
+    case NetplayMenuAction::BattleLogWarnings:
+        return "BattleLogWarnings";
+    case NetplayMenuAction::BattleLogCharacterSwitches:
+        return "BattleLogCharacterSwitches";
     case NetplayMenuAction::BattleLogApplyFilters:
         return "BattleLogApplyFilters";
     case NetplayMenuAction::BattleLogResetFilters:
@@ -282,6 +288,10 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "BattleLogGame3";
     case NetplayMenuAction::BattleLogGame4:
         return "BattleLogGame4";
+    case NetplayMenuAction::BattleLogGame5:
+        return "BattleLogGame5";
+    case NetplayMenuAction::BattleLogGame6:
+        return "BattleLogGame6";
     case NetplayMenuAction::BattleLogDetailPrevPage:
         return "BattleLogDetailPrevPage";
     case NetplayMenuAction::BattleLogDetailNextPage:

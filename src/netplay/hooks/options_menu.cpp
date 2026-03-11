@@ -2,6 +2,7 @@
 
 #include "logger.h"
 #include "netplay/core/input_utils.h"
+#include "netplay/core/mod_settings.h"
 #include "netplay/core/options_keybinds.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
@@ -140,7 +141,6 @@ struct State
 };
 
 State g_state = {};
-std::string g_otherOfflineVsMode = "Tournament";
 
 void EnsureSpecInitialized();
 std::wstring TrimWide(std::wstring_view value);
@@ -1328,41 +1328,96 @@ void AppendSyntheticItems()
         categoryIndex = static_cast<int>(g_state.categories.size()) - 1;
     }
 
-    const int existingItemIndex = FindItemIndexBySectionAndKey("Others", "OfflineVsHumanMode");
-    if (existingItemIndex >= 0)
+    const auto upsertChoiceItem =
+        [&](const char* keyName, const char* defaultValue, std::initializer_list<const char*> choiceValues, const char* tooltip)
     {
-        Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+        const int existingItemIndex = FindItemIndexBySectionAndKey("Others", keyName);
+        if (existingItemIndex >= 0)
+        {
+            Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+            item.kind = ItemKind::Choice;
+            item.rawKeyName = Utf8ToWide(keyName);
+            item.tooltipSummary = tooltip;
+            item.choiceValues.assign(choiceValues.begin(), choiceValues.end());
+            if (std::find(item.choiceValues.begin(), item.choiceValues.end(), item.currentValue) == item.choiceValues.end())
+            {
+                item.currentValue = defaultValue;
+                item.originalValue = defaultValue;
+            }
+            return;
+        }
+
+        Item item;
         item.kind = ItemKind::Choice;
-        item.choiceValues = {"Tournament", "VS Human"};
-        item.tooltipSummary =
-            "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.";
-        if (std::find(item.choiceValues.begin(), item.choiceValues.end(), item.currentValue) == item.choiceValues.end())
-        {
-            item.currentValue = g_otherOfflineVsMode;
-            item.originalValue = g_otherOfflineVsMode;
-        }
-        else
-        {
-            g_otherOfflineVsMode = item.currentValue;
-        }
-        return;
-    }
+        item.sectionName = "Others";
+        item.keyName = keyName;
+        item.rawKeyName = Utf8ToWide(keyName);
+        item.currentValue = defaultValue;
+        item.originalValue = defaultValue;
+        item.tooltipSummary = tooltip;
+        item.choiceValues.assign(choiceValues.begin(), choiceValues.end());
+        item.lineIndex = -1;
 
-    Item item;
-    item.kind = ItemKind::Choice;
-    item.sectionName = "Others";
-    item.keyName = "OfflineVsHumanMode";
-    item.rawKeyName = L"OfflineVsHumanMode";
-    item.currentValue = g_otherOfflineVsMode;
-    item.originalValue = g_otherOfflineVsMode;
-    item.tooltipSummary =
-        "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.";
-    item.choiceValues = {"Tournament", "VS Human"};
-    item.lineIndex = -1;
+        g_state.items.push_back(std::move(item));
+        g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
+            static_cast<int>(g_state.items.size()) - 1);
+    };
 
-    g_state.items.push_back(std::move(item));
-    g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
-        static_cast<int>(g_state.items.size()) - 1);
+    const auto upsertBoolIntItem =
+        [&](const char* keyName, bool defaultEnabled, const char* tooltip)
+    {
+        const std::string defaultValue = defaultEnabled ? "1" : "0";
+        const int existingItemIndex = FindItemIndexBySectionAndKey("Others", keyName);
+        if (existingItemIndex >= 0)
+        {
+            Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+            item.kind = ItemKind::BoolInt;
+            item.rawKeyName = Utf8ToWide(keyName);
+            item.tooltipSummary = tooltip;
+            if (item.currentValue != "0" && item.currentValue != "1")
+            {
+                item.currentValue = defaultValue;
+                item.originalValue = defaultValue;
+            }
+            return;
+        }
+
+        Item item;
+        item.kind = ItemKind::BoolInt;
+        item.sectionName = "Others";
+        item.keyName = keyName;
+        item.rawKeyName = Utf8ToWide(keyName);
+        item.currentValue = defaultValue;
+        item.originalValue = defaultValue;
+        item.tooltipSummary = tooltip;
+        item.lineIndex = -1;
+
+        g_state.items.push_back(std::move(item));
+        g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
+            static_cast<int>(g_state.items.size()) - 1);
+    };
+
+    upsertChoiceItem(
+        "OfflineVsHumanMode",
+        "Tournament",
+        {"Tournament", "VS Human"},
+        "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.");
+    upsertBoolIntItem(
+        "WriteLogFile",
+        true,
+        "Write efz_netplay_mod.log to disk while the mod is running.");
+    upsertBoolIntItem(
+        "EnableConsole",
+        false,
+        "Open the logger console window automatically when the mod starts.");
+    upsertBoolIntItem(
+        "EnableDebugMenu",
+        false,
+        "Allow the D button to open the in-game debug menu.");
+    upsertBoolIntItem(
+        "HideEmptySetsInBattleLog",
+        true,
+        "Hide empty 0-0 Battle Log sets by default.");
 }
 
 void ApplyRuntimeNetplaySettings()
@@ -1388,6 +1443,22 @@ void ApplyRuntimeNetplaySettings()
             }
         }
     }
+
+    netplay::mod_settings::Reload();
+
+    HMODULE moduleHandle = nullptr;
+    (void)GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&ApplyRuntimeNetplaySettings),
+        &moduleHandle);
+
+    mod::SetFileLoggingEnabled(moduleHandle, netplay::mod_settings::IsFileLoggingEnabled());
+    mod::SetConsoleVisible(netplay::mod_settings::IsConsoleEnabled());
+    hooks::g_debugOverlay.showConsole = netplay::mod_settings::IsConsoleEnabled();
+    if (!netplay::mod_settings::IsDebugMenuEnabled())
+    {
+        hooks::g_debugOverlay.open = false;
+    }
 }
 
 bool SaveItemsToDisk()
@@ -1398,6 +1469,17 @@ bool SaveItemsToDisk()
     }
 
     std::vector<std::wstring> updatedLines = g_state.lines;
+    auto shiftLineIndices = [&](int fromLine)
+    {
+        for (Item& other : g_state.items)
+        {
+            if (other.lineIndex >= fromLine)
+            {
+                ++other.lineIndex;
+            }
+        }
+    };
+
     for (Item& item : g_state.items)
     {
         if (item.lineIndex >= 0 && item.lineIndex < static_cast<int>(updatedLines.size()))
@@ -1405,17 +1487,71 @@ bool SaveItemsToDisk()
             updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
             continue;
         }
+    }
 
-        if (item.sectionName == "Others" && item.keyName == "OfflineVsHumanMode")
+    int syntheticOthersInsertLine = -1;
+    for (const Item& item : g_state.items)
+    {
+        if (item.sectionName == "Others" && item.lineIndex >= 0)
         {
-            if (!updatedLines.empty() && !TrimWide(updatedLines.back()).empty())
-            {
-                updatedLines.push_back(L"");
-            }
-            updatedLines.push_back(L"[Others]");
-            item.lineIndex = static_cast<int>(updatedLines.size());
-            updatedLines.push_back(item.rawKeyName + L"=" + Utf8ToWide(item.currentValue));
+            syntheticOthersInsertLine = (std::max)(syntheticOthersInsertLine, item.lineIndex + 1);
         }
+    }
+
+    if (syntheticOthersInsertLine < 0)
+    {
+        bool insideOthers = false;
+        for (int lineIndex = 0; lineIndex < static_cast<int>(updatedLines.size()); ++lineIndex)
+        {
+            const std::wstring trimmed = TrimWide(updatedLines[static_cast<size_t>(lineIndex)]);
+            if (!trimmed.empty() && trimmed.front() == L'[' && trimmed.back() == L']')
+            {
+                const std::wstring sectionName = TrimWide(std::wstring_view(trimmed).substr(1, trimmed.size() - 2));
+                if (insideOthers)
+                {
+                    syntheticOthersInsertLine = lineIndex;
+                    break;
+                }
+                insideOthers = (sectionName == L"Others");
+                if (insideOthers)
+                {
+                    syntheticOthersInsertLine = lineIndex + 1;
+                }
+                continue;
+            }
+
+            if (insideOthers)
+            {
+                syntheticOthersInsertLine = lineIndex + 1;
+            }
+        }
+    }
+
+    if (syntheticOthersInsertLine < 0)
+    {
+        syntheticOthersInsertLine = static_cast<int>(updatedLines.size());
+        if (!updatedLines.empty() && !TrimWide(updatedLines.back()).empty())
+        {
+            updatedLines.push_back(L"");
+            ++syntheticOthersInsertLine;
+        }
+        updatedLines.push_back(L"[Others]");
+        syntheticOthersInsertLine = static_cast<int>(updatedLines.size());
+    }
+
+    for (Item& item : g_state.items)
+    {
+        if (item.sectionName != "Others" || item.lineIndex >= 0)
+        {
+            continue;
+        }
+
+        updatedLines.insert(
+            updatedLines.begin() + syntheticOthersInsertLine,
+            item.rawKeyName + L"=" + Utf8ToWide(item.currentValue));
+        shiftLineIndices(syntheticOthersInsertLine);
+        item.lineIndex = syntheticOthersInsertLine;
+        ++syntheticOthersInsertLine;
     }
 
     const std::wstring joined = JoinLines(updatedLines);
@@ -1429,10 +1565,6 @@ bool SaveItemsToDisk()
     for (Item& item : g_state.items)
     {
         item.originalValue = item.currentValue;
-        if (item.sectionName == "Others" && item.keyName == "OfflineVsHumanMode")
-        {
-            g_otherOfflineVsMode = item.currentValue;
-        }
     }
     ApplyRuntimeNetplaySettings();
     SetStatusMessage("Settings saved.");
@@ -2840,6 +2972,6 @@ bool IsBusy()
 
 bool UseTournamentModeForOfflineVsHuman()
 {
-    return g_otherOfflineVsMode != "VS Human";
+    return netplay::mod_settings::UseTournamentModeForOfflineVsHuman();
 }
 } // namespace netplay::options

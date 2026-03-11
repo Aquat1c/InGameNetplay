@@ -95,19 +95,24 @@ enum class NetplayMenuAction : uint8_t
     BattleLogEditOpponentName = 50,
     BattleLogPlayerCharacter = 51,
     BattleLogOpponentCharacter = 52,
-    BattleLogApplyFilters = 53,
-    BattleLogResetFilters = 54,
-    BattleLogBrowserPrevPage = 55,
-    BattleLogBrowserNextPage = 56,
-    BattleLogBrowserFilters = 57,
-    BattleLogGame0 = 58,
-    BattleLogGame1 = 59,
-    BattleLogGame2 = 60,
-    BattleLogGame3 = 61,
-    BattleLogGame4 = 62,
-    BattleLogDetailPrevPage = 63,
-    BattleLogDetailNextPage = 64,
-    BattleLogBack = 65,
+    BattleLogSetStatus = 53,
+    BattleLogWarnings = 54,
+    BattleLogCharacterSwitches = 55,
+    BattleLogApplyFilters = 56,
+    BattleLogResetFilters = 57,
+    BattleLogBrowserPrevPage = 58,
+    BattleLogBrowserNextPage = 59,
+    BattleLogBrowserFilters = 60,
+    BattleLogGame0 = 61,
+    BattleLogGame1 = 62,
+    BattleLogGame2 = 63,
+    BattleLogGame3 = 64,
+    BattleLogGame4 = 65,
+    BattleLogGame5 = 66,
+    BattleLogGame6 = 67,
+    BattleLogDetailPrevPage = 68,
+    BattleLogDetailNextPage = 69,
+    BattleLogBack = 70,
 };
 
 constexpr NetplayMenuAction PlayerRoomsSlotAction(int slot)
@@ -142,7 +147,7 @@ constexpr NetplayMenuAction BattleLogGameAction(int slot)
 constexpr int kLobbyMaxDisplayPlayers = 6;
 constexpr int kLobbyMaxPlayingPairs   = 1;
 constexpr int kBattleLogVisibleSessionRows = 6;
-constexpr int kBattleLogVisibleGameRows = 5;
+constexpr int kBattleLogVisibleGameRows = 7;
 
 struct NetplayMenuEntry
 {

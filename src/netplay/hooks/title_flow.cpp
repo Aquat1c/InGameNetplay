@@ -4,6 +4,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
 #include "netplay/core/input_utils.h"
+#include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
 #include "netplay/core/tls_http_client.h"
@@ -460,6 +461,55 @@ void ActivateJoiningOverlay(const char* address, uint16_t port)
     strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
     g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
     mod::Log("JoiningOverlay: activated  target=%s:%u", address, static_cast<unsigned>(port));
+}
+
+bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage)
+{
+    (void)screenContext;
+
+    if (outErrorMessage != nullptr)
+    {
+        outErrorMessage->clear();
+    }
+
+    const auto& menuState = g_netplayMenuState;
+    if (menuState.joinAddress.empty() || menuState.joinPort == 0)
+    {
+        if (outErrorMessage != nullptr)
+        {
+            *outErrorMessage = "Set the join address and port first.";
+        }
+        mod::Log("WaitToSpectate: missing join address/port");
+        return false;
+    }
+
+    const bool started = netplay::bridge::StartSession(
+        netplay::bridge::NetbridgeRole::Spectate,
+        menuState.joinPort,
+        menuState.joinAddress.c_str(),
+        "");
+    if (started)
+    {
+        ActivateJoiningOverlay(menuState.joinAddress.c_str(), menuState.joinPort);
+        mod::Log(
+            "WaitToSpectate: started spectate session -> %s:%u",
+            menuState.joinAddress.c_str(),
+            static_cast<unsigned>(menuState.joinPort));
+        return true;
+    }
+
+    const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+    if (outErrorMessage != nullptr)
+    {
+        *outErrorMessage =
+            status.errorMsg[0] != '\0'
+                ? status.errorMsg
+                : "Unknown error";
+    }
+    mod::Log(
+        "WaitToSpectate: StartSession failed -> %s",
+        status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+    return false;
 }
 
 namespace  // reopen anonymous namespace
@@ -2183,6 +2233,14 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    // --- Debug overlay (D key) ---
+    // Always poll the D key toggle before menu-specific handlers so the
+    // debug overlay is truly modal once opened.
+    if (windowFocused && HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
+    {
+        return 0;
+    }
+
     if (windowFocused
         && g_netplayMenuState.menuId == NetplayMenuId::Options
         && netplay::options::HandleInput(screenContext, inputBytes, inactivityCounter, &g_netplayEscapeDown))
@@ -2209,6 +2267,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         && g_netplayMenuState.menuId == NetplayMenuId::Join
         && !g_inlineEditState.active)
     {
+        const bool debugMenuEnabled = netplay::mod_settings::IsDebugMenuEnabled();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
             if (inputBytes[playerIndex + 20] == 1)
@@ -2251,16 +2310,27 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 }
                 break;
             }
-        }
-    }
 
-    // --- Debug overlay (D key) ---
-    // Always poll the D key toggle; if the overlay is open, consume input.
-    if (windowFocused && HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
-    {
-        // Don't clear input latches — the debug overlay manages them internally
-        // to prevent axis repeat.
-        return 0;
+            if (!debugMenuEnabled && inputBytes[playerIndex + 22] == 1)
+            {
+                std::string errorMessage;
+                if (TryStartWaitToSpectateFromJoinSettings(screenContext, &errorMessage))
+                {
+                    PlayUiSound(screenContext, kSfxConfirm);
+                }
+                else
+                {
+                    const HWND owner = reinterpret_cast<HWND>(
+                        *reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+                    ShowStubActionMessage(
+                        owner,
+                        "Wait to spectate failed.\n\n"
+                        + (errorMessage.empty() ? std::string("Unknown error") : errorMessage));
+                }
+                *inactivityCounter = 0;
+                return 0;
+            }
+        }
     }
 
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();

@@ -44,6 +44,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
+    src/netplay/core/mod_settings.cpp
     src/netplay/core/options_keybinds.cpp
     src/netplay/core/patch_utils.cpp
     src/netplay/core/tls_http_client.cpp

@@ -13,6 +13,8 @@ namespace
 std::mutex g_logMutex;
 bool g_consoleReady = false;
 FILE* g_logFile = nullptr;
+bool g_fileLoggingEnabled = true;
+std::string g_logPath;
 
 std::string BuildLogPathFromModule(HMODULE moduleHandle)
 {
@@ -51,13 +53,41 @@ void WriteLineUnlocked(const char* line)
         fflush(g_logFile);
     }
 }
+
+void OpenLogFileUnlocked()
+{
+    if (!g_fileLoggingEnabled || g_logFile != nullptr || g_logPath.empty())
+    {
+        return;
+    }
+
+    FILE* file = _fsopen(g_logPath.c_str(), "a", _SH_DENYNO);
+    if (file != nullptr)
+    {
+        g_logFile = file;
+    }
+}
+
+void CloseLogFileUnlocked()
+{
+    if (g_logFile == nullptr)
+    {
+        return;
+    }
+
+    fclose(g_logFile);
+    g_logFile = nullptr;
+}
 }
 
 namespace mod
 {
-bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole)
+bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
+
+    g_logPath = BuildLogPathFromModule(moduleHandle);
+    g_fileLoggingEnabled = writeLogFile;
 
     if (!g_consoleReady && spawnConsole)
     {
@@ -76,15 +106,7 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole)
         }
     }
 
-    if (g_logFile == nullptr)
-    {
-        const std::string logPath = BuildLogPathFromModule(moduleHandle);
-        FILE* file = _fsopen(logPath.c_str(), "a", _SH_DENYNO);
-        if (file != nullptr)
-        {
-            g_logFile = file;
-        }
-    }
+    OpenLogFileUnlocked();
 
     WriteLineUnlocked("[efz_netplay_mod] logger initialized\n");
     return true;
@@ -117,6 +139,31 @@ void SetConsoleVisible(bool visible)
     }
 }
 
+void SetFileLoggingEnabled(HMODULE moduleHandle, bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    if (g_logPath.empty() && moduleHandle != nullptr)
+    {
+        g_logPath = BuildLogPathFromModule(moduleHandle);
+    }
+
+    if (g_fileLoggingEnabled == enabled)
+    {
+        return;
+    }
+
+    g_fileLoggingEnabled = enabled;
+    if (enabled)
+    {
+        OpenLogFileUnlocked();
+    }
+    else
+    {
+        CloseLogFileUnlocked();
+    }
+}
+
 void ShutdownLogger()
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
@@ -125,8 +172,7 @@ void ShutdownLogger()
     {
         fputs("[efz_netplay_mod] logger shutting down\n", g_logFile);
         fflush(g_logFile);
-        fclose(g_logFile);
-        g_logFile = nullptr;
+        CloseLogFileUnlocked();
     }
 
     if (g_consoleReady)
@@ -161,4 +207,3 @@ void Log(const char* fmt, ...)
     WriteLineUnlocked(line);
 }
 }
-

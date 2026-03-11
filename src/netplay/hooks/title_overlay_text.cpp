@@ -1,6 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
 #include "netplay/render/draw_surface.h"
@@ -253,12 +254,15 @@ std::string AppendPlayerRoomCodeFooter(std::string footer)
 
 std::string BuildActionTooltip(NetplayMenuAction action)
 {
+    const bool joinWaitShortcutAvailable = !netplay::mod_settings::IsDebugMenuEnabled();
     switch (action)
     {
     case NetplayMenuAction::OpenHost:
         return "Host a direct match.";
     case NetplayMenuAction::OpenJoin:
-        return "Configure a direct host connection.\nPress C to paste IP:PORT.";
+        return joinWaitShortcutAvailable
+            ? "Configure a direct host connection.\nPress C to paste IP:PORT. Press D to wait to spectate."
+            : "Configure a direct host connection.\nPress C to paste IP:PORT.";
     case NetplayMenuAction::OpenPlayerRooms:
         return "Browse public and private player rooms.";
     case NetplayMenuAction::OpenLobby:
@@ -288,11 +292,17 @@ std::string BuildActionTooltip(NetplayMenuAction action)
     case NetplayMenuAction::HostEditPort:
         return "Set the port other players will use.";
     case NetplayMenuAction::JoinConnect:
-        return "Connect to the host using the settings below.\nPress C to paste IP:PORT.";
+        return joinWaitShortcutAvailable
+            ? "Connect to the host using the settings below.\nPress C to paste IP:PORT. Press D to wait to spectate."
+            : "Connect to the host using the settings below.\nPress C to paste IP:PORT.";
     case NetplayMenuAction::JoinEditAddress:
-        return "Set the host address.\nPress C to paste IP:PORT.";
+        return joinWaitShortcutAvailable
+            ? "Set the host address.\nPress C to paste IP:PORT. Press D to wait to spectate."
+            : "Set the host address.\nPress C to paste IP:PORT.";
     case NetplayMenuAction::JoinEditPort:
-        return "Set the host port.\nPress C to paste IP:PORT.";
+        return joinWaitShortcutAvailable
+            ? "Set the host port.\nPress C to paste IP:PORT. Press D to wait to spectate."
+            : "Set the host port.\nPress C to paste IP:PORT.";
     case NetplayMenuAction::NicknameEdit:
         return "Update the nickname shown in lobbies and online matches.";
     case NetplayMenuAction::BackToMain:
@@ -1026,6 +1036,12 @@ static constexpr const char* kDebugMenuItems[kDebugMenuItemCount] = {
 
 bool DrawDebugOverlay(uint32_t screenContext)
 {
+    if (!netplay::mod_settings::IsDebugMenuEnabled())
+    {
+        g_debugOverlay.open = false;
+        return false;
+    }
+
     if (!g_debugOverlay.open)
     {
         return false;
@@ -1130,6 +1146,12 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
 {
     if (inputBytes == nullptr || inactivityCounter == nullptr)
     {
+        return false;
+    }
+
+    if (!netplay::mod_settings::IsDebugMenuEnabled())
+    {
+        g_debugOverlay.open = false;
         return false;
     }
 
@@ -1249,30 +1271,18 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             }
             else if (sel == 4)
             {
-                // "Wait to Spectate" — start a Spectate session using Join address/port
-                const auto& ms = g_netplayMenuState;
-                if (ms.joinAddress.empty() || ms.joinPort == 0)
+                std::string errorMessage;
+                const bool started = TryStartWaitToSpectateFromJoinSettings(screenContext, &errorMessage);
+                if (started)
                 {
-                    mod::Log("DebugOverlay: Wait to Spectate — no join address/port configured");
+                    g_debugOverlay.open = false;
+                    mod::Log("DebugOverlay: Wait to Spectate started");
                 }
                 else
                 {
-                    const bool started = netplay::bridge::StartSession(
-                        netplay::bridge::NetbridgeRole::Spectate,
-                        ms.joinPort,
-                        ms.joinAddress.c_str(),
-                        "");
-                    if (started)
-                    {
-                        ActivateJoiningOverlay(ms.joinAddress.c_str(), ms.joinPort);
-                        g_debugOverlay.open = false;
-                        mod::Log("DebugOverlay: Wait to Spectate started -> %s:%u",
-                            ms.joinAddress.c_str(), static_cast<unsigned>(ms.joinPort));
-                    }
-                    else
-                    {
-                        mod::Log("DebugOverlay: Wait to Spectate — StartSession failed");
-                    }
+                    mod::Log(
+                        "DebugOverlay: Wait to Spectate failed -> %s",
+                        errorMessage.empty() ? "Unknown error" : errorMessage.c_str());
                 }
             }
             else if (sel == 5)
