@@ -28,5 +28,6 @@ bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction acti
 bool DrawSaveOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool IsSaveOverlayActive();
 bool IsBusy();
+uint8_t GetMenuDetailForStateExport();
 bool UseTournamentModeForOfflineVsHuman();
 }

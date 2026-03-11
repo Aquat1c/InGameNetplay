@@ -32,6 +32,7 @@ bool GetInlineEditDisplayValue(
     bool includeCaret);
 std::string GetRoomCode();
 void SetRoomCode(std::string value);
+uint8_t GetMenuDetailForStateExport();
 
 bool ConsumePendingJoinedRoom(netplay::lobby::LobbyJoinedRoom* outJoinedRoom);
 }

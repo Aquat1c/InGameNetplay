@@ -1,5 +1,6 @@
 #include "netplay/core/battle_log_menu.h"
 
+#include "efz_netplay_state.h"
 #include "logger.h"
 #include "netplay/assets/assets.h"
 #include "netplay/core/constants.h"
@@ -17,6 +18,10 @@
 #include <cstring>
 #include <d3d9.h>
 #include <fstream>
+#if defined(EFZ_XP_COMPAT)
+using std::max;
+using std::min;
+#endif
 #include <gdiplus.h>
 #include <iterator>
 #include <map>
@@ -52,9 +57,9 @@ constexpr int kActionStackW = 80;
 constexpr int kSummaryCardX = 12;
 constexpr int kSummaryCardY = 80;
 constexpr int kSummaryCardW = 296;
-constexpr int kSummaryCardH = 94;
+constexpr int kSummaryCardH = 108;
 constexpr int kSummaryActionPanelX = 12;
-constexpr int kSummaryActionPanelY = 180;
+constexpr int kSummaryActionPanelY = 190;
 constexpr int kSummaryActionPanelW = 296;
 constexpr int kSummaryActionPanelH = 28;
 constexpr int kSummaryActionButtonW = 52;
@@ -341,8 +346,8 @@ constexpr std::array<CharacterSpriteFile, 23> kCharacterSpriteFiles = {{
     {"Mishio", "mishio.png"},
     {"Misuzu", "misuzu.png"},
     {"Nagamori", "nagamori.png"},
-    {"Nayuki A", "nayuki_awake.png"},
-    {"Nayuki S", "nayuki_sleepy.png"},
+    {"Nayuki (Awake)", "nayuki_awake.png"},
+    {"Nayuki (Sleepy)", "nayuki_sleepy.png"},
     {"Rumi", "rumi.png"},
     {"Sayuri", "sayuri.png"},
     {"Shiori", "shiori.png"},
@@ -413,6 +418,9 @@ std::string AbbreviateForChip(std::string text);
 int GetSessionFinalScoreLeft(const BattleLogSession& session);
 int GetSessionFinalScoreRight(const BattleLogSession& session);
 size_t CountDocumentMatches(const BattleLogDocument& document);
+void LogParseDiagnostic(const std::string& path, int lineNumber, const char* message);
+void UpdateDerivedSummaryStats(BattleLogSummary* summary, const BattleLogSession& session);
+void FinalizeDerivedSummaryStats(BattleLogSummary* summary);
 bool ParseHeaderLine(const std::string& line, int sessionIndex, int lineNumber, BattleLogSession* outSession);
 bool ParseMatchLine(const std::string& line, int matchIndex, int lineNumber, BattleLogMatch* outMatch);
 BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabled);
@@ -481,10 +489,15 @@ std::string BuildSummaryIdentityText();
 std::string BuildSummaryLoadText();
 std::string BuildSummarySetRateText();
 std::string BuildSummaryGameRateText();
+std::string BuildSummaryAverageGamesText();
+std::string BuildSummaryAverageSetDurationText();
+std::string BuildSummaryLongestSetText();
+std::string BuildSummaryCompletionRatioText();
 std::string BuildBrowserRecordLeftText();
 std::string BuildBrowserRecordRightText();
 std::string BuildBrowserUsageLeftText();
 std::string BuildBrowserUsageRightText();
+std::string BuildBrowserLongestSetText();
 int FindCharacterOptionIndex(const std::string& value);
 void CycleCharacterOption(std::string* value, int delta);
 std::string GetDefaultBattleLogSetStatus();
@@ -516,13 +529,13 @@ void DrawPanelBox(const netplay::font::IndexedSurfaceView& surface, int x, int y
 void DrawRowBox(const netplay::font::IndexedSurfaceView& surface, int y, int h, bool selected, uint8_t fillColor, uint8_t frameColor, uint8_t selectedFillColor);
 void DrawRowBoxAt(const netplay::font::IndexedSurfaceView& surface, int x, int y, int w, int h, bool selected, uint8_t fillColor, uint8_t frameColor, uint8_t selectedFillColor);
 int DrawChip(const netplay::font::IndexedSurfaceView& surface, const std::string& label, int x, int y, uint8_t fillColor, uint8_t frameColor, uint8_t textColor, bool switched);
-void DrawSummaryPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t warnColor);
-void DrawBrowserPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t warnColor);
+void DrawSummaryPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t alertColor);
+void DrawBrowserPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t alertColor);
 void DrawFiltersPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor);
-void DrawDetailPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t warnColor);
+void DrawDetailPanel(const netplay::font::IndexedSurfaceView& surface, uint8_t panelFill, uint8_t panelFrame, uint8_t titleColor, uint8_t textColor, uint8_t dimColor, uint8_t alertColor);
 void DrawScreenTitleBar(const netplay::font::IndexedSurfaceView& surface, uint8_t fillColor, uint8_t frameColor, uint8_t titleColor, uint8_t dimColor);
 void DrawSummaryRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText);
-void DrawBrowserRows(const netplay::font::IndexedSurfaceView& surface, uint32_t screenContext, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText, uint8_t warnColor);
+void DrawBrowserRows(const netplay::font::IndexedSurfaceView& surface, uint32_t screenContext, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText, uint8_t alertColor);
 void DrawFilterRows(const netplay::font::IndexedSurfaceView& surface, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t dimText);
 void DrawDetailRows(const netplay::font::IndexedSurfaceView& surface, uint32_t screenContext, int selection, uint8_t rowFill, uint8_t rowFrame, uint8_t selectedFill, uint8_t normalText, uint8_t selectedText, uint8_t chipFill, uint8_t chipFrame, uint8_t chipText, uint8_t dimText);
 
@@ -2982,11 +2995,11 @@ std::string NormalizeCharacterToken(std::string token)
     token = netplay::text::TrimAscii(std::move(token));
     if (token == "NayukiA")
     {
-        return "Nayuki A";
+        return "Nayuki (Awake)";
     }
     if (token == "NayukiS")
     {
-        return "Nayuki S";
+        return "Nayuki (Sleepy)";
     }
     if (token == "BossUnknown")
     {
@@ -3037,6 +3050,63 @@ size_t CountDocumentMatches(const BattleLogDocument& document)
         count += session.matches.size();
     }
     return count;
+}
+
+void LogParseDiagnostic(const std::string& path, int lineNumber, const char* message)
+{
+    if (lineNumber > 0)
+    {
+        mod::Log(
+            "BattleLog::Parse: %s line=%d file='%s'",
+            message,
+            lineNumber,
+            path.c_str());
+        return;
+    }
+
+    mod::Log("BattleLog::Parse: %s file='%s'", message, path.c_str());
+}
+
+void UpdateDerivedSummaryStats(BattleLogSummary* summary, const BattleLogSession& session)
+{
+    if (summary == nullptr || session.matches.empty())
+    {
+        return;
+    }
+
+    const int gameCount = static_cast<int>(session.matches.size());
+    if (session.totalDurationSeconds > summary->longestSetByDurationSeconds)
+    {
+        summary->longestSetByDurationSeconds = session.totalDurationSeconds;
+        summary->longestSetByDurationSessionIndex = session.sessionIndex;
+    }
+
+    if (gameCount > summary->longestSetByGamesCount)
+    {
+        summary->longestSetByGamesCount = gameCount;
+        summary->longestSetByGamesSessionIndex = session.sessionIndex;
+    }
+}
+
+void FinalizeDerivedSummaryStats(BattleLogSummary* summary)
+{
+    if (summary == nullptr)
+    {
+        return;
+    }
+
+    if (summary->completedSessions > 0)
+    {
+        summary->averageGamesPerCompletedSet =
+            static_cast<double>(summary->totalGames) / static_cast<double>(summary->completedSessions);
+        summary->averageSetDurationSeconds =
+            (summary->totalDurationSeconds + (summary->completedSessions / 2)) / summary->completedSessions;
+    }
+    else
+    {
+        summary->averageGamesPerCompletedSet = 0.0;
+        summary->averageSetDurationSeconds = 0;
+    }
 }
 
 bool ParseHeaderLine(const std::string& line, int sessionIndex, int lineNumber, BattleLogSession* outSession)
@@ -3163,13 +3233,14 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
     document.sourcePath = path;
     document.saveBattleLogEnabled = saveEnabled;
     document.characterOptions.push_back("All");
+    int diagnosticCount = 0;
 
     const DWORD attrs = GetFileAttributesA(path.c_str());
     document.fileExists = (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0);
     if (!document.fileExists)
     {
         document.sourceEncoding = "missing";
-        document.warnings.push_back({0, "Battle log file was not found."});
+        LogParseDiagnostic(path, 0, "battle log file was not found");
         return document;
     }
 
@@ -3178,7 +3249,7 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
     if (!ReadWideTextFile(path, &text, &encoding))
     {
         document.sourceEncoding = "unreadable";
-        document.warnings.push_back({0, "Battle log file could not be read."});
+        LogParseDiagnostic(path, 0, "battle log file could not be read");
         return document;
     }
 
@@ -3188,6 +3259,7 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
         "utf8";
 
     std::set<std::string> characters;
+    characters.insert("Unknown");
     BattleLogSession* currentSession = nullptr;
     int sessionIndex = 0;
     int matchIndex = 0;
@@ -3210,7 +3282,8 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
             {
                 if (currentSession == nullptr)
                 {
-                    document.warnings.push_back({lineNumber, "Match row was found before any session header."});
+                    ++diagnosticCount;
+                    LogParseDiagnostic(path, lineNumber, "match row was found before any session header");
                     continue;
                 }
 
@@ -3222,11 +3295,8 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
                 continue;
             }
 
-            document.warnings.push_back({lineNumber, "Malformed match row was skipped."});
-            if (currentSession != nullptr)
-            {
-                ++currentSession->warningCount;
-            }
+            ++diagnosticCount;
+            LogParseDiagnostic(path, lineNumber, "malformed match row was skipped");
             continue;
         }
 
@@ -3239,11 +3309,8 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
             continue;
         }
 
-        document.warnings.push_back({lineNumber, "Unrecognized battle log line was skipped."});
-        if (currentSession != nullptr)
-        {
-            ++currentSession->warningCount;
-        }
+        ++diagnosticCount;
+        LogParseDiagnostic(path, lineNumber, "unrecognized battle log line was skipped");
     }
 
     for (BattleLogSession& session : document.sessions)
@@ -3274,6 +3341,14 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
         {
             document.characterOptions.push_back(character);
         }
+    }
+
+    if (diagnosticCount > 0)
+    {
+        mod::Log(
+            "BattleLog::Parse: completed with %d diagnostic(s) file='%s'",
+            diagnosticCount,
+            path.c_str());
     }
     return document;
 }
@@ -3445,6 +3520,7 @@ void FinalizeSummaryUsageCounts(
         }
     }
 
+    FinalizeDerivedSummaryStats(summary);
     summary->hasSessions = summary->totalSessions > 0;
 }
 
@@ -3463,10 +3539,6 @@ void AccumulatePerspectiveSummary(
     summary->hasPerspective = true;
     ++summary->matchingSessions;
     ++summary->totalSessions;
-    if (session.warningCount > 0)
-    {
-        ++summary->warningSessions;
-    }
 
     if (session.matches.empty())
     {
@@ -3475,6 +3547,7 @@ void AccumulatePerspectiveSummary(
     }
 
     ++summary->completedSessions;
+    UpdateDerivedSummaryStats(summary, session);
     const int playerSetScore = focusIsP1 ? GetSessionFinalScoreLeft(session) : GetSessionFinalScoreRight(session);
     const int opponentSetScore = focusIsP1 ? GetSessionFinalScoreRight(session) : GetSessionFinalScoreLeft(session);
     if (playerSetScore > opponentSetScore)
@@ -3532,10 +3605,6 @@ void AccumulateAggregateSummary(
 
     ++summary->matchingSessions;
     ++summary->totalSessions;
-    if (session.warningCount > 0)
-    {
-        ++summary->warningSessions;
-    }
 
     if (session.matches.empty())
     {
@@ -3544,6 +3613,7 @@ void AccumulateAggregateSummary(
     }
 
     ++summary->completedSessions;
+    UpdateDerivedSummaryStats(summary, session);
     summary->totalGames += static_cast<int>(session.matches.size());
     for (const BattleLogMatch& match : session.matches)
     {
@@ -4245,15 +4315,9 @@ void RefreshParsedDocument()
     {
         SetStatusMessage("Battle log file was not found.");
     }
-    else if (!g_state.document.warnings.empty())
+    else if (g_state.document.sourceEncoding == "unreadable")
     {
-        char buffer[64] = {};
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "Parsed %zu warning(s) from the battle log.",
-            g_state.document.warnings.size());
-        SetStatusMessage(buffer);
+        SetStatusMessage("Battle log file could not be read.");
     }
     else
     {
@@ -4372,7 +4436,7 @@ void RebuildMenuEntries()
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogPlayerCharacter, blankRow, "BATTLELOG_PLAYER_CHAR"};
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogOpponentCharacter, blankRow, "BATTLELOG_OPPONENT_CHAR"};
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogSetStatus, blankRow, "BATTLELOG_SET_STATUS"};
-        g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogWarnings, blankRow, "BATTLELOG_WARNINGS"};
+        g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogGameCount, blankRow, "BATTLELOG_GAME_COUNT"};
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogCharacterSwitches, blankRow, "BATTLELOG_SWITCHES"};
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogApplyFilters, blankRow, "BATTLELOG_APPLY"};
         g_state.entries[entryIndex++] = {NetplayMenuAction::BattleLogResetFilters, blankRow, "BATTLELOG_RESET"};
@@ -4434,11 +4498,11 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
     }
     if (!IsAllCharacterValue(filter.playerCharacter))
     {
-        parts.push_back("P1 " + filter.playerCharacter);
+        parts.push_back("Player character " + filter.playerCharacter);
     }
     if (!IsAllCharacterValue(filter.opponentCharacter))
     {
-        parts.push_back("P2 " + filter.opponentCharacter);
+        parts.push_back("Opponent character " + filter.opponentCharacter);
     }
     if (ParseSetStatusMode(filter.setStatus) == SetStatusMode::Played)
     {
@@ -4465,11 +4529,11 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
     }
     if (ParseSwitchFilterMode(filter.characterSwitches) == SwitchFilterMode::Stable)
     {
-        parts.push_back("no char changes");
+        parts.push_back("No character changes");
     }
     else if (ParseSwitchFilterMode(filter.characterSwitches) == SwitchFilterMode::Swapped)
     {
-        parts.push_back("has char changes");
+        parts.push_back("Has character changes");
     }
 
     if (parts.empty())
@@ -4609,12 +4673,7 @@ std::string BuildSummaryLoadText()
         g_state.summaryMode == SummaryMode::Search ? "Found" : "Loaded",
         summary.totalSessions,
         summary.totalGames);
-    std::string text = buffer;
-    if (summary.warningSessions > 0)
-    {
-        text += "  Warnings " + std::to_string(summary.warningSessions);
-    }
-    return text;
+    return buffer;
 }
 
 std::string BuildSummarySetRateText()
@@ -4622,8 +4681,7 @@ std::string BuildSummarySetRateText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (!summary.hasPerspective)
     {
-        return "Completed " + std::to_string(summary.completedSessions)
-            + "  Empty " + std::to_string(summary.emptySessions);
+        return "Completed " + std::to_string(summary.completedSessions);
     }
     return FormatRateText("Set WR", summary.setWins, summary.setLosses);
 }
@@ -4633,9 +4691,65 @@ std::string BuildSummaryGameRateText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (!summary.hasPerspective)
     {
-        return "Warnings " + std::to_string(summary.warningSessions);
+        return BuildSummaryAverageSetDurationText();
     }
     return FormatRateText("Game WR", summary.gameWins, summary.gameLosses);
+}
+
+std::string BuildSummaryAverageGamesText()
+{
+    const BattleLogSummary& summary = GetDisplayedSummary();
+    if (summary.completedSessions <= 0)
+    {
+        return "Avg Games/Set N/A";
+    }
+
+    char buffer[64] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Avg Games/Set %.1f",
+        summary.averageGamesPerCompletedSet);
+    return buffer;
+}
+
+std::string BuildSummaryAverageSetDurationText()
+{
+    const BattleLogSummary& summary = GetDisplayedSummary();
+    if (summary.completedSessions <= 0)
+    {
+        return "Avg Set Time N/A";
+    }
+
+    return "Avg Set Time " + FormatDurationShort(summary.averageSetDurationSeconds);
+}
+
+std::string BuildSummaryLongestSetText()
+{
+    const BattleLogSummary& summary = GetDisplayedSummary();
+    if (summary.completedSessions <= 0)
+    {
+        return "Longest Set N/A";
+    }
+
+    char buffer[96] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Longest: %s / %d games",
+        FormatDurationShort(summary.longestSetByDurationSeconds).c_str(),
+        summary.longestSetByGamesCount);
+    return buffer;
+}
+
+std::string BuildSummaryCompletionRatioText()
+{
+    const BattleLogSummary& summary = GetDisplayedSummary();
+    if (summary.hasPerspective)
+    {
+        return FormatRecordWithRate("Win-Lose", summary.setWins, summary.setLosses);
+    }
+    return FormatRecordWithRate("Played", summary.completedSessions, summary.emptySessions);
 }
 
 std::string BuildSummaryUsageText()
@@ -4660,21 +4774,25 @@ std::string BuildSummaryRecentText()
     if (!summary.hasSessions)
     {
         return g_state.summaryMode == SummaryMode::FullLog
-            ? "No logged sessions were found."
-            : "No sessions found for '" + BuildSummaryIdentityText() + "'.";
+            ? "No logged sessions found."
+            : "No sessions found.";
     }
+
+    const std::string recentDate =
+        summary.recentTimestamp.empty()
+            ? std::string("unknown date")
+            : summary.recentTimestamp.substr(0, summary.recentTimestamp.find(' '));
 
     if (summary.isHeadToHead)
     {
-        return "Last played at "
-            + (summary.recentTimestamp.empty() ? std::string("unknown time") : summary.recentTimestamp);
+        return "Most recent: " + recentDate;
     }
 
-    const std::string prefix = summary.hasPerspective ? "Last vs " : "Last log ";
+    const std::string prefix = summary.hasPerspective ? "Last vs " : "Most recent: ";
     return prefix
         + (summary.recentOpponent.empty() ? "?" : summary.recentOpponent)
-        + " at "
-        + (summary.recentTimestamp.empty() ? "unknown time" : summary.recentTimestamp);
+        + " on "
+        + recentDate;
 }
 
 std::string BuildLoadStatusText()
@@ -4688,15 +4806,14 @@ std::string BuildLoadStatusText()
     {
         return "Missing: " + Basename(g_state.document.sourcePath);
     }
+    if (g_state.document.sourceEncoding == "unreadable")
+    {
+        return "Unreadable: " + Basename(g_state.document.sourcePath);
+    }
 
-    std::string text =
+    return
         "Loaded " + std::to_string(g_state.document.sessions.size()) + " set(s), "
         + std::to_string(matchCount) + " game(s)";
-    if (!g_state.document.warnings.empty())
-    {
-        text += "  Warnings " + std::to_string(g_state.document.warnings.size());
-    }
-    return text;
 }
 
 std::string BuildBrowserRecordLeftText()
@@ -4717,8 +4834,7 @@ std::string BuildBrowserRecordRightText()
         return FormatRecordWithRate("Games", g_state.browserSummary.gameWins, g_state.browserSummary.gameLosses);
     }
 
-    return "Games " + std::to_string(g_state.browserSummary.totalGames)
-        + "  Warn " + std::to_string(g_state.browserSummary.warningSessions);
+    return "Games " + std::to_string(g_state.browserSummary.totalGames);
 }
 
 std::string BuildBrowserUsageLeftText()
@@ -4728,27 +4844,35 @@ std::string BuildBrowserUsageLeftText()
 
 std::string BuildBrowserUsageRightText()
 {
-    if (g_state.browserSummary.isHeadToHead)
+    if (g_state.browserSummary.completedSessions <= 0)
     {
-        return "Matchup "
-            + AbbreviateForDisplay(
-                g_state.browserSummary.mostUsedMatchup.empty()
-                    ? std::string("N/A")
-                    : g_state.browserSummary.mostUsedMatchup,
-                12);
+        return "Avg Games/Set N/A";
     }
 
-    if (g_state.browserSummary.hasPerspective)
+    char buffer[64] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Avg Games/Set %.1f",
+        g_state.browserSummary.averageGamesPerCompletedSet);
+    return buffer;
+}
+
+std::string BuildBrowserLongestSetText()
+{
+    if (g_state.browserSummary.completedSessions <= 0)
     {
-        return "Empty " + std::to_string(g_state.browserSummary.emptySessions);
+        return "Longest N/A";
     }
 
-    return "Most played: "
-        + AbbreviateForDisplay(
-            g_state.browserSummary.mostUsedCharacter.empty()
-                ? std::string("N/A")
-                : g_state.browserSummary.mostUsedCharacter,
-            12);
+    char buffer[96] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Longest %s / %dg",
+        FormatDurationShort(g_state.browserSummary.longestSetByDurationSeconds).c_str(),
+        g_state.browserSummary.longestSetByGamesCount);
+    return buffer;
 }
 
 int FindCharacterOptionIndex(const std::string& value)
@@ -5309,7 +5433,7 @@ void DrawSummaryPanel(
     uint8_t titleColor,
     uint8_t textColor,
     uint8_t dimColor,
-    uint8_t warnColor)
+    uint8_t alertColor)
 {
     DrawPanelBox(
         surface,
@@ -5334,82 +5458,71 @@ void DrawSummaryPanel(
     netplay::font::DrawTextCentered5x7(surface, BuildSummaryLoadText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 30, 1, 1, dimColor);
 
     const BattleLogSummary& summary = GetDisplayedSummary();
+    const int halfSplitLeft = kSummaryCardX + (kSummaryCardW / 2) - 4;
+    const int halfSplitRight = kSummaryCardX + (kSummaryCardW / 2) + 4;
+    const int wideRightLeft = kSummaryCardX + 122;
     const std::string setsText = summary.hasPerspective
         ? ("Sets " + std::to_string(summary.setWins) + "-" + std::to_string(summary.setLosses))
         : ("Sessions " + std::to_string(summary.totalSessions));
     const std::string gamesText = summary.hasPerspective
         ? ("Games " + std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses))
         : ("Games " + std::to_string(summary.totalGames));
-    netplay::font::DrawTextLeft5x7(
-        surface,
-        setsText,
-        kSummaryCardX + 8,
-        kSummaryCardX + (kSummaryCardW / 2) - 4,
-        kSummaryCardY + 44,
-        1,
-        1,
-        textColor);
-    netplay::font::DrawTextRight5x7(
-        surface,
-        gamesText,
-        kSummaryCardX + (kSummaryCardW / 2) + 4,
-        kSummaryCardX + kSummaryCardW - 8,
-        kSummaryCardY + 44,
-        1,
-        1,
-        textColor);
+    netplay::font::DrawTextLeft5x7(surface, setsText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 42, 1, 1, textColor);
+    netplay::font::DrawTextRight5x7(surface, gamesText, halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 42, 1, 1, textColor);
 
     netplay::font::DrawTextLeft5x7(
         surface,
         BuildSummarySetRateText(),
         kSummaryCardX + 8,
-        kSummaryCardX + (kSummaryCardW / 2) - 4,
-        kSummaryCardY + 56,
+        halfSplitLeft,
+        kSummaryCardY + 53,
         1,
         1,
         dimColor);
     netplay::font::DrawTextRight5x7(
         surface,
         BuildSummaryGameRateText(),
-        kSummaryCardX + (kSummaryCardW / 2) + 4,
+        halfSplitRight,
         kSummaryCardX + kSummaryCardW - 8,
-        kSummaryCardY + 56,
+        kSummaryCardY + 53,
         1,
         1,
         dimColor);
 
-    const std::string playTimeText = "Play time " + FormatDurationShort(summary.totalDurationSeconds);
+    const std::string playTimeText = "Playtime: " + FormatDurationShort(summary.totalDurationSeconds);
     const std::string mostPlayedText =
         summary.isHeadToHead
-            ? ("Matchup: "
+            ? ("Most played matchup: "
                 + AbbreviateForDisplay(
                     summary.mostUsedMatchup.empty() ? std::string("N/A") : summary.mostUsedMatchup,
-                    16))
-            : ("Most played: "
+                    18))
+            : ("Most played character: "
                 + AbbreviateForDisplay(
                     summary.mostUsedCharacter.empty() ? std::string("N/A") : summary.mostUsedCharacter,
-                    14));
-    netplay::font::DrawTextLeft5x7(
-        surface,
-        playTimeText,
-        kSummaryCardX + 8,
-        kSummaryCardX + (kSummaryCardW / 2) - 4,
-        kSummaryCardY + 68,
-        1,
-        1,
-        textColor);
+                    18));
+    netplay::font::DrawTextLeft5x7(surface, BuildSummaryAverageGamesText(), kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 64, 1, 1, dimColor);
+    if (summary.hasPerspective)
+    {
+        netplay::font::DrawTextRight5x7(surface, BuildSummaryAverageSetDurationText(), halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, 1, 1, dimColor);
+    }
+    else
+    {
+        netplay::font::DrawTextRight5x7(surface, BuildSummaryLongestSetText(), wideRightLeft, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, 1, 1, dimColor);
+    }
+    netplay::font::DrawTextLeft5x7(surface, playTimeText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 75, 1, 1, textColor);
     netplay::font::DrawTextRight5x7(
         surface,
-        mostPlayedText,
-        kSummaryCardX + (kSummaryCardW / 2) + 4,
+        summary.hasPerspective ? BuildSummaryLongestSetText() : BuildSummaryCompletionRatioText(),
+        wideRightLeft,
         kSummaryCardX + kSummaryCardW - 8,
-        kSummaryCardY + 68,
+        kSummaryCardY + 75,
         1,
         1,
-        textColor);
+        dimColor);
 
-    const uint8_t recentColor = summary.hasSessions ? textColor : warnColor;
-    netplay::font::DrawTextLeft5x7(surface, BuildSummaryRecentText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 82, 1, 1, recentColor);
+    const uint8_t recentColor = summary.hasSessions ? textColor : alertColor;
+    netplay::font::DrawTextLeft5x7(surface, mostPlayedText, kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 86, 1, 1, textColor);
+    netplay::font::DrawTextLeft5x7(surface, BuildSummaryRecentText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 97, 1, 1, recentColor);
 }
 
 void DrawBrowserPanel(
@@ -5419,7 +5532,7 @@ void DrawBrowserPanel(
     uint8_t titleColor,
     uint8_t textColor,
     uint8_t dimColor,
-    uint8_t warnColor)
+    uint8_t /*alertColor*/)
 {
     DrawPanelBox(surface, kBrowserHeaderPanelX, kBrowserHeaderPanelY, kBrowserHeaderPanelW, kBrowserHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kBrowserContentPanelY, kContentColumnW + 4, 84, panelFill, panelFrame);
@@ -5427,6 +5540,7 @@ void DrawBrowserPanel(
     netplay::font::DrawTextCentered5x7(surface, "SET BROWSER", kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, 1, 1, titleColor);
     netplay::font::DrawTextLeft5x7(surface, BuildFilterSummary(g_state.activeFilter), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 18, 1, 1, textColor);
     netplay::font::DrawTextLeft5x7(surface, BuildBrowserPageText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, 1, 1, dimColor);
+    netplay::font::DrawTextRight5x7(surface, BuildBrowserLongestSetText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, 1, 1, dimColor);
     netplay::font::DrawTextLeft5x7(surface, BuildBrowserRecordLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 44, 1, 1, textColor);
     netplay::font::DrawTextRight5x7(surface, BuildBrowserRecordRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 44, 1, 1, textColor);
     netplay::font::DrawTextLeft5x7(surface, BuildBrowserUsageLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 57, 1, 1, dimColor);
@@ -5440,11 +5554,6 @@ void DrawBrowserPanel(
         1,
         1,
         titleColor);
-    if (!g_state.document.warnings.empty())
-    {
-        const std::string warnText = "Warnings: " + std::to_string(g_state.document.warnings.size());
-        netplay::font::DrawTextRight5x7(surface, warnText, kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, 1, 1, warnColor);
-    }
 }
 
 void DrawFiltersPanel(
@@ -5460,7 +5569,7 @@ void DrawFiltersPanel(
     DrawPanelBox(surface, kActionStackX, 164, kActionStackW, 44, panelFill, panelFrame);
     netplay::font::DrawTextCentered5x7(surface, "SEARCH", kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, 1, 1, titleColor);
     netplay::font::DrawTextLeft5x7(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 18, 1, 1, textColor);
-    netplay::font::DrawTextLeft5x7(surface, "Exact names. Side chars. Set type, games, char changes.", kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, 1, 1, dimColor);
+    netplay::font::DrawTextLeft5x7(surface, "Exact names. Character, set type, and game count filters.", kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, 1, 1, dimColor);
     netplay::font::DrawTextCentered5x7(surface, "ACTIONS", kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, 1, 1, titleColor);
 }
 
@@ -5471,7 +5580,7 @@ void DrawDetailPanel(
     uint8_t titleColor,
     uint8_t textColor,
     uint8_t dimColor,
-    uint8_t warnColor)
+    uint8_t alertColor)
 {
     DrawPanelBox(surface, kDetailHeaderPanelX, kDetailHeaderPanelY, kDetailHeaderPanelW, kDetailHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kDetailContentPanelY, kContentColumnW + 4, kDetailContentPanelH, panelFill, panelFrame);
@@ -5482,7 +5591,7 @@ void DrawDetailPanel(
     const BattleLogSession* session = GetDetailSession();
     if (session == nullptr)
     {
-        netplay::font::DrawTextCentered5x7(surface, "No set selected.", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, 1, 1, warnColor);
+        netplay::font::DrawTextCentered5x7(surface, "No set selected.", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, 1, 1, alertColor);
         return;
     }
 
@@ -5512,11 +5621,6 @@ void DrawDetailPanel(
         textColor);
     netplay::font::DrawTextLeft5x7(surface, dateTimeText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, 1, 1, dimColor);
     netplay::font::DrawTextRight5x7(surface, durationText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, 1, 1, dimColor);
-    if (session->warningCount > 0)
-    {
-        const std::string warningText = "Warnings: " + std::to_string(session->warningCount);
-        netplay::font::DrawTextLeft5x7(surface, warningText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 49, 1, 1, warnColor);
-    }
 }
 
 void DrawScreenTitleBar(
@@ -5584,7 +5688,7 @@ void DrawBrowserRows(
     uint8_t chipFrame,
     uint8_t chipText,
     uint8_t dimText,
-    uint8_t warnColor)
+    uint8_t alertColor)
 {
     (void)screenContext;
     (void)chipFill;
@@ -5610,7 +5714,7 @@ void DrawBrowserRows(
                     rowY + 2,
                     1,
                     1,
-                    isSelected ? selectedText : warnColor);
+                    isSelected ? selectedText : alertColor);
             }
             continue;
         }
@@ -5657,18 +5761,6 @@ void DrawBrowserRows(
             1,
             1,
             isSelected ? selectedText : normalText);
-        if (session->warningCount > 0)
-        {
-            netplay::font::DrawTextRight5x7(
-                surface,
-                "!",
-                kContentColumnX + 4,
-                kContentColumnX + kContentColumnW - 4,
-                rowY + 2,
-                1,
-                1,
-                warnColor);
-        }
     }
 
     static const std::array<const char*, 4> kControls = {
@@ -5721,8 +5813,8 @@ void DrawFilterRows(
     const std::array<FilterRow, 10> rows = {{
         {"PLAYER", GetFilterFieldValue(FilterEditField::PlayerName, true)},
         {"OPPONENT", GetFilterFieldValue(FilterEditField::OpponentName, true)},
-        {"PLAYER CHAR", g_state.draftFilter.playerCharacter},
-        {"OPP CHAR", g_state.draftFilter.opponentCharacter},
+        {"PLAYER CHARACTER", g_state.draftFilter.playerCharacter},
+        {"OPPONENT CHARACTER", g_state.draftFilter.opponentCharacter},
         {"SET TYPE", g_state.draftFilter.setStatus},
         {"GAMES IN SET", g_state.draftFilter.gameCount},
         {"CHAR CHANGES", g_state.draftFilter.characterSwitches},
@@ -5972,12 +6064,12 @@ std::string BuildRowLabel(NetplayMenuAction action)
     case NetplayMenuAction::BattleLogEditOpponentName:
         return "OPPONENT";
     case NetplayMenuAction::BattleLogPlayerCharacter:
-        return "PLAYER CHAR";
+        return "PLAYER CHARACTER";
     case NetplayMenuAction::BattleLogOpponentCharacter:
-        return "OPP CHAR";
+        return "OPPONENT CHARACTER";
     case NetplayMenuAction::BattleLogSetStatus:
         return "SET TYPE";
-    case NetplayMenuAction::BattleLogWarnings:
+    case NetplayMenuAction::BattleLogGameCount:
         return "GAMES IN SET";
     case NetplayMenuAction::BattleLogCharacterSwitches:
         return "CHAR CHANGES";
@@ -6048,7 +6140,7 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
         return g_state.draftFilter.opponentCharacter;
     case NetplayMenuAction::BattleLogSetStatus:
         return g_state.draftFilter.setStatus;
-    case NetplayMenuAction::BattleLogWarnings:
+    case NetplayMenuAction::BattleLogGameCount:
         return g_state.draftFilter.gameCount;
     case NetplayMenuAction::BattleLogCharacterSwitches:
         return g_state.draftFilter.characterSwitches;
@@ -6060,6 +6152,7 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
 std::string BuildFooterText(NetplayMenuAction selectedAction)
 {
     std::string footer;
+    std::string hint;
     if (g_state.edit.active)
     {
         footer = "Typing filter name. Enter/A=Apply  B/Esc=Cancel  Backspace=Delete";
@@ -6095,7 +6188,7 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         case NetplayMenuAction::BattleLogSetStatus:
             footer = "Choose any set, only played sets, or only empty 0-0 headers.";
             break;
-        case NetplayMenuAction::BattleLogWarnings:
+        case NetplayMenuAction::BattleLogGameCount:
             footer = "Filter by how many games were logged inside the set.";
             break;
         case NetplayMenuAction::BattleLogCharacterSwitches:
@@ -6154,54 +6247,59 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     {
         if (g_state.view == View::Summary)
         {
-            const char* hint =
+            hint =
                 g_state.summaryMode == SummaryMode::Search
                     ? "Press C to Switch to Profile"
                     : (g_state.summaryMode == SummaryMode::FullLog
                         ? "Press C to Switch to Profile"
                         : "Press C to Switch to Full Summary");
-            footer = footer.empty() ? std::string(hint) : (footer + "  " + hint);
         }
         else if (g_state.view == View::Filters)
         {
-            const char* hint =
+            hint =
                 selectedAction == NetplayMenuAction::BattleLogApplyFilters
                     || selectedAction == NetplayMenuAction::BattleLogResetFilters
                     || selectedAction == NetplayMenuAction::BattleLogBack
                 ? "Press C to Switch to Fields"
                 : "Press C to Switch to Actions";
-            footer = footer.empty() ? std::string(hint) : (footer + "  " + hint);
         }
         else if (g_state.view == View::Browser)
         {
-            const char* hint =
+            hint =
                 selectedAction >= NetplayMenuAction::BattleLogBrowserPrevPage
                     && selectedAction <= NetplayMenuAction::BattleLogBack
                 ? "Press C to Switch to Set List"
                 : "Press C to Switch to Actions";
-            footer = footer.empty() ? std::string(hint) : (footer + "  " + hint);
         }
         else if (g_state.view == View::SetDetail)
         {
-            const char* hint =
+            hint =
                 selectedAction >= NetplayMenuAction::BattleLogDetailPrevPage
                     && selectedAction <= NetplayMenuAction::BattleLogBack
                 ? "Press C to Switch to Games"
                 : "Press C to Switch to Actions";
-            footer = footer.empty() ? std::string(hint) : (footer + "  " + hint);
         }
     }
 
     if (HasStatusMessage())
     {
-        if (footer.empty())
+        if (hint.empty())
         {
             return g_state.statusMessage;
         }
-        return g_state.statusMessage + "\n" + footer;
+        return g_state.statusMessage + "\n" + hint;
     }
 
-    return footer;
+    if (footer.empty())
+    {
+        return hint;
+    }
+    if (hint.empty())
+    {
+        return footer;
+    }
+
+    return footer + "\n" + hint;
 }
 
 bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelection)
@@ -6367,7 +6465,7 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
         if ((selectedAction == NetplayMenuAction::BattleLogPlayerCharacter
                 || selectedAction == NetplayMenuAction::BattleLogOpponentCharacter
                 || selectedAction == NetplayMenuAction::BattleLogSetStatus
-                || selectedAction == NetplayMenuAction::BattleLogWarnings
+                || selectedAction == NetplayMenuAction::BattleLogGameCount
                 || selectedAction == NetplayMenuAction::BattleLogCharacterSwitches)
             && horizontalEdge)
         {
@@ -6385,7 +6483,7 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
             {
                 CycleOptionValue(&g_state.draftFilter.setStatus, GetSetStatusOptions(), delta);
             }
-            else if (selectedAction == NetplayMenuAction::BattleLogWarnings)
+            else if (selectedAction == NetplayMenuAction::BattleLogGameCount)
             {
                 CycleOptionValue(&g_state.draftFilter.gameCount, GetGameCountFilterOptions(), delta);
             }
@@ -6630,7 +6728,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         CycleOptionValue(&g_state.draftFilter.setStatus, GetSetStatusOptions(), +1);
         return true;
 
-    case NetplayMenuAction::BattleLogWarnings:
+    case NetplayMenuAction::BattleLogGameCount:
         CycleOptionValue(&g_state.draftFilter.gameCount, GetGameCountFilterOptions(), +1);
         return true;
 
@@ -6780,7 +6878,7 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const uint8_t textColor = netplay::draw::ResolveBestPaletteColor(screenContext, 212, 220, 230);
     const uint8_t selectedText = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 255, 255);
     const uint8_t dimColor = netplay::draw::ResolveBestPaletteColor(screenContext, 150, 168, 190);
-    const uint8_t warnColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 176, 110);
+    const uint8_t alertColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 176, 110);
     const uint8_t chipFill = netplay::draw::ResolveBestPaletteColor(screenContext, 28, 40, 62);
     const uint8_t chipFrame = netplay::draw::ResolveBestPaletteColor(screenContext, 135, 180, 220);
     const uint8_t chipText = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 230, 160);
@@ -6795,19 +6893,19 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     switch (g_state.view)
     {
     case View::Summary:
-        DrawSummaryPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, warnColor);
+        DrawSummaryPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, alertColor);
         DrawSummaryRows(surface, selection, rowFill, rowFrame, selectedFill, textColor, selectedText);
         break;
     case View::Browser:
-        DrawBrowserPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, warnColor);
-        DrawBrowserRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor, warnColor);
+        DrawBrowserPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, alertColor);
+        DrawBrowserRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor, alertColor);
         break;
     case View::Filters:
         DrawFiltersPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor);
         DrawFilterRows(surface, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, dimColor);
         break;
     case View::SetDetail:
-        DrawDetailPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, warnColor);
+        DrawDetailPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, alertColor);
         DrawDetailRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor);
         break;
     }
@@ -6850,5 +6948,30 @@ bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc)
     }
 
     return DrawBrowserIconsGdi(screenContext, allowWindowDc);
+}
+
+uint8_t GetMenuDetailForStateExport()
+{
+    switch (g_state.view)
+    {
+    case View::Browser:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_BROWSER);
+    case View::Filters:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_FILTERS);
+    case View::SetDetail:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_SET_DETAILS);
+    case View::Summary:
+    default:
+        switch (g_state.summaryMode)
+        {
+        case SummaryMode::FullLog:
+            return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_FULL);
+        case SummaryMode::Search:
+            return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_SEARCH);
+        case SummaryMode::Profile:
+        default:
+            return static_cast<uint8_t>(EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_PROFILE);
+        }
+    }
 }
 } // namespace netplay::battle_log

@@ -21,6 +21,9 @@
 #include "efz_netplay_state.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/battle_log_menu.h"
+#include "netplay/core/options_menu.h"
+#include "netplay/core/player_rooms_menu.h"
 #include "netplay/hooks/internal/shared.h"
 #include "logger.h"
 
@@ -319,6 +322,48 @@ static uint8_t DeriveEndReason(const NetbridgeStatus& status, int prevPhase)
 
     return EFZ_END_GRACEFUL;
 }
+
+static uint8_t ResolveExportedMenuScreen(netplay::menu::NetplayMenuId menuId)
+{
+    switch (menuId)
+    {
+    case netplay::menu::NetplayMenuId::Main:
+        return EFZ_MENU_MAIN;
+    case netplay::menu::NetplayMenuId::Host:
+        return EFZ_MENU_HOST;
+    case netplay::menu::NetplayMenuId::Join:
+        return EFZ_MENU_JOIN;
+    case netplay::menu::NetplayMenuId::PlayerRooms:
+        return EFZ_MENU_PLAYER_ROOMS;
+    case netplay::menu::NetplayMenuId::Options:
+        return EFZ_MENU_OPTIONS;
+    case netplay::menu::NetplayMenuId::Lobby:
+        return EFZ_MENU_LOBBY;
+    case netplay::menu::NetplayMenuId::BattleLog:
+        return EFZ_MENU_BATTLE_LOG;
+    default:
+        return EFZ_MENU_MAIN;
+    }
+}
+
+static uint8_t ResolveExportedMenuDetail(
+    const netplay::hooks::internal::NetplayMenuState& menu)
+{
+    if (!menu.active)
+        return EFZ_MENU_DETAIL_NONE;
+
+    switch (menu.menuId)
+    {
+    case netplay::menu::NetplayMenuId::PlayerRooms:
+        return netplay::player_rooms::GetMenuDetailForStateExport();
+    case netplay::menu::NetplayMenuId::Options:
+        return netplay::options::GetMenuDetailForStateExport();
+    case netplay::menu::NetplayMenuId::BattleLog:
+        return netplay::battle_log::GetMenuDetailForStateExport();
+    default:
+        return EFZ_MENU_DETAIL_NONE;
+    }
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -576,25 +621,16 @@ void Update(const NetbridgeStatus& status)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-    // Netplay menu state (v2)
+    // Netplay menu state (v2/v6)
     {
         const auto& menu = netplay::hooks::internal::g_netplayMenuState;
-        const uint8_t exportedMenuScreen = [&]() -> uint8_t
-        {
-            switch (menu.menuId)
-            {
-            case netplay::menu::NetplayMenuId::PlayerRooms:
-                // Preserve the existing public ABI by folding the new
-                // Player Rooms browser into the old "Lobby" exported slot.
-                return EFZ_MENU_LOBBY;
-            default:
-                return static_cast<uint8_t>(menu.menuId);
-            }
-        }();
         s.inNetplayMenu = menu.active ? 1 : 0;
         s.netplayMenuScreen = menu.active
-            ? exportedMenuScreen
+            ? ResolveExportedMenuScreen(menu.menuId)
             : 0;
+        s.netplayMenuDetail = menu.active
+            ? ResolveExportedMenuDetail(menu)
+            : EFZ_MENU_DETAIL_NONE;
         if (s.inNetplayMenu)
             caps |= EFZ_CAP_MENU;
     }
@@ -610,6 +646,7 @@ void Update(const NetbridgeStatus& status)
             static_cast<unsigned>(screenIdx));
         s.inNetplayMenu = 0;
         s.netplayMenuScreen = 0;
+        s.netplayMenuDetail = EFZ_MENU_DETAIL_NONE;
         caps &= ~EFZ_CAP_MENU;
     }
 

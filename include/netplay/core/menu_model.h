@@ -96,7 +96,7 @@ enum class NetplayMenuAction : uint8_t
     BattleLogPlayerCharacter = 51,
     BattleLogOpponentCharacter = 52,
     BattleLogSetStatus = 53,
-    BattleLogWarnings = 54,
+    BattleLogGameCount = 54,
     BattleLogCharacterSwitches = 55,
     BattleLogApplyFilters = 56,
     BattleLogResetFilters = 57,

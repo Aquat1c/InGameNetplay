@@ -1,5 +1,6 @@
 #include "netplay/core/player_rooms_menu.h"
 
+#include "efz_netplay_state.h"
 #include "logger.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
@@ -894,5 +895,19 @@ bool ConsumePendingJoinedRoom(netplay::lobby::LobbyJoinedRoom* outJoinedRoom)
     g_state.pendingJoinedRoom = {};
     g_state.hasPendingJoinedRoom = false;
     return true;
+}
+
+uint8_t GetMenuDetailForStateExport()
+{
+    switch (g_state.view)
+    {
+    case BrowserView::Join:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_PLAYER_ROOMS_JOIN);
+    case BrowserView::Create:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_PLAYER_ROOMS_CREATE);
+    case BrowserView::Root:
+    default:
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_PLAYER_ROOMS_ROOT);
+    }
 }
 }

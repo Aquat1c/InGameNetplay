@@ -264,8 +264,8 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "BattleLogOpponentCharacter";
     case NetplayMenuAction::BattleLogSetStatus:
         return "BattleLogSetStatus";
-    case NetplayMenuAction::BattleLogWarnings:
-        return "BattleLogWarnings";
+    case NetplayMenuAction::BattleLogGameCount:
+        return "BattleLogGameCount";
     case NetplayMenuAction::BattleLogCharacterSwitches:
         return "BattleLogCharacterSwitches";
     case NetplayMenuAction::BattleLogApplyFilters:

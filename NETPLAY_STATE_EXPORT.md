@@ -18,13 +18,14 @@ containing:
 | `p1Wins` | `int32_t` | P1 win count within current set (absolute, not perspective-adjusted). Sourced from Revival session object; backed by high-water-mark latch. Works for online, spectator, and tournament sessions. |
 | `p2Wins` | `int32_t` | P2 win count within current set |
 | `matchCounter` | `int32_t` | Current match index within the set |
-| `localNickname` | `char[32]` | Our chosen nickname (from `EfzRevival.ini`) |
+| `localNickname` | `char[64]` | Our chosen nickname (from `EfzRevival.ini`) |
 | `p1Name` | `char[64]` | P1 nickname (from Revival session object — online and spectator sessions) |
 | `p2Name` | `char[64]` | P2 nickname (from Revival session object — online and spectator sessions) |
 | `pingMs` | `int32_t` | Round-trip ping in ms (`-1` = unavailable) |
 | `rollbackFrames` | `int32_t` | Agreed input-delay frames (`-1` = not set) |
 | `inNetplayMenu` | `uint8_t` | Non-zero when the netplay menu overlay is open *(v2)* |
-| `netplayMenuScreen` | `uint8_t` | `EFZNetplayMenuScreen` — which sub-menu page is active *(v2)* |
+| `netplayMenuScreen` | `uint8_t` | `EFZNetplayMenuScreen` — which top-level netplay menu page is active *(v2, updated in v6)* |
+| `netplayMenuDetail` | `uint8_t` | `EFZNetplayMenuDetail` — menu-specific subview / mode *(v6)* |
 | `revivalVersion` | `char[16]` | EfzRevival.dll version tag (e.g. `"1.02e"`, `"1.02i"`) *(v2)* |
 | `inNetplayCharacterSelect` | `uint8_t` | Non-zero during online character-select screen *(v3)* |
 | `inNetplayMatch` | `uint8_t` | Non-zero during active online match / round *(v3)* |
@@ -127,11 +128,36 @@ Only meaningful when `inNetplayMenu` is non-zero.
 
 | Value | Name | Meaning |
 |---|---|---|
-| 0 | `EFZ_MENU_MAIN` | Top-level: Host / Join / Nickname / Lobby / Back |
+| 0 | `EFZ_MENU_MAIN` | Top-level: Host / Join / Player Rooms / Lobby / Battle Log / Options / Back |
 | 1 | `EFZ_MENU_HOST` | Host settings sub-menu |
 | 2 | `EFZ_MENU_JOIN` | Join settings sub-menu |
-| 3 | `EFZ_MENU_NICKNAME` | Nickname edit sub-menu |
-| 4 | `EFZ_MENU_LOBBY` | Lobby browser |
+| 3 | `EFZ_MENU_PLAYER_ROOMS` | Player Rooms browser |
+| 4 | `EFZ_MENU_OPTIONS` | Options menu |
+| 4 | `EFZ_MENU_NICKNAME` | Legacy source alias for `EFZ_MENU_OPTIONS` |
+| 5 | `EFZ_MENU_LOBBY` | Active lobby / room screen |
+| 6 | `EFZ_MENU_BATTLE_LOG` | Battle Log |
+
+### `EFZNetplayMenuDetail` *(v6)*
+
+Only meaningful when `inNetplayMenu` is non-zero. The meaning depends on
+`netplayMenuScreen`.
+
+| Value | Name | Meaning |
+|---|---|---|
+| 0 | `EFZ_MENU_DETAIL_NONE` | No menu-specific detail / not applicable |
+| 1 | `EFZ_MENU_DETAIL_PLAYER_ROOMS_ROOT` | Player Rooms root view |
+| 2 | `EFZ_MENU_DETAIL_PLAYER_ROOMS_JOIN` | Player Rooms join view |
+| 3 | `EFZ_MENU_DETAIL_PLAYER_ROOMS_CREATE` | Player Rooms create view |
+| 16 | `EFZ_MENU_DETAIL_OPTIONS_ROOT` | Options root category list |
+| 17 | `EFZ_MENU_DETAIL_OPTIONS_CATEGORY` | Options category contents |
+| 18 | `EFZ_MENU_DETAIL_OPTIONS_EDIT` | Options inline edit mode |
+| 19 | `EFZ_MENU_DETAIL_OPTIONS_MODAL` | Options modal / confirmation overlay |
+| 32 | `EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_PROFILE` | Battle Log profile summary |
+| 33 | `EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_FULL` | Battle Log full-log summary |
+| 34 | `EFZ_MENU_DETAIL_BATTLE_LOG_SUMMARY_SEARCH` | Battle Log search summary |
+| 35 | `EFZ_MENU_DETAIL_BATTLE_LOG_BROWSER` | Battle Log set browser |
+| 36 | `EFZ_MENU_DETAIL_BATTLE_LOG_FILTERS` | Battle Log filter screen |
+| 37 | `EFZ_MENU_DETAIL_BATTLE_LOG_SET_DETAILS` | Battle Log set-details screen |
 
 ### `EFZNetplayActivityPhase` *(v4)*
 
@@ -178,7 +204,7 @@ screen object is not allocated, or the game system pointer is null).
 | 1 | `EFZ_CAP_SCORES` | `p1Wins`, `p2Wins`, `matchCounter` |
 | 2 | `EFZ_CAP_NICKNAMES` | `localNickname`, `p1Name`, `p2Name` |
 | 3 | `EFZ_CAP_NETWORK` | `pingMs`, `rollbackFrames` |
-| 4 | `EFZ_CAP_MENU` | `inNetplayMenu`, `netplayMenuScreen` |
+| 4 | `EFZ_CAP_MENU` | `inNetplayMenu`, `netplayMenuScreen`, `netplayMenuDetail` |
 | 5 | `EFZ_CAP_REVIVAL` | `revivalVersion` |
 | 6 | `EFZ_CAP_GAME_FLOW` | `inNetplayCharacterSelect`, `inNetplayMatch` |
 | 7 | `EFZ_CAP_ACTIVITY` | `activityPhase`, `endReason` |
@@ -335,20 +361,42 @@ the title screen and renders its own overlay.
 
 The `inNetplayMenu` flag reads `g_netplayMenuState.active` (set to `true` by
 `EnterNetplayMenu()`, cleared by `LeaveNetplayMenu()` and match-handoff
-functions).  The `netplayMenuScreen` field maps directly from the internal
-`NetplayMenuId` enum:
+functions). The exported menu fields are now split into:
+
+- `netplayMenuScreen` — current top-level menu page
+- `netplayMenuDetail` — menu-specific subview / mode for menus that have
+  internal browsing state
+
+`netplayMenuScreen` maps from the internal `NetplayMenuId` enum:
 
 | Internal `NetplayMenuId` | Exported `EFZNetplayMenuScreen` | Meaning |
 |---|---|---|
 | `Main` (0) | `EFZ_MENU_MAIN` (0) | Top-level menu |
 | `Host` (1) | `EFZ_MENU_HOST` (1) | Hosting settings |
 | `Join` (2) | `EFZ_MENU_JOIN` (2) | Join settings |
-| `Nickname` (3) | `EFZ_MENU_NICKNAME` (3) | Nickname editor |
-| `Lobby` (4) | `EFZ_MENU_LOBBY` (4) | Lobby browser |
+| `PlayerRooms` (3) | `EFZ_MENU_PLAYER_ROOMS` (3) | Player Rooms browser |
+| `Options` (4) | `EFZ_MENU_OPTIONS` (4) | Options menu |
+| `Lobby` (5) | `EFZ_MENU_LOBBY` (5) | Active lobby / room screen |
+| `BattleLog` (6) | `EFZ_MENU_BATTLE_LOG` (6) | Battle Log |
+
+`netplayMenuDetail` is derived only for menus that have meaningful internal
+subviews:
+
+| Menu | Source of `netplayMenuDetail` |
+|---|---|
+| `PlayerRooms` | `player_rooms::GetMenuDetailForStateExport()` |
+| `Options` | `options::GetMenuDetailForStateExport()` |
+| `BattleLog` | `battle_log::GetMenuDetailForStateExport()` |
+| everything else | `EFZ_MENU_DETAIL_NONE` |
 
 Note: A host or join session can be **connecting** while the menu is still
 open (`inNetplayMenu = 1` and `sessionPhase = EFZ_PHASE_CONNECTING`).
 The menu closes only when a successful handoff to a match occurs.
+
+The exporter also suppresses stale menu state once EFZ leaves the title
+screen. If `g_netplayMenuState.active` is still set but the live screen index
+is no longer `0`, `inNetplayMenu`, `netplayMenuScreen`, and
+`netplayMenuDetail` are all cleared before the state is published.
 
 ### Game-flow flags (v3)
 
@@ -544,3 +592,4 @@ using version-specific memory offsets.
 | 4 | Added capability bits (`capabilityFlags`), sequence/identity counters (`stateSeq`, `sessionId`, `setId`), granular activity phase (`activityPhase`), session end reason (`endReason`), character-select context (`p1CharId`, `p2CharId`, `p1Locked`, `p2Locked`, `localCursorCharId`), and match context (`stageId`, `roundIndex`, `isRoundActive`, `roundTimerFrames`). v3 flags remain populated for backward compatibility. |
 | 4.1 | **Win counter fix**: `TickExportOnly()` now calls `RefreshRuntimeStatus()` every frame so wins (and other volatile session fields) are re-read from Revival memory during match/charselect — previously they were only read during title-screen ticks, causing 0-0 display at character select. Added high-water-mark latch (`g_latchedP1Wins` / `g_latchedP2Wins`) as safety net against transient read gaps during screen transitions. |
 | 4.2 | **Spectator session support**: Wins and nicknames are now read from spectator session objects (mode 1) using spectator-specific offsets: P1 wins at +128, P2 wins at +132, P1 name at +154, P2 name at +282. These offsets are consistent across all Revival versions (1.02e–i). Previously, spectator sessions exported empty nicknames and 0-0 wins because the online session offsets are out of bounds for the smaller 1088-byte spectator object. |
+| 6 | **Menu ABI refresh**: Updated `netplayMenuScreen` to match the current in-game menu model (`Main`, `Host`, `Join`, `Player Rooms`, `Options`, `Lobby`, `Battle Log`) instead of the old Nickname/Lobby-only export. Added `netplayMenuDetail` for Player Rooms, Options, and Battle Log subviews. `localNickname` is now exported as `char[64]`. |

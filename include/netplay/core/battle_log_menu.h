@@ -8,12 +8,6 @@
 
 namespace netplay::battle_log
 {
-struct BattleLogWarning
-{
-    int lineNumber = 0;
-    std::string message;
-};
-
 struct BattleLogMatch
 {
     int lineNumber = 0;
@@ -47,7 +41,6 @@ struct BattleLogSession
     bool p1SwitchedCharacter = false;
     bool p2SwitchedCharacter = false;
     int totalDurationSeconds = 0;
-    int warningCount = 0;
     int64_t sortKey = 0;
 };
 
@@ -76,7 +69,12 @@ struct BattleLogSummary
     int gameLosses = 0;
     int totalGames = 0;
     int totalDurationSeconds = 0;
-    int warningSessions = 0;
+    double averageGamesPerCompletedSet = 0.0;
+    int averageSetDurationSeconds = 0;
+    int longestSetByDurationSeconds = 0;
+    int longestSetByDurationSessionIndex = -1;
+    int longestSetByGamesCount = 0;
+    int longestSetByGamesSessionIndex = -1;
     std::string mostUsedCharacter;
     std::string mostUsedMatchup;
     std::string recentOpponent;
@@ -93,7 +91,6 @@ struct BattleLogDocument
     bool fileExists = false;
     bool saveBattleLogEnabled = true;
     std::vector<BattleLogSession> sessions;
-    std::vector<BattleLogWarning> warnings;
     std::vector<std::string> characterOptions;
 };
 
@@ -116,4 +113,5 @@ bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction acti
 
 bool DrawOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc);
+uint8_t GetMenuDetailForStateExport();
 }

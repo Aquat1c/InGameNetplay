@@ -1,5 +1,6 @@
 #include "netplay/core/options_menu.h"
 
+#include "efz_netplay_state.h"
 #include "logger.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
@@ -2968,6 +2969,22 @@ bool IsSaveOverlayActive()
 bool IsBusy()
 {
     return g_state.edit.active || g_state.modal.active;
+}
+
+uint8_t GetMenuDetailForStateExport()
+{
+    if (g_state.modal.active)
+    {
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_OPTIONS_MODAL);
+    }
+    if (g_state.edit.active)
+    {
+        return static_cast<uint8_t>(EFZ_MENU_DETAIL_OPTIONS_EDIT);
+    }
+    return static_cast<uint8_t>(
+        IsRootCategoryView()
+            ? EFZ_MENU_DETAIL_OPTIONS_ROOT
+            : EFZ_MENU_DETAIL_OPTIONS_CATEGORY);
 }
 
 bool UseTournamentModeForOfflineVsHuman()
