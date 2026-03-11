@@ -831,10 +831,24 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const int tL = panelX + 6;
     const int tR = panelX + panelW - 4;
 
-    netplay::font::DrawTextLeft5x7(sv, "HOSTING", tL, tR, panelY + 4, 1, 1, titleColor);
+    netplay::font::DrawTextLeft5x7(
+        sv,
+        g_hostingOverlay.challengeMode ? "CHALLENGING" : "HOSTING",
+        tL,
+        tR,
+        panelY + 4,
+        1,
+        1,
+        titleColor);
 
     char line[192] = {};
-    if (!g_hostingOverlay.ipFetchDone)
+    if (g_hostingOverlay.challengeMode)
+    {
+        std::snprintf(line, sizeof(line), "Challenging %s ...", g_hostingOverlay.targetName);
+        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, brightColor);
+        netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel challenge", tL, tR, panelY + 50, 1, 1, textColor);
+    }
+    else if (!g_hostingOverlay.ipFetchDone)
     {
         std::snprintf(line, sizeof(line), "Fetching public IP...");
         netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 18, 1, 1, dimColor);
@@ -853,18 +867,22 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     }
 
     // Copied feedback or help text
-    const bool showCopiedFlash = g_hostingOverlay.copiedToClipboard
+    const bool showCopiedFlash = !g_hostingOverlay.challengeMode
+        && g_hostingOverlay.copiedToClipboard
         && (GetTickCount() - g_hostingOverlay.copiedFlashTick) < 2000;
     if (showCopiedFlash)
     {
         netplay::font::DrawTextLeft5x7(sv, "Copied to clipboard!", tL, tR, panelY + 34, 1, 1, greenColor);
     }
-    else if (g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
+    else if (!g_hostingOverlay.challengeMode && g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
     {
         netplay::font::DrawTextLeft5x7(sv, "Press C button to copy the address", tL, tR, panelY + 34, 1, 1, dimColor);
     }
 
-    netplay::font::DrawTextLeft5x7(sv, "Waiting for opponent...  ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, textColor);
+    if (!g_hostingOverlay.challengeMode)
+    {
+        netplay::font::DrawTextLeft5x7(sv, "Waiting for opponent...  ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, textColor);
+    }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;
@@ -923,8 +941,15 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     else
     {
         // Connecting state
-        std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
-            g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
+        if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
+        {
+            std::snprintf(line, sizeof(line), "Connecting to %s ...", g_joiningOverlay.targetName);
+        }
+        else
+        {
+            std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
+                g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
+        }
         netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, textColor);
 
         netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);

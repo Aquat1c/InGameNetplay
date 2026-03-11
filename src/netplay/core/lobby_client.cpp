@@ -91,6 +91,7 @@ struct LobbyEndpointConfig
 {
     bool forceWinInet = false;
     bool forceEmbeddedTls = false;
+    bool preferWinInet = false;
     bool tlsVerify = false;
     bool hasBaseUrlOverride = false;
     std::string baseUrl;
@@ -603,9 +604,9 @@ const LobbyEndpointConfig& GetLobbyEndpointConfig()
         const WindowsVersionInfo windowsVersion = QueryWindowsVersion();
         if (IsWindowsXpFamily(windowsVersion))
         {
-            config.forceEmbeddedTls = true;
+            config.preferWinInet = true;
             mod::Log(
-                "LobbySession: detected legacy Windows %lu.%lu build=%lu; auto enabling ForceEmbeddedTls=1",
+                "LobbySession: detected legacy Windows %lu.%lu build=%lu; auto enabling PreferWinInet=1",
                 static_cast<unsigned long>(windowsVersion.major),
                 static_cast<unsigned long>(windowsVersion.minor),
                 static_cast<unsigned long>(windowsVersion.build));
@@ -631,13 +632,14 @@ const LobbyEndpointConfig& GetLobbyEndpointConfig()
     }
 
     mod::Log(
-        "LobbySession: endpoint config override=%d baseUrl='%s' proxyOverride=%d proxyBaseUrl='%s' forceWinInet=%d forceEmbeddedTls=%d tlsVerify=%d embeddedAvailable=%d",
+        "LobbySession: endpoint config override=%d baseUrl='%s' proxyOverride=%d proxyBaseUrl='%s' forceWinInet=%d forceEmbeddedTls=%d preferWinInet=%d tlsVerify=%d embeddedAvailable=%d",
         config.hasBaseUrlOverride ? 1 : 0,
         config.hasBaseUrlOverride ? config.baseUrl.c_str() : "",
         config.hasProxyBaseUrl ? 1 : 0,
         config.hasProxyBaseUrl ? config.proxyBaseUrl.c_str() : "",
         config.forceWinInet ? 1 : 0,
         config.forceEmbeddedTls ? 1 : 0,
+        config.preferWinInet ? 1 : 0,
         config.tlsVerify ? 1 : 0,
         netplay::tls::IsAvailable() ? 1 : 0);
 
@@ -981,7 +983,10 @@ std::string DoHttpGetViaWinHttp(const std::string& path)
     return result;
 }
 
-std::string DoHttpGetViaWinInet(const std::string& fullUrl)
+std::string DoHttpGetViaWinInet(
+    const std::string& fullUrl,
+    DWORD connectTimeoutMs = kConnectTimeoutMs,
+    DWORD receiveTimeoutMs = kReceiveTimeoutMs)
 {
     std::string result;
     WinInetApi& api = GetWinInetApi();
@@ -1002,8 +1007,8 @@ std::string DoHttpGetViaWinInet(const std::string& fullUrl)
         return result;
     }
 
-    const DWORD connectTimeout = kConnectTimeoutMs;
-    const DWORD receiveTimeout = kReceiveTimeoutMs;
+    const DWORD connectTimeout = connectTimeoutMs;
+    const DWORD receiveTimeout = receiveTimeoutMs;
     if (api.SetOption(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, (LPVOID)&connectTimeout, sizeof(connectTimeout)) == FALSE)
     {
         LogWinInetFailure("InternetSetOption(CONNECT_TIMEOUT)", api);
@@ -1076,6 +1081,30 @@ std::string TryHttpGetForEndpoint(
 
     const bool isHttps = HasHttpsScheme(requestUrl);
     const bool tryEmbeddedTls = isHttps && (!endpointConfig.forceWinInet || endpointConfig.forceEmbeddedTls);
+    bool triedWinInet = false;
+
+    const bool tryPreferredWinInetFirst =
+        endpointConfig.preferWinInet
+        && !endpointConfig.forceWinInet
+        && !endpointConfig.forceEmbeddedTls;
+    if (tryPreferredWinInetFirst)
+    {
+        triedWinInet = true;
+        const std::string preferredWinInetResult = DoHttpGetViaWinInet(requestUrl);
+        if (!preferredWinInetResult.empty())
+        {
+            if (outBackend != nullptr)
+            {
+                *outBackend = 2;
+            }
+            return preferredWinInetResult;
+        }
+
+        mod::Log(
+            "LobbySession::DoHttpGet: %s endpoint preferred WinINet failed url='%s'; falling back",
+            endpointTag.c_str(),
+            requestUrl.c_str());
+    }
 
     if (tryEmbeddedTls)
     {
@@ -1116,14 +1145,17 @@ std::string TryHttpGetForEndpoint(
         }
     }
 
-    const std::string winInetResult = DoHttpGetViaWinInet(requestUrl);
-    if (!winInetResult.empty())
+    if (!triedWinInet)
     {
-        if (outBackend != nullptr)
+        const std::string winInetResult = DoHttpGetViaWinInet(requestUrl);
+        if (!winInetResult.empty())
         {
-            *outBackend = 2;
+            if (outBackend != nullptr)
+            {
+                *outBackend = 2;
+            }
+            return winInetResult;
         }
-        return winInetResult;
     }
 
     return std::string();
@@ -1687,6 +1719,10 @@ LobbySession::~LobbySession()
     {
         m_pollThread.join();
     }
+    if (m_publicIpThread.joinable())
+    {
+        m_publicIpThread.join();
+    }
     if (m_wakeEvent != nullptr)
     {
         CloseHandle(m_wakeEvent);
@@ -1722,11 +1758,10 @@ void LobbySession::RequestRefresh()
     // If we were returning from a match, now is the time to finalise.
     if (m_returningFromMatch.exchange(false))
     {
-        const bool wasHost = m_isMatchHost.load();
-        if (wasHost)
+        const bool sendDeferredEnd = m_endDeferred.exchange(false);
+        if (sendDeferredEnd)
         {
-            // HOST: the End action was deferred — send it now.
-            mod::Log("LobbySession::RequestRefresh (host): returning-from-match cleared, queuing End");
+            mod::Log("LobbySession::RequestRefresh: returning-from-match cleared, queuing deferred End");
             std::lock_guard<std::mutex> lock(m_mutex);
             m_status.inBattle = false;
             PendingAction action;
@@ -1735,9 +1770,7 @@ void LobbySession::RequestRefresh()
         }
         else
         {
-            // CLIENT: End was already sent in NotifyEndMatch — just
-            // clear the local suppression so we can be challenged again.
-            mod::Log("LobbySession::RequestRefresh (client): returning-from-match cleared");
+            mod::Log("LobbySession::RequestRefresh: returning-from-match cleared");
             std::lock_guard<std::mutex> lock(m_mutex);
             m_status.inBattle = false;
         }
@@ -1761,6 +1794,9 @@ void LobbySession::RequestRefresh()
 void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
 {
     m_isMatchHost.store(true);
+    m_challengePending.store(true);
+    m_matchConnected.store(false);
+    m_endDeferred.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         PendingAction action;
@@ -1779,8 +1815,13 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
 void LobbySession::AcceptChallenge(int challengerPlayerId)
 {
     m_isMatchHost.store(false);
+    m_inBattle.store(true);
+    m_challengePending.store(true);
+    m_matchConnected.store(false);
+    m_endDeferred.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::PreAccept;
         action.targetPlayerId = challengerPlayerId;
@@ -1797,6 +1838,9 @@ void LobbySession::NotifyMatchConnected()
     // Called when the P2P connection is established (delay setup overlay shown).
     // Queue the deferred 'accept' so the lobby shows the pair as "playing".
     m_inBattle.store(true);
+    m_challengePending.store(false);
+    m_matchConnected.store(true);
+    m_endDeferred.store(false);
     mod::Log("LobbySession::NotifyMatchConnected: inBattle=true");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1821,11 +1865,26 @@ void LobbySession::NotifyEndMatch()
     m_returningFromMatch.store(true);
 
     const bool wasHost = m_isMatchHost.load();
-    if (wasHost)
+    const bool challengePending = m_challengePending.exchange(false);
+    const bool matchConnected = m_matchConnected.load();
+    if (challengePending && !matchConnected)
+    {
+        mod::Log("LobbySession::NotifyEndMatch: challenge canceled before connect, queuing End immediately");
+        m_returningFromMatch.store(false);
+        m_matchConnected.store(false);
+        m_endDeferred.store(false);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = false;
+        PendingAction action;
+        action.type = PendingAction::End;
+        m_pendingActions.push_back(std::move(action));
+    }
+    else if (wasHost)
     {
         // HOST: defer the End action until we re-enter the lobby menu
         // (via RequestRefresh).  This keeps the playing-pair visible on
         // the server and prevents us from appearing idle prematurely.
+        m_endDeferred.store(true);
         mod::Log("LobbySession::NotifyEndMatch (host): inBattle=false "
                  "returningFromMatch=true (End deferred)");
     }
@@ -1837,6 +1896,7 @@ void LobbySession::NotifyEndMatch()
         // still set m_returningFromMatch so IsInBattle() returns true
         // and local challenge acceptance is suppressed until we return
         // to the lobby menu.
+        m_endDeferred.store(false);
         mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
                  "returningFromMatch=true, queuing End immediately");
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1975,8 +2035,8 @@ void LobbySession::PollThreadEntry()
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
 
-    // Discover public IP in the background after joining.
-    DiscoverPublicIp();
+    // Discover public IP in the background after joining so lobby entry is not blocked.
+    StartPublicIpDiscoveryAsync();
 
     // Poll loop.
     while (!m_shouldStop.load())
@@ -2013,6 +2073,10 @@ void LobbySession::PollThreadEntry()
             allowPoll = (m_status.pollState != PollState::Error);
         }
         const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
+        if (m_shouldStop.load())
+        {
+            break;
+        }
         if (!skipPoll && allowPoll)
         {
             if (!DoPollStatus() && m_rejoinRequested.load())
@@ -2465,7 +2529,45 @@ void LobbySession::ParsePlayingPairs(const std::string& json, std::vector<LobbyP
             ++cursor;
         }
 
-        out->push_back(std::move(pair));
+        auto isDuplicatePair = [&](const LobbyPlayingPair& existing) {
+            const bool idsValid =
+                pair.p1Id != 0 && pair.p2Id != 0
+                && existing.p1Id != 0 && existing.p2Id != 0;
+            if (idsValid)
+            {
+                return (pair.p1Id == existing.p1Id && pair.p2Id == existing.p2Id)
+                    || (pair.p1Id == existing.p2Id && pair.p2Id == existing.p1Id);
+            }
+
+            const bool namesMatch =
+                (pair.p1Name == existing.p1Name && pair.p2Name == existing.p2Name)
+                || (pair.p1Name == existing.p2Name && pair.p2Name == existing.p1Name);
+            if (!namesMatch)
+            {
+                return false;
+            }
+
+            if (!pair.hostIp.empty() && !existing.hostIp.empty())
+            {
+                return pair.hostIp == existing.hostIp;
+            }
+
+            return true;
+        };
+
+        bool duplicate = false;
+        for (const auto& existing : *out)
+        {
+            if (isDuplicatePair(existing))
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+        {
+            out->push_back(std::move(pair));
+        }
     }
 }
 
@@ -2597,7 +2699,7 @@ void LobbySession::BuildDisplayEntries(
         ? std::vector<LobbyChallenge>{}
         : challenges;
 
-    out->reserve(effectiveChallenges.size() + idlePlayers.size());
+    out->reserve(effectiveChallenges.size() + idlePlayers.size() + playing.size());
 
     // Build a set of player IDs that appear in challenges, so we can
     // deduplicate them from the idle list (a challenger also shows in idle).
@@ -2621,6 +2723,32 @@ void LobbySession::BuildDisplayEntries(
         return false;
     };
 
+    auto isEntryInPlayingPair = [&](int id, const std::string& name, std::string* outSpectateIp) -> bool {
+        for (const auto& pp : playing)
+        {
+            if (pp.p1Id == id || pp.p2Id == id)
+            {
+                if (outSpectateIp != nullptr)
+                {
+                    *outSpectateIp = pp.hostIp;
+                }
+                return true;
+            }
+
+            // Fallback by exact name because servers sometimes surface
+            // different ids across idle/challenge/playing lists.
+            if (!name.empty() && (pp.p1Name == name || pp.p2Name == name))
+            {
+                if (outSpectateIp != nullptr)
+                {
+                    *outSpectateIp = pp.hostIp;
+                }
+                return true;
+            }
+        }
+        return false;
+    };
+
     auto findSpectateIp = [&](int id) -> std::string {
         for (const auto& pp : playing)
         {
@@ -2635,6 +2763,12 @@ void LobbySession::BuildDisplayEntries(
     // Challenges first — they are actionable and time-sensitive.
     for (const auto& ch : effectiveChallenges)
     {
+        std::string playingSpectateIp;
+        if (isPlayerPlaying(ch.playerId) || isEntryInPlayingPair(ch.playerId, ch.name, &playingSpectateIp))
+        {
+            continue;
+        }
+
         challengerIds.push_back(ch.playerId);
 
         LobbyDisplayEntry entry;
@@ -2654,32 +2788,6 @@ void LobbySession::BuildDisplayEntries(
         for (const auto& e : *out)
         {
             if (e.playerId == id) return true;
-        }
-        return false;
-    };
-
-    // Check if a player (by ID or name+ip fallback) appears in a playing pair.
-    // Two different people can sharea nickname, so name alone is not reliable.
-    // We prefer IDs; name is only used as a secondary signal when combined
-    // with matching inside our own pair (identified by selfPlayerId).
-    auto isIdInPlayingPair = [&](int id, const std::string& name, std::string* outSpectateIp) -> bool {
-        for (const auto& pp : playing)
-        {
-            if (pp.p1Id == id || pp.p2Id == id)
-            {
-                if (outSpectateIp) *outSpectateIp = pp.hostIp;
-                return true;
-            }
-            // Fallback: name match only when the player is in OUR pair
-            // (server sometimes assigns new IDs across lists).
-            if (pp.p1Id == selfPlayerId || pp.p2Id == selfPlayerId)
-            {
-                if (pp.p1Name == name || pp.p2Name == name)
-                {
-                    if (outSpectateIp) *outSpectateIp = pp.hostIp;
-                    return true;
-                }
-            }
         }
         return false;
     };
@@ -2708,51 +2816,29 @@ void LobbySession::BuildDisplayEntries(
             continue;
         }
 
+        std::string spectateIpByName;
+        if (isPlayerPlaying(p.playerId) || isEntryInPlayingPair(p.playerId, p.name, &spectateIpByName))
+        {
+            continue;
+        }
+
         LobbyDisplayEntry entry;
         entry.name = p.name;
         entry.playerId = p.playerId;
         entry.isChallenge = false;
         entry.isSelf = (p.playerId == selfPlayerId);
-        // Check by ID first; name fallback only for our own pair where
-        // the server may assign a different ID across lists.
-        std::string spectateIpByName;
-        entry.isPlaying = isPlayerPlaying(p.playerId) || isIdInPlayingPair(p.playerId, p.name, &spectateIpByName);
-        if (entry.isPlaying && entry.spectateIp.empty())
-        {
-            entry.spectateIp = spectateIpByName;
-        }
-        if (entry.spectateIp.empty())
-        {
-            entry.spectateIp = findSpectateIp(p.playerId);
-        }
+        entry.isPlaying = false;
         out->push_back(std::move(entry));
     }
 
-    // Finally, add playing pairs whose players are NOT already in the list.
-    // On many Concerto servers, playing players are removed from the idle
-    // list.  We add synthetic display entries for each pair so they appear
-    // in the scrollable slot list and can be selected to spectate.
+    // Finally, add exactly one synthetic entry per active pair.
     for (const auto& pp : playing)
     {
-        // Use the first player in the pair who isn't already listed (by ID).
-        // Prefer p1 (typically the host) so the spectateIp resolves correctly.
-        const bool p1Listed = isIdAlreadyListed(pp.p1Id);
-        const bool p2Listed = isIdAlreadyListed(pp.p2Id);
-        const int displayId = !p1Listed ? pp.p1Id
-                            : !p2Listed ? pp.p2Id
-                            : 0;
-        if (displayId == 0)
-        {
-            continue; // both players already appear via idle/challenge entries
-        }
-
         LobbyDisplayEntry entry;
-        entry.name = (displayId == pp.p1Id)
-            ? pp.p1Name + " vs " + pp.p2Name
-            : pp.p2Name + " vs " + pp.p1Name;
-        entry.playerId = displayId;
+        entry.name = pp.p1Name + " vs " + pp.p2Name;
+        entry.playerId = (pp.p1Id != 0) ? pp.p1Id : pp.p2Id;
         entry.isChallenge = false;
-        entry.isSelf = (displayId == selfPlayerId);
+        entry.isSelf = (pp.p1Id == selfPlayerId || pp.p2Id == selfPlayerId);
         entry.isPlaying = true;
         entry.spectateIp = pp.hostIp;
         out->push_back(std::move(entry));
@@ -2860,14 +2946,42 @@ bool LobbySession::DoEnd()
 // Public IP discovery
 // ---------------------------------------------------------------------------
 
+void LobbySession::StartPublicIpDiscoveryAsync()
+{
+    if (!m_publicIp.empty())
+    {
+        return;
+    }
+    if (m_publicIpDiscoveryStarted.exchange(true))
+    {
+        return;
+    }
+
+    if (m_publicIpThread.joinable())
+    {
+        m_publicIpThread.join();
+    }
+
+    m_publicIpThread = std::thread([this]() {
+        DiscoverPublicIp();
+    });
+}
+
 void LobbySession::DiscoverPublicIp()
 {
+    constexpr DWORD kPublicIpTimeoutMs = 2000;
+
+    if (m_shouldStop.load())
+    {
+        return;
+    }
+
     // Try the embedded TLS client first (works on all platforms).
     if (netplay::tls::IsAvailable())
     {
         std::string body;
         std::string error;
-        if (netplay::tls::HttpGet("https://api.ipify.org", false, 5000, &body, &error))
+        if (netplay::tls::HttpGet("https://api.ipify.org", false, kPublicIpTimeoutMs, &body, &error))
         {
             // Trim whitespace.
             while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
@@ -2886,6 +3000,11 @@ void LobbySession::DiscoverPublicIp()
         mod::Log("LobbySession::DiscoverPublicIp: TLS request failed: %s", error.c_str());
     }
 
+    if (m_shouldStop.load())
+    {
+        return;
+    }
+
     // Fallback: plain HTTP to 4.ident.me (same service Concerto uses) via WinINet.
     static auto TrimIpBody = [](std::string& s) {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
@@ -2894,7 +3013,7 @@ void LobbySession::DiscoverPublicIp()
         }
     };
 
-    std::string body = DoHttpGetViaWinInet("http://4.ident.me");
+    std::string body = DoHttpGetViaWinInet("http://4.ident.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
     TrimIpBody(body);
     if (!body.empty())
     {
@@ -2905,7 +3024,12 @@ void LobbySession::DiscoverPublicIp()
         return;
     }
 
-    body = DoHttpGetViaWinInet("http://4.tnedi.me");
+    if (m_shouldStop.load())
+    {
+        return;
+    }
+
+    body = DoHttpGetViaWinInet("http://4.tnedi.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
     TrimIpBody(body);
     if (!body.empty())
     {
@@ -2971,6 +3095,9 @@ void LobbySession::ProcessPendingActions()
             mod::Log("LobbySession: processing end");
             DoEnd();
             m_pendingAcceptTargetId = 0;
+            m_challengePending.store(false);
+            m_matchConnected.store(false);
+            m_endDeferred.store(false);
             break;
         }
     }

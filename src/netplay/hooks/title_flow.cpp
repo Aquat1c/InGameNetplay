@@ -75,8 +75,71 @@ unsigned short g_lobbyChallengeAlertBufferIndex = kInvalidSoundBufferIndex;
 std::array<uint8_t, kFilteredMenuInputBytes> g_filteredMenuInputs = {};
 std::array<uint8_t, kFilteredMenuInputBytes> g_unfocusedHeldMenuInputs = {};
 std::array<uint8_t, 256> g_netplayHotkeyDown = {};
+std::thread g_lobbySessionShutdownThread;
+std::atomic<bool> g_lobbySessionShutdownInFlight{false};
+std::atomic<bool> g_lobbySessionShutdownCompleted{false};
+std::atomic<bool> g_lobbySessionShutdownReturnToPlayerRooms{false};
 
 void PlayLobbyChallengeAlert(uint32_t screenContext);
+
+void PumpLobbySessionShutdown()
+{
+    if (!g_lobbySessionShutdownCompleted.load())
+    {
+        return;
+    }
+
+    if (g_lobbySessionShutdownThread.joinable())
+    {
+        g_lobbySessionShutdownThread.join();
+    }
+
+    const bool returnToPlayerRooms = g_lobbySessionShutdownReturnToPlayerRooms.exchange(false);
+    g_lobbySessionShutdownCompleted.store(false);
+    g_lobbySessionShutdownInFlight.store(false);
+
+    mod::Log(
+        "LobbySessionShutdown: completed returnToPlayerRooms=%d",
+        returnToPlayerRooms ? 1 : 0);
+
+    if (returnToPlayerRooms)
+    {
+        netplay::player_rooms::NotifyLobbySessionShutdownCompleted();
+    }
+}
+
+void BeginLobbySessionShutdown(bool returnToPlayerRooms)
+{
+    PumpLobbySessionShutdown();
+
+    if (!g_lobbySession)
+    {
+        return;
+    }
+
+    if (g_lobbySessionShutdownThread.joinable())
+    {
+        g_lobbySessionShutdownThread.join();
+    }
+
+    g_lobbySessionShutdownInFlight.store(true);
+    g_lobbySessionShutdownCompleted.store(false);
+    g_lobbySessionShutdownReturnToPlayerRooms.store(returnToPlayerRooms);
+
+    if (returnToPlayerRooms)
+    {
+        netplay::player_rooms::NotifyLobbySessionShutdownStarted();
+    }
+
+    mod::Log(
+        "LobbySessionShutdown: begin returnToPlayerRooms=%d",
+        returnToPlayerRooms ? 1 : 0);
+
+    g_lobbySessionShutdownThread = std::thread([session = std::move(g_lobbySession)]() mutable {
+        session.reset();
+        g_lobbySessionShutdownCompleted.store(true);
+    });
+}
 
 void ResetWindowFocusInputSuppression()
 {
@@ -444,6 +507,20 @@ void ActivateHostingOverlay(uint16_t port)
     std::thread(FetchPublicIpThread).detach();
 }
 
+void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port)
+{
+    ResetHostingOverlayState();
+    g_hostingOverlay.active = true;
+    g_hostingOverlay.port = port;
+    g_hostingOverlay.challengeMode = true;
+    strncpy_s(g_hostingOverlay.targetName, sizeof(g_hostingOverlay.targetName), targetName, _TRUNCATE);
+    g_hostingOverlay.targetName[sizeof(g_hostingOverlay.targetName) - 1] = '\0';
+    mod::Log(
+        "HostingOverlay: activated challenge target='%s' port=%u",
+        g_hostingOverlay.targetName,
+        static_cast<unsigned>(port));
+}
+
 // ---------------------------------------------------------------------------
 // Joining overlay — shows "Connecting to IP:PORT ..." while connecting.
 // Transitions to delay setup on success, or shows the error on failure.
@@ -461,6 +538,23 @@ void ActivateJoiningOverlay(const char* address, uint16_t port)
     strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
     g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
     mod::Log("JoiningOverlay: activated  target=%s:%u", address, static_cast<unsigned>(port));
+}
+
+void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port)
+{
+    ResetJoiningOverlayState();
+    g_joiningOverlay.active = true;
+    g_joiningOverlay.port = port;
+    g_joiningOverlay.displayTargetName = true;
+    strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
+    g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
+    strncpy_s(g_joiningOverlay.targetName, sizeof(g_joiningOverlay.targetName), targetName, _TRUNCATE);
+    g_joiningOverlay.targetName[sizeof(g_joiningOverlay.targetName) - 1] = '\0';
+    mod::Log(
+        "JoiningOverlay: activated challenge target='%s' address=%s:%u",
+        g_joiningOverlay.targetName,
+        g_joiningOverlay.address,
+        static_cast<unsigned>(port));
 }
 
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage)
@@ -1369,6 +1463,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 
 void LeaveNetplayMenu(uint32_t screenContext)
 {
+    PumpLobbySessionShutdown();
     mod::Log("LeaveNetplayMenu: request active=%d bgmActive=%d", g_netplayMenuState.active, g_netplayMenuState.bgmActive);
     if (!g_netplayMenuState.active)
     {
@@ -1396,9 +1491,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     if (g_lobbySession)
     {
         mod::Log("LeaveNetplayMenu: tearing down g_lobbySession defensively");
-        std::thread([session = std::move(g_lobbySession)]() mutable {
-            session.reset();
-        }).detach();
+        BeginLobbySessionShutdown(false);
     }
 
     g_netplayMenuState.active = false;
@@ -1557,6 +1650,7 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
 
 void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
 {
+    PumpLobbySessionShutdown();
     const NetplayMenuId previousMenu = g_netplayMenuState.menuId;
     if (g_inlineEditState.active)
     {
@@ -1585,13 +1679,13 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     {
         if (g_lobbySession)
         {
-            mod::Log("SwitchToMenu: leaving Lobby, tearing down lobby session asynchronously");
-            // Move the session into a detached thread so the destructor
-            // (which joins the poll thread and sends the HTTP /leave request)
-            // does not block the UI thread and cause a visible hitch.
-            std::thread([session = std::move(g_lobbySession)]() mutable {
-                session.reset();
-            }).detach();
+            const bool returnToPlayerRooms =
+                (menuId == NetplayMenuId::PlayerRooms
+                    && g_lobbySession->GetOrigin() == netplay::lobby::RoomOrigin::PlayerRooms);
+            mod::Log(
+                "SwitchToMenu: leaving Lobby, tearing down lobby session asynchronously returnToPlayerRooms=%d",
+                returnToPlayerRooms ? 1 : 0);
+            BeginLobbySessionShutdown(returnToPlayerRooms);
         }
         g_netplayMenuState.lobbyScrollOffset = 0;
         ResetLobbyChallengeNotificationState();
@@ -1817,10 +1911,20 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         StartMenuSlideTransition(screenContext, NetplayMenuId::Join, -1, +1);
         break;
     case NetplayMenuAction::OpenPlayerRooms:
+        if (g_lobbySessionShutdownInFlight.load())
+        {
+            ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
+            break;
+        }
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::PlayerRooms, -1, +1);
         break;
     case NetplayMenuAction::OpenLobby:
+        if (g_lobbySessionShutdownInFlight.load())
+        {
+            ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
+            break;
+        }
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
         break;
@@ -2099,7 +2203,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 g_netplayMenuState.nickname.c_str());
             if (started)
             {
-                ActivateJoiningOverlay(challengeAddr.c_str(), challengePort);
+                ActivateChallengeJoiningOverlay(entry.name.c_str(), challengeAddr.c_str(), challengePort);
             }
             else
             {
@@ -2146,7 +2250,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 g_netplayMenuState.nickname.c_str());
             if (started)
             {
-                ActivateHostingOverlay(g_netplayMenuState.hostPort);
+                ActivateChallengeHostingOverlay(entry.name.c_str(), g_netplayMenuState.hostPort);
 
                 // Send the challenge to the lobby server (async on poll thread).
                 g_lobbySession->SendChallenge(entry.playerId, std::string(ipPortBuf));
@@ -2175,6 +2279,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     auto const render = GetOriginalTitleRender();
     auto const processInput = reinterpret_cast<ProcessPlayerInputFn>(RuntimeAddress(kVaProcessPlayerInput));
 
+    PumpLobbySessionShutdown();
     AdvanceMenuSlideTransition(screenContext);
     if (g_useRuntimeTextOverlay)
     {
@@ -2847,7 +2952,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         // C button (heavy attack, offset 20/21) — copy IP:PORT to clipboard
-        if (g_hostingOverlay.active && g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
+        if (g_hostingOverlay.active
+            && !g_hostingOverlay.challengeMode
+            && g_hostingOverlay.ipFetchDone
+            && !g_hostingOverlay.ipFetchFailed)
         {
             bool copyRequested = false;
             for (int playerIndex = 0; playerIndex < 2; ++playerIndex)

@@ -176,9 +176,11 @@ public:
     void NotifyMatchConnected();
 
     // Notify that a match/challenge has ended (user cancelled or
-    // connection dropped).  The lobby 'end' action is deferred until
-    // RequestRefresh() is called (i.e. we re-enter the lobby menu),
-    // preventing other players from challenging us during cleanup.
+    // connection dropped).  Pending challenges that never reached the
+    // connected-match state send 'end' immediately so the opponent's
+    // client clears the challenge right away.  Connected host matches
+    // still defer 'end' until RequestRefresh() so the playing pair is
+    // preserved until the host returns to the lobby.
     void NotifyEndMatch();
 
     // Returns true while we are in an active match or returning from
@@ -203,6 +205,7 @@ private:
 
     // Discover our public IP address via an external service.
     void DiscoverPublicIp();
+    void StartPublicIpDiscoveryAsync();
 
     // Process any queued actions from the main thread.
     void ProcessPendingActions();
@@ -230,8 +233,8 @@ private:
     // exclude ourselves from being challengeable).  Challengers that also
     // appear in idlePlayers are deduplicated by player ID.  Players in
     // |playing| pairs are flagged so the UI can show them distinctly.
-    // Deduplication uses player IDs rather than names because different
-    // players can share a nickname.
+    // Server IDs are not always stable across idle/challenge/playing lists,
+    // so an exact-name fallback is also used to suppress stale duplicates.
     static void BuildDisplayEntries(
         const std::vector<LobbyChallenge>& challenges,
         const std::vector<LobbyPlayer>& idlePlayers,
@@ -270,6 +273,9 @@ private:
     std::atomic<bool> m_rejoinRequested{false};
     std::atomic<bool> m_inBattle{false};
     std::atomic<bool> m_returningFromMatch{false};
+    std::atomic<bool> m_challengePending{false};
+    std::atomic<bool> m_matchConnected{false};
+    std::atomic<bool> m_endDeferred{false};
     // true when we initiated the lobby match (sent the challenge);
     // false when we accepted an incoming challenge (joined as client).
     std::atomic<bool> m_isMatchHost{false};
@@ -278,6 +284,8 @@ private:
     HANDLE m_wakeEvent = nullptr;
 
     std::thread m_pollThread;
+    std::thread m_publicIpThread;
+    std::atomic<bool> m_publicIpDiscoveryStarted{false};
 };
 
 } // namespace netplay::lobby

@@ -92,7 +92,9 @@ struct HostingOverlayState
 {
     bool active = false;
     uint16_t port = 0;
+    bool challengeMode = false;
     char publicIp[128] = {};       // filled asynchronously
+    char targetName[64] = {};
     bool ipFetchDone = false;      // true once background fetch completes (success or fail)
     bool ipFetchFailed = false;    // true if all attempts failed
     bool copiedToClipboard = false;
@@ -103,7 +105,9 @@ struct JoiningOverlayState
 {
     bool active = false;
     uint16_t port = 0;
+    bool displayTargetName = false;
     char address[128] = {};         // target address
+    char targetName[64] = {};
     char errorText[128] = {};       // populated when bridge reports failure
     bool failed = false;            // true when connection attempt failed
 };
@@ -211,8 +215,10 @@ void ClearNetplayStatusMessage();
 std::string GetNetplayStatusMessage();
 void PlayUiSound(uint32_t screenContext, unsigned short soundIndex);
 void ActivateHostingOverlay(uint16_t port);
+void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port);
 void ResetHostingOverlayState();
 void ActivateJoiningOverlay(const char* address, uint16_t port);
+void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port);
 void ResetJoiningOverlayState();
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage);
 void InstallNetplayWindowHook(uint32_t screenContext);

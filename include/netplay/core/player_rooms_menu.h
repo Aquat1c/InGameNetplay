@@ -15,6 +15,8 @@ const netplay::menu::NetplayMenuSpec* GetMenuSpec();
 void ResetState();
 bool EnterMenu();
 void LeaveMenu();
+void NotifyLobbySessionShutdownStarted();
+void NotifyLobbySessionShutdownCompleted();
 
 std::string BuildRowLabel(netplay::menu::NetplayMenuAction action);
 std::string BuildRowPrimaryText(netplay::menu::NetplayMenuAction action);

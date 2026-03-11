@@ -56,11 +56,18 @@ struct State
 State g_state = {};
 std::mutex g_refreshMutex;
 std::atomic<bool> g_refreshInFlight{false};
+std::atomic<uint32_t> g_refreshGeneration{1};
 bool g_refreshResultReady = false;
 bool g_refreshResultShowStatus = false;
 bool g_refreshResultOk = false;
+uint32_t g_refreshResultGeneration = 0;
 std::vector<netplay::lobby::PublicRoomSummary> g_refreshResultRooms;
 std::string g_refreshResultError;
+bool g_lobbySessionShutdownInFlight = false;
+bool g_refreshAfterLobbySessionShutdown = false;
+std::array<int8_t, 2> g_lastHorizontalInput = {};
+
+bool StartAsyncRefresh(bool showStatusMessage);
 
 int* GetSelectionStorage(BrowserView view)
 {
@@ -122,6 +129,23 @@ void ClearStatusMessage()
 {
     g_state.statusMessage.clear();
     g_state.statusExpireTick = 0;
+}
+
+void InvalidateRefreshResults()
+{
+    g_refreshGeneration.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(g_refreshMutex);
+    g_refreshResultReady = false;
+    g_refreshResultShowStatus = false;
+    g_refreshResultOk = false;
+    g_refreshResultGeneration = 0;
+    g_refreshResultRooms.clear();
+    g_refreshResultError.clear();
+}
+
+void ResetHorizontalInputState()
+{
+    g_lastHorizontalInput.fill(0);
 }
 
 const char* GetRoomTypeLabel()
@@ -352,6 +376,7 @@ void PumpRefreshResult()
     bool ready = false;
     bool showStatusMessage = false;
     bool ok = false;
+    uint32_t resultGeneration = 0;
     std::vector<netplay::lobby::PublicRoomSummary> rooms;
     std::string error;
     {
@@ -364,6 +389,7 @@ void PumpRefreshResult()
 
         showStatusMessage = g_refreshResultShowStatus;
         ok = g_refreshResultOk;
+        resultGeneration = g_refreshResultGeneration;
         rooms = std::move(g_refreshResultRooms);
         error = std::move(g_refreshResultError);
         g_refreshResultRooms.clear();
@@ -371,9 +397,24 @@ void PumpRefreshResult()
         g_refreshResultReady = false;
         g_refreshResultShowStatus = false;
         g_refreshResultOk = false;
+        g_refreshResultGeneration = 0;
     }
 
     g_refreshInFlight.store(false, std::memory_order_release);
+
+    if (resultGeneration != g_refreshGeneration.load(std::memory_order_acquire))
+    {
+        mod::Log(
+            "PlayerRooms::PumpRefreshResult: discarded stale refresh result generation=%u current=%u",
+            static_cast<unsigned>(resultGeneration),
+            static_cast<unsigned>(g_refreshGeneration.load(std::memory_order_relaxed)));
+        if (g_refreshAfterLobbySessionShutdown && !g_lobbySessionShutdownInFlight && !IsRefreshInFlight())
+        {
+            g_refreshAfterLobbySessionShutdown = false;
+            (void)StartAsyncRefresh(false);
+        }
+        return;
+    }
 
     if (ok)
     {
@@ -407,6 +448,12 @@ void PumpRefreshResult()
     }
 
     RebuildMenuEntries();
+
+    if (g_refreshAfterLobbySessionShutdown && !g_lobbySessionShutdownInFlight && !IsRefreshInFlight())
+    {
+        g_refreshAfterLobbySessionShutdown = false;
+        (void)StartAsyncRefresh(false);
+    }
 }
 
 bool StartAsyncRefresh(bool showStatusMessage)
@@ -421,11 +468,13 @@ bool StartAsyncRefresh(bool showStatusMessage)
         return false;
     }
 
+    const uint32_t generation = g_refreshGeneration.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(g_refreshMutex);
         g_refreshResultReady = false;
         g_refreshResultShowStatus = false;
         g_refreshResultOk = false;
+        g_refreshResultGeneration = 0;
         g_refreshResultRooms.clear();
         g_refreshResultError.clear();
     }
@@ -436,7 +485,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
         SetStatusMessage("Refreshing public room list...");
     }
 
-    std::thread([showStatusMessage]() {
+    std::thread([showStatusMessage, generation]() {
         std::vector<netplay::lobby::PublicRoomSummary> rooms;
         std::string error;
         const bool ok = netplay::lobby::ListPublicRooms(&rooms, &error);
@@ -445,6 +494,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
             g_refreshResultReady = true;
             g_refreshResultShowStatus = showStatusMessage;
             g_refreshResultOk = ok;
+            g_refreshResultGeneration = generation;
             g_refreshResultRooms = std::move(rooms);
             g_refreshResultError = std::move(error);
         }
@@ -513,6 +563,15 @@ const NetplayMenuSpec* GetMenuSpec()
 void ResetState()
 {
     g_state = {};
+    g_lobbySessionShutdownInFlight = false;
+    g_refreshAfterLobbySessionShutdown = false;
+    g_refreshInFlight.store(false, std::memory_order_release);
+    g_refreshGeneration.store(1, std::memory_order_release);
+    g_refreshResultReady = false;
+    g_refreshResultShowStatus = false;
+    g_refreshResultOk = false;
+    g_refreshResultGeneration = 0;
+    ResetHorizontalInputState();
     EnsureSpecInitialized();
 }
 
@@ -520,11 +579,20 @@ bool EnterMenu()
 {
     EnsureSpecInitialized();
     PumpRefreshResult();
+    ResetHorizontalInputState();
     if (g_state.roomCode.empty())
     {
         g_state.roomCode.clear();
     }
-    (void)StartAsyncRefresh(false);
+    if (g_lobbySessionShutdownInFlight)
+    {
+        SetStatusMessage("Leaving room...");
+        g_refreshAfterLobbySessionShutdown = true;
+    }
+    else
+    {
+        (void)StartAsyncRefresh(false);
+    }
     RebuildMenuEntries();
     return true;
 }
@@ -532,12 +600,43 @@ bool EnterMenu()
 void LeaveMenu()
 {
     PumpRefreshResult();
+    InvalidateRefreshResults();
+    ResetHorizontalInputState();
     g_state.view = BrowserView::Root;
     g_state.rootSelection = 0;
     g_state.joinSelection = 0;
     g_state.createSelection = 0;
     RebuildMenuEntries();
     ClearStatusMessage();
+}
+
+void NotifyLobbySessionShutdownStarted()
+{
+    g_lobbySessionShutdownInFlight = true;
+    g_refreshAfterLobbySessionShutdown = true;
+    InvalidateRefreshResults();
+    if (!HasStatusMessage())
+    {
+        SetStatusMessage("Leaving room...");
+    }
+}
+
+void NotifyLobbySessionShutdownCompleted()
+{
+    g_lobbySessionShutdownInFlight = false;
+    if (!g_refreshAfterLobbySessionShutdown)
+    {
+        return;
+    }
+
+    ClearStatusMessage();
+    if (IsRefreshInFlight())
+    {
+        return;
+    }
+
+    g_refreshAfterLobbySessionShutdown = false;
+    (void)StartAsyncRefresh(false);
 }
 
 std::string BuildRowPrimaryText(NetplayMenuAction action)
@@ -721,8 +820,15 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
         const int8_t horizontal = static_cast<int8_t>(inputBytes[playerIndex + 12]);
         if (horizontal == 0)
         {
+            g_lastHorizontalInput[static_cast<size_t>(playerIndex)] = 0;
             continue;
         }
+
+        if (horizontal == g_lastHorizontalInput[static_cast<size_t>(playerIndex)])
+        {
+            continue;
+        }
+        g_lastHorizontalInput[static_cast<size_t>(playerIndex)] = horizontal;
 
         *inactivityCounter = 0;
         if (*inputLatch != 0)
@@ -790,6 +896,24 @@ bool HandleCancel(uint32_t screenContext)
 bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 {
     PumpRefreshResult();
+
+    const bool requiresStableRoomState =
+        action == NetplayMenuAction::PlayerRoomsOpenJoin
+        || action == NetplayMenuAction::PlayerRoomsOpenCreate
+        || action == NetplayMenuAction::PlayerRoomsRefresh
+        || action == NetplayMenuAction::PlayerRoomsJoin
+        || action == NetplayMenuAction::PlayerRoomsEditCode
+        || action == NetplayMenuAction::PlayerRoomsCreate
+        || action == NetplayMenuAction::PlayerRoomsRoomType
+        || action == NetplayMenuAction::PlayerRoomsSlot0
+        || action == NetplayMenuAction::PlayerRoomsSlot1
+        || action == NetplayMenuAction::PlayerRoomsSlot2;
+    if (g_lobbySessionShutdownInFlight && requiresStableRoomState)
+    {
+        SetStatusMessage("Leaving room...");
+        return true;
+    }
+
     switch (action)
     {
     case NetplayMenuAction::PlayerRoomsOpenJoin:
