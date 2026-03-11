@@ -1216,6 +1216,7 @@ void HandoffSpectateSession(uint32_t screenContext)
     g_netplayMenuState.lobbyScrollOffset = 0;
     ResetMenuSlideTransition();
     ResetInlineEditState();
+    ClearNetplayStatusMessage();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
     g_pendingVsHumanAutoConfirm = false;
@@ -1307,6 +1308,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_charSelectResetPending = true;
     ResetMenuSlideTransition();
     ResetInlineEditState();
+    ClearNetplayStatusMessage();
     g_lastNetplayFrameLogTick = 0;
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -1410,6 +1412,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_netplayMenuState.lobbyScrollOffset = 0;
     ResetMenuSlideTransition();
     ResetInlineEditState();
+    ClearNetplayStatusMessage();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
     ResetWindowFocusInputSuppression();
@@ -1502,6 +1505,7 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     g_netplayMenuState.lobbyScrollOffset = 0;
     ResetMenuSlideTransition();
     ResetInlineEditState();
+    ClearNetplayStatusMessage();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
     g_pendingVsHumanAutoConfirm = false;
@@ -1557,6 +1561,10 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     if (g_inlineEditState.active)
     {
         CancelInlineEdit();
+    }
+    if (previousMenu != menuId)
+    {
+        ClearNetplayStatusMessage();
     }
     if (previousMenu == NetplayMenuId::Options && menuId != NetplayMenuId::Options)
     {
@@ -1674,7 +1682,89 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
 
 void ShowStubActionMessage(HWND owner, const std::string& message)
 {
-    MessageBoxA(owner, message.c_str(), "Netplay", MB_OK | MB_ICONINFORMATION);
+    (void)owner;
+    SetNetplayStatusMessage(message.c_str());
+}
+
+void SetNetplayStatusMessage(const char* text, DWORD durationMs)
+{
+    g_netplayStatusMessage.clear();
+    g_netplayStatusExpireTick = 0;
+
+    if (text == nullptr || text[0] == '\0')
+    {
+        return;
+    }
+
+    std::string normalized;
+    normalized.reserve(std::strlen(text));
+
+    bool lastWasNewline = false;
+    for (const char* p = text; *p != '\0'; ++p)
+    {
+        const char ch = *p;
+        if (ch == '\r')
+        {
+            continue;
+        }
+        if (ch == '\n')
+        {
+            if (!lastWasNewline)
+            {
+                normalized.push_back('\n');
+                lastWasNewline = true;
+            }
+            continue;
+        }
+
+        normalized.push_back(ch);
+        lastWasNewline = false;
+    }
+
+    while (!normalized.empty() && (normalized.back() == ' ' || normalized.back() == '\n'))
+    {
+        normalized.pop_back();
+    }
+
+    if (const size_t firstNewline = normalized.find('\n'); firstNewline != std::string::npos)
+    {
+        for (size_t extra = normalized.find('\n', firstNewline + 1);
+             extra != std::string::npos;
+             extra = normalized.find('\n', extra + 1))
+        {
+            normalized[extra] = ' ';
+        }
+    }
+
+    g_netplayStatusMessage = std::move(normalized);
+    if (!g_netplayStatusMessage.empty())
+    {
+        g_netplayStatusExpireTick = GetTickCount() + durationMs;
+        mod::Log(
+            "NetplayStatus: '%s' durationMs=%lu",
+            g_netplayStatusMessage.c_str(),
+            static_cast<unsigned long>(durationMs));
+    }
+}
+
+bool HasNetplayStatusMessage()
+{
+    return !g_netplayStatusMessage.empty() && GetTickCount() < g_netplayStatusExpireTick;
+}
+
+void ClearNetplayStatusMessage()
+{
+    g_netplayStatusMessage.clear();
+    g_netplayStatusExpireTick = 0;
+}
+
+std::string GetNetplayStatusMessage()
+{
+    if (!HasNetplayStatusMessage())
+    {
+        return {};
+    }
+    return g_netplayStatusMessage;
 }
 
 NetplayMenuId ResolveCancelTargetMenu()

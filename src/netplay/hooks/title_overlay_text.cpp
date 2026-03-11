@@ -461,6 +461,11 @@ std::string BuildFooterText()
         }
     }
 
+    if (HasNetplayStatusMessage())
+    {
+        return GetNetplayStatusMessage();
+    }
+
     if (g_netplayMenuState.menuId == NetplayMenuId::Options)
     {
         if (netplay::options::IsSaveOverlayActive())

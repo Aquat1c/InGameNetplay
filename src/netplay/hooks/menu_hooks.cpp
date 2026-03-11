@@ -40,6 +40,8 @@ HFONT g_menuOverlayFont = nullptr;
 HWND g_hookedWindow = nullptr;
 WNDPROC g_originalWindowProc = nullptr;
 bool g_netplayEscapeDown = false;
+std::string g_netplayStatusMessage;
+DWORD g_netplayStatusExpireTick = 0;
 bool g_restoreReplaySelectionOnNextTitleUpdate = false;
 uint32_t g_replaySelectionGuardFramesRemaining = 0;
 int8_t g_replaySelectionRestoreTarget = -1;
@@ -901,6 +903,13 @@ bool AreHooksInstalled()
 void ShowInProgressMessage(HWND owner)
 {
     mod::Log("ShowInProgressMessage: owner=0x%p", owner);
-    MessageBoxA(owner, "In progress", "Netplay", MB_OK | MB_ICONINFORMATION);
+    (void)owner;
+    if (hooks::internal::g_netplayMenuState.active)
+    {
+        hooks::internal::SetNetplayStatusMessage("In progress.");
+        return;
+    }
+
+    mod::Log("ShowInProgressMessage: netplay menu inactive, suppressed popup");
 }
 } // namespace netplay
