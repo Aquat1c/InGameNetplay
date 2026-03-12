@@ -46,9 +46,14 @@ Common optional files:
 ```text
 mods\efz_netplay_mod\
   assets\
-    battle_log_icons.dat
     res_alert.wav
     netplay_font_map.txt
+    sprites\
+      akane.png
+      akiko.png
+      ayu.png
+      ...
+      unknown.png
   wave\
     bgm\
       bgm08.wav
@@ -59,9 +64,9 @@ mods\efz_netplay_mod\
 What they are used for:
 - `assets\netplay_bg.dat` - netplay menu background
 - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
-- `assets\battle_log_icons.dat` - indexed Battle Log icon sheet
 - `assets\res_alert.wav` - custom lobby challenge alert sound
 - `assets\netplay_font_map.txt` - optional sprite-font mapping
+- `assets\sprites\*.png` - Battle Log character portraits
 - `wave\bgm\bgm08.wav` - optional netplay menu BGM override
 - `system\title_ob.dat` - optional title object-sheet override
 
@@ -137,9 +142,9 @@ Notes:
 DLL-relative assets:
 - `<dll_folder>\\assets\\netplay_bg.dat`
 - `<dll_folder>\\assets\\netplay_ob.dat`
-- `<dll_folder>\\assets\\battle_log_icons.dat`
 - `<dll_folder>\\assets\\res_alert.wav`
 - `<dll_folder>\\assets\\netplay_font_map.txt` (optional)
+- `<dll_folder>\\assets\\sprites\\*.png` (Battle Log portraits)
 
 Object fallback order:
 - `<dll_folder>\\assets\\netplay_ob.dat`
@@ -225,8 +230,9 @@ Core areas:
 ## Copyright and Licenses
 
 Project status:
-- This repository currently does not include a top-level license file for the In-game Netplay project itself.
-- Unless and until one is added, do not assume the project source is released under a standalone open-source license.
+- The original project-authored source code and documentation are released under the MIT License.
+- That license is intentionally scoped. It applies to the project's own source/docs, not to every file in this repository.
+- See the top-level `LICENSE` and `NOTICE` files for scope and attribution requirements.
 
 Third-party code used by this project:
 - Mbed TLS is vendored under `third_party/mbedtls` and is provided under a dual `Apache-2.0` or `GPL-2.0-or-later` license.
@@ -238,3 +244,4 @@ Game assets and reverse-engineered targets:
 - EFZ, EfzRevival, and their original binaries/assets are not part of this project's licensing.
 - Files such as `EfzRevival.dll`, `EfzRevival.exe`, `efz.exe`, and original game art/audio remain under their respective owners' rights.
 - Users are expected to provide their own legally obtained game/mod files.
+- Reverse-engineered and reference-material directories such as `decompilations/`, `assets/`, and `shared_documentation/concerto-efz-master/` are excluded from the top-level MIT license unless explicitly stated otherwise.
