@@ -1,4 +1,5 @@
 build/
+build_*/
 .vs/
 *.user
 *.VC.db
@@ -12,3 +13,5 @@ build/
 *.dll
 *.exe
 *.c
+shared_documentation/
+decompilations/

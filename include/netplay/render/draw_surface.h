@@ -17,6 +17,7 @@ struct LockedMenuSurface
 };
 
 bool AcquireMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HWND* outWindow, bool allowWindowDc);
+bool AcquirePresentedMenuDrawDc(uint32_t screenContext, HDC* outDc, void** outSurface, HWND* outWindow, bool allowWindowDc);
 void ReleaseMenuDrawDc(HDC dc, void* surface, HWND window);
 
 bool AcquireMenuDrawSurfaceLock(uint32_t screenContext, LockedMenuSurface* outSurface);
@@ -28,5 +29,10 @@ void ResolveOverlayTextPaletteColors(
     uint8_t paletteCount,
     uint8_t* outSelected,
     uint8_t* outNormal);
-}
 
+uint8_t ResolveBestPaletteColor(
+    uint32_t screenContext,
+    int targetR,
+    int targetG,
+    int targetB);
+}

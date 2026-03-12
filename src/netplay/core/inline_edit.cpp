@@ -9,6 +9,8 @@
 
 #include <array>
 #include <cctype>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -25,6 +27,8 @@ size_t GetMaxLength(NetplayMenuAction action)
         return kInlineEditMaxPortLength;
     case NetplayMenuAction::JoinEditAddress:
         return kInlineEditMaxJoinAddressLength;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return kInlineEditMaxRoomCodeLength;
     case NetplayMenuAction::NicknameEdit:
         return kInlineEditMaxNicknameLength;
     default:
@@ -42,11 +46,231 @@ bool IsCharacterAllowed(NetplayMenuAction action, char c)
         return c >= '0' && c <= '9';
     case NetplayMenuAction::JoinEditAddress:
         return std::isalnum(uc) != 0 || c == '.' || c == ':' || c == '-' || c == '_';
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        return std::isalnum(uc) != 0 || c == '.' || c == '-' || c == '_';
     case NetplayMenuAction::NicknameEdit:
-        return c >= 32 && c <= 126;
+        // Allow printable ASCII (32-126) and non-ASCII bytes (UTF-8 lead/continuation)
+        return (c >= 32 && c <= 126) || uc >= 0x80u;
     default:
         return false;
     }
+}
+
+// Erase the last UTF-8 codepoint from a string.
+void EraseLastUtf8Codepoint(std::string& s)
+{
+    if (s.empty())
+    {
+        return;
+    }
+
+    size_t i = s.size();
+    // Skip continuation bytes (10xxxxxx)
+    while (i > 0 && (static_cast<unsigned char>(s[i - 1]) & 0xC0u) == 0x80u)
+    {
+        --i;
+    }
+    // Remove the lead byte
+    if (i > 0)
+    {
+        --i;
+    }
+    s.erase(i);
+}
+
+size_t ClampCaretOffset(const std::string& text, size_t offset)
+{
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t PrevUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset == 0)
+    {
+        return 0;
+    }
+    --offset;
+    while (offset > 0 && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        --offset;
+    }
+    return offset;
+}
+
+size_t NextUtf8Boundary(const std::string& text, size_t offset)
+{
+    offset = ClampCaretOffset(text, offset);
+    if (offset >= text.size())
+    {
+        return text.size();
+    }
+    ++offset;
+    while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u)
+    {
+        ++offset;
+    }
+    return offset;
+}
+
+void TouchCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return;
+    }
+    state->caretVisible = true;
+    state->lastCaretTick = GetTickCount();
+}
+
+void InsertBytesAtCaret(netplay::inline_edit::State* state, const std::string& bytes)
+{
+    if (state == nullptr || bytes.empty())
+    {
+        return;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    state->buffer.insert(caret, bytes);
+    state->caretByteOffset = caret + bytes.size();
+    TouchCaret(state);
+}
+
+bool EraseCodepointBeforeCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return false;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    if (caret == 0)
+    {
+        return false;
+    }
+    const size_t start = PrevUtf8Boundary(state->buffer, caret);
+    state->buffer.erase(start, caret - start);
+    state->caretByteOffset = start;
+    TouchCaret(state);
+    return true;
+}
+
+bool EraseCodepointAtCaret(netplay::inline_edit::State* state)
+{
+    if (state == nullptr)
+    {
+        return false;
+    }
+    const size_t caret = ClampCaretOffset(state->buffer, state->caretByteOffset);
+    if (caret >= state->buffer.size())
+    {
+        return false;
+    }
+    const size_t end = NextUtf8Boundary(state->buffer, caret);
+    state->buffer.erase(caret, end - caret);
+    state->caretByteOffset = caret;
+    TouchCaret(state);
+    return true;
+}
+
+// Append a UTF-8 string to the edit buffer, respecting per-byte and per-action checks.
+void TryAppendUtf8String(netplay::inline_edit::State* state, const std::string& utf8)
+{
+    if (state == nullptr || !state->active || utf8.empty())
+    {
+        return;
+    }
+
+    const size_t maxLength = GetMaxLength(state->action);
+    for (char c : utf8)
+    {
+        if (!IsCharacterAllowed(state->action, c))
+        {
+            continue;
+        }
+        if (maxLength > 0 && state->buffer.size() >= maxLength)
+        {
+            break;
+        }
+        InsertBytesAtCaret(state, std::string(1, c));
+    }
+}
+
+// Convert a wchar_t (from WM_CHAR) to UTF-8.
+static std::string WcharToUtf8(wchar_t ch)
+{
+    if (ch == 0)
+    {
+        return {};
+    }
+
+    wchar_t buf[2] = {ch, L'\0'};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, buf, 1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+    {
+        return {};
+    }
+    std::vector<char> out(static_cast<size_t>(needed));
+    if (WideCharToMultiByte(CP_UTF8, 0, buf, 1, out.data(), needed, nullptr, nullptr) <= 0)
+    {
+        return {};
+    }
+    return std::string(out.data(), static_cast<size_t>(needed));
+}
+
+// Drain WM_CHAR and WM_IME_CHAR messages from the thread message queue and append them as UTF-8.
+// Returns true if any characters were consumed.
+static bool DrainWmCharMessages(netplay::inline_edit::State* state)
+{
+    if (state == nullptr || !state->active)
+    {
+        return false;
+    }
+
+    bool consumed = false;
+    MSG msg = {};
+
+    // Drain WM_CHAR messages (generated by TranslateMessage / IME).
+    // Only consume non-ASCII characters to avoid duplicating ASCII keys
+    // already handled by the VK polling path.
+    while (PeekMessageW(&msg, nullptr, WM_CHAR, WM_CHAR, PM_REMOVE))
+    {
+        const wchar_t ch = static_cast<wchar_t>(msg.wParam);
+        if (ch < 128)
+        {
+            continue; // ASCII range is handled by VK polling
+        }
+        const std::string utf8 = WcharToUtf8(ch);
+        if (!utf8.empty())
+        {
+            TryAppendUtf8String(state, utf8);
+            consumed = true;
+        }
+    }
+
+    // Also drain WM_IME_CHAR which is sent by some IMEs.
+    while (PeekMessageW(&msg, nullptr, WM_IME_CHAR, WM_IME_CHAR, PM_REMOVE))
+    {
+        const wchar_t ch = static_cast<wchar_t>(msg.wParam);
+        if (ch < 128)
+        {
+            continue;
+        }
+        const std::string utf8 = WcharToUtf8(ch);
+        if (!utf8.empty())
+        {
+            TryAppendUtf8String(state, utf8);
+            consumed = true;
+        }
+    }
+
+    return consumed;
 }
 
 bool GetCommittedValue(NetplayMenuAction action, const netplay::inline_edit::Values& values, std::string* outValue)
@@ -69,6 +293,9 @@ bool GetCommittedValue(NetplayMenuAction action, const netplay::inline_edit::Val
         return true;
     case NetplayMenuAction::NicknameEdit:
         *outValue = values.nickname;
+        return true;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        *outValue = values.playerRoomsRoomCode;
         return true;
     default:
         return false;
@@ -158,9 +385,7 @@ void TryAppendChar(netplay::inline_edit::State* state, char c)
         return;
     }
 
-    state->buffer.push_back(c);
-    state->caretVisible = true;
-    state->lastCaretTick = GetTickCount();
+    InsertBytesAtCaret(state, std::string(1, c));
     ClearError(state);
 }
 
@@ -172,14 +397,24 @@ void TryPasteText(netplay::inline_edit::State* state, HWND owner)
     }
 
     std::string clipboardText;
-    if (!netplay::input::TryReadClipboardAsciiText(owner, &clipboardText))
+    if (state->action == NetplayMenuAction::NicknameEdit)
     {
-        return;
+        if (!netplay::input::TryReadClipboardUtf8Text(owner, &clipboardText))
+        {
+            return;
+        }
+        TryAppendUtf8String(state, clipboardText);
     }
-
-    for (char c : clipboardText)
+    else
     {
-        TryAppendChar(state, c);
+        if (!netplay::input::TryReadClipboardAsciiText(owner, &clipboardText))
+        {
+            return;
+        }
+        for (char c : clipboardText)
+        {
+            TryAppendChar(state, c);
+        }
     }
 }
 
@@ -233,6 +468,15 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
         }
         values->nickname = value;
         break;
+    case NetplayMenuAction::PlayerRoomsEditCode:
+        if (!netplay::validation::IsValidLobbyRoomCode(value))
+        {
+            SetError(state, "INVALID ROOM CODE");
+            mod::Log("InlineEdit: invalid room code '%s'", value.c_str());
+            return false;
+        }
+        values->playerRoomsRoomCode = value;
+        break;
     default:
         return false;
     }
@@ -253,6 +497,7 @@ bool IsInlineEditableAction(NetplayMenuAction action)
     case NetplayMenuAction::JoinEditAddress:
     case NetplayMenuAction::JoinEditPort:
     case NetplayMenuAction::NicknameEdit:
+    case NetplayMenuAction::PlayerRoomsEditCode:
         return true;
     default:
         return false;
@@ -281,6 +526,7 @@ void BeginEdit(State* state, NetplayMenuAction action, const Values& values)
     state->active = true;
     state->action = action;
     state->buffer = initialValue;
+    state->caretByteOffset = state->buffer.size();
     state->caretVisible = true;
     state->lastCaretTick = GetTickCount();
     ClearError(state);
@@ -317,7 +563,8 @@ bool GetDisplayValue(
         *outValue = state.buffer;
         if (includeCaret && state.caretVisible)
         {
-            outValue->push_back('_');
+            const size_t caret = ClampCaretOffset(*outValue, state.caretByteOffset);
+            outValue->insert(caret, 1, '_');
         }
     }
     return true;
@@ -357,13 +604,39 @@ InputResult HandleInput(
     }
 
     bool changed = false;
-    if (ConsumeKeyEdge(state, VK_BACK) || ConsumeKeyEdge(state, VK_DELETE))
+    if (ConsumeKeyEdge(state, VK_LEFT))
     {
-        if (!state->buffer.empty())
+        state->caretByteOffset = PrevUtf8Boundary(state->buffer, state->caretByteOffset);
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_RIGHT))
+    {
+        state->caretByteOffset = NextUtf8Boundary(state->buffer, state->caretByteOffset);
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_HOME))
+    {
+        state->caretByteOffset = 0;
+        TouchCaret(state);
+    }
+    if (ConsumeKeyEdge(state, VK_END))
+    {
+        state->caretByteOffset = state->buffer.size();
+        TouchCaret(state);
+    }
+
+    if (ConsumeKeyEdge(state, VK_BACK))
+    {
+        if (EraseCodepointBeforeCaret(state))
         {
-            state->buffer.pop_back();
-            state->caretVisible = true;
-            state->lastCaretTick = GetTickCount();
+            ClearError(state);
+            changed = true;
+        }
+    }
+    if (ConsumeKeyEdge(state, VK_DELETE))
+    {
+        if (EraseCodepointAtCaret(state))
+        {
             ClearError(state);
             changed = true;
         }
@@ -441,6 +714,15 @@ InputResult HandleInput(
     }
     handlePrintableKey(VK_DECIMAL);
 
+    // Drain WM_CHAR messages for IME / Unicode input (nickname edit only).
+    if (state->action == NetplayMenuAction::NicknameEdit)
+    {
+        if (DrainWmCharMessages(state))
+        {
+            changed = true;
+        }
+    }
+
     if (changed)
     {
         mod::Log("InlineEdit: action=%s buffer='%s'", MenuActionToString(state->action), state->buffer.c_str());
@@ -448,5 +730,3 @@ InputResult HandleInput(
     return InputResult::Consumed;
 }
 }
-
-

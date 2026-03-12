@@ -1,4 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/core/battle_log_menu.h"
+#include "netplay/core/options_menu.h"
 
 #include <cctype>
 #include <string>
@@ -94,12 +96,11 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
 
     const int panelLeft = 152;
     const int panelRight = 316;
-    const int titleY = 58;
+    const int titleY = 18;
     const int rowTextOffsetY = 1;
 
     DrawSpriteText(screenContext, panelLeft, titleY, BuildMenuHeaderText(), panelRight - panelLeft, true);
 
-    const int selection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
     int count = 0;
     const NetplayMenuEntry* entries = GetMenuEntries(g_netplayMenuState.menuId, &count);
     if (entries != nullptr && count > 0)
@@ -112,33 +113,29 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
                 continue;
             }
 
+            // Main menu entries already have correct labels baked into the
+            // sprite sheet; drawing sprite-font text on top would double-render.
+            if (g_netplayMenuState.menuId == NetplayMenuId::Main)
+            {
+                continue;
+            }
+
+            // Lobby player/playing slots display arbitrary network strings that may
+            // not exist in the sprite sheet -- skip here and let GDI handle them.
+            const bool isLobbyNicknameRow =
+                g_netplayMenuState.menuId == NetplayMenuId::Lobby
+                && entries[i].action >= NetplayMenuAction::LobbySlot0
+                && entries[i].action <= NetplayMenuAction::LobbyPlaying0;
+            if (isLobbyNicknameRow)
+            {
+                continue;
+            }
+
             const int y = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)] + rowTextOffsetY;
             DrawSpriteText(screenContext, panelLeft, y, BuildRowLabel(entries[i]), panelRight - panelLeft, false);
         }
     }
 
-    std::string footer = BuildFooterText();
-    if (!g_inlineEditState.active && selection >= 0 && selection < count)
-    {
-        const NetplayMenuEntry& selected = entries[selection];
-        if (selected.action == NetplayMenuAction::HostEditPort)
-        {
-            footer = "CONFIRM TO EDIT HOST PORT";
-        }
-        else if (selected.action == NetplayMenuAction::JoinEditAddress)
-        {
-            footer = "CONFIRM TO EDIT SERVER ADDRESS";
-        }
-        else if (selected.action == NetplayMenuAction::JoinEditPort)
-        {
-            footer = "CONFIRM TO EDIT SERVER PORT";
-        }
-        else if (selected.action == NetplayMenuAction::NicknameEdit)
-        {
-            footer = "CONFIRM TO EDIT NICKNAME";
-        }
-    }
-    DrawSpriteText(screenContext, panelLeft, 224, footer, panelRight - panelLeft, false);
 }
 
 void BlitMenuRowClipped(
@@ -287,6 +284,15 @@ void DrawAnimatedCompactMenuLayer(uint32_t screenContext)
     DrawCompactMenuRows(screenContext, g_netplayMenuState.menuId, logicalSelection, 0);
 }
 
+void DrawNetplayBackgroundOnly(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
+
+    (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
+}
+
 void DrawNetplayBaseLayer(uint32_t screenContext)
 {
     auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
@@ -299,9 +305,12 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
     (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
     (void)blit(graphicsContext, 0, 0, 320, 240, objectsSurface, 0, 0, 320, 240, transparentColor, 0);
 
-    if (g_netplayMenuState.useConfigStyleRender && !g_useRuntimeTextOverlay)
     {
-        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Reserved5);
+        // Always stamp unused sprite-sheet rows with a blank black bar so
+        // labels from other menus (ADDRESS, PORT, etc.) don't bleed through.
+        // Blank is intentionally label-free in the sheet and is used as the
+        // shared filler row for unused slots and lobby display lines.
+        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Blank);
         if (kBlankRowIndex >= 0 && kBlankRowIndex < kNetplayConfigOptionCount)
         {
             const int blankSrcY = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(kBlankRowIndex)];
@@ -367,32 +376,75 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
 BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawDebugOverlay(screenContext);
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
+    }
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
-    bool drewGdiOverlay = false;
-    if (!g_spriteFont.loaded)
+    // All overlays now draw via surface lock + pixel writes before present,
+    // so there is no post-present window DC fallback needed.
+    const bool forceGdi = (g_netplayMenuState.menuId == NetplayMenuId::Lobby);
+    if (!g_spriteFont.loaded || forceGdi)
     {
-        drewGdiOverlay = DrawRuntimeTextOverlayGdi(screenContext, false);
+        (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }
-    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
-    if (!g_spriteFont.loaded && !drewGdiOverlay)
-    {
-        (void)DrawRuntimeTextOverlayGdi(screenContext, true);
-    }
-    return presentResult;
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawDebugOverlay(screenContext);
+    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
 }
 
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
-    DrawAnimatedCompactMenuLayer(screenContext);
-    const bool drewGdiOverlay = DrawDynamicFieldValuesGdi(screenContext, false);
-    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
-    if (!drewGdiOverlay)
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
     {
-        (void)DrawDynamicFieldValuesGdi(screenContext, true);
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawDebugOverlay(screenContext);
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
     }
-    return presentResult;
+    DrawAnimatedCompactMenuLayer(screenContext);
+    (void)DrawDynamicFieldValuesGdi(screenContext, false);
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawDebugOverlay(screenContext);
+    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
 }
 } // namespace netplay::hooks::internal
-

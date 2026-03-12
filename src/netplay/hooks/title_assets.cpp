@@ -2,8 +2,10 @@
 
 #include "logger.h"
 #include "netplay/assets/assets.h"
+#include "netplay/core/validation.h"
 
 #include <array>
+#include <cctype>
 
 namespace netplay::hooks::internal
 {
@@ -18,7 +20,50 @@ using netplay::assets::ParseEfzDatImage;
 using netplay::assets::ParsedDatImage;
 using netplay::assets::ResolveNetplayBackgroundPath;
 using netplay::assets::ResolveNetplayObjectsPath;
+using netplay::assets::ResolveTitleObjectsPath;
 using netplay::assets::NetplayObjectProfile;
+using netplay::validation::IsValidNickname;
+using netplay::validation::ParsePort;
+
+namespace
+{
+std::string TrimAscii(std::string value)
+{
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0)
+    {
+        ++begin;
+    }
+
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0)
+    {
+        --end;
+    }
+
+    return value.substr(begin, end - begin);
+}
+
+std::string ResolveRevivalIniPath()
+{
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exePath, static_cast<DWORD>(std::size(exePath))) == 0)
+    {
+        return "EfzRevival.ini";
+    }
+
+    std::string iniPath = exePath;
+    const size_t sep = iniPath.find_last_of("\\/");
+    if (sep == std::string::npos)
+    {
+        return "EfzRevival.ini";
+    }
+
+    iniPath.resize(sep + 1);
+    iniPath += "EfzRevival.ini";
+    return iniPath;
+}
+} // namespace
 
 HMODULE ResolveCurrentModule()
 {
@@ -82,6 +127,7 @@ void ResetTitleMenuState(uint32_t screenContext, int8_t selection)
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetTitleMenuState) = 0;
     *reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter) = 0;
+    *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY) = 0;
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetScreenInitState) = 0;
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetScreenExitState) = 0;
     mod::Log(
@@ -126,6 +172,10 @@ bool LoadTitleAssets(uint32_t screenContext)
     auto const readPixelValue = reinterpret_cast<ReadPixelValueFn>(RuntimeAddress(kVaReadPixelValue));
     auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
 
+    // Resolve title_ob.dat — prefer mod folder override, fallback to vanilla.
+    const std::string titleObjPath = ResolveTitleObjectsPath(g_moduleDirectory);
+    const char* titleObjPathC = titleObjPath.c_str();
+
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
         reinterpret_cast<uint32_t*>(screenContext + kOffsetBackgroundSurface),
@@ -135,12 +185,12 @@ bool LoadTitleAssets(uint32_t screenContext)
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
         reinterpret_cast<uint32_t*>(screenContext + kOffsetObjectsSurface),
-        "system\\title_ob.dat",
+        titleObjPathC,
         0,
         193);
 
     const bool bgPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), "system\\title.dat", 0, 1, 192) != 0;
-    const bool objPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), "system\\title_ob.dat", 0, 193, 48) != 0;
+    const bool objPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), titleObjPathC, 0, 193, 48) != 0;
 
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor) = static_cast<uint8_t>(readPixelValue(*reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface)));
     setPalette(GetGraphicsContext(screenContext), static_cast<int>(screenContext + kOffsetPalette));
@@ -151,6 +201,93 @@ bool LoadTitleAssets(uint32_t screenContext)
         objPaletteOk,
         static_cast<unsigned>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor)));
     return bgPaletteOk && objPaletteOk;
+}
+
+void LoadNetplayMenuSettingsFromIni()
+{
+    const std::string iniPath = ResolveRevivalIniPath();
+    if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        mod::Log("LoadNetplayMenuSettingsFromIni: ini not found path='%s' (using in-memory defaults)", iniPath.c_str());
+        return;
+    }
+
+    // Use GetPrivateProfileStringW so Windows gives us the real wide
+    // characters rather than converting through CP_ACP (which destroys
+    // CJK/Cyrillic characters on non-matching system locales).
+    std::string nickname;
+    {
+        const std::wstring wideIniPath(iniPath.begin(), iniPath.end());
+        wchar_t wideNickname[128] = {};
+        (void)GetPrivateProfileStringW(L"Network", L"Name", L"", wideNickname, static_cast<DWORD>(std::size(wideNickname)), wideIniPath.c_str());
+        // Trim whitespace from the wide string.
+        int len = static_cast<int>(wcslen(wideNickname));
+        while (len > 0 && (wideNickname[len - 1] == L' ' || wideNickname[len - 1] == L'\t' ||
+                           wideNickname[len - 1] == L'\r' || wideNickname[len - 1] == L'\n'))
+            --len;
+        int start = 0;
+        while (start < len && (wideNickname[start] == L' ' || wideNickname[start] == L'\t' ||
+                               wideNickname[start] == L'\r' || wideNickname[start] == L'\n'))
+            ++start;
+        // Convert wide -> UTF-8.
+        if (start < len)
+        {
+            const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nullptr, 0, nullptr, nullptr);
+            if (utf8Len > 0)
+            {
+                nickname.resize(static_cast<std::size_t>(utf8Len));
+                WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nickname.data(), utf8Len, nullptr, nullptr);
+            }
+        }
+    }
+    if (!nickname.empty())
+    {
+        if (IsValidNickname(nickname))
+        {
+            g_netplayMenuState.nickname = nickname;
+            mod::Log("LoadNetplayMenuSettingsFromIni: loaded Network.Name='%s'", g_netplayMenuState.nickname.c_str());
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Name='%s' (keeping '%s')",
+                nickname.c_str(),
+                g_netplayMenuState.nickname.c_str());
+        }
+    }
+    else
+    {
+        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Name missing/empty (keeping '%s')", g_netplayMenuState.nickname.c_str());
+    }
+
+    char portBuffer[32] = {};
+    (void)GetPrivateProfileStringA("Network", "Port", "", portBuffer, static_cast<DWORD>(std::size(portBuffer)), iniPath.c_str());
+    const std::string portText = TrimAscii(portBuffer);
+    if (!portText.empty())
+    {
+        uint16_t parsedPort = 0;
+        if (ParsePort(portText, &parsedPort))
+        {
+            g_netplayMenuState.hostPort = parsedPort;
+            g_netplayMenuState.joinPort = parsedPort;
+            mod::Log("LoadNetplayMenuSettingsFromIni: loaded Network.Port=%u", static_cast<unsigned>(parsedPort));
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Port='%s' (keeping host=%u join=%u)",
+                portText.c_str(),
+                static_cast<unsigned>(g_netplayMenuState.hostPort),
+                static_cast<unsigned>(g_netplayMenuState.joinPort));
+        }
+    }
+    else
+    {
+        mod::Log(
+            "LoadNetplayMenuSettingsFromIni: Network.Port missing/empty (keeping host=%u join=%u)",
+            static_cast<unsigned>(g_netplayMenuState.hostPort),
+            static_cast<unsigned>(g_netplayMenuState.joinPort));
+    }
 }
 
 bool LoadNetplayAssets(uint32_t screenContext)
@@ -307,4 +444,3 @@ bool LoadNetplaySpriteFont()
     return netplay::fontmap::LoadNetplaySpriteFont(g_moduleDirectory, &g_spriteFont);
 }
 } // namespace netplay::hooks::internal
-

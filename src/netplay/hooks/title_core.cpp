@@ -1,6 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 
 #include "logger.h"
+#include "netplay/core/player_rooms_menu.h"
 
 #include <cstring>
 
@@ -95,15 +96,34 @@ bool IsRenderRowUsedByMenu(NetplayMenuId menuId, int rowIndex)
 
 int GetScaledNativeSlideY(uint32_t screenContext)
 {
-    int slideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
-    slideY /= kNetplayNativeSlideDivisor;
-    if (slideY < -400)
+    if (!g_menuSlideTransition.active)
     {
-        slideY = -400;
+        return 0;
     }
-    if (slideY > 400)
+
+    const int rawSlideY = *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY);
+    if (rawSlideY < -8192 || rawSlideY > 8192)
     {
-        slideY = 400;
+        static bool loggedInvalidSlideY = false;
+        if (!loggedInvalidSlideY)
+        {
+            mod::Log(
+                "GetScaledNativeSlideY: ignoring out-of-range raw value=%d at 0x%08X",
+                rawSlideY,
+                screenContext + kOffsetSlideAnimationY);
+            loggedInvalidSlideY = true;
+        }
+        return 0;
+    }
+
+    int slideY = rawSlideY / kNetplayNativeSlideDivisor;
+    if (slideY < -120)
+    {
+        slideY = -120;
+    }
+    if (slideY > 120)
+    {
+        slideY = 120;
     }
     return slideY;
 }
@@ -131,7 +151,26 @@ void StartMenuSlideTransition(uint32_t screenContext, NetplayMenuId targetMenu, 
 
     const int currentSelection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
     const int resolvedTargetSelection = (targetSelection < 0) ? GetDefaultSelectionForMenu(targetMenu) : targetSelection;
+    const bool bypassNativeSlide =
+        (g_netplayMenuState.menuId == NetplayMenuId::BattleLog
+            || targetMenu == NetplayMenuId::BattleLog);
     auto const performSlide = reinterpret_cast<int(__thiscall*)(void*, unsigned char)>(RuntimeAddress(kVaPerformSlideAnimation));
+
+    if (bypassNativeSlide)
+    {
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        *reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter) = 0;
+        *reinterpret_cast<int*>(screenContext + kOffsetSlideAnimationY) = 0;
+        mod::Log(
+            "NetplaySlide(native): bypass from=%s(%d) to=%s(%d)",
+            MenuIdToString(g_netplayMenuState.menuId),
+            currentSelection,
+            MenuIdToString(targetMenu),
+            resolvedTargetSelection);
+        SwitchToMenu(screenContext, targetMenu, resolvedTargetSelection);
+        return;
+    }
 
     g_menuSlideTransition.active = true;
     g_menuSlideTransition.fromMenu = g_netplayMenuState.menuId;
@@ -180,6 +219,7 @@ InlineEditValues GetInlineEditValuesSnapshot()
     values.joinAddress = g_netplayMenuState.joinAddress;
     values.joinPort = g_netplayMenuState.joinPort;
     values.nickname = g_netplayMenuState.nickname;
+    values.playerRoomsRoomCode = netplay::player_rooms::GetRoomCode();
     return values;
 }
 
@@ -189,6 +229,7 @@ void ApplyInlineEditValues(const InlineEditValues& values)
     g_netplayMenuState.joinAddress = values.joinAddress;
     g_netplayMenuState.joinPort = values.joinPort;
     g_netplayMenuState.nickname = values.nickname;
+    netplay::player_rooms::SetRoomCode(values.playerRoomsRoomCode);
 }
 
 bool IsInlineEditableAction(NetplayMenuAction action)
@@ -261,6 +302,18 @@ bool HandleInlineEditInput(uint32_t screenContext, const uint8_t* inputBytes)
 
 LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    const bool closeRequested =
+        message == WM_CLOSE
+        || (message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE)
+        || message == WM_QUERYENDSESSION
+        || (message == WM_ENDSESSION && wParam != 0)
+        || message == WM_DESTROY
+        || message == WM_NCDESTROY;
+    if (closeRequested)
+    {
+        (void)ShutdownLobbySessionForProcessExit(false, "window_close");
+    }
+
     if (g_netplayMenuState.active)
     {
         const bool isEsc = (wParam == static_cast<WPARAM>(VK_ESCAPE));
@@ -342,10 +395,37 @@ void RemoveNetplayWindowHook()
     g_originalWindowProc = nullptr;
 }
 
+bool IsWindowFocused(HWND hwnd)
+{
+    if (hwnd == nullptr || !IsWindow(hwnd))
+    {
+        return false;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr || !IsWindow(foreground))
+    {
+        return false;
+    }
+
+    const HWND hwndRoot = GetAncestor(hwnd, GA_ROOTOWNER);
+    const HWND foregroundRoot = GetAncestor(foreground, GA_ROOTOWNER);
+    const HWND resolvedHwndRoot = hwndRoot != nullptr ? hwndRoot : hwnd;
+    const HWND resolvedForegroundRoot = foregroundRoot != nullptr ? foregroundRoot : foreground;
+    return resolvedHwndRoot == resolvedForegroundRoot;
+}
+
+bool IsScreenWindowFocused(uint32_t screenContext)
+{
+    const HWND hwnd = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+    return IsWindowFocused(hwnd);
+}
+
 bool ConsumeNetplayEscapeEdge()
 {
     const bool down = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-    const bool pressed = down && !g_netplayEscapeDown;
+    const bool focused = IsWindowFocused(g_hookedWindow);
+    const bool pressed = focused && down && !g_netplayEscapeDown;
     g_netplayEscapeDown = down;
     return pressed;
 }
@@ -355,4 +435,3 @@ uintptr_t RuntimeAddress(uintptr_t va)
     return g_exeBase + (va - kEfzImageBase);
 }
 } // namespace netplay::hooks::internal
-

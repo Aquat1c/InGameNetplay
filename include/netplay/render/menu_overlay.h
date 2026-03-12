@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <windows.h>
 
@@ -15,11 +16,15 @@ struct OverlayCallbacks
     std::function<const netplay::menu::NetplayMenuEntry*(netplay::menu::NetplayMenuId, int*)> getMenuEntries;
     std::function<std::string()> buildMenuHeaderText;
     std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowLabel;
+    std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowPrimaryText;
+    std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowSecondaryText;
     std::function<std::string()> buildFooterText;
     std::function<HFONT()> getMenuOverlayFont;
     std::function<bool(netplay::menu::NetplayMenuAction)> isInlineEditableAction;
     std::function<bool(netplay::menu::NetplayMenuAction, std::string*, bool)> getInlineEditDisplayValue;
     std::function<int(uint32_t)> getScaledNativeSlideY;
+    // Optional: override text color per row. Return nullopt to use defaults.
+    std::function<std::optional<COLORREF>(const netplay::menu::NetplayMenuEntry&, bool isSelected)> getRowTextColor;
 };
 
 struct RuntimeOverlayState
@@ -53,5 +58,4 @@ bool DrawDynamicFieldValuesGdi(
     uint32_t screenContext,
     bool allowWindowDc);
 }
-
 

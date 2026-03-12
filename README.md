@@ -1,84 +1,165 @@
-# EFZ In-Game Netplay Mod (DLL)
+# In-game Netplay (DLL)
 
-Runtime DLL mod that injects a `NETPLAY` entry into EFZ title menu and runs a custom in-engine netplay submenu loop.
+Runtime DLL mod for EFZ that injects a `NETPLAY` entry into the title screen and replaces the old external-flow model with an in-engine netplay menu, integrated Revival takeover, room browser, lobby UI, options editor, and battle log browser.
 
-## Current Status
-- Buildable Win32 DLL with runtime hook install/remove.
-- Logger opens a console and writes to:
-  - `<dll_folder>\\efz_netplay_mod.log`
-- Title menu hook/patch stack is active (`netplay::InstallHooks()`):
-  - Selection range expanded `0..6 -> 0..7`
-  - Title dispatch switched to custom 8-entry table
-  - Title render and update vtable entries are hooked
-  - 8-row panel/highlight geometry patches applied
-- Netplay menu entry/exit flow includes:
-  - Fade-out/fade-in transition calls
-  - Netplay BGM track `8` start on enter
-  - BGM stop + title assets restore on leave
-  - State reset for menu selection/latches/counters
-- Netplay submenu model:
-  - Main: `HOST`, `JOIN`, `CHANGE NICKNAME`, `RETURN TO TITLE`
-  - Host: `START HOST`, editable `PORT`, `BACK`
-  - Join: `CONNECT`, editable `ADDRESS`, editable `PORT`, `BACK`
-  - Nickname: editable `NAME`, `BACK`
-  - Canonical row slots: `0,1,2,3,4,7` (`5/6` reserved)
-- Inline editing is embedded in-menu (no extra modal input window):
-  - `Enter` commits
-  - `Esc` cancels edit only
-  - Outside edit mode, cancel/ESC follows menu back behavior
-  - Validation:
-    - Port: `1..65535`
-    - Address: alnum + `.:-_`
-    - Nickname: printable ASCII, max 20 chars
-- Rendering:
-  - Preferred: sprite-glyph runtime text from object sheet + `netplay_font_map.txt`
-  - Object-sheet-only mode: dynamic field values are drawn directly on menu rows
-  - Optional GDI fallback overlay exists (disabled by default)
+The built DLL name remains:
+- `efz_netplay_mod.dll`
 
-## Asset Lookup
-- DLL-relative assets:
-  - `<dll_folder>\\assets\\netplay_bg.dat`
-  - `<dll_folder>\\assets\\netplay_ob.dat` (or fallback object candidates)
-  - `<dll_folder>\\assets\\netplay_font_map.txt` (optional, template in `assets\\netplay_font_map.example.txt`)
-- Object fallback order:
-  - `<dll_folder>\\assets\\netplay_ob.dat`
-  - `<dll_folder>\\assets\\netplay_ui_ob.dat`
-  - `<dll_folder>\\assets\\config_ob.dat`
-  - `system\\title_ob.dat`
-- BGM path remains vanilla:
-  - `wave\\bgm\\bgm08.wav`
+## Inspiration and Reference
 
-## Source Layout
-- Hooks:
-  - `src/netplay/hooks/menu_hooks.cpp` (shared state + hook entrypoints/thunks)
-  - `src/netplay/hooks/title_patch_install.cpp`
-  - `src/netplay/hooks/title_flow.cpp`
-  - `src/netplay/hooks/title_draw_layers.cpp`
-  - `src/netplay/hooks/title_core.cpp`
-  - `src/netplay/hooks/title_assets.cpp`
-  - `src/netplay/hooks/title_overlay_text.cpp`
-  - `src/netplay/hooks/title_patch_helpers.cpp`
-- Shared hook internals:
-  - `include/netplay/hooks/internal/shared.h`
-- Core helpers:
-  - `src/netplay/core/*`
-- Rendering helpers:
-  - `src/netplay/render/*`
-- Asset parsing/pathing:
-  - `src/netplay/assets/assets.cpp`
+This project takes direct inspiration from Concerto EFZ by shiburizu:
+- https://github.com/shiburizu/concerto-efz
 
-## Build (CMake / Visual Studio)
+Concerto was the main reference for:
+- lobby and player-room UX
+- room lifecycle and challenge flow
+- backend endpoint semantics
+- Revival automation expectations
+
+This project does **not** embed Concerto itself. Instead, it reimplements the relevant online flow inside EFZ as a DLL mod with direct hook/bridge integration.
+
+## Current Feature Set
+
+Top-level menu:
+- `Host`
+- `Join`
+- `Player Rooms`
+- `Lobby`
+- `Battle Log`
+- `Options`
+- `Return to Title`
+
+Online flow:
+- Integrated Revival takeover bridge; no separate `netbridge.dll`
+- Host / Join / Spectate session startup from the in-game menu
+- Delay prompt overlay and connected-session handoff back into EFZ
+- Cancel / disconnect / recovery paths back into the netplay menu
+- Runtime state export for companion mods/tools
+
+Lobby and rooms:
+- Global `EFZ` lobby browser
+- Public/private room flow under `Player Rooms`
+- Create / join / refresh room flow
+- Challenge / accept / spectate flow
+- Async room-list, room-create, and room-join networking to avoid UI hitches
+- Deferred re-entry / refresh guards so room presence is not broadcast too early during recovery
+
+Battle Log:
+- In-game parser and browser for `BattleLog.txt`
+- Summary / browser / filter / set-detail views
+- Search/filter by player, opponent, characters, set type, game count, and character changes
+- Character portrait rendering in browser/detail views
+
+Options:
+- Dynamic in-game editor for `EfzRevival.ini`
+- Category-based options UI
+- Key and pad rebinding flow
+- Mod-owned `Others` settings such as:
+  - `OfflineVsHumanMode`
+  - `WriteLogFile`
+  - `EnableConsole`
+  - `EnableDebugMenu`
+  - `HideEmptySetsInBattleLog`
+- `About` modal with version/build information
+
+Logging and diagnostics:
+- Logger banner includes version and build timestamp
+- Optional console and optional file logging
+- Crash handler writes crash logs / diagnostics
+
+## Runtime Assets
+
+DLL-relative assets:
+- `<dll_folder>\\assets\\netplay_bg.dat`
+- `<dll_folder>\\assets\\netplay_ob.dat`
+- `<dll_folder>\\assets\\battle_log_icons.dat`
+- `<dll_folder>\\assets\\res_alert.wav`
+- `<dll_folder>\\assets\\netplay_font_map.txt` (optional)
+
+Object fallback order:
+- `<dll_folder>\\assets\\netplay_ob.dat`
+- `<dll_folder>\\assets\\netplay_ui_ob.dat`
+- `<dll_folder>\\assets\\config_ob.dat`
+- `system\\title_ob.dat`
+
+BGM override:
+- Vanilla track used by the menu: `wave\\bgm\\bgm08.wav`
+- Mod-local override supported from:
+  - `<dll_folder>\\wave\\bgm\\bgm08.wav`
+  - mod-relative fallback paths under Wine / Proton
+
+Linux / Wine / Proton notes:
+- Menu/background `.dat` assets are resolved through mod-relative fallback paths
+- Wine / Proton auto-select embedded TLS for lobby reliability
+- BGM override probing also supports mod-local relative paths under Wine / Proton
+
+## Build
+
+Configure and build:
+
 ```powershell
-cmake -S . -B build -A Win32
-cmake --build build --config Release
+cmake --preset release
+cmake --build --preset build-release
+```
+
+XP-compatible build:
+
+```powershell
+cmake --preset xp-release
+cmake --build --preset build-xp-release
 ```
 
 Output:
-- `build/bin/Release/efz_netplay_mod.dll`
+- `build_release_win32/bin/Release/efz_netplay_mod.dll`
+- `build_xp_win32/bin/Release/efz_netplay_mod.dll`
 
 Notes:
-- EFZ is 32-bit; always use `-A Win32`.
-- Patches validate expected original bytes before writing.
-- Unsupported `efz.exe` builds fail hook install safely with logs.
+- EFZ is 32-bit; builds target `Win32`
+- Hook/patch install validates expected bytes before patching
+- Unsupported EFZ / Revival builds fail safely with log output
 
-See `NETPLAY_MENU_INTEGRATION.md` for detailed reverse-engineering notes, addresses, and menu flow documentation.
+## Lobby Backend Notes
+
+The lobby implementation follows Concerto-style backend semantics.
+
+Current behavior:
+- Primary lobby flow uses the Concerto-style HTTPS backend
+- Legacy Windows auto-prefers `WinINet`
+- Wine / Proton auto-prefers embedded TLS
+- Optional base/proxy overrides are available through `EfzRevival.ini` and environment variables
+
+Relevant INI keys:
+
+```ini
+[Lobby]
+BaseUrl=
+ProxyBaseUrl=
+ForceWinInet=0
+ForceEmbeddedTls=0
+TlsVerify=0
+```
+
+Relevant environment overrides:
+- `EFZ_LOBBY_BASE_URL`
+- `EFZ_LOBBY_PROXY_BASE_URL`
+- `EFZ_LOBBY_FORCE_WININET`
+- `EFZ_LOBBY_FORCE_EMBEDDED_TLS`
+- `EFZ_LOBBY_TLS_VERIFY`
+
+## Repository Layout
+
+Core areas:
+- `src/netplay/hooks/` - title/menu hooks, overlays, flow control, bridge handoff
+- `src/netplay/core/` - menu models, lobby client, inline edit, validation, settings
+- `src/netplay/render/` - indexed-surface drawing helpers, software font, overlays
+- `src/netplay/assets/` - DAT parsing, runtime asset resolution
+- `src/netplay/bridge/` - Revival takeover, IPC, exports, process/session bridge
+- `include/` - public/internal headers
+- `shared_documentation/` - reverse-engineering notes and implementation writeups
+
+Useful docs:
+- `NETPLAY_STATE_EXPORT.md`
+- `NETPLAY_MENU_INTEGRATION.md`
+- `shared_documentation/EFZ_Concerto_Lobby_Reverse_Engineering.md`
+- `shared_documentation/BATTLE_LOG_MENU_ASSESSMENT.md`
+- `shared_documentation/PUBLIC_ROOMS_IMPLEMENTATION_PLAN.md`

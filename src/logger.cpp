@@ -1,10 +1,12 @@
 #include "logger.h"
+#include "mod_version.h"
 
 #include <windows.h>
 
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <share.h>
 #include <string>
 
 namespace
@@ -12,6 +14,8 @@ namespace
 std::mutex g_logMutex;
 bool g_consoleReady = false;
 FILE* g_logFile = nullptr;
+bool g_fileLoggingEnabled = true;
+std::string g_logPath;
 
 std::string BuildLogPathFromModule(HMODULE moduleHandle)
 {
@@ -50,19 +54,47 @@ void WriteLineUnlocked(const char* line)
         fflush(g_logFile);
     }
 }
+
+void OpenLogFileUnlocked()
+{
+    if (!g_fileLoggingEnabled || g_logFile != nullptr || g_logPath.empty())
+    {
+        return;
+    }
+
+    FILE* file = _fsopen(g_logPath.c_str(), "a", _SH_DENYNO);
+    if (file != nullptr)
+    {
+        g_logFile = file;
+    }
+}
+
+void CloseLogFileUnlocked()
+{
+    if (g_logFile == nullptr)
+    {
+        return;
+    }
+
+    fclose(g_logFile);
+    g_logFile = nullptr;
+}
 }
 
 namespace mod
 {
-bool InitializeLogger(HMODULE moduleHandle)
+bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
 
-    if (!g_consoleReady)
+    g_logPath = BuildLogPathFromModule(moduleHandle);
+    g_fileLoggingEnabled = writeLogFile;
+
+    if (!g_consoleReady && spawnConsole)
     {
         if (AllocConsole() != FALSE)
         {
-            SetConsoleTitleA("EFZ Netplay Mod Logger");
+            SetConsoleTitleA("In-game Netplay Logger");
 
             FILE* outStream = nullptr;
             FILE* errStream = nullptr;
@@ -75,18 +107,71 @@ bool InitializeLogger(HMODULE moduleHandle)
         }
     }
 
-    if (g_logFile == nullptr)
-    {
-        const std::string logPath = BuildLogPathFromModule(moduleHandle);
-        FILE* file = nullptr;
-        if (fopen_s(&file, logPath.c_str(), "a") == 0 && file != nullptr)
-        {
-            g_logFile = file;
-        }
-    }
+    OpenLogFileUnlocked();
 
+    char versionLine[256] = {};
+    std::snprintf(
+        versionLine,
+        sizeof(versionLine),
+        "[efz_netplay_mod] %s v%s build %s\n",
+        netplay::build_info::kDisplayName,
+        netplay::build_info::kVersion,
+        netplay::build_info::kBuildTimestamp);
+    WriteLineUnlocked(versionLine);
     WriteLineUnlocked("[efz_netplay_mod] logger initialized\n");
     return true;
+}
+
+void SetConsoleVisible(bool visible)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    if (visible && !g_consoleReady)
+    {
+        if (AllocConsole() != FALSE)
+        {
+            SetConsoleTitleA("In-game Netplay Logger");
+
+            FILE* outStream = nullptr;
+            FILE* errStream = nullptr;
+            FILE* inStream = nullptr;
+            freopen_s(&outStream, "CONOUT$", "w", stdout);
+            freopen_s(&errStream, "CONOUT$", "w", stderr);
+            freopen_s(&inStream, "CONIN$", "r", stdin);
+
+            g_consoleReady = true;
+        }
+    }
+    else if (!visible && g_consoleReady)
+    {
+        FreeConsole();
+        g_consoleReady = false;
+    }
+}
+
+void SetFileLoggingEnabled(HMODULE moduleHandle, bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    if (g_logPath.empty() && moduleHandle != nullptr)
+    {
+        g_logPath = BuildLogPathFromModule(moduleHandle);
+    }
+
+    if (g_fileLoggingEnabled == enabled)
+    {
+        return;
+    }
+
+    g_fileLoggingEnabled = enabled;
+    if (enabled)
+    {
+        OpenLogFileUnlocked();
+    }
+    else
+    {
+        CloseLogFileUnlocked();
+    }
 }
 
 void ShutdownLogger()
@@ -97,8 +182,7 @@ void ShutdownLogger()
     {
         fputs("[efz_netplay_mod] logger shutting down\n", g_logFile);
         fflush(g_logFile);
-        fclose(g_logFile);
-        g_logFile = nullptr;
+        CloseLogFileUnlocked();
     }
 
     if (g_consoleReady)
@@ -123,8 +207,13 @@ void Log(const char* fmt, ...)
         return;
     }
 
-    char line[1200];
-    snprintf(line, sizeof(line), "[efz_netplay_mod] %s\n", message);
+    char line[1248];
+    snprintf(
+        line,
+        sizeof(line),
+        "[efz_netplay_mod][pid=%lu] %s\n",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        message);
     WriteLineUnlocked(line);
 }
 }

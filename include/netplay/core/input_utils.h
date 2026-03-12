@@ -11,5 +11,6 @@ bool ConsumeKeyEdge(std::array<uint8_t, 256>* keyDown, int virtualKey);
 bool IsCtrlPressed();
 bool TryTranslateVirtualKeyToAscii(int virtualKey, char* outChar);
 bool TryReadClipboardAsciiText(HWND owner, std::string* outText);
+bool TryReadClipboardUtf8Text(HWND owner, std::string* outText);
 }
 

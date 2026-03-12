@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,18 +23,32 @@ struct NetplayObjectProfile
 
 struct ParsedDatImage
 {
+    struct PaletteColor
+    {
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        bool present = false;
+    };
+
     int width = 0;
     int height = 0;
     uint8_t transparentIndex = 0;
     bool hasTransparentIndex = false;
+    size_t paletteEntryCount = 0;
+    std::array<PaletteColor, 256> palette = {};
     std::vector<uint8_t> pixelsTopDown;
 };
 
 bool FileExists(const std::string& path);
 std::string JoinPath(const std::string& left, const char* right);
 std::string BuildModuleDirectory(HMODULE moduleHandle);
+std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory);
 std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory);
 std::string ResolveNetplayObjectsPath(const std::string& moduleDirectory);
+std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory);
+std::string ResolveChallengeAlertPath(const std::string& moduleDirectory);
+std::string ResolveTitleObjectsPath(const std::string& moduleDirectory);
 
 bool ParseEfzDatImage(const std::string& path, ParsedDatImage* outImage);
 bool DeriveConfigStyleRowsFromDat(
@@ -45,5 +60,3 @@ bool DeriveConfigStyleRowsFromDat(
 
 NetplayObjectProfile DetermineObjectProfile(const std::string& objectPath);
 }
-
-
