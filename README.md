@@ -1,8 +1,8 @@
 # In-game Netplay (DLL)
 
-Runtime DLL mod for EFZ that injects a `NETPLAY` entry into the title screen and replaces the old external-flow model with an in-engine netplay menu, integrated Revival takeover, room browser, lobby UI, options editor, and battle log browser.
+Runtime DLL mod for EFZ that injects a `NETPLAY` entry into the title screen and replaces the old external-flow model with an in-engine netplay menu, integrates all EfzRevival.exe console window functionality into the game, adds room browser, lobby UI, options editor, and battle log browser.
 
-The built DLL name remains:
+The built DLL name is:
 - `efz_netplay_mod.dll`
 
 ## Inspiration and Reference
@@ -11,12 +11,64 @@ This project takes direct inspiration from Concerto EFZ by shiburizu:
 - https://github.com/shiburizu/concerto-efz
 
 Concerto was the main reference for:
-- lobby and player-room UX
 - room lifecycle and challenge flow
 - backend endpoint semantics
 - Revival automation expectations
 
 This project does **not** embed Concerto itself. Instead, it reimplements the relevant online flow inside EFZ as a DLL mod with direct hook/bridge integration.
+
+## Installation
+
+- Build the DLL from source (see Building) or download a release.
+- Install EFZ Mod Manager if it's not installed already:
+  - EFZ Mod Manager download: https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing
+- Place `efz_netplay_mod.dll` in your EFZ mods folder, alongside the other mod assets.
+  Example path:
+  `EFZ\\mods\\efz_netplay_mod\\efz_netplay_mod.dll`
+- Edit `EfzModManager.ini` and add:
+  - `efz_netplay_mod=1`
+- After installing, a new `NETPLAY` option should appear on the title screen.
+
+## Expected Mod Folder Layout
+
+At minimum, the mod expects this structure next to the DLL:
+
+```text
+mods\efz_netplay_mod\
+  efz_netplay_mod.dll
+  assets\
+    netplay_bg.dat
+    netplay_ob.dat
+```
+
+Common optional files:
+
+```text
+mods\efz_netplay_mod\
+  assets\
+    battle_log_icons.dat
+    res_alert.wav
+    netplay_font_map.txt
+  wave\
+    bgm\
+      bgm08.wav
+  system\
+    title_ob.dat
+```
+
+What they are used for:
+- `assets\netplay_bg.dat` - netplay menu background
+- `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
+- `assets\battle_log_icons.dat` - indexed Battle Log icon sheet
+- `assets\res_alert.wav` - custom lobby challenge alert sound
+- `assets\netplay_font_map.txt` - optional sprite-font mapping
+- `wave\bgm\bgm08.wav` - optional netplay menu BGM override
+- `system\title_ob.dat` - optional title object-sheet override
+
+Fallback behavior:
+- If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
+- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`.
+- Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
 
 ## Current Feature Set
 
@@ -66,6 +118,19 @@ Logging and diagnostics:
 - Logger banner includes version and build timestamp
 - Optional console and optional file logging
 - Crash handler writes crash logs / diagnostics
+
+## Supported Revival Versions
+
+Supported `EfzRevival.dll` versions:
+- `1.02e`
+- `1.02f`
+- `1.02g`
+- `1.02h`
+- `1.02i`
+
+Notes:
+- `1.02h` and `1.02i` are the most tested versions.
+- Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
 
 ## Runtime Assets
 
@@ -155,11 +220,21 @@ Core areas:
 - `src/netplay/assets/` - DAT parsing, runtime asset resolution
 - `src/netplay/bridge/` - Revival takeover, IPC, exports, process/session bridge
 - `include/` - public/internal headers
-- `shared_documentation/` - reverse-engineering notes and implementation writeups
+- `shared_documentation/` - reverse-engineering notes, Concerto references, and implementation writeups
 
-Useful docs:
-- `NETPLAY_STATE_EXPORT.md`
-- `NETPLAY_MENU_INTEGRATION.md`
-- `shared_documentation/EFZ_Concerto_Lobby_Reverse_Engineering.md`
-- `shared_documentation/BATTLE_LOG_MENU_ASSESSMENT.md`
-- `shared_documentation/PUBLIC_ROOMS_IMPLEMENTATION_PLAN.md`
+## Copyright and Licenses
+
+Project status:
+- This repository currently does not include a top-level license file for the In-game Netplay project itself.
+- Unless and until one is added, do not assume the project source is released under a standalone open-source license.
+
+Third-party code used by this project:
+- Mbed TLS is vendored under `third_party/mbedtls` and is provided under a dual `Apache-2.0` or `GPL-2.0-or-later` license.
+  See: `third_party/mbedtls/LICENSE`
+- MinHook is used for the D3D9/Battle Log hook path and is expected from `third_party/minhook` or `../InGameControlsRebind/third_party/minhook` depending on the checkout.
+  Its license is the BSD-style license distributed with MinHook in `LICENSE.txt`.
+
+Game assets and reverse-engineered targets:
+- EFZ, EfzRevival, and their original binaries/assets are not part of this project's licensing.
+- Files such as `EfzRevival.dll`, `EfzRevival.exe`, `efz.exe`, and original game art/audio remain under their respective owners' rights.
+- Users are expected to provide their own legally obtained game/mod files.
