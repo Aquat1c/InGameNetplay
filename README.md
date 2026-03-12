@@ -288,8 +288,6 @@ Third-party code used by this project:
 - MinHook is used for the D3D9/Battle Log hook path and is expected from `third_party/minhook` or `../InGameControlsRebind/third_party/minhook` depending on the checkout.
   Its license is the BSD-style license distributed with MinHook in `LICENSE.txt`.
 
-Game assets and reverse-engineered targets:
+Other targets:
 - EFZ, EfzRevival, and their original binaries/assets are not part of this project's licensing.
 - Files such as `EfzRevival.dll`, `EfzRevival.exe`, `efz.exe`, and original game art/audio remain under their respective owners' rights.
-- Users are expected to provide their own legally obtained game/mod files.
-- Reverse-engineered material, mirrored external references, original game assets, and other non-project-owned content are excluded from the top-level MIT license unless explicitly stated otherwise.
