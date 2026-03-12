@@ -1826,6 +1826,7 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
+    m_endPending.store(false);
     m_isMatchHost.store(false);
     m_pendingAcceptTargetId = 0;
 
@@ -1846,7 +1847,12 @@ int LobbySession::GetPlayerId() const
 
 bool LobbySession::IsInBattle() const
 {
-    return m_inBattle.load() || m_returningFromMatch.load();
+    return m_inBattle.load()
+        || m_returningFromMatch.load()
+        || m_challengePending.load()
+        || m_matchConnected.load()
+        || m_endDeferred.load()
+        || m_endPending.load();
 }
 
 bool LobbySession::ConsumeAbandonedOutgoingChallenge()
@@ -1860,20 +1866,35 @@ void LobbySession::RequestRefresh()
     if (m_returningFromMatch.exchange(false))
     {
         const bool sendDeferredEnd = m_endDeferred.exchange(false);
+        const bool wasInBattle = m_inBattle.load();
+        const bool hadPendingChallenge = m_challengePending.load();
+        const bool hadConnectedMatch = m_matchConnected.load();
+        const bool hadEndPending = m_endPending.load();
+        ClearMatchLifecycleState(true);
         if (sendDeferredEnd)
         {
-            mod::Log("LobbySession::RequestRefresh: returning-from-match cleared, queuing deferred End");
+            m_endPending.store(true);
+            mod::Log(
+                "LobbySession::RequestRefresh: returning-from-match cleared, queuing deferred End"
+                " (inBattle=%d challengePending=%d matchConnected=%d endPending=%d)",
+                wasInBattle ? 1 : 0,
+                hadPendingChallenge ? 1 : 0,
+                hadConnectedMatch ? 1 : 0,
+                hadEndPending ? 1 : 0);
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_status.inBattle = false;
             PendingAction action;
             action.type = PendingAction::End;
             m_pendingActions.push_back(std::move(action));
         }
         else
         {
-            mod::Log("LobbySession::RequestRefresh: returning-from-match cleared");
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_status.inBattle = false;
+            mod::Log(
+                "LobbySession::RequestRefresh: returning-from-match cleared"
+                " (inBattle=%d challengePending=%d matchConnected=%d endPending=%d)",
+                wasInBattle ? 1 : 0,
+                hadPendingChallenge ? 1 : 0,
+                hadConnectedMatch ? 1 : 0,
+                hadEndPending ? 1 : 0);
         }
     }
     {
@@ -1899,6 +1920,7 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetNa
     m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
+    m_endPending.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = targetPlayerId;
@@ -1924,6 +1946,7 @@ void LobbySession::AcceptChallenge(int challengerPlayerId)
     m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
+    m_endPending.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = 0;
@@ -1949,6 +1972,7 @@ void LobbySession::NotifyMatchConnected()
     m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(true);
     m_endDeferred.store(false);
+    m_endPending.store(false);
     mod::Log("LobbySession::NotifyMatchConnected: inBattle=true");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2010,6 +2034,7 @@ void LobbySession::NotifyEndMatch()
         m_returningFromMatch.store(false);
         m_matchConnected.store(false);
         m_endDeferred.store(false);
+        m_endPending.store(true);
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = 0;
         m_pendingChallengeTargetName.clear();
@@ -2024,6 +2049,7 @@ void LobbySession::NotifyEndMatch()
         // (via RequestRefresh).  This keeps the playing-pair visible on
         // the server and prevents us from appearing idle prematurely.
         m_endDeferred.store(true);
+        m_endPending.store(false);
         mod::Log("LobbySession::NotifyEndMatch (host): inBattle=false "
                  "returningFromMatch=true (End deferred)");
     }
@@ -2036,6 +2062,7 @@ void LobbySession::NotifyEndMatch()
         // and local challenge acceptance is suppressed until we return
         // to the lobby menu.
         m_endDeferred.store(false);
+        m_endPending.store(true);
         mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
                  "returningFromMatch=true, queuing End immediately");
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2251,7 +2278,8 @@ void LobbySession::PollThreadEntry()
             || m_returningFromMatch.load()
             || m_challengePending.load()
             || m_matchConnected.load()
-            || m_endDeferred.load());
+            || m_endDeferred.load()
+            || m_endPending.load());
 
     // Leave the lobby on the way out.
     {
@@ -2434,6 +2462,7 @@ bool LobbySession::DoPollStatus()
             m_challengePending.store(false);
             m_matchConnected.store(false);
             m_endDeferred.store(false);
+            m_endPending.store(true);
             m_returningFromMatch.store(false);
             m_abandonedOutgoingChallenge.store(true);
         }
@@ -2441,7 +2470,7 @@ bool LobbySession::DoPollStatus()
 
     std::vector<LobbyDisplayEntry> displayEntries;
     const bool inBattle = m_inBattle.load();
-    const bool suppressChallenges = inBattle || m_returningFromMatch.load();
+    const bool suppressChallenges = IsInBattle();
     BuildDisplayEntries(
         challenges,
         idlePlayers,
@@ -2452,8 +2481,16 @@ bool LobbySession::DoPollStatus()
 
     if (suppressChallenges && !challenges.empty())
     {
-        mod::Log("LobbySession::DoPollStatus: suppressing %zu incoming challenges (inBattle=%d returning=%d)",
-                 challenges.size(), (int)inBattle, (int)m_returningFromMatch.load());
+        mod::Log(
+            "LobbySession::DoPollStatus: suppressing %zu incoming challenges "
+            "(inBattle=%d returning=%d pending=%d connected=%d endDeferred=%d endPending=%d)",
+            challenges.size(),
+            (int)inBattle,
+            (int)m_returningFromMatch.load(),
+            (int)m_challengePending.load(),
+            (int)m_matchConnected.load(),
+            (int)m_endDeferred.load(),
+            (int)m_endPending.load());
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -3316,10 +3353,19 @@ void LobbySession::ProcessPendingActions()
             break;
 
         case PendingAction::End:
+        {
+            const bool preserveReturningFromMatch = m_returningFromMatch.load();
             mod::Log("LobbySession: processing end");
-            DoEnd();
+            (void)DoEnd();
             ClearMatchLifecycleState(true);
+            if (preserveReturningFromMatch)
+            {
+                m_returningFromMatch.store(true);
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_status.inBattle = true;
+            }
             break;
+        }
         }
     }
 }

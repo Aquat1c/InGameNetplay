@@ -183,9 +183,10 @@ public:
     // preserved until the host returns to the lobby.
     void NotifyEndMatch();
 
-    // Returns true while we are in an active match or returning from
-    // one (between NotifyMatchConnected and the next RequestRefresh
-    // after NotifyEndMatch).  Thread-safe.
+    // Returns true while this joined-room session is still busy with an
+    // active or just-finished challenge/match lifecycle. This includes
+    // post-match return and deferred end-cleanup windows, so callers do
+    // not treat the room as idle too early. Thread-safe.
     bool IsInBattle() const;
 
     // Returns true once when an outgoing challenge target disappears from
@@ -287,6 +288,7 @@ private:
     std::atomic<bool> m_abandonedOutgoingChallenge{false};
     std::atomic<bool> m_matchConnected{false};
     std::atomic<bool> m_endDeferred{false};
+    std::atomic<bool> m_endPending{false};
     // true when we initiated the lobby match (sent the challenge);
     // false when we accepted an incoming challenge (joined as client).
     std::atomic<bool> m_isMatchHost{false};

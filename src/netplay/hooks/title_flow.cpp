@@ -95,6 +95,17 @@ PendingLobbySpectateWait g_pendingLobbySpectateWait;
 
 void PlayLobbyChallengeAlert(uint32_t screenContext);
 
+void ReenterNetplayMenuAfterSessionAbort(uint32_t screenContext, const char* reason)
+{
+    const bool skipFadeOut = (g_lobbySession != nullptr);
+    mod::Log(
+        "NetplayReturn: re-entering menu after session abort reason='%s' existingLobby=%d skipFadeOut=%d",
+        reason != nullptr ? reason : "",
+        g_lobbySession ? 1 : 0,
+        skipFadeOut ? 1 : 0);
+    EnterNetplayMenu(screenContext, skipFadeOut);
+}
+
 void ClearPendingLobbySpectateWait(const char* reason)
 {
     if (g_pendingLobbySpectateWait.active)
@@ -2444,9 +2455,9 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             // against race conditions.
             if (g_lobbySession && g_lobbySession->IsInBattle())
             {
-                mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d — we are in battle",
+                mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d — lobby session still busy",
                     entry.name.c_str(), entry.playerId);
-                ShowStubActionMessage(owner, "Cannot accept challenges\nwhile in a match.");
+                ShowStubActionMessage(owner, "Cannot accept challenges\nright now.");
                 break;
             }
 
@@ -2498,9 +2509,9 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             // Safety guard: if we are in a match, do not send challenges.
             if (g_lobbySession && g_lobbySession->IsInBattle())
             {
-                mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d — we are in battle",
+                mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d — lobby session still busy",
                     entry.name.c_str(), entry.playerId);
-                ShowStubActionMessage(owner, "Cannot send challenges\nwhile in a match.");
+                ShowStubActionMessage(owner, "Cannot send challenges\nright now.");
                 break;
             }
 
@@ -2914,7 +2925,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 {
                     g_lobbySession->NotifyEndMatch();
                 }
-                EnterNetplayMenu(screenContext);
+                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3012,7 +3023,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 {
                     g_lobbySession->NotifyEndMatch();
                 }
-                EnterNetplayMenu(screenContext);
+                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_spectate_transition");
                 return 0;
             }
             mod::Log(
@@ -3142,7 +3153,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     {
                         g_lobbySession->NotifyEndMatch();
                     }
-                    EnterNetplayMenu(screenContext);
+                    ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                     return 0;
                 }
                 mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3167,7 +3178,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 {
                     g_lobbySession->NotifyEndMatch();
                 }
-                EnterNetplayMenu(screenContext);
+                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3208,7 +3219,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 {
                     g_lobbySession->NotifyEndMatch();
                 }
-                EnterNetplayMenu(screenContext);
+                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
