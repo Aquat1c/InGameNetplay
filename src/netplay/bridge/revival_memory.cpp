@@ -3232,6 +3232,7 @@ static bool    g_perFrameMismatchLogged     = false;
 // mid-tick causes a use-after-free crash in SetEvent(this[2]).
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
+static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
 
 // Spectator tick holdoff: when true, the per-frame tick hook will not
 // call RunPerFrameTickDispatch while the spectator session is active on
@@ -3592,6 +3593,47 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 g_frameTick,
                 static_cast<long>(preTickErrSerial));
             preTickDisconnect = true;
+        }
+    }
+
+    // ---- Online match ESC graceful-quit priming --------------------------
+    // Pressing Esc during an active online battle should queue Revival's own
+    // Quit packet before the later ExitProcess interception tears the helper
+    // down. Restrict this to the battle screen so normal post-match cleanup
+    // remains untouched.
+    {
+        static bool s_onlineMatchEscWasDown = false;
+        const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        uint8_t escScreen = 0xFF;
+        __try {
+            escScreen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        const bool onlineBattleActive =
+            g_localRoleFlag == kLocalRoleOnline
+            && g_localInitAppliedForSession
+            && g_dllExitProcessPatchesSaved
+            && currentSession != 0
+            && escScreen == 3;
+        const bool escRisingEdge =
+            onlineBattleActive && escDown && !s_onlineMatchEscWasDown;
+        s_onlineMatchEscWasDown = escDown;
+
+        if (escRisingEdge)
+        {
+            const bool quitQueued =
+                SignalGracefulQuitRing("online_match_esc_key", 0);
+            mod::Log(
+                "TICK_HOOK: online match ESC detected frameTick=%u screen=%u "
+                "session=0x%08lX quitQueued=%d",
+                g_frameTick,
+                static_cast<unsigned>(escScreen),
+                static_cast<unsigned long>(currentSession),
+                quitQueued ? 1 : 0);
+            if (quitQueued)
+            {
+                ArmOnlineMatchEscGracefulQuit();
+            }
         }
     }
 
@@ -4779,6 +4821,21 @@ void RequestDeferredCancelCleanup()
     g_deferredCancelCleanup = true;
 }
 
+void ArmOnlineMatchEscGracefulQuit()
+{
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 1);
+}
+
+bool ConsumeOnlineMatchEscGracefulQuit()
+{
+    return InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0) != 0;
+}
+
+void ResetOnlineMatchEscGracefulQuit()
+{
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0);
+}
+
 // Reset the per-frame validator state.  Called when a session ends so the
 // next session gets fresh validation.
 void ResetGameModeValidation()
@@ -4794,6 +4851,7 @@ void ResetGameModeValidation()
     g_lastToggleValue = 0xFFFFFFFFu;
     g_toggleSameCount = 0;
     g_toggleDiagLogged = false;
+    ResetOnlineMatchEscGracefulQuit();
 
     // Increment session number and reset cross-session change-detection state.
     ++g_sessionNumber;

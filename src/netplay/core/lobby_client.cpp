@@ -84,6 +84,8 @@ constexpr const wchar_t* kConcertoHost = L"concerto-mbaacc.shib.live";
 constexpr INTERNET_PORT kConcertoPort = INTERNET_DEFAULT_HTTPS_PORT;
 constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kReceiveTimeoutMs = 12000;
+constexpr DWORD kShutdownConnectTimeoutMs = 1200;
+constexpr DWORD kShutdownReceiveTimeoutMs = 1500;
 constexpr DWORD kPollIntervalMs = 1000;
 std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
 
@@ -935,7 +937,10 @@ std::wstring Utf8ToWideNullTerminated(const std::string& utf8)
     return wide;
 }
 
-std::string DoHttpGetViaWinHttp(const std::string& path)
+std::string DoHttpGetViaWinHttp(
+    const std::string& path,
+    DWORD connectTimeoutMs = kConnectTimeoutMs,
+    DWORD receiveTimeoutMs = kReceiveTimeoutMs)
 {
     std::string result;
     WinHttpApi& api = GetWinHttpApi();
@@ -957,10 +962,10 @@ std::string DoHttpGetViaWinHttp(const std::string& path)
     }
 
     api.SetTimeouts(hSession,
-        static_cast<int>(kConnectTimeoutMs),
-        static_cast<int>(kConnectTimeoutMs),
-        static_cast<int>(kReceiveTimeoutMs),
-        static_cast<int>(kReceiveTimeoutMs));
+        static_cast<int>(connectTimeoutMs),
+        static_cast<int>(connectTimeoutMs),
+        static_cast<int>(receiveTimeoutMs),
+        static_cast<int>(receiveTimeoutMs));
 
     HINTERNET hConnect = api.Connect(hSession, kConcertoHost, kConcertoPort, 0);
     if (hConnect == nullptr)
@@ -1119,6 +1124,8 @@ std::string TryHttpGetForEndpoint(
     const std::string& requestUrl,
     const std::string& defaultPathForWinHttp,
     bool allowWinHttpForThisUrl,
+    DWORD connectTimeoutMs,
+    DWORD receiveTimeoutMs,
     int* outBackend)
 {
     if (outBackend != nullptr)
@@ -1137,7 +1144,8 @@ std::string TryHttpGetForEndpoint(
     if (tryPreferredWinInetFirst)
     {
         triedWinInet = true;
-        const std::string preferredWinInetResult = DoHttpGetViaWinInet(requestUrl);
+        const std::string preferredWinInetResult =
+            DoHttpGetViaWinInet(requestUrl, connectTimeoutMs, receiveTimeoutMs);
         if (!preferredWinInetResult.empty())
         {
             if (outBackend != nullptr)
@@ -1157,7 +1165,7 @@ std::string TryHttpGetForEndpoint(
     {
         std::string body;
         std::string error;
-        if (netplay::tls::HttpGet(requestUrl, endpointConfig.tlsVerify, kReceiveTimeoutMs, &body, &error))
+        if (netplay::tls::HttpGet(requestUrl, endpointConfig.tlsVerify, receiveTimeoutMs, &body, &error))
         {
             if (outBackend != nullptr)
             {
@@ -1181,7 +1189,8 @@ std::string TryHttpGetForEndpoint(
 
     if (allowWinHttpForThisUrl && !endpointConfig.forceWinInet && !endpointConfig.forceEmbeddedTls)
     {
-        const std::string result = DoHttpGetViaWinHttp(defaultPathForWinHttp);
+        const std::string result =
+            DoHttpGetViaWinHttp(defaultPathForWinHttp, connectTimeoutMs, receiveTimeoutMs);
         if (!result.empty())
         {
             if (outBackend != nullptr)
@@ -1194,7 +1203,8 @@ std::string TryHttpGetForEndpoint(
 
     if (!triedWinInet)
     {
-        const std::string winInetResult = DoHttpGetViaWinInet(requestUrl);
+        const std::string winInetResult =
+            DoHttpGetViaWinInet(requestUrl, connectTimeoutMs, receiveTimeoutMs);
         if (!winInetResult.empty())
         {
             if (outBackend != nullptr)
@@ -1260,7 +1270,10 @@ std::string UrlEncode(const std::string& s)
     return out;
 }
 
-std::string DoLobbyHttpGetPath(const std::string& path)
+std::string DoLobbyHttpGetPath(
+    const std::string& path,
+    DWORD connectTimeoutMs = kConnectTimeoutMs,
+    DWORD receiveTimeoutMs = kReceiveTimeoutMs)
 {
     const LobbyEndpointConfig& endpointConfig = GetLobbyEndpointConfig();
     const std::string primaryUrl = BuildLobbyRequestUrl(path);
@@ -1278,6 +1291,8 @@ std::string DoLobbyHttpGetPath(const std::string& path)
         primaryUrl,
         path,
         allowPrimaryWinHttp,
+        connectTimeoutMs,
+        receiveTimeoutMs,
         &backend);
     if (!body.empty())
     {
@@ -1297,6 +1312,8 @@ std::string DoLobbyHttpGetPath(const std::string& path)
             proxyUrl,
             path,
             false,
+            connectTimeoutMs,
+            receiveTimeoutMs,
             &backend);
         if (!body.empty())
         {
@@ -1789,6 +1806,38 @@ LobbyStatus LobbySession::GetStatus() const
     return m_status;
 }
 
+bool LobbySession::HasPendingEndActionLocked() const
+{
+    for (const PendingAction& action : m_pendingActions)
+    {
+        if (action.type == PendingAction::End)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
+{
+    m_inBattle.store(false);
+    m_returningFromMatch.store(false);
+    m_challengePending.store(false);
+    m_abandonedOutgoingChallenge.store(false);
+    m_matchConnected.store(false);
+    m_endDeferred.store(false);
+    m_isMatchHost.store(false);
+    m_pendingAcceptTargetId = 0;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_pendingChallengeTargetId = 0;
+    m_pendingChallengeTargetName.clear();
+    if (clearStatusInBattle)
+    {
+        m_status.inBattle = false;
+    }
+}
+
 int LobbySession::GetPlayerId() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1922,13 +1971,40 @@ void LobbySession::NotifyMatchConnected()
 
 void LobbySession::NotifyEndMatch()
 {
+    const bool alreadyReturning = m_returningFromMatch.load();
+    const bool inBattle = m_inBattle.load();
+    const bool challengePending = m_challengePending.load();
+    const bool matchConnected = m_matchConnected.load();
+    const bool endDeferred = m_endDeferred.load();
+
+    if (alreadyReturning)
+    {
+        mod::Log("LobbySession::NotifyEndMatch: redundant call ignored (already returning from match)");
+        return;
+    }
+
+    if (!inBattle && !challengePending && !matchConnected && !endDeferred)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = false;
+        if (HasPendingEndActionLocked())
+        {
+            mod::Log("LobbySession::NotifyEndMatch: redundant call ignored (End already queued)");
+        }
+        else
+        {
+            mod::Log("LobbySession::NotifyEndMatch: redundant call ignored (no active match/challenge state)");
+        }
+        return;
+    }
+
     m_inBattle.store(false);
     m_returningFromMatch.store(true);
 
     const bool wasHost = m_isMatchHost.load();
-    const bool challengePending = m_challengePending.exchange(false);
-    const bool matchConnected = m_matchConnected.load();
-    if (challengePending && !matchConnected)
+    const bool hadPendingChallenge = m_challengePending.exchange(false);
+    const bool hadConnectedMatch = m_matchConnected.load();
+    if (hadPendingChallenge && !hadConnectedMatch)
     {
         mod::Log("LobbySession::NotifyEndMatch: challenge canceled before connect, queuing End immediately");
         m_returningFromMatch.store(false);
@@ -2003,11 +2079,13 @@ bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::
         m_status.displayEntries.clear();
         m_status.playing.clear();
         m_status.inBattle = false;
+        m_pendingActions.clear();
         m_pendingChallengeTargetId = 0;
         m_pendingChallengeTargetName.clear();
     }
 
     m_pendingAcceptTargetId = 0;
+    ClearMatchLifecycleState(true);
     m_abandonedOutgoingChallenge.store(false);
     m_rejoinRequested.store(true);
     if (m_wakeEvent != nullptr)
@@ -2167,11 +2245,25 @@ void LobbySession::PollThreadEntry()
         }
     }
 
+    const bool shouldSendEndOnShutdown =
+        m_joinedRoom.lobbyNumericId != 0
+        && (m_inBattle.load()
+            || m_returningFromMatch.load()
+            || m_challengePending.load()
+            || m_matchConnected.load()
+            || m_endDeferred.load());
+
     // Leave the lobby on the way out.
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.pollState = PollState::Leaving;
         m_status.statusMessage = "Leaving lobby...";
+    }
+    if (shouldSendEndOnShutdown)
+    {
+        mod::Log(
+            "LobbySession::PollThread: shutdown during active challenge/match, sending End before Leave");
+        (void)DoEnd();
     }
     DoLeave();
     mod::Log("LobbySession::PollThread: exiting");
@@ -2250,7 +2342,7 @@ bool LobbySession::DoJoin()
         m_joinedRoom.roomAlias = joinedRoom.roomAlias;
     }
     m_joinedRoom.isGlobalRoom = joinedRoom.isGlobalRoom;
-    m_abandonedOutgoingChallenge.store(false);
+    ClearMatchLifecycleState(true);
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_pendingChallengeTargetId = 0;
@@ -2427,7 +2519,12 @@ void LobbySession::DoLeave()
 
 std::string LobbySession::DoHttpGet(const std::string& path)
 {
-    return DoLobbyHttpGetPath(path);
+    const bool shutdownRequest = m_shouldStop.load();
+    const DWORD connectTimeoutMs =
+        shutdownRequest ? kShutdownConnectTimeoutMs : kConnectTimeoutMs;
+    const DWORD receiveTimeoutMs =
+        shutdownRequest ? kShutdownReceiveTimeoutMs : kReceiveTimeoutMs;
+    return DoLobbyHttpGetPath(path, connectTimeoutMs, receiveTimeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3221,16 +3318,7 @@ void LobbySession::ProcessPendingActions()
         case PendingAction::End:
             mod::Log("LobbySession: processing end");
             DoEnd();
-            m_pendingAcceptTargetId = 0;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_pendingChallengeTargetId = 0;
-                m_pendingChallengeTargetName.clear();
-            }
-            m_abandonedOutgoingChallenge.store(false);
-            m_challengePending.store(false);
-            m_matchConnected.store(false);
-            m_endDeferred.store(false);
+            ClearMatchLifecycleState(true);
             break;
         }
     }

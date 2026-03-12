@@ -142,6 +142,66 @@ void NeutralizeRevivalSessionVtable()
 typedef VOID (WINAPI *ExitProcessFn)(UINT uExitCode);
 static ExitProcessFn g_realExitProcess = nullptr;
 
+bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
+{
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Quit");
+    if (hMap == nullptr)
+    {
+        mod::Log(
+            "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
+            "OpenFileMappingA('Quit') failed err=%lu",
+            contextTag != nullptr ? contextTag : "",
+            static_cast<unsigned long>(callerRva),
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    auto* view = static_cast<volatile uint8_t*>(
+        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 9));
+    if (view == nullptr)
+    {
+        const DWORD mapErr = GetLastError();
+        CloseHandle(hMap);
+        mod::Log(
+            "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
+            "MapViewOfFile('Quit') failed err=%lu",
+            contextTag != nullptr ? contextTag : "",
+            static_cast<unsigned long>(callerRva),
+            static_cast<unsigned long>(mapErr));
+        return false;
+    }
+
+    auto* header = reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(view));
+    const LONG headBefore = header[0];
+    const LONG tailBefore = header[1];
+    const bool alreadyQueued = headBefore != tailBefore;
+
+    if (!alreadyQueued)
+    {
+        view[8] = 1;
+        MemoryBarrier();
+        InterlockedExchange(&header[1], tailBefore + 1);
+    }
+
+    const LONG headAfter = header[0];
+    const LONG tailAfter = header[1];
+
+    UnmapViewOfFile(const_cast<uint8_t*>(view));
+    CloseHandle(hMap);
+
+    mod::Log(
+        "GracefulQuitRing: %s (%s) callerRva=0x%lX "
+        "head=%ld->%ld tail=%ld->%ld",
+        alreadyQueued ? "already pending" : "queued",
+        contextTag != nullptr ? contextTag : "",
+        static_cast<unsigned long>(callerRva),
+        static_cast<long>(headBefore),
+        static_cast<long>(headAfter),
+        static_cast<long>(tailBefore),
+        static_cast<long>(tailAfter));
+    return true;
+}
+
 static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 {
     // Capture caller context for diagnostics before any side-effects.
@@ -182,6 +242,19 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             callerModule, static_cast<unsigned long>(callerRva), callerAddr,
             g_netplayFrameJmpActive ? 1 : 0,
             g_netplayUiJmpActive ? 1 : 0);
+
+        if (ConsumeOnlineMatchEscGracefulQuit())
+        {
+            // Match-local ESC already queued a graceful Quit packet from the
+            // live battle screen. Give the helper a moment to flush it to the
+            // peer before we tear the process down.
+            mod::Log(
+                "NeutralizeExitProcess: online match ESC graceful quit already primed "
+                "caller=%s+0x%lX — sleeping 100ms before cleanup",
+                callerModule,
+                static_cast<unsigned long>(callerRva));
+            Sleep(100u);
+        }
 
         if (role == kLocalRoleTournament)
         {

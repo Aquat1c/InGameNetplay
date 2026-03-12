@@ -390,6 +390,14 @@ bool IsInsideFrameTick();
 // current frame tick completes instead of immediately.
 void RequestDeferredCancelCleanup();
 
+// Arm/consume the one-shot "online match ESC already queued a graceful quit"
+// marker. The per-frame tick sets it when it detects a local Esc edge on the
+// live battle screen, and ExitProcess interception consumes it to wait briefly
+// before tearing the helper down.
+void ArmOnlineMatchEscGracefulQuit();
+bool ConsumeOnlineMatchEscGracefulQuit();
+void ResetOnlineMatchEscGracefulQuit();
+
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
 
@@ -440,6 +448,7 @@ void ReinitLocalPlay();
 static constexpr DWORD kExitProcessInterceptedException = 0xE0EF0001u;
 
 bool PatchRevivalDllExitProcess();
+bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva);
 void NeutralizeRevivalSessionVtable();
 uintptr_t ResolveHostRevivalBase();
 bool PatchRevivalErrorCodeNullGuard();

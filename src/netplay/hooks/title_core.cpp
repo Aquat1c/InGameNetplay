@@ -302,6 +302,18 @@ bool HandleInlineEditInput(uint32_t screenContext, const uint8_t* inputBytes)
 
 LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    const bool closeRequested =
+        message == WM_CLOSE
+        || (message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE)
+        || message == WM_QUERYENDSESSION
+        || (message == WM_ENDSESSION && wParam != 0)
+        || message == WM_DESTROY
+        || message == WM_NCDESTROY;
+    if (closeRequested)
+    {
+        (void)ShutdownLobbySessionForProcessExit(false, "window_close");
+    }
+
     if (g_netplayMenuState.active)
     {
         const bool isEsc = (wParam == static_cast<WPARAM>(VK_ESCAPE));

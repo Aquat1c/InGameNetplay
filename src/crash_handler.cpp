@@ -1,4 +1,5 @@
 #include "crash_handler.h"
+#include "netplay/hooks/menu_hooks.h"
 #include "netplay/bridge/session_bridge.h"
 
 #include "logger.h"
@@ -588,6 +589,18 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
 
 LONG WINAPI UnhandledExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
 {
+    if (!g_injectedMode)
+    {
+        __try
+        {
+            netplay::PrepareForProcessExit(true);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log("CrashHandler: process-exit lobby cleanup raised an exception");
+        }
+    }
+
     WriteCrashArtifacts(exceptionPointers, "unhandled");
     return EXCEPTION_CONTINUE_SEARCH;
 }

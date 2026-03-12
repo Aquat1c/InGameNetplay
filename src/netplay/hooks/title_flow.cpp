@@ -79,6 +79,7 @@ std::thread g_lobbySessionShutdownThread;
 std::atomic<bool> g_lobbySessionShutdownInFlight{false};
 std::atomic<bool> g_lobbySessionShutdownCompleted{false};
 std::atomic<bool> g_lobbySessionShutdownReturnToPlayerRooms{false};
+bool g_deferredLobbyRefreshPending = false;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -300,6 +301,55 @@ void BeginLobbySessionShutdown(bool returnToPlayerRooms)
         session.reset();
         g_lobbySessionShutdownCompleted.store(true);
     });
+}
+
+bool ShutdownLobbySessionForProcessExitImpl(bool emergency, const char* reason)
+{
+    const char* shutdownReason = reason != nullptr
+        ? reason
+        : (emergency ? "process_exit_emergency" : "process_exit");
+
+    PumpLobbySessionShutdown();
+
+    if (g_lobbySessionShutdownThread.joinable())
+    {
+        mod::Log(
+            "LobbySessionShutdown: waiting for in-flight shutdown reason='%s' emergency=%d",
+            shutdownReason,
+            emergency ? 1 : 0);
+        g_lobbySessionShutdownThread.join();
+        g_lobbySessionShutdownCompleted.store(false);
+        g_lobbySessionShutdownInFlight.store(false);
+        g_lobbySessionShutdownReturnToPlayerRooms.store(false);
+        netplay::player_rooms::NotifyLobbySessionShutdownCompleted();
+    }
+
+    if (!g_lobbySession)
+    {
+        return false;
+    }
+
+    const auto status = g_lobbySession->GetStatus();
+    mod::Log(
+        "LobbySessionShutdown: process-exit begin reason='%s' emergency=%d roomCode='%s' origin=%d inBattle=%d pollState=%d",
+        shutdownReason,
+        emergency ? 1 : 0,
+        g_lobbySession->GetRoomCode().c_str(),
+        static_cast<int>(g_lobbySession->GetOrigin()),
+        status.inBattle ? 1 : 0,
+        static_cast<int>(status.pollState));
+
+    std::unique_ptr<netplay::lobby::LobbySession> session = std::move(g_lobbySession);
+    session.reset();
+
+    g_lobbySessionShutdownCompleted.store(false);
+    g_lobbySessionShutdownInFlight.store(false);
+    g_lobbySessionShutdownReturnToPlayerRooms.store(false);
+    mod::Log(
+        "LobbySessionShutdown: process-exit complete reason='%s' emergency=%d",
+        shutdownReason,
+        emergency ? 1 : 0);
+    return true;
 }
 
 void ResetWindowFocusInputSuppression()
@@ -1451,6 +1501,11 @@ void PrepareSpectateReplayState(uint32_t screenContext)
 }
 } // namespace
 
+bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason)
+{
+    return ShutdownLobbySessionForProcessExitImpl(emergency, reason);
+}
+
 // ---------------------------------------------------------------------------
 // HandoffSpectateSession — transition directly to Character Select (mode 1)
 // for spectating.  The DLL creates a client session (type 1) for spectating
@@ -1534,7 +1589,6 @@ void HandoffSpectateSession(uint32_t screenContext)
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     ClearPendingLobbySpectateWait("handoff_spectate_session");
-    RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
 
     // Spectate bypasses the delay overlay, so the normal
@@ -1608,6 +1662,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     // re-enter the Lobby menu directly instead of Main so the user stays in
     // the lobby and can immediately see the player list / challenge again.
     const bool returnToLobby = (g_lobbySession != nullptr);
+    g_deferredLobbyRefreshPending = returnToLobby && skipFadeOut;
 
     g_netplayMenuState.active = true;
     g_netplayMenuState.bgmActive = true;
@@ -1666,14 +1721,15 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 
     RunTransitionFadeIn(screenContext);
     mod::Log(
-        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d skipFadeOut=%d",
+        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d skipFadeOut=%d deferredLobbyRefresh=%d",
         MenuIdToString(g_netplayMenuState.menuId),
         static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
         kNetplayBgmTrack,
         g_netplayMenuState.useConfigStyleRender,
         g_netplayMenuState.optionCount,
         g_netplayMenuState.backIndex,
-        skipFadeOut ? 1 : 0);
+        skipFadeOut ? 1 : 0,
+        g_deferredLobbyRefreshPending ? 1 : 0);
 }
 
 void LeaveNetplayMenu(uint32_t screenContext)
@@ -1736,6 +1792,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     ResetJoiningOverlayState();
     ClearPendingLobbySpectateWait("leave_netplay_menu");
     ResetLobbyChallengeNotificationState();
+    g_deferredLobbyRefreshPending = false;
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -1824,7 +1881,6 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
-    RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
@@ -1893,6 +1949,7 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     // Lobby session lifecycle: destroy when navigating away, create when entering.
     if (previousMenu == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
     {
+        g_deferredLobbyRefreshPending = false;
         if (g_lobbySession)
         {
             const bool returnToPlayerRooms =
@@ -1954,13 +2011,20 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     else if (menuId == NetplayMenuId::Lobby && g_lobbySession)
     {
         // Re-entering Lobby with an existing session (e.g. returning from a
-        // lobby match).  Reset the menu state and trigger an immediate poll
-        // so the display list refreshes right away instead of waiting for
-        // the next kPollIntervalMs cycle.
+        // lobby match). During disconnect/post-match recovery, defer the
+        // first refresh until the Lobby screen is actively running again so
+        // the local "returning from match" guard survives the recovery phase.
         RebuildLobbyMenuEntries(0, 0);
         g_netplayMenuState.lobbyScrollOffset = 0;
-        g_lobbySession->RequestRefresh();
-        mod::Log("SwitchToMenu: re-entering Lobby with existing session, requested immediate refresh");
+        if (g_deferredLobbyRefreshPending)
+        {
+            mod::Log("SwitchToMenu: re-entering Lobby with existing session, refresh deferred until recovery completes");
+        }
+        else
+        {
+            g_lobbySession->RequestRefresh();
+            mod::Log("SwitchToMenu: re-entering Lobby with existing session, requested immediate refresh");
+        }
     }
     int requestedSelection = selection;
     if (requestedSelection < 0)
@@ -2615,11 +2679,30 @@ char UpdateNetplayMenu(uint32_t screenContext)
             const int clampedSel = ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
             *selectionPtr = static_cast<int8_t>(clampedSel);
         }
+
+        if (g_deferredLobbyRefreshPending && g_lobbySession)
+        {
+            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+            const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
+            if (bridgePhase == NetbridgePhase::Idle
+                || bridgePhase == NetbridgePhase::Failed
+                || bridgePhase == NetbridgePhase::SessionEnded)
+            {
+                g_deferredLobbyRefreshPending = false;
+                g_lobbySession->RequestRefresh();
+                mod::Log(
+                    "LobbyReturn: deferred refresh released phase=%s selection=%d inactivity=%u",
+                    netplay::bridge::PhaseToString(bridgePhase),
+                    static_cast<int>(*selectionPtr),
+                    *inactivityCounter);
+            }
+        }
     }
 
     // Lobby: allow R key to trigger an immediate poll refresh.
     if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
         && g_lobbySession
+        && !g_deferredLobbyRefreshPending
         && ConsumeWindowFocusedHotkeyEdge(windowFocused, 'R'))
     {
         g_lobbySession->RequestRefresh();

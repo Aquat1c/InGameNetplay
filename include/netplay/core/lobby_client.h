@@ -194,6 +194,9 @@ public:
     bool ConsumeAbandonedOutgoingChallenge();
 
 private:
+    bool HasPendingEndActionLocked() const;
+    void ClearMatchLifecycleState(bool clearStatusInBattle);
+
     // Background thread entry point: join → poll loop → leave.
     void PollThreadEntry();
 

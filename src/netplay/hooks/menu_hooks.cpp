@@ -900,6 +900,13 @@ bool AreHooksInstalled()
     return hooks::internal::g_hooksInstalled.load();
 }
 
+void PrepareForProcessExit(bool emergency)
+{
+    (void)hooks::internal::ShutdownLobbySessionForProcessExit(
+        emergency,
+        emergency ? "process_exit_emergency" : "process_exit");
+}
+
 void ShowInProgressMessage(HWND owner)
 {
     mod::Log("ShowInProgressMessage: owner=0x%p", owner);

@@ -281,6 +281,7 @@ void DrawNetplayBaseLayer(uint32_t screenContext);
 
 void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut = false);
 void LeaveNetplayMenu(uint32_t screenContext);
+bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason);
 void ExecuteNetplayAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action, int logicalSelection);
 char UpdateNetplayMenu(uint32_t screenContext);
 void TriggerNetplayMenuEntry(uint32_t screenContext);
