@@ -67,7 +67,7 @@ What they are used for:
 - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
 - `assets\res_alert.wav` - custom lobby challenge alert sound
 - `assets\sprites\*.png` - Battle Log character portraits
-- `wave\bgm\bgm08.wav` - optional netplay menu BGM override with proper loop information, uses track 14 from the ONE. (2023) visual novel.
+- `wave\bgm\bgm08.wav` - optional netplay menu BGM override with proper loop information; this project may be packaged with a replacement based on track 14 from `ONE.` (2023)
 - `system\title_ob.dat` - optional title object-sheet override
 
 Fallback behavior:
@@ -206,6 +206,7 @@ BGM override:
 - Mod-local override supported from:
   - `<dll_folder>\\wave\\bgm\\bgm08.wav`
   - mod-relative fallback paths under Wine / Proton
+- Some builds/packages may include a replacement track. Any such third-party music is not covered by this project's MIT license, and rights to music from `ONE.` or any other third-party title remain with their original copyright holders.
 
 Linux / Wine / Proton notes:
 - Menu/background `.dat` assets are resolved through mod-relative fallback paths
@@ -291,3 +292,4 @@ Third-party code used by this project:
 Other targets:
 - EFZ, EfzRevival, and their original binaries/assets are not part of this project's licensing.
 - Files such as `EfzRevival.dll`, `EfzRevival.exe`, `efz.exe`, and original game art/audio remain under their respective owners' rights.
+- If a release, package, or local install includes music derived from `ONE.`, that audio is third-party material and is not covered by this project's MIT license. The official `ONE.` site lists the work as `© 2022 NEXTON/novamicus`.
