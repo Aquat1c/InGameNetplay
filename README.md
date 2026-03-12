@@ -72,7 +72,7 @@ What they are used for:
 
 Fallback behavior:
 - If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
-- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`(EFZ Bad Moon editin character selection OST).
+- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`(EFZ Bad Moon edition character selection OST).
 - Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
 
 ## Current Feature Set
@@ -87,7 +87,7 @@ Top-level menu:
 - `Return to Title`
 
 Online flow:
-- Integrated Revival takeover bridge; no separate `netbridge.dll`
+- Integrated Revival takeover bridge
 - Host / Join / Spectate session startup from the in-game menu
 - Delay prompt overlay and connected-session handoff back into EFZ
 - Cancel / disconnect / recovery paths back into the netplay menu
