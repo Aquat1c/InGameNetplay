@@ -22,13 +22,13 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
 - Build the DLL from source (see Building) or download a release.
 - Install EFZ Mod Manager if it's not installed already:
   - EFZ Mod Manager download: https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing
-- Launch the game through `efz.exe`.
-  Do not start the mod through `EfzRevival.exe` or `Concerto.exe`; this project expects to be injected into the main game process and can crash if started from those executables directly.
 - Place `efz_netplay_mod.dll` in your EFZ mods folder, alongside the other mod assets.
   Example path:
   `EFZ\\mods\\efz_netplay_mod\\efz_netplay_mod.dll`
 - Edit `EfzModManager.ini` and add:
   - `efz_netplay_mod=1`
+- Launch the game through `efz.exe`.
+  Do not start the mod through `EfzRevival.exe` or `Concerto.exe`; this project expects to be injected into the main game process and can crash if started from those executables directly.
 - After installing, a new `NETPLAY` option should appear on the title screen.
 
 ## Expected Mod Folder Layout
