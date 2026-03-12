@@ -4,7 +4,7 @@
 //
 // Shared between efz_netplay_mod and consumer mods (e.g., EFZRichPresence).
 //
-// The netplay mod creates a named shared memory block and populates it each
+// In-game Netplay creates a named shared memory block and populates it each
 // frame.  Consumer mods open the same block to read the latest state.
 //
 // Access methods (both operate in-process — all DLLs live inside EFZ.exe):
@@ -165,7 +165,7 @@ enum EFZNetplayMenuDetail
 // Fixed-layout C struct for inter-mod state sharing.
 // All integers are naturally aligned; char arrays are ASCII / UTF-8.
 //
-// The struct is written atomically (memcpy under lock) by the netplay mod
+// The struct is written atomically (memcpy under lock) by In-game Netplay
 // and read by consumer mods via the shared memory mapping.
 // ---------------------------------------------------------------------------
 struct EFZNetplayState

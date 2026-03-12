@@ -1,4 +1,5 @@
 #include "logger.h"
+#include "mod_version.h"
 
 #include <windows.h>
 
@@ -93,7 +94,7 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile
     {
         if (AllocConsole() != FALSE)
         {
-            SetConsoleTitleA("EFZ Netplay Mod Logger");
+            SetConsoleTitleA("In-game Netplay Logger");
 
             FILE* outStream = nullptr;
             FILE* errStream = nullptr;
@@ -108,6 +109,15 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile
 
     OpenLogFileUnlocked();
 
+    char versionLine[256] = {};
+    std::snprintf(
+        versionLine,
+        sizeof(versionLine),
+        "[efz_netplay_mod] %s v%s build %s\n",
+        netplay::build_info::kDisplayName,
+        netplay::build_info::kVersion,
+        netplay::build_info::kBuildTimestamp);
+    WriteLineUnlocked(versionLine);
     WriteLineUnlocked("[efz_netplay_mod] logger initialized\n");
     return true;
 }
@@ -120,7 +130,7 @@ void SetConsoleVisible(bool visible)
     {
         if (AllocConsole() != FALSE)
         {
-            SetConsoleTitleA("EFZ Netplay Mod Logger");
+            SetConsoleTitleA("In-game Netplay Logger");
 
             FILE* outStream = nullptr;
             FILE* errStream = nullptr;

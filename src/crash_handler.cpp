@@ -174,7 +174,7 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
             ? reinterpret_cast<ULONG_PTR>(exceptionPointers->ExceptionRecord->ExceptionAddress)
             : 0;
 
-    std::fprintf(file, "EFZ Netplay Mod Crash Log\n");
+    std::fprintf(file, "In-game Netplay Crash Log\n");
     std::fprintf(file, "reason=%s\n", reason != nullptr ? reason : "unknown");
     std::fprintf(file, "mode=%s\n", g_injectedMode ? "injected_takeover" : "host");
     std::fprintf(file, "pid=%lu\n", static_cast<unsigned long>(GetCurrentProcessId()));

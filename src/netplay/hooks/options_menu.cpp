@@ -2,6 +2,7 @@
 
 #include "efz_netplay_state.h"
 #include "logger.h"
+#include "mod_version.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/options_keybinds.h"
@@ -56,6 +57,7 @@ enum class ItemKind : uint8_t
     BoolText,
     BoolInt,
     Protocol,
+    Action,
 };
 
 struct Item
@@ -69,6 +71,7 @@ struct Item
     std::string tooltipSummary;
     std::vector<std::string> choiceValues;
     int lineIndex = -1;
+    bool persistToIni = true;
 };
 
 struct EditState
@@ -111,6 +114,7 @@ enum class ModalKind : uint8_t
     Save,
     Exit,
     Rebind,
+    About,
 };
 
 struct ModalOverlayState
@@ -165,6 +169,7 @@ bool IsSectionHeader(const Item& item);
 bool IsTextEditable(const Item& item);
 bool IsKeyBindingEditable(const Item& item);
 bool IsToggleEditable(const Item& item);
+bool IsActionItem(const Item& item);
 bool IsDirty(const Item& item);
 bool HasDirtyItemsInCategory(int categoryIndex);
 bool HasUnsavedChanges();
@@ -854,6 +859,11 @@ bool IsToggleEditable(const Item& item)
         || item.kind == ItemKind::Choice;
 }
 
+bool IsActionItem(const Item& item)
+{
+    return item.kind == ItemKind::Action;
+}
+
 bool IsDirty(const Item& item)
 {
     return item.currentValue != item.originalValue;
@@ -1398,6 +1408,42 @@ void AppendSyntheticItems()
             static_cast<int>(g_state.items.size()) - 1);
     };
 
+    const auto upsertActionItem =
+        [&](const char* keyName, const char* tooltip)
+    {
+        const int existingItemIndex = FindItemIndexBySectionAndKey("Others", keyName);
+        if (existingItemIndex >= 0)
+        {
+            Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+            item.kind = ItemKind::Action;
+            item.rawKeyName = Utf8ToWide(keyName);
+            item.currentValue = "Open";
+            item.originalValue = "Open";
+            item.tooltipSummary = tooltip;
+            item.persistToIni = false;
+            if (item.lineIndex >= 0)
+            {
+                item.lineIndex = -1;
+            }
+            return;
+        }
+
+        Item item;
+        item.kind = ItemKind::Action;
+        item.sectionName = "Others";
+        item.keyName = keyName;
+        item.rawKeyName = Utf8ToWide(keyName);
+        item.currentValue = "Open";
+        item.originalValue = "Open";
+        item.tooltipSummary = tooltip;
+        item.lineIndex = -1;
+        item.persistToIni = false;
+
+        g_state.items.push_back(std::move(item));
+        g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
+            static_cast<int>(g_state.items.size()) - 1);
+    };
+
     upsertChoiceItem(
         "OfflineVsHumanMode",
         "Tournament",
@@ -1419,6 +1465,9 @@ void AppendSyntheticItems()
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
+    upsertActionItem(
+        "About",
+        "Show the mod version and build information.");
 }
 
 void ApplyRuntimeNetplaySettings()
@@ -1483,6 +1532,10 @@ bool SaveItemsToDisk()
 
     for (Item& item : g_state.items)
     {
+        if (!item.persistToIni)
+        {
+            continue;
+        }
         if (item.lineIndex >= 0 && item.lineIndex < static_cast<int>(updatedLines.size()))
         {
             updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
@@ -1493,7 +1546,7 @@ bool SaveItemsToDisk()
     int syntheticOthersInsertLine = -1;
     for (const Item& item : g_state.items)
     {
-        if (item.sectionName == "Others" && item.lineIndex >= 0)
+        if (item.persistToIni && item.sectionName == "Others" && item.lineIndex >= 0)
         {
             syntheticOthersInsertLine = (std::max)(syntheticOthersInsertLine, item.lineIndex + 1);
         }
@@ -1542,7 +1595,7 @@ bool SaveItemsToDisk()
 
     for (Item& item : g_state.items)
     {
-        if (item.sectionName != "Others" || item.lineIndex >= 0)
+        if (!item.persistToIni || item.sectionName != "Others" || item.lineIndex >= 0)
         {
             continue;
         }
@@ -1630,6 +1683,8 @@ std::string FormatDisplayValue(const Item& item)
         return value.empty() ? "(empty)" : value;
     case ItemKind::Protocol:
         return value;
+    case ItemKind::Action:
+        return "Open";
     case ItemKind::Integer:
     case ItemKind::String:
         return value.empty() ? "(empty)" : value;
@@ -2347,6 +2402,33 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
         return HandleRebindOverlayInput(screenContext, inputBytes, inactivityCounter, escapeDown);
     }
 
+    if (g_state.modal.kind == ModalKind::About)
+    {
+        if (escapeDown != nullptr)
+        {
+            *escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        }
+
+        bool closeRequested = hooks::ConsumeNetplayEscapeEdge();
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 16] == 1 || inputBytes[playerIndex + 18] == 1)
+            {
+                closeRequested = true;
+            }
+        }
+
+        ++(*inactivityCounter);
+        if (!closeRequested)
+        {
+            return true;
+        }
+
+        hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
+        CloseModal();
+        return true;
+    }
+
     if (escapeDown != nullptr)
     {
         *escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -2598,6 +2680,10 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     {
         return help + " Pad bindings only work when that controller is assigned to a player.\nA=Rebind C=Revert D=Save";
     }
+    if (IsActionItem(item))
+    {
+        return help + "\nA=Open C=Revert D=Save";
+    }
     if (IsToggleEditable(item))
     {
         return help + "\nA=Change C=Revert D=Save";
@@ -2824,6 +2910,12 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         return true;
     }
 
+    if (IsActionItem(item))
+    {
+        OpenModal(ModalKind::About);
+        return true;
+    }
+
     if (IsTextEditable(item))
     {
         BeginEdit(visible.itemIndex);
@@ -2865,9 +2957,10 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     const bool isExitModal = (g_state.modal.kind == ModalKind::Exit);
     const bool isRebindModal = (g_state.modal.kind == ModalKind::Rebind);
+    const bool isAboutModal = (g_state.modal.kind == ModalKind::About);
     const int optionCount = isExitModal ? 3 : 2;
     constexpr int panelW = 214;
-    const int panelH = isRebindModal ? 92 : (isExitModal ? 100 : 84);
+    const int panelH = isAboutModal ? 96 : (isRebindModal ? 92 : (isExitModal ? 100 : 84));
     constexpr int panelX = (320 - panelW) / 2;
     const int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
@@ -2911,7 +3004,25 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         netplay::font::DrawTextCentered5x7(sv, window, left, right, y, 1, 1, color);
     };
 
-    if (isRebindModal)
+    if (isAboutModal)
+    {
+        drawModalText("ABOUT", textLeft, textRight, panelY + 6, titleColor);
+        drawModalText(netplay::build_info::kDisplayName, textLeft, textRight, panelY + 22, brightColor);
+        drawModalText(
+            std::string("Version: ") + netplay::build_info::kVersion,
+            textLeft,
+            textRight,
+            panelY + 38,
+            textColor);
+        drawModalText(
+            std::string("Build: ") + netplay::build_info::kBuildTimestamp,
+            textLeft,
+            textRight,
+            panelY + 54,
+            dimColor);
+        drawModalText("A/B/Esc=Close", textLeft, textRight, panelY + 72, dimColor);
+    }
+    else if (isRebindModal)
     {
         std::string keyLabel = "Option";
         std::string currentValue = "(empty)";

@@ -35,6 +35,13 @@ enum class BrowserView : uint8_t
     Create = 2,
 };
 
+enum class AsyncRoomActionKind : uint8_t
+{
+    None = 0,
+    Join = 1,
+    Create = 2,
+};
+
 struct State
 {
     BrowserView view = BrowserView::Root;
@@ -63,11 +70,22 @@ bool g_refreshResultOk = false;
 uint32_t g_refreshResultGeneration = 0;
 std::vector<netplay::lobby::PublicRoomSummary> g_refreshResultRooms;
 std::string g_refreshResultError;
+std::mutex g_roomActionMutex;
+std::atomic<bool> g_roomActionInFlight{false};
+std::atomic<uint32_t> g_roomActionGeneration{1};
+bool g_roomActionResultReady = false;
+bool g_roomActionResultOk = false;
+uint32_t g_roomActionResultGeneration = 0;
+AsyncRoomActionKind g_roomActionResultKind = AsyncRoomActionKind::None;
+netplay::lobby::LobbyJoinedRoom g_roomActionResultJoinedRoom = {};
+std::string g_roomActionResultError;
 bool g_lobbySessionShutdownInFlight = false;
 bool g_refreshAfterLobbySessionShutdown = false;
 std::array<int8_t, 2> g_lastHorizontalInput = {};
 
 bool StartAsyncRefresh(bool showStatusMessage);
+bool StartAsyncJoinRoom(const std::string& roomCode);
+bool StartAsyncCreateRoom();
 
 int* GetSelectionStorage(BrowserView view)
 {
@@ -141,6 +159,18 @@ void InvalidateRefreshResults()
     g_refreshResultGeneration = 0;
     g_refreshResultRooms.clear();
     g_refreshResultError.clear();
+}
+
+void InvalidateRoomActionResults()
+{
+    g_roomActionGeneration.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(g_roomActionMutex);
+    g_roomActionResultReady = false;
+    g_roomActionResultOk = false;
+    g_roomActionResultGeneration = 0;
+    g_roomActionResultKind = AsyncRoomActionKind::None;
+    g_roomActionResultJoinedRoom = {};
+    g_roomActionResultError.clear();
 }
 
 void ResetHorizontalInputState()
@@ -328,47 +358,14 @@ void SwitchView(uint32_t screenContext, BrowserView newView, int selection = -1)
     ApplySelectionToScreen(screenContext, nextSelection);
 }
 
-bool RefreshPublicRooms(bool showStatusMessage)
-{
-    std::vector<netplay::lobby::PublicRoomSummary> rooms;
-    std::string error;
-    const bool ok = netplay::lobby::ListPublicRooms(&rooms, &error);
-    if (ok)
-    {
-        g_state.publicRooms = std::move(rooms);
-        if (g_state.listScrollOffset > GetMaxListScroll())
-        {
-            g_state.listScrollOffset = GetMaxListScroll();
-        }
-        if (showStatusMessage)
-        {
-            if (g_state.publicRooms.empty())
-            {
-                SetStatusMessage("No public rooms found.");
-            }
-            else
-            {
-                SetStatusMessage("Public room list refreshed.");
-            }
-        }
-    }
-    else
-    {
-        g_state.publicRooms.clear();
-        g_state.listScrollOffset = 0;
-        if (showStatusMessage)
-        {
-            SetStatusMessage(error.empty() ? "Public room list request failed." : error.c_str());
-        }
-    }
-
-    RebuildMenuEntries();
-    return ok;
-}
-
 bool IsRefreshInFlight()
 {
     return g_refreshInFlight.load(std::memory_order_acquire);
+}
+
+bool IsRoomActionInFlight()
+{
+    return g_roomActionInFlight.load(std::memory_order_acquire);
 }
 
 void PumpRefreshResult()
@@ -503,54 +500,166 @@ bool StartAsyncRefresh(bool showStatusMessage)
     return true;
 }
 
+bool PumpRoomActionResult(uint32_t screenContext)
+{
+    bool ready = false;
+    bool ok = false;
+    uint32_t resultGeneration = 0;
+    AsyncRoomActionKind kind = AsyncRoomActionKind::None;
+    netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_roomActionMutex);
+        ready = g_roomActionResultReady;
+        if (!ready)
+        {
+            return false;
+        }
+
+        ok = g_roomActionResultOk;
+        resultGeneration = g_roomActionResultGeneration;
+        kind = g_roomActionResultKind;
+        joinedRoom = std::move(g_roomActionResultJoinedRoom);
+        error = std::move(g_roomActionResultError);
+        g_roomActionResultReady = false;
+        g_roomActionResultOk = false;
+        g_roomActionResultGeneration = 0;
+        g_roomActionResultKind = AsyncRoomActionKind::None;
+        g_roomActionResultJoinedRoom = {};
+        g_roomActionResultError.clear();
+    }
+
+    g_roomActionInFlight.store(false, std::memory_order_release);
+
+    if (resultGeneration != g_roomActionGeneration.load(std::memory_order_acquire))
+    {
+        mod::Log(
+            "PlayerRooms::PumpRoomActionResult: discarded stale result generation=%u current=%u kind=%d",
+            static_cast<unsigned>(resultGeneration),
+            static_cast<unsigned>(g_roomActionGeneration.load(std::memory_order_relaxed)),
+            static_cast<int>(kind));
+        return false;
+    }
+
+    if (!ok)
+    {
+        SetStatusMessage(error.empty()
+            ? (kind == AsyncRoomActionKind::Create ? "Create room failed." : "Join room failed.")
+            : error.c_str());
+        return true;
+    }
+
+    g_state.pendingJoinedRoom = std::move(joinedRoom);
+    g_state.hasPendingJoinedRoom = true;
+    ClearStatusMessage();
+    if (screenContext != 0)
+    {
+        hooks::StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
+    }
+    return true;
+}
+
+bool StartAsyncJoinRoom(const std::string& roomCode)
+{
+    PumpRefreshResult();
+    if (IsRoomActionInFlight())
+    {
+        SetStatusMessage("Room request is already in progress.");
+        return false;
+    }
+
+    const uint32_t generation = g_roomActionGeneration.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(g_roomActionMutex);
+        g_roomActionResultReady = false;
+        g_roomActionResultOk = false;
+        g_roomActionResultGeneration = 0;
+        g_roomActionResultKind = AsyncRoomActionKind::None;
+        g_roomActionResultJoinedRoom = {};
+        g_roomActionResultError.clear();
+    }
+    g_roomActionInFlight.store(true, std::memory_order_release);
+    SetStatusMessage("Joining room...");
+
+    const std::string nickname = hooks::g_netplayMenuState.nickname;
+    const uint16_t hostPort = hooks::g_netplayMenuState.hostPort;
+    std::thread([generation, nickname, roomCode, hostPort]() {
+        netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+        std::string error;
+        const bool ok = netplay::lobby::JoinRoom(
+            nickname,
+            roomCode,
+            hostPort,
+            netplay::lobby::RoomOrigin::PlayerRooms,
+            &joinedRoom,
+            &error);
+        {
+            std::lock_guard<std::mutex> lock(g_roomActionMutex);
+            g_roomActionResultReady = true;
+            g_roomActionResultOk = ok;
+            g_roomActionResultGeneration = generation;
+            g_roomActionResultKind = AsyncRoomActionKind::Join;
+            g_roomActionResultJoinedRoom = std::move(joinedRoom);
+            g_roomActionResultError = std::move(error);
+        }
+    }).detach();
+
+    return true;
+}
+
+bool StartAsyncCreateRoom()
+{
+    PumpRefreshResult();
+    if (IsRoomActionInFlight())
+    {
+        SetStatusMessage("Room request is already in progress.");
+        return false;
+    }
+
+    const uint32_t generation = g_roomActionGeneration.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(g_roomActionMutex);
+        g_roomActionResultReady = false;
+        g_roomActionResultOk = false;
+        g_roomActionResultGeneration = 0;
+        g_roomActionResultKind = AsyncRoomActionKind::None;
+        g_roomActionResultJoinedRoom = {};
+        g_roomActionResultError.clear();
+    }
+    g_roomActionInFlight.store(true, std::memory_order_release);
+    SetStatusMessage("Creating room...");
+
+    const std::string nickname = hooks::g_netplayMenuState.nickname;
+    const std::string roomType = GetRoomTypeLabel();
+    const uint16_t hostPort = hooks::g_netplayMenuState.hostPort;
+    std::thread([generation, nickname, roomType, hostPort]() {
+        netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+        std::string error;
+        const bool ok = netplay::lobby::CreateRoom(
+            nickname,
+            roomType,
+            hostPort,
+            netplay::lobby::RoomOrigin::PlayerRooms,
+            &joinedRoom,
+            &error);
+        {
+            std::lock_guard<std::mutex> lock(g_roomActionMutex);
+            g_roomActionResultReady = true;
+            g_roomActionResultOk = ok;
+            g_roomActionResultGeneration = generation;
+            g_roomActionResultKind = AsyncRoomActionKind::Create;
+            g_roomActionResultJoinedRoom = std::move(joinedRoom);
+            g_roomActionResultError = std::move(error);
+        }
+    }).detach();
+
+    return true;
+}
+
 void ToggleRoomType()
 {
     g_state.createPublic = !g_state.createPublic;
     ClearStatusMessage();
-}
-
-bool JoinRoomAndQueue(const std::string& roomCode)
-{
-    netplay::lobby::LobbyJoinedRoom joinedRoom;
-    std::string error;
-    if (!netplay::lobby::JoinRoom(
-            hooks::g_netplayMenuState.nickname,
-            roomCode,
-            hooks::g_netplayMenuState.hostPort,
-            netplay::lobby::RoomOrigin::PlayerRooms,
-            &joinedRoom,
-            &error))
-    {
-        SetStatusMessage(error.empty() ? "Join room failed." : error.c_str());
-        return false;
-    }
-
-    g_state.pendingJoinedRoom = std::move(joinedRoom);
-    g_state.hasPendingJoinedRoom = true;
-    ClearStatusMessage();
-    return true;
-}
-
-bool CreateRoomAndQueue()
-{
-    netplay::lobby::LobbyJoinedRoom joinedRoom;
-    std::string error;
-    if (!netplay::lobby::CreateRoom(
-            hooks::g_netplayMenuState.nickname,
-            GetRoomTypeLabel(),
-            hooks::g_netplayMenuState.hostPort,
-            netplay::lobby::RoomOrigin::PlayerRooms,
-            &joinedRoom,
-            &error))
-    {
-        SetStatusMessage(error.empty() ? "Create room failed." : error.c_str());
-        return false;
-    }
-
-    g_state.pendingJoinedRoom = std::move(joinedRoom);
-    g_state.hasPendingJoinedRoom = true;
-    ClearStatusMessage();
-    return true;
 }
 } // namespace
 
@@ -571,6 +680,14 @@ void ResetState()
     g_refreshResultShowStatus = false;
     g_refreshResultOk = false;
     g_refreshResultGeneration = 0;
+    g_roomActionInFlight.store(false, std::memory_order_release);
+    g_roomActionGeneration.store(1, std::memory_order_release);
+    g_roomActionResultReady = false;
+    g_roomActionResultOk = false;
+    g_roomActionResultGeneration = 0;
+    g_roomActionResultKind = AsyncRoomActionKind::None;
+    g_roomActionResultJoinedRoom = {};
+    g_roomActionResultError.clear();
     ResetHorizontalInputState();
     EnsureSpecInitialized();
 }
@@ -601,6 +718,7 @@ void LeaveMenu()
 {
     PumpRefreshResult();
     InvalidateRefreshResults();
+    InvalidateRoomActionResults();
     ResetHorizontalInputState();
     g_state.view = BrowserView::Root;
     g_state.rootSelection = 0;
@@ -737,6 +855,10 @@ std::string BuildRowLabel(NetplayMenuAction action)
 std::string BuildFooterText(NetplayMenuAction selectedAction)
 {
     PumpRefreshResult();
+    if (IsRoomActionInFlight())
+    {
+        return g_state.statusMessage.empty() ? "Processing room request..." : g_state.statusMessage;
+    }
     if (HasStatusMessage())
     {
         return g_state.statusMessage;
@@ -807,6 +929,10 @@ bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelec
 bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
 {
     PumpRefreshResult();
+    if (PumpRoomActionResult(screenContext))
+    {
+        return true;
+    }
     if (inputBytes == nullptr)
     {
         return false;
@@ -884,6 +1010,15 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
 bool HandleCancel(uint32_t screenContext)
 {
     PumpRefreshResult();
+    if (PumpRoomActionResult(screenContext))
+    {
+        return true;
+    }
+    if (IsRoomActionInFlight())
+    {
+        SetStatusMessage("Wait for the room request to finish.");
+        return true;
+    }
     if (g_state.view == BrowserView::Root)
     {
         return false;
@@ -896,6 +1031,16 @@ bool HandleCancel(uint32_t screenContext)
 bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 {
     PumpRefreshResult();
+    if (PumpRoomActionResult(screenContext))
+    {
+        return true;
+    }
+
+    if (IsRoomActionInFlight())
+    {
+        SetStatusMessage("Room request is already in progress.");
+        return true;
+    }
 
     const bool requiresStableRoomState =
         action == NetplayMenuAction::PlayerRoomsOpenJoin
@@ -931,20 +1076,12 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
             SetStatusMessage("Enter a valid room code first.");
             return true;
         }
-        if (JoinRoomAndQueue(g_state.roomCode))
-        {
-            hooks::StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
-        }
-        return true;
+        return StartAsyncJoinRoom(g_state.roomCode);
     case NetplayMenuAction::PlayerRoomsEditCode:
         hooks::BeginInlineEdit(NetplayMenuAction::PlayerRoomsEditCode);
         return true;
     case NetplayMenuAction::PlayerRoomsCreate:
-        if (CreateRoomAndQueue())
-        {
-            hooks::StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
-        }
-        return true;
+        return StartAsyncCreateRoom();
     case NetplayMenuAction::PlayerRoomsRoomType:
         ToggleRoomType();
         return true;
@@ -958,11 +1095,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
             SetStatusMessage("No public room is available in this slot.");
             return true;
         }
-        if (JoinRoomAndQueue(g_state.publicRooms[static_cast<size_t>(roomIndex)].roomCode))
-        {
-            hooks::StartMenuSlideTransition(screenContext, NetplayMenuId::Lobby, -1, +1);
-        }
-        return true;
+        return StartAsyncJoinRoom(g_state.publicRooms[static_cast<size_t>(roomIndex)].roomCode);
     }
     case NetplayMenuAction::BackToMain:
         if (g_state.view != BrowserView::Root)
