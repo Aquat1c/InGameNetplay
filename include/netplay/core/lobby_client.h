@@ -214,12 +214,13 @@ private:
     // Individual HTTP operations (blocking, called from polling thread only).
     bool DoJoin();
     bool DoPollStatus();
-    void DoLeave();
+    bool DoLeave();
     bool DoChallenge(int targetPlayerId, const std::string& ipPort);
     bool DoPreAccept(int challengerPlayerId);
     bool DoAccept(int challengerPlayerId);
     bool DoEnd();
     bool TryRejoinIfNeeded();
+    bool TryDetachFromLobbyForSpectate();
     bool HandleServerRemovalFailure(const char* operation, const std::string& body);
 
     // Discover our public IP address via an external service.
@@ -301,6 +302,8 @@ private:
     std::atomic<bool> m_endPending{false};
     std::atomic<bool> m_spectateActive{false};
     std::atomic<bool> m_returningFromSpectate{false};
+    std::atomic<bool> m_spectateLeavePending{false};
+    std::atomic<bool> m_spectateDetachedFromRoom{false};
     // true when we initiated the lobby match (sent the challenge);
     // false when we accepted an incoming challenge (joined as client).
     std::atomic<bool> m_isMatchHost{false};

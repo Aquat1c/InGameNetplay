@@ -1829,6 +1829,8 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     m_endPending.store(false);
     m_spectateActive.store(false);
     m_returningFromSpectate.store(false);
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     m_isMatchHost.store(false);
     m_pendingAcceptTargetId = 0;
 
@@ -1866,7 +1868,17 @@ bool LobbySession::ConsumeAbandonedOutgoingChallenge()
 
 void LobbySession::RequestRefresh()
 {
-    if (m_returningFromSpectate.exchange(false))
+    if (m_returningFromSpectate.load() && m_spectateDetachedFromRoom.load())
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_status.pollState = PollState::Joining;
+            m_status.statusMessage = "Rejoining room...";
+        }
+        m_rejoinRequested.store(true);
+        mod::Log("LobbySession::RequestRefresh: returning-from-spectate queued room rejoin");
+    }
+    else if (m_returningFromSpectate.exchange(false))
     {
         m_spectateActive.store(false);
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1929,6 +1941,8 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetNa
 {
     m_spectateActive.store(false);
     m_returningFromSpectate.store(false);
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     m_isMatchHost.store(true);
     m_challengePending.store(true);
     m_abandonedOutgoingChallenge.store(false);
@@ -1956,6 +1970,8 @@ void LobbySession::AcceptChallenge(int challengerPlayerId)
 {
     m_spectateActive.store(false);
     m_returningFromSpectate.store(false);
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     m_isMatchHost.store(false);
     m_inBattle.store(true);
     m_challengePending.store(true);
@@ -1985,6 +2001,8 @@ void LobbySession::NotifyMatchConnected()
     // Queue the deferred 'accept' so the lobby shows the pair as "playing".
     m_spectateActive.store(false);
     m_returningFromSpectate.store(false);
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     m_inBattle.store(true);
     m_challengePending.store(false);
     m_abandonedOutgoingChallenge.store(false);
@@ -2021,11 +2039,27 @@ void LobbySession::NotifySpectateStarted()
 
     m_spectateActive.store(true);
     m_returningFromSpectate.store(false);
+    if (m_joinedRoom.lobbyNumericId != 0 && !m_spectateDetachedFromRoom.load())
+    {
+        m_spectateLeavePending.store(true);
+    }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.inBattle = true;
+        if (m_spectateLeavePending.load())
+        {
+            m_status.statusMessage = "Leaving room for spectate...";
+        }
     }
-    mod::Log("LobbySession::NotifySpectateStarted: local spectate lifecycle active");
+    mod::Log(
+        "LobbySession::NotifySpectateStarted: local spectate lifecycle active detachPending=%d roomCode='%s' origin=%d",
+        m_spectateLeavePending.load() ? 1 : 0,
+        m_joinedRoom.roomCode.c_str(),
+        static_cast<int>(m_joinedRoom.origin));
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
 }
 
 void LobbySession::NotifyEndMatch()
@@ -2224,6 +2258,72 @@ bool LobbySession::TryRejoinIfNeeded()
     return true;
 }
 
+bool LobbySession::TryDetachFromLobbyForSpectate()
+{
+    if (!m_spectateLeavePending.load())
+    {
+        return true;
+    }
+
+    if (m_spectateDetachedFromRoom.load())
+    {
+        m_spectateLeavePending.store(false);
+        return true;
+    }
+
+    if (m_joinedRoom.lobbyNumericId == 0)
+    {
+        m_spectateLeavePending.store(false);
+        m_spectateDetachedFromRoom.store(true);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::NotJoined;
+        m_status.idlePlayers.clear();
+        m_status.challenges.clear();
+        m_status.displayEntries.clear();
+        m_status.playing.clear();
+        m_status.statusMessage = "Spectating...";
+        m_status.inBattle = true;
+        mod::Log("LobbySession::TryDetachFromLobbyForSpectate: no joined credentials, treating room as detached");
+        return true;
+    }
+
+    mod::Log(
+        "LobbySession::TryDetachFromLobbyForSpectate: leaving roomCode='%s' roomId=%d playerId=%d origin=%d",
+        m_joinedRoom.roomCode.c_str(),
+        m_joinedRoom.lobbyNumericId,
+        m_joinedRoom.playerId,
+        static_cast<int>(m_joinedRoom.origin));
+
+    if (!DoLeave())
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.statusMessage = "Leaving room for spectate...";
+        return false;
+    }
+
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(true);
+    m_joinedRoom.lobbyNumericId = 0;
+    m_joinedRoom.playerId = 0;
+    m_joinedRoom.secret = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.pollState = PollState::NotJoined;
+        m_status.idlePlayers.clear();
+        m_status.challenges.clear();
+        m_status.displayEntries.clear();
+        m_status.playing.clear();
+        m_status.statusMessage = "Spectating...";
+        m_status.inBattle = true;
+    }
+
+    mod::Log(
+        "LobbySession::TryDetachFromLobbyForSpectate: detached roomCode='%s' origin=%d",
+        m_joinedRoom.roomCode.c_str(),
+        static_cast<int>(m_joinedRoom.origin));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Background thread
 // ---------------------------------------------------------------------------
@@ -2284,6 +2384,32 @@ void LobbySession::PollThreadEntry()
             break;
         }
 
+        if (m_spectateLeavePending.load() && !TryDetachFromLobbyForSpectate())
+        {
+            if (m_wakeEvent != nullptr)
+            {
+                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
+            }
+            else
+            {
+                Sleep(kPollIntervalMs);
+            }
+            continue;
+        }
+
+        if (m_spectateDetachedFromRoom.load() && !m_rejoinRequested.load())
+        {
+            if (m_wakeEvent != nullptr)
+            {
+                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
+            }
+            else
+            {
+                Sleep(kPollIntervalMs);
+            }
+            continue;
+        }
+
         if (!TryRejoinIfNeeded())
         {
             if (m_wakeEvent != nullptr)
@@ -2341,6 +2467,9 @@ void LobbySession::PollThreadEntry()
             || m_matchConnected.load()
             || m_endDeferred.load()
             || m_endPending.load());
+    const bool shouldSendLeaveOnShutdown =
+        m_joinedRoom.lobbyNumericId != 0
+        && (!m_spectateDetachedFromRoom.load() || m_spectateLeavePending.load());
 
     // Leave the lobby on the way out.
     {
@@ -2354,7 +2483,10 @@ void LobbySession::PollThreadEntry()
             "LobbySession::PollThread: shutdown during active challenge/match, sending End before Leave");
         (void)DoEnd();
     }
-    DoLeave();
+    if (shouldSendLeaveOnShutdown)
+    {
+        (void)DoLeave();
+    }
     mod::Log("LobbySession::PollThread: exiting");
 }
 
@@ -2591,11 +2723,11 @@ bool LobbySession::DoPollStatus()
     return true;
 }
 
-void LobbySession::DoLeave()
+bool LobbySession::DoLeave()
 {
     if (m_joinedRoom.lobbyNumericId == 0)
     {
-        return;
+        return true;
     }
 
     char path[512];
@@ -2609,6 +2741,17 @@ void LobbySession::DoLeave()
 
     const std::string body = DoHttpGet(path);
     mod::Log("LobbySession::DoLeave: response='%s'", body.c_str());
+    if (body.empty())
+    {
+        return false;
+    }
+
+    if (IsJsonStatusOk(body) || IsMissingLobbyFailure(body))
+    {
+        return true;
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
