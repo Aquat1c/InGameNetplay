@@ -373,13 +373,20 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 
             if (exitMode == 0 || exitMode == 1)
             {
-                // Netplay (host / join) — return to the netplay menu.
+                // Online or spectate netplay — return to the netplay menu.
                 // Schedule multi-frame text clearing to ensure any DLL-side
                 // text overlays (nicknames, ping, delay) are fully purged.
                 g_postExitTextClearFrames = 5;
                 if (g_lobbySession)
                 {
-                    g_lobbySession->NotifyEndMatch();
+                    if (exitMode == netplay::bridge::takeover::kLocalRoleSpectate)
+                    {
+                        g_lobbySession->NotifyEndSpectate(true);
+                    }
+                    else
+                    {
+                        g_lobbySession->NotifyEndMatch();
+                    }
                 }
                 mod::Log(
                     "HookedTitleUpdateImpl: exit intercepted (netplay mode=%d), re-entering netplay menu (skipFadeOut)",
@@ -408,8 +415,11 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             g_returnToNetplayAfterMatch = false;
             mod::ResetCrashRecoveryState();
             DisarmSpectateReplayBypass();
+            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
+            const bool wasSpectate = (bridgeStatus.roleFlag == netplay::bridge::takeover::kLocalRoleSpectate);
 
-            // The match ended and the game naturally returned to title screen.
+            // The active online/spectate session ended and the game naturally
+            // returned to the title screen.
             // Cancel the session to terminate the peer process, restore DLL
             // patches, clear stale delay/nickname state, and reset the bridge
             // phase to Idle.  Without this, the old session's delayPromptSerial
@@ -418,7 +428,14 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             netplay::bridge::CancelSession("match_ended");
             if (g_lobbySession)
             {
-                g_lobbySession->NotifyEndMatch();
+                if (wasSpectate)
+                {
+                    g_lobbySession->NotifyEndSpectate(true);
+                }
+                else
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
             }
             // Keep clearing DLL text rendering for several frames, just as
             // the tournament-mode exit path does.  init(3,102) or a transient

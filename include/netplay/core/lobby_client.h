@@ -175,6 +175,11 @@ public:
     // lobby server so the pair appears as "playing".
     void NotifyMatchConnected();
 
+    // Notify that a local spectate session has left the room UI and is now
+    // actively spectating. This is a local-only busy state and does not send
+    // any lobby accept/end verbs.
+    void NotifySpectateStarted();
+
     // Notify that a match/challenge has ended (user cancelled or
     // connection dropped).  Pending challenges that never reached the
     // connected-match state send 'end' immediately so the opponent's
@@ -182,6 +187,11 @@ public:
     // still defer 'end' until RequestRefresh() so the playing pair is
     // preserved until the host returns to the lobby.
     void NotifyEndMatch();
+
+    // Notify that a spectate session has ended. When |preserveUntilRefresh|
+    // is true, the room remains locally busy until RequestRefresh() runs on
+    // the re-entered room screen.
+    void NotifyEndSpectate(bool preserveUntilRefresh);
 
     // Returns true while this joined-room session is still busy with an
     // active or just-finished challenge/match lifecycle. This includes
@@ -289,6 +299,8 @@ private:
     std::atomic<bool> m_matchConnected{false};
     std::atomic<bool> m_endDeferred{false};
     std::atomic<bool> m_endPending{false};
+    std::atomic<bool> m_spectateActive{false};
+    std::atomic<bool> m_returningFromSpectate{false};
     // true when we initiated the lobby match (sent the challenge);
     // false when we accepted an incoming challenge (joined as client).
     std::atomic<bool> m_isMatchHost{false};

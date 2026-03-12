@@ -1827,6 +1827,8 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     m_endPending.store(false);
+    m_spectateActive.store(false);
+    m_returningFromSpectate.store(false);
     m_isMatchHost.store(false);
     m_pendingAcceptTargetId = 0;
 
@@ -1852,7 +1854,9 @@ bool LobbySession::IsInBattle() const
         || m_challengePending.load()
         || m_matchConnected.load()
         || m_endDeferred.load()
-        || m_endPending.load();
+        || m_endPending.load()
+        || m_spectateActive.load()
+        || m_returningFromSpectate.load();
 }
 
 bool LobbySession::ConsumeAbandonedOutgoingChallenge()
@@ -1862,6 +1866,14 @@ bool LobbySession::ConsumeAbandonedOutgoingChallenge()
 
 void LobbySession::RequestRefresh()
 {
+    if (m_returningFromSpectate.exchange(false))
+    {
+        m_spectateActive.store(false);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = false;
+        mod::Log("LobbySession::RequestRefresh: returning-from-spectate cleared");
+    }
+
     // If we were returning from a match, now is the time to finalise.
     if (m_returningFromMatch.exchange(false))
     {
@@ -1915,6 +1927,8 @@ void LobbySession::RequestRefresh()
 
 void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetName, const std::string& ipPort)
 {
+    m_spectateActive.store(false);
+    m_returningFromSpectate.store(false);
     m_isMatchHost.store(true);
     m_challengePending.store(true);
     m_abandonedOutgoingChallenge.store(false);
@@ -1940,6 +1954,8 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetNa
 
 void LobbySession::AcceptChallenge(int challengerPlayerId)
 {
+    m_spectateActive.store(false);
+    m_returningFromSpectate.store(false);
     m_isMatchHost.store(false);
     m_inBattle.store(true);
     m_challengePending.store(true);
@@ -1967,6 +1983,8 @@ void LobbySession::NotifyMatchConnected()
 {
     // Called when the P2P connection is established (delay setup overlay shown).
     // Queue the deferred 'accept' so the lobby shows the pair as "playing".
+    m_spectateActive.store(false);
+    m_returningFromSpectate.store(false);
     m_inBattle.store(true);
     m_challengePending.store(false);
     m_abandonedOutgoingChallenge.store(false);
@@ -1991,6 +2009,23 @@ void LobbySession::NotifyMatchConnected()
     {
         SetEvent(m_wakeEvent);
     }
+}
+
+void LobbySession::NotifySpectateStarted()
+{
+    if (m_spectateActive.load() && !m_returningFromSpectate.load())
+    {
+        mod::Log("LobbySession::NotifySpectateStarted: redundant call ignored (already spectating)");
+        return;
+    }
+
+    m_spectateActive.store(true);
+    m_returningFromSpectate.store(false);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = true;
+    }
+    mod::Log("LobbySession::NotifySpectateStarted: local spectate lifecycle active");
 }
 
 void LobbySession::NotifyEndMatch()
@@ -2078,6 +2113,32 @@ void LobbySession::NotifyEndMatch()
     {
         SetEvent(m_wakeEvent);
     }
+}
+
+void LobbySession::NotifyEndSpectate(bool preserveUntilRefresh)
+{
+    const bool wasActive = m_spectateActive.load();
+    const bool wasReturning = m_returningFromSpectate.load();
+    if (!wasActive && !wasReturning)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = false;
+        mod::Log("LobbySession::NotifyEndSpectate: redundant call ignored (no active spectate state)");
+        return;
+    }
+
+    m_spectateActive.store(false);
+    m_returningFromSpectate.store(preserveUntilRefresh);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.inBattle = preserveUntilRefresh;
+    }
+
+    mod::Log(
+        "LobbySession::NotifyEndSpectate: active=%d returning=%d -> preserveUntilRefresh=%d",
+        wasActive ? 1 : 0,
+        wasReturning ? 1 : 0,
+        preserveUntilRefresh ? 1 : 0);
 }
 
 bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::string& body)

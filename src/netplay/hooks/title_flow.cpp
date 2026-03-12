@@ -1602,14 +1602,13 @@ void HandoffSpectateSession(uint32_t screenContext)
     ClearPendingLobbySpectateWait("handoff_spectate_session");
     g_returnToNetplayAfterMatch = true;
 
-    // Spectate bypasses the delay overlay, so the normal
-    // NotifyMatchConnected call inside ActivateDelaySetupOverlay never fires.
-    // Notify the lobby here so it can send the deferred 'accept' and
-    // transition to "playing" for spectate sessions.
+    // Spectating should suppress room actions locally while we are out of the
+    // lobby UI, but it must not reuse the real match accept/end lifecycle.
+    // Mark a local spectate-busy state here instead of driving accept/end.
     if (g_lobbySession)
     {
-        mod::Log("HandoffSpectateSession: notifying lobby — setting inBattle=true (spectate path)");
-        g_lobbySession->NotifyMatchConnected();
+        mod::Log("HandoffSpectateSession: notifying lobby — entering spectate lifecycle");
+        g_lobbySession->NotifySpectateStarted();
     }
 
     // Transition directly to charselect (mode 1).  The DLL's client
@@ -2324,6 +2323,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             selectedPair.p1Name.c_str(), selectedPair.p2Name.c_str(),
             selectedPair.hostIp.c_str(), status.inBattle ? 1 : 0);
 
+        if (g_lobbySession->IsInBattle())
+        {
+            mod::Log("LobbyPlaying0: BLOCKED spectate — lobby session still busy");
+            ShowStubActionMessage(owner, "Cannot spectate right now.");
+            break;
+        }
+
         // Parse ip:port from the playing pair's hostIp field.
         std::string spectateAddr = selectedPair.hostIp;
         uint16_t spectatePort = g_netplayMenuState.joinPort;
@@ -2397,6 +2403,14 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         if (entry.isPlaying && !entry.isChallenge)
         {
             // --- Spectating a playing player ---
+            if (g_lobbySession->IsInBattle())
+            {
+                mod::Log("LobbySpectate: BLOCKED spectate for '%s' id=%d — lobby session still busy",
+                    entry.name.c_str(), entry.playerId);
+                ShowStubActionMessage(owner, "Cannot spectate right now.");
+                break;
+            }
+
             if (entry.spectateIp.empty())
             {
                 ShowStubActionMessage(owner, "No host information available\nfor spectating.");
@@ -2837,6 +2851,20 @@ char UpdateNetplayMenu(uint32_t screenContext)
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
     const bool bridgeDelaySetupReady = bridgeStatus.delaySetupReady != 0;
+    auto notifyLobbySessionEndedForCurrentBridgeRole = [&](bool preserveSpectateUntilRefresh) {
+        if (!g_lobbySession)
+        {
+            return;
+        }
+        if (bridgeStatus.roleFlag == kRoleFlagSpectate)
+        {
+            g_lobbySession->NotifyEndSpectate(preserveSpectateUntilRefresh);
+        }
+        else
+        {
+            g_lobbySession->NotifyEndMatch();
+        }
+    };
 
     if (g_lobbySession && g_lobbySession->ConsumeAbandonedOutgoingChallenge())
     {
@@ -2921,10 +2949,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "re-entering netplay menu",
                     nextState);
                 netplay::bridge::CancelSession("peer_died_before_transition");
-                if (g_lobbySession)
-                {
-                    g_lobbySession->NotifyEndMatch();
-                }
+                notifyLobbySessionEndedForCurrentBridgeRole(true);
                 ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
@@ -3019,10 +3044,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     nextState);
                 DisarmSpectateReplayBypass();
                 netplay::bridge::CancelSession("peer_died_before_spectate_transition");
-                if (g_lobbySession)
-                {
-                    g_lobbySession->NotifyEndMatch();
-                }
+                notifyLobbySessionEndedForCurrentBridgeRole(true);
                 ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_spectate_transition");
                 return 0;
             }
@@ -3144,18 +3166,15 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 g_pendingGlobalStateTransition = -1;
                 if (!netplay::bridge::IsPeerProcessAlive())
                 {
-                    mod::Log(
-                        "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                        "re-entering netplay menu",
-                        nextState);
-                    netplay::bridge::CancelSession("peer_died_before_transition");
-                    if (g_lobbySession)
-                    {
-                        g_lobbySession->NotifyEndMatch();
-                    }
-                    ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
-                    return 0;
-                }
+                mod::Log(
+                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
+                    "re-entering netplay menu",
+                    nextState);
+                netplay::bridge::CancelSession("peer_died_before_transition");
+                notifyLobbySessionEndedForCurrentBridgeRole(true);
+                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
+                return 0;
+            }
                 mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
                 return static_cast<char>(nextState);
             }
@@ -3174,10 +3193,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "re-entering netplay menu",
                     nextState);
                 netplay::bridge::CancelSession("peer_died_before_transition");
-                if (g_lobbySession)
-                {
-                    g_lobbySession->NotifyEndMatch();
-                }
+                notifyLobbySessionEndedForCurrentBridgeRole(true);
                 ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
@@ -3215,10 +3231,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     "re-entering netplay menu",
                     nextState);
                 netplay::bridge::CancelSession("peer_died_before_transition");
-                if (g_lobbySession)
-                {
-                    g_lobbySession->NotifyEndMatch();
-                }
+                notifyLobbySessionEndedForCurrentBridgeRole(true);
                 ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
@@ -3271,10 +3284,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 ResetHostingOverlayState();
                 ClearPendingLobbySpectateWait("dismissed_error");
                 netplay::bridge::CancelSession("dismissed_error");
-                if (g_lobbySession)
-                {
-                    g_lobbySession->NotifyEndMatch();
-                }
+                notifyLobbySessionEndedForCurrentBridgeRole(false);
                 mod::Log("JoiningOverlay: error dismissed by user");
             }
             *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
@@ -3290,10 +3300,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         ClearPendingLobbySpectateWait("session_ended");
         DisarmSpectateReplayBypass();
         netplay::bridge::CancelSession("no_overlay_session_ended");
-        if (g_lobbySession)
-        {
-            g_lobbySession->NotifyEndMatch();
-        }
+        notifyLobbySessionEndedForCurrentBridgeRole(false);
     }
 
     if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
@@ -3346,10 +3353,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ResetJoiningOverlayState();
             ClearPendingLobbySpectateWait("user_cancel");
             netplay::bridge::CancelSession("user_cancel");
-            if (g_lobbySession)
-            {
-                g_lobbySession->NotifyEndMatch();
-            }
+            notifyLobbySessionEndedForCurrentBridgeRole(false);
             mod::Log("NetplayBridge: cancel requested during connecting");
         }
 
