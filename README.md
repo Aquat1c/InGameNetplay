@@ -148,11 +148,11 @@ Supported `EfzRevival.dll` versions:
 - `1.02e`
 - `1.02f`
 - `1.02g`
-- `1.02h`
-- `1.02i`
+- `1.02h!!!`
+- `1.02i!!!`
 
 Notes:
-- `1.02h` and `1.02i` are the most tested versions.
+- `1.02h!!!` and `1.02i!!!` are the most tested versions.
 - Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
 
 ## Shared Netplay Exports
@@ -162,7 +162,6 @@ tools that run inside the same `EFZ.exe` process.
 
 Public interface:
 - Header: `include/efz_netplay_state.h`
-- Reference notes: `NETPLAY_STATE_EXPORT.md`
 - Named shared memory block: `EFZNetplay_State`
 - DLL export: `EFZNetplay_GetState()`
 - Current ABI version: `6`
@@ -275,7 +274,6 @@ Core areas:
 - `src/netplay/assets/` - DAT parsing, runtime asset resolution
 - `src/netplay/bridge/` - Revival takeover, IPC, exports, process/session bridge
 - `include/` - public/internal headers
-- top-level docs such as `README.md` and `NETPLAY_STATE_EXPORT.md` - setup and public ABI notes
 
 ## Copyright and Licenses
 
