@@ -17,11 +17,8 @@ documentation in this repository, including:
 This license does not apply to:
 
 - `third_party/`
-- `decompilations/`
-- `build_release_win32/`
-- `build_xp_win32/`
 - `assets/`
-- `shared_documentation/concerto-efz-master/`
+- mirrored external references, archival reverse-engineering material, or generated build artifacts
 - any proprietary game binaries, game assets, or other files not owned by this project
 - any file that carries its own separate license or copyright notice
 

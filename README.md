@@ -22,6 +22,8 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
 - Build the DLL from source (see Building) or download a release.
 - Install EFZ Mod Manager if it's not installed already:
   - EFZ Mod Manager download: https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing
+- Launch the game through `efz.exe`.
+  Do not start the mod through `EfzRevival.exe` or `Concerto.exe`; this project expects to be injected into the main game process and can crash if started from those executables directly.
 - Place `efz_netplay_mod.dll` in your EFZ mods folder, alongside the other mod assets.
   Example path:
   `EFZ\\mods\\efz_netplay_mod\\efz_netplay_mod.dll`
@@ -47,7 +49,6 @@ Common optional files:
 mods\efz_netplay_mod\
   assets\
     res_alert.wav
-    netplay_font_map.txt
     sprites\
       akane.png
       akiko.png
@@ -65,14 +66,13 @@ What they are used for:
 - `assets\netplay_bg.dat` - netplay menu background
 - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
 - `assets\res_alert.wav` - custom lobby challenge alert sound
-- `assets\netplay_font_map.txt` - optional sprite-font mapping
 - `assets\sprites\*.png` - Battle Log character portraits
-- `wave\bgm\bgm08.wav` - optional netplay menu BGM override
+- `wave\bgm\bgm08.wav` - optional netplay menu BGM override with proper loop information, uses track 14 from the ONE. (2023) visual novel.
 - `system\title_ob.dat` - optional title object-sheet override
 
 Fallback behavior:
 - If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
-- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`.
+- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`(EFZ Bad Moon editin character selection OST).
 - Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
 
 ## Current Feature Set
@@ -124,6 +124,24 @@ Logging and diagnostics:
 - Optional console and optional file logging
 - Crash handler writes crash logs / diagnostics
 
+## How Revival Is Used
+
+In-game Netplay still relies on `EfzRevival` as the underlying online/session
+backend, but it hides the old external console-driven workflow from the player.
+
+In practical terms, the mod:
+- starts and controls `EfzRevival` in the background when a netplay action needs it
+- uses Revival for host, join, spectate, delay setup, and online session handling
+- synchronizes important settings such as nickname and port with `EfzRevival.ini`
+- reads Revival status/errors and converts them into in-game overlays and menu flow
+- returns you to the in-game netplay UI after cancel, disconnect, spectate end, or match end
+
+What this means for a regular player:
+- you still need a supported `EfzRevival` installation in your EFZ folder
+- you do **not** need to manually drive the old Revival console flow during normal use
+- the in-game menu is the intended front end, while Revival runs behind it
+- always launch through `efz.exe`, not `EfzRevival.exe` or `Concerto.exe`
+
 ## Supported Revival Versions
 
 Supported `EfzRevival.dll` versions:
@@ -136,6 +154,38 @@ Supported `EfzRevival.dll` versions:
 Notes:
 - `1.02h` and `1.02i` are the most tested versions.
 - Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
+
+## Shared Netplay Exports
+
+In-game Netplay exposes a stable shared-state interface for companion mods and
+tools that run inside the same `EFZ.exe` process.
+
+Public interface:
+- Header: `include/efz_netplay_state.h`
+- Reference notes: `NETPLAY_STATE_EXPORT.md`
+- Named shared memory block: `EFZNetplay_State`
+- DLL export: `EFZNetplay_GetState()`
+- Current ABI version: `6`
+
+Consumer expectations:
+- Validate `magic == EFZ_NETPLAY_STATE_MAGIC`
+- Check `version` against the maximum layout your consumer supports
+- Use `structSize` for forward-compatible reads
+- Check `capabilityFlags` before assuming a field group is populated
+
+Exported state currently includes:
+- session mode, phase, and local side
+- set score and match counter
+- local, P1, and P2 nicknames
+- ping and rollback/input-delay metrics
+- active netplay menu screen and detail subview
+- detected Revival version
+- activity phase and last end reason
+- online character-select state
+- match context such as stage, round index, and timer
+
+The shared state is refreshed continuously while the mod is active, which makes
+it suitable for rich presence, overlays, stream tooling, and companion mods.
 
 ## Runtime Assets
 
@@ -179,9 +229,9 @@ cmake --preset xp-release
 cmake --build --preset build-xp-release
 ```
 
-Output:
-- `build_release_win32/bin/Release/efz_netplay_mod.dll`
-- `build_xp_win32/bin/Release/efz_netplay_mod.dll`
+Result:
+- The selected preset produces `efz_netplay_mod.dll`
+- Both standard and XP-compatible builds are supported
 
 Notes:
 - EFZ is 32-bit; builds target `Win32`
@@ -225,7 +275,7 @@ Core areas:
 - `src/netplay/assets/` - DAT parsing, runtime asset resolution
 - `src/netplay/bridge/` - Revival takeover, IPC, exports, process/session bridge
 - `include/` - public/internal headers
-- `shared_documentation/` - reverse-engineering notes, Concerto references, and implementation writeups
+- top-level docs such as `README.md` and `NETPLAY_STATE_EXPORT.md` - setup and public ABI notes
 
 ## Copyright and Licenses
 
@@ -244,4 +294,4 @@ Game assets and reverse-engineered targets:
 - EFZ, EfzRevival, and their original binaries/assets are not part of this project's licensing.
 - Files such as `EfzRevival.dll`, `EfzRevival.exe`, `efz.exe`, and original game art/audio remain under their respective owners' rights.
 - Users are expected to provide their own legally obtained game/mod files.
-- Reverse-engineered and reference-material directories such as `decompilations/`, `assets/`, and `shared_documentation/concerto-efz-master/` are excluded from the top-level MIT license unless explicitly stated otherwise.
+- Reverse-engineered material, mirrored external references, original game assets, and other non-project-owned content are excluded from the top-level MIT license unless explicitly stated otherwise.
