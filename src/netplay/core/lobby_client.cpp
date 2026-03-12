@@ -87,6 +87,53 @@ constexpr DWORD kReceiveTimeoutMs = 12000;
 constexpr DWORD kPollIntervalMs = 1000;
 std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
 
+bool OutgoingChallengeTargetStillPresent(
+    int targetPlayerId,
+    const std::string& targetName,
+    const std::vector<LobbyPlayer>& idlePlayers,
+    const std::vector<LobbyChallenge>& challenges,
+    const std::vector<LobbyPlayingPair>& playingPairs)
+{
+    if (targetPlayerId == 0)
+    {
+        return false;
+    }
+
+    for (const auto& player : idlePlayers)
+    {
+        if (player.playerId == targetPlayerId)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& challenge : challenges)
+    {
+        if (challenge.playerId == targetPlayerId)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& pair : playingPairs)
+    {
+        if (pair.p1Id == targetPlayerId || pair.p2Id == targetPlayerId)
+        {
+            return true;
+        }
+
+        // The server can surface different IDs across list types during the
+        // idle -> playing transition. Keep the outgoing challenge alive if the
+        // same exact nickname is already in an active pair.
+        if (!targetName.empty() && (pair.p1Name == targetName || pair.p2Name == targetName))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct LobbyEndpointConfig
 {
     bool forceWinInet = false;
@@ -1753,6 +1800,11 @@ bool LobbySession::IsInBattle() const
     return m_inBattle.load() || m_returningFromMatch.load();
 }
 
+bool LobbySession::ConsumeAbandonedOutgoingChallenge()
+{
+    return m_abandonedOutgoingChallenge.exchange(false);
+}
+
 void LobbySession::RequestRefresh()
 {
     // If we were returning from a match, now is the time to finalise.
@@ -1791,14 +1843,17 @@ void LobbySession::RequestRefresh()
     }
 }
 
-void LobbySession::SendChallenge(int targetPlayerId, const std::string& ipPort)
+void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetName, const std::string& ipPort)
 {
     m_isMatchHost.store(true);
     m_challengePending.store(true);
+    m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_pendingChallengeTargetId = targetPlayerId;
+        m_pendingChallengeTargetName = targetName;
         PendingAction action;
         action.type = PendingAction::Challenge;
         action.targetPlayerId = targetPlayerId;
@@ -1817,10 +1872,13 @@ void LobbySession::AcceptChallenge(int challengerPlayerId)
     m_isMatchHost.store(false);
     m_inBattle.store(true);
     m_challengePending.store(true);
+    m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
         m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::PreAccept;
@@ -1839,11 +1897,14 @@ void LobbySession::NotifyMatchConnected()
     // Queue the deferred 'accept' so the lobby shows the pair as "playing".
     m_inBattle.store(true);
     m_challengePending.store(false);
+    m_abandonedOutgoingChallenge.store(false);
     m_matchConnected.store(true);
     m_endDeferred.store(false);
     mod::Log("LobbySession::NotifyMatchConnected: inBattle=true");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
         m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::ConfirmAccept;
@@ -1874,6 +1935,8 @@ void LobbySession::NotifyEndMatch()
         m_matchConnected.store(false);
         m_endDeferred.store(false);
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
         m_status.inBattle = false;
         PendingAction action;
         action.type = PendingAction::End;
@@ -1900,6 +1963,8 @@ void LobbySession::NotifyEndMatch()
         mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
                  "returningFromMatch=true, queuing End immediately");
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
         m_status.inBattle = false;
         PendingAction action;
         action.type = PendingAction::End;
@@ -1938,9 +2003,12 @@ bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::
         m_status.displayEntries.clear();
         m_status.playing.clear();
         m_status.inBattle = false;
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
     }
 
     m_pendingAcceptTargetId = 0;
+    m_abandonedOutgoingChallenge.store(false);
     m_rejoinRequested.store(true);
     if (m_wakeEvent != nullptr)
     {
@@ -2182,8 +2250,11 @@ bool LobbySession::DoJoin()
         m_joinedRoom.roomAlias = joinedRoom.roomAlias;
     }
     m_joinedRoom.isGlobalRoom = joinedRoom.isGlobalRoom;
+    m_abandonedOutgoingChallenge.store(false);
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    m_pendingChallengeTargetId = 0;
+    m_pendingChallengeTargetName.clear();
     m_status.pollState = PollState::Polling;
     m_status.roomType = m_joinedRoom.roomType;
     m_status.roomAlias = m_joinedRoom.roomAlias;
@@ -2239,6 +2310,43 @@ bool LobbySession::DoPollStatus()
     std::vector<LobbyPlayingPair> playingPairs;
     ParsePlayingPairs(body, &playingPairs);
 
+    bool abandonOutgoingChallenge = false;
+    int abandonedTargetId = 0;
+    std::string abandonedTargetName;
+    if (m_isMatchHost.load() && m_challengePending.load() && !m_matchConnected.load())
+    {
+        int pendingTargetId = 0;
+        std::string pendingTargetName;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pendingTargetId = m_pendingChallengeTargetId;
+            pendingTargetName = m_pendingChallengeTargetName;
+        }
+
+        if (pendingTargetId != 0
+            && !OutgoingChallengeTargetStillPresent(
+                pendingTargetId,
+                pendingTargetName,
+                idlePlayers,
+                challenges,
+                playingPairs))
+        {
+            abandonOutgoingChallenge = true;
+            abandonedTargetId = pendingTargetId;
+            abandonedTargetName = std::move(pendingTargetName);
+            mod::Log(
+                "LobbySession::DoPollStatus: outgoing challenge target left lobby target=%d name='%s' -- canceling local challenge",
+                abandonedTargetId,
+                abandonedTargetName.c_str());
+
+            m_challengePending.store(false);
+            m_matchConnected.store(false);
+            m_endDeferred.store(false);
+            m_returningFromMatch.store(false);
+            m_abandonedOutgoingChallenge.store(true);
+        }
+    }
+
     std::vector<LobbyDisplayEntry> displayEntries;
     const bool inBattle = m_inBattle.load();
     const bool suppressChallenges = inBattle || m_returningFromMatch.load();
@@ -2257,6 +2365,14 @@ bool LobbySession::DoPollStatus()
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (abandonOutgoingChallenge)
+    {
+        m_pendingChallengeTargetId = 0;
+        m_pendingChallengeTargetName.clear();
+        PendingAction action;
+        action.type = PendingAction::End;
+        m_pendingActions.push_back(std::move(action));
+    }
     m_status.pollState = PollState::Polling;
     m_status.idlePlayers = std::move(idlePlayers);
     m_status.challenges = suppressChallenges ? std::vector<LobbyChallenge>{} : std::move(challenges);
@@ -2268,9 +2384,20 @@ bool LobbySession::DoPollStatus()
     m_status.roomCode = m_joinedRoom.roomCode;
     m_status.roomOrigin = m_joinedRoom.origin;
     m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
-    m_status.statusMessage.clear();
+    if (abandonOutgoingChallenge)
+    {
+        m_status.statusMessage = "Challenge canceled: player left lobby";
+    }
+    else
+    {
+        m_status.statusMessage.clear();
+    }
     m_status.lastPollTick = GetTickCount();
     m_status.inBattle = suppressChallenges;
+    if (abandonOutgoingChallenge && m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
     return true;
 }
 
@@ -3095,6 +3222,12 @@ void LobbySession::ProcessPendingActions()
             mod::Log("LobbySession: processing end");
             DoEnd();
             m_pendingAcceptTargetId = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_pendingChallengeTargetId = 0;
+                m_pendingChallengeTargetName.clear();
+            }
+            m_abandonedOutgoingChallenge.store(false);
             m_challengePending.store(false);
             m_matchConnected.store(false);
             m_endDeferred.store(false);

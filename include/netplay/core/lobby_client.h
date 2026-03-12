@@ -161,10 +161,10 @@ public:
     const std::string& GetRoomAlias() const { return m_joinedRoom.roomAlias; }
     const std::string& GetRoomCode() const { return m_joinedRoom.roomCode; }
 
-    // Queue a challenge request for |targetPlayerId|.  |ipPort| is our
-    // public ip:port string (e.g. "1.2.3.4:10800").  Processed on the
-    // poll thread during the next iteration.
-    void SendChallenge(int targetPlayerId, const std::string& ipPort);
+    // Queue a challenge request for |targetPlayerId| / |targetName|.
+    // |ipPort| is our public ip:port string (e.g. "1.2.3.4:10800").
+    // Processed on the poll thread during the next iteration.
+    void SendChallenge(int targetPlayerId, const std::string& targetName, const std::string& ipPort);
 
     // Queue a pre_accept for an incoming challenge from |challengerPlayerId|.
     // The actual accept is deferred until NotifyMatchConnected() is called.
@@ -187,6 +187,11 @@ public:
     // one (between NotifyMatchConnected and the next RequestRefresh
     // after NotifyEndMatch).  Thread-safe.
     bool IsInBattle() const;
+
+    // Returns true once when an outgoing challenge target disappears from
+    // the lobby before the match connects. The title/menu layer consumes
+    // this to cancel the local waiting host session immediately.
+    bool ConsumeAbandonedOutgoingChallenge();
 
 private:
     // Background thread entry point: join → poll loop → leave.
@@ -255,6 +260,8 @@ private:
 
     // Target player ID from the last pre_accept, used for the deferred accept.
     int m_pendingAcceptTargetId = 0;
+    int m_pendingChallengeTargetId = 0;
+    std::string m_pendingChallengeTargetName;
 
     mutable std::mutex m_mutex;
     LobbyStatus m_status;
@@ -274,6 +281,7 @@ private:
     std::atomic<bool> m_inBattle{false};
     std::atomic<bool> m_returningFromMatch{false};
     std::atomic<bool> m_challengePending{false};
+    std::atomic<bool> m_abandonedOutgoingChallenge{false};
     std::atomic<bool> m_matchConnected{false};
     std::atomic<bool> m_endDeferred{false};
     // true when we initiated the lobby match (sent the challenge);

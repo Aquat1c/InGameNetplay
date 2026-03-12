@@ -79,8 +79,169 @@ std::thread g_lobbySessionShutdownThread;
 std::atomic<bool> g_lobbySessionShutdownInFlight{false};
 std::atomic<bool> g_lobbySessionShutdownCompleted{false};
 std::atomic<bool> g_lobbySessionShutdownReturnToPlayerRooms{false};
+struct PendingLobbySpectateWait
+{
+    bool active = false;
+    int trackedPlayerId = 0;
+    std::string trackedPlayerName;
+    int p1Id = 0;
+    int p2Id = 0;
+    std::string p1Name;
+    std::string p2Name;
+    std::string hostIp;
+};
+PendingLobbySpectateWait g_pendingLobbySpectateWait;
 
 void PlayLobbyChallengeAlert(uint32_t screenContext);
+
+void ClearPendingLobbySpectateWait(const char* reason)
+{
+    if (g_pendingLobbySpectateWait.active)
+    {
+        mod::Log(
+            "LobbySpectateWait: cleared reason='%s' hostIp=%s trackedPlayer='%s' pair='%s' vs '%s'",
+            reason != nullptr ? reason : "",
+            g_pendingLobbySpectateWait.hostIp.c_str(),
+            g_pendingLobbySpectateWait.trackedPlayerName.c_str(),
+            g_pendingLobbySpectateWait.p1Name.c_str(),
+            g_pendingLobbySpectateWait.p2Name.c_str());
+    }
+    g_pendingLobbySpectateWait = {};
+}
+
+void ArmPendingLobbySpectateWait(
+    const netplay::lobby::LobbyPlayingPair* pair,
+    int trackedPlayerId,
+    const std::string& trackedPlayerName,
+    const std::string& hostIp)
+{
+    g_pendingLobbySpectateWait = {};
+    g_pendingLobbySpectateWait.active = true;
+    g_pendingLobbySpectateWait.trackedPlayerId = trackedPlayerId;
+    g_pendingLobbySpectateWait.trackedPlayerName = trackedPlayerName;
+    g_pendingLobbySpectateWait.hostIp = hostIp;
+    if (pair != nullptr)
+    {
+        g_pendingLobbySpectateWait.p1Id = pair->p1Id;
+        g_pendingLobbySpectateWait.p2Id = pair->p2Id;
+        g_pendingLobbySpectateWait.p1Name = pair->p1Name;
+        g_pendingLobbySpectateWait.p2Name = pair->p2Name;
+        if (g_pendingLobbySpectateWait.hostIp.empty())
+        {
+            g_pendingLobbySpectateWait.hostIp = pair->hostIp;
+        }
+    }
+
+    mod::Log(
+        "LobbySpectateWait: armed hostIp=%s trackedPlayerId=%d trackedPlayer='%s' pair='%s'(%d) vs '%s'(%d)",
+        g_pendingLobbySpectateWait.hostIp.c_str(),
+        g_pendingLobbySpectateWait.trackedPlayerId,
+        g_pendingLobbySpectateWait.trackedPlayerName.c_str(),
+        g_pendingLobbySpectateWait.p1Name.c_str(),
+        g_pendingLobbySpectateWait.p1Id,
+        g_pendingLobbySpectateWait.p2Name.c_str(),
+        g_pendingLobbySpectateWait.p2Id);
+}
+
+bool PairContainsTrackedPlayer(
+    const netplay::lobby::LobbyPlayingPair& pair,
+    const PendingLobbySpectateWait& pending)
+{
+    if (pending.trackedPlayerId != 0
+        && (pair.p1Id == pending.trackedPlayerId || pair.p2Id == pending.trackedPlayerId))
+    {
+        return true;
+    }
+    if (!pending.trackedPlayerName.empty()
+        && (pair.p1Name == pending.trackedPlayerName || pair.p2Name == pending.trackedPlayerName))
+    {
+        return true;
+    }
+    return false;
+}
+
+bool PairMatchesPendingLobbySpectateWait(
+    const netplay::lobby::LobbyPlayingPair& pair,
+    const PendingLobbySpectateWait& pending)
+{
+    if (!pending.hostIp.empty() && pair.hostIp != pending.hostIp)
+    {
+        return false;
+    }
+
+    if (pending.p1Id != 0 && pending.p2Id != 0)
+    {
+        const bool sameOrder = pair.p1Id == pending.p1Id && pair.p2Id == pending.p2Id;
+        const bool swappedOrder = pair.p1Id == pending.p2Id && pair.p2Id == pending.p1Id;
+        if (sameOrder || swappedOrder)
+        {
+            return true;
+        }
+    }
+
+    if (!pending.p1Name.empty() && !pending.p2Name.empty())
+    {
+        const bool sameOrder = pair.p1Name == pending.p1Name && pair.p2Name == pending.p2Name;
+        const bool swappedOrder = pair.p1Name == pending.p2Name && pair.p2Name == pending.p1Name;
+        if (sameOrder || swappedOrder)
+        {
+            return true;
+        }
+    }
+
+    return PairContainsTrackedPlayer(pair, pending);
+}
+
+bool IsPendingLobbySpectateWaitStillValid()
+{
+    if (!g_pendingLobbySpectateWait.active || !g_lobbySession)
+    {
+        return false;
+    }
+
+    const auto status = g_lobbySession->GetStatus();
+    for (const auto& pair : status.playing)
+    {
+        if (PairMatchesPendingLobbySpectateWait(pair, g_pendingLobbySpectateWait))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TryResolvePlayingPairForLobbyEntry(
+    const netplay::lobby::LobbyStatus& status,
+    const netplay::lobby::LobbyDisplayEntry& entry,
+    netplay::lobby::LobbyPlayingPair* outPair)
+{
+    if (outPair == nullptr)
+    {
+        return false;
+    }
+
+    for (const auto& pair : status.playing)
+    {
+        if (!entry.spectateIp.empty() && pair.hostIp != entry.spectateIp)
+        {
+            continue;
+        }
+
+        const bool playerIdMatches =
+            entry.playerId != 0 && (pair.p1Id == entry.playerId || pair.p2Id == entry.playerId);
+        const bool playerNameMatches =
+            !entry.name.empty() && (pair.p1Name == entry.name || pair.p2Name == entry.name);
+        if (!playerIdMatches && !playerNameMatches)
+        {
+            continue;
+        }
+
+        *outPair = pair;
+        return true;
+    }
+
+    return false;
+}
 
 void PumpLobbySessionShutdown()
 {
@@ -560,6 +721,7 @@ void ActivateChallengeJoiningOverlay(const char* targetName, const char* address
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage)
 {
     (void)screenContext;
+    ClearPendingLobbySpectateWait("join_settings_wait_to_spectate");
 
     if (outErrorMessage != nullptr)
     {
@@ -589,6 +751,57 @@ bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string*
             "WaitToSpectate: started spectate session -> %s:%u",
             menuState.joinAddress.c_str(),
             static_cast<unsigned>(menuState.joinPort));
+        return true;
+    }
+
+    const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
+    if (outErrorMessage != nullptr)
+    {
+        *outErrorMessage =
+            status.errorMsg[0] != '\0'
+                ? status.errorMsg
+                : "Unknown error";
+    }
+    mod::Log(
+        "WaitToSpectate: StartSession failed -> %s",
+        status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+    return false;
+}
+
+bool TryStartWaitToSpectateAtAddress(
+    const char* address,
+    uint16_t port,
+    std::string* outErrorMessage)
+{
+    ClearPendingLobbySpectateWait("start_wait_to_spectate");
+
+    if (outErrorMessage != nullptr)
+    {
+        outErrorMessage->clear();
+    }
+
+    if (address == nullptr || address[0] == '\0' || port == 0)
+    {
+        if (outErrorMessage != nullptr)
+        {
+            *outErrorMessage = "No active match host information is available for spectating yet.";
+        }
+        mod::Log("WaitToSpectate: missing address/port");
+        return false;
+    }
+
+    const bool started = netplay::bridge::StartSession(
+        netplay::bridge::NetbridgeRole::Spectate,
+        port,
+        address,
+        "");
+    if (started)
+    {
+        ActivateJoiningOverlay(address, port);
+        mod::Log(
+            "WaitToSpectate: started spectate session -> %s:%u",
+            address,
+            static_cast<unsigned>(port));
         return true;
     }
 
@@ -1320,6 +1533,7 @@ void HandoffSpectateSession(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ClearPendingLobbySpectateWait("handoff_spectate_session");
     RemoveNetplayWindowHook();
     g_returnToNetplayAfterMatch = true;
 
@@ -1416,6 +1630,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ClearPendingLobbySpectateWait("enter_netplay_menu");
     ResetLobbyChallengeNotificationState();
     ReleaseLoadedSoundBuffer(
         GetGameSystem(screenContext),
@@ -1519,6 +1734,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ClearPendingLobbySpectateWait("leave_netplay_menu");
     ResetLobbyChallengeNotificationState();
     RemoveNetplayWindowHook();
 
@@ -2027,13 +2243,14 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             ShowStubActionMessage(owner, "No active match host information is available for spectating yet.");
             break;
         }
+        const auto selectedPair = status.playing[0];
 
         mod::Log("LobbyPlaying0: spectating playing pair '%s' vs '%s' hostIp=%s inBattle=%d",
-            status.playing[0].p1Name.c_str(), status.playing[0].p2Name.c_str(),
-            status.playing[0].hostIp.c_str(), status.inBattle ? 1 : 0);
+            selectedPair.p1Name.c_str(), selectedPair.p2Name.c_str(),
+            selectedPair.hostIp.c_str(), status.inBattle ? 1 : 0);
 
         // Parse ip:port from the playing pair's hostIp field.
-        std::string spectateAddr = status.playing[0].hostIp;
+        std::string spectateAddr = selectedPair.hostIp;
         uint16_t spectatePort = g_netplayMenuState.joinPort;
         const size_t colonPos = spectateAddr.rfind(':');
         if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < spectateAddr.size())
@@ -2049,31 +2266,24 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         mod::Log("LobbyPlaying0: parsed spectateAddr=%s spectatePort=%u",
             spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
 
-        // Use JoinSpectate (Revival choice 3 + auto-accept) instead of
-        // Spectate (choice 4).  Direct spectate (choice 4) disrupts the
-        // host's active match and freezes all clients.  JoinSpectate goes
-        // through the normal join flow which safely redirects to spectate
-        // when the host is already playing.
-        const bool started = netplay::bridge::StartSession(
-            NetbridgeRole::JoinSpectate,
-            spectatePort,
-            spectateAddr.c_str(),
-            g_netplayMenuState.nickname.c_str());
-        mod::Log("LobbyPlaying0: StartSession(JoinSpectate) returned %d", started ? 1 : 0);
+        std::string errorMessage;
+        const bool started =
+            TryStartWaitToSpectateAtAddress(spectateAddr.c_str(), spectatePort, &errorMessage);
+        mod::Log("LobbyPlaying0: TryStartWaitToSpectateAtAddress returned %d", started ? 1 : 0);
         if (started)
         {
-            ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
+            ArmPendingLobbySpectateWait(&selectedPair, 0, std::string(), selectedPair.hostIp);
+            mod::Log("LobbyPlaying0: waiting to spectate active pair");
         }
         else
         {
-            const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
             char text[320] = {};
             snprintf(
                 text,
                 sizeof(text),
-                "Spectate start failed.\n\n%s",
-                bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
-            mod::Log("LobbyPlaying0: spectate start FAILED: %s", bridgeStatus.errorMsg);
+                "Wait to spectate failed.\n\n%s",
+                errorMessage.empty() ? "Unknown error" : errorMessage.c_str());
+            mod::Log("LobbyPlaying0: wait-to-spectate FAILED: %s", errorMessage.c_str());
             ShowStubActionMessage(owner, text);
         }
         break;
@@ -2134,27 +2344,29 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             mod::Log("LobbySpectate: spectating '%s' id=%d via %s addr=%s port=%u",
                 entry.name.c_str(), entry.playerId, entry.spectateIp.c_str(),
                 spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
+            netplay::lobby::LobbyPlayingPair selectedPair = {};
+            const bool foundSelectedPair =
+                TryResolvePlayingPairForLobbyEntry(lobStatus, entry, &selectedPair);
 
-            // Use JoinSpectate (Revival choice 3 + auto-accept) instead of
-            // Spectate (choice 4).  Direct spectate (choice 4) disrupts the
-            // host's active match and freezes all clients.
-            const bool started = netplay::bridge::StartSession(
-                NetbridgeRole::JoinSpectate,
-                spectatePort,
-                spectateAddr.c_str(),
-                g_netplayMenuState.nickname.c_str());
+            std::string errorMessage;
+            const bool started =
+                TryStartWaitToSpectateAtAddress(spectateAddr.c_str(), spectatePort, &errorMessage);
             if (started)
             {
-                ActivateJoiningOverlay(spectateAddr.c_str(), spectatePort);
+                ArmPendingLobbySpectateWait(
+                    foundSelectedPair ? &selectedPair : nullptr,
+                    entry.playerId,
+                    entry.name,
+                    entry.spectateIp);
+                mod::Log("LobbySpectate: waiting to spectate '%s'", entry.name.c_str());
             }
             else
             {
-                const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
                 char text[320] = {};
                 snprintf(text, sizeof(text),
-                    "Spectate failed for '%s'.\n\n%s",
+                    "Wait to spectate failed for '%s'.\n\n%s",
                     entry.name.c_str(),
-                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                    errorMessage.empty() ? "Unknown error" : errorMessage.c_str());
                 ShowStubActionMessage(owner, text);
             }
             break;
@@ -2253,7 +2465,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 ActivateChallengeHostingOverlay(entry.name.c_str(), g_netplayMenuState.hostPort);
 
                 // Send the challenge to the lobby server (async on poll thread).
-                g_lobbySession->SendChallenge(entry.playerId, std::string(ipPortBuf));
+                g_lobbySession->SendChallenge(entry.playerId, entry.name, std::string(ipPortBuf));
             }
             else
             {
@@ -2532,6 +2744,54 @@ char UpdateNetplayMenu(uint32_t screenContext)
     const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
     const bool bridgeDelaySetupReady = bridgeStatus.delaySetupReady != 0;
 
+    if (g_lobbySession && g_lobbySession->ConsumeAbandonedOutgoingChallenge())
+    {
+        mod::Log(
+            "LobbyChallenge: target left lobby before connect, canceling local session phase=%s",
+            netplay::bridge::PhaseToString(bridgePhase));
+        SetNetplayStatusMessage("Challenge canceled: player left lobby.");
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+        if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
+        {
+            netplay::bridge::CancelSession("challenge_target_left_lobby");
+        }
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
+    if (g_pendingLobbySpectateWait.active
+        && g_lobbySession
+        && bridgeStatus.roleFlag == kRoleFlagSpectate
+        && (bridgePhase == NetbridgePhase::Connecting
+            || bridgePhase == NetbridgePhase::DelaySetup
+            || bridgePhase == NetbridgePhase::Connected)
+        && !IsPendingLobbySpectateWaitStillValid())
+    {
+        mod::Log(
+            "LobbySpectateWait: tracked playing pair disappeared before handoff, canceling spectate wait phase=%s hostIp=%s pair='%s' vs '%s'",
+            netplay::bridge::PhaseToString(bridgePhase),
+            g_pendingLobbySpectateWait.hostIp.c_str(),
+            g_pendingLobbySpectateWait.p1Name.c_str(),
+            g_pendingLobbySpectateWait.p2Name.c_str());
+        SetNetplayStatusMessage("Wait to spectate canceled: players stopped playing.");
+        ClearPendingLobbySpectateWait("pair_left_playing");
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+        DisarmSpectateReplayBypass();
+        netplay::bridge::CancelSession("spectate_pair_left_lobby_playing");
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
     // --- Fast handoff ---
     // If the Revival rollback engine is already in sync state (vsHumanSyncReady)
     // and the delay overlay has been submitted (waitingForRuntimeReady) or delay
@@ -2649,6 +2909,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
             static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
             netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+        ClearPendingLobbySpectateWait("spectate_handoff");
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
         HandoffSpectateSession(screenContext);
@@ -2914,6 +3175,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 PlayUiSound(screenContext, kSfxConfirm);
                 ResetJoiningOverlayState();
                 ResetHostingOverlayState();
+                ClearPendingLobbySpectateWait("dismissed_error");
                 netplay::bridge::CancelSession("dismissed_error");
                 if (g_lobbySession)
                 {
@@ -2931,6 +3193,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         mod::Log("UpdateNetplayMenu: session ended with no overlay active, resetting (inBattle will be cleared)");
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
+        ClearPendingLobbySpectateWait("session_ended");
         DisarmSpectateReplayBypass();
         netplay::bridge::CancelSession("no_overlay_session_ended");
         if (g_lobbySession)
@@ -2987,6 +3250,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             PlayUiSound(screenContext, kSfxConfirm);
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
+            ClearPendingLobbySpectateWait("user_cancel");
             netplay::bridge::CancelSession("user_cancel");
             if (g_lobbySession)
             {
