@@ -3233,6 +3233,7 @@ static bool    g_perFrameMismatchLogged     = false;
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
+static volatile LONG* g_quitRingHeader = nullptr;
 
 // Spectator tick holdoff: when true, the per-frame tick hook will not
 // call RunPerFrameTickDispatch while the spectator session is active on
@@ -3261,6 +3262,11 @@ using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
 static PerFrameTickFn g_origPerFrameTick = nullptr;
 
 static uint32_t g_frameTick = 0;           // monotonic per-frame counter
+
+static bool EnsureQuitRingHeader();
+static void ReleaseQuitRingHeader();
+static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefore);
+static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore);
 
 // --- Double-speed diagnostics -------------------------------------------
 // Wall-clock time tracking: measure actual FPS by comparing timeGetTime()
@@ -3564,35 +3570,42 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         g_lastToggleValue = toggleVal;
     }
 
-    // ---- Pre-tick disconnect detection ------------------------------------
-    // Check consoleErrorSerial BEFORE calling RunPerFrameTickDispatch.
-    // The helper process (EfzRevival.exe) captures DLL console output
-    // asynchronously and writes disconnect errors to the IPC shared block.
-    // If the error was set between frames (i.e. during the previous tick
-    // or during a DLL-side timeout), catching it here lets us SKIP the
-    // DLL's session tick entirely — preventing the DLL's RollbackLoopTick
-    // from rendering a corrupted frame with missing opponent data and then
-    // Flip()ping it to the display.
-    //
-    // Without this pre-tick check, the DLL renders + flips the corrupted
-    // frame inside RunPerFrameTickDispatch, and we only detect the error
-    // afterwards — too late to prevent the visual corruption.
-    // --------------------------------------------------------------------
+    // ---- Pre-tick graceful-end / disconnect detection --------------------
+    // Replace Revival's patched-out quitMem -> ExitProcess path on the host
+    // side, and keep the existing console-error short-circuit as well.
     bool preTickDisconnect = false;
+    bool preTickGracefulQuit = false;
+    LONG preTickQuitHead = 0;
+    LONG preTickQuitTail = 0;
     if (g_dllExitProcessPatchesSaved
-        && g_hostBlock != nullptr)
+        && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
     {
-        const LONG preTickErrSerial =
-            InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
-        if (preTickErrSerial > 0)
+        if (ConsumeGracefulQuitRingSignal(&preTickQuitHead, &preTickQuitTail))
         {
             mod::Log(
-                "TICK_HOOK: *** PRE-TICK DISCONNECT *** frameTick=%u "
-                "consoleErrorSerial=%ld — skipping DLL tick to prevent "
-                "corrupted render",
+                "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
+                "quitHead=%ld quitTail=%ld — skipping DLL tick",
                 g_frameTick,
-                static_cast<long>(preTickErrSerial));
+                static_cast<long>(preTickQuitHead),
+                static_cast<long>(preTickQuitTail));
             preTickDisconnect = true;
+            preTickGracefulQuit = true;
+        }
+
+        if (!preTickDisconnect && g_hostBlock != nullptr)
+        {
+            const LONG preTickErrSerial =
+                InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
+            if (preTickErrSerial > 0)
+            {
+                mod::Log(
+                    "TICK_HOOK: *** PRE-TICK DISCONNECT *** frameTick=%u "
+                    "consoleErrorSerial=%ld — skipping DLL tick to prevent "
+                    "corrupted render",
+                    g_frameTick,
+                    static_cast<long>(preTickErrSerial));
+                preTickDisconnect = true;
+            }
         }
     }
 
@@ -4422,6 +4435,25 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         return 0;
     }
 
+    if (preTickGracefulQuit)
+    {
+        return RecoverFromQuitRingSignal("PRE-TICK", preTickQuitHead, preTickQuitTail);
+    }
+
+    // ---- Proactive graceful session-end detection -------------------------
+    // Also catch Quit-ring signals that were published during the current
+    // DLL tick, not just between frames.
+    if (g_dllExitProcessPatchesSaved
+        && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
+    {
+        LONG quitHeadAfter = 0;
+        LONG quitTailAfter = 0;
+        if (ConsumeGracefulQuitRingSignal(&quitHeadAfter, &quitTailAfter))
+        {
+            return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
+        }
+    }
+
     // ---- Proactive network-disconnect detection ---------------------------
     // The DLL exit-process Jcc patches make ExitProcess unreachable, which
     // is a problem during charselect/loading: the DLL's session tick doesn't
@@ -4836,6 +4868,151 @@ void ResetOnlineMatchEscGracefulQuit()
     InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0);
 }
 
+static bool EnsureQuitRingHeader()
+{
+    if (g_quitRingHeader != nullptr)
+    {
+        return true;
+    }
+
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Quit");
+    if (hMap == nullptr)
+    {
+        return false;
+    }
+
+    auto* header = static_cast<volatile LONG*>(
+        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 8));
+    if (header == nullptr)
+    {
+        CloseHandle(hMap);
+        return false;
+    }
+
+    g_quitRingHeader = header;
+    CloseHandle(hMap);
+    return true;
+}
+
+static void ReleaseQuitRingHeader()
+{
+    if (g_quitRingHeader != nullptr)
+    {
+        UnmapViewOfFile(const_cast<LONG*>(g_quitRingHeader));
+        g_quitRingHeader = nullptr;
+    }
+}
+
+static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefore)
+{
+    if (outHeadBefore != nullptr)
+    {
+        *outHeadBefore = 0;
+    }
+    if (outTailBefore != nullptr)
+    {
+        *outTailBefore = 0;
+    }
+
+    if (!EnsureQuitRingHeader())
+    {
+        return false;
+    }
+
+    auto* headPtr = const_cast<LONG*>(&g_quitRingHeader[0]);
+    auto* tailPtr = const_cast<LONG*>(&g_quitRingHeader[1]);
+    const LONG headBefore = InterlockedCompareExchange(headPtr, 0, 0);
+    const LONG tailBefore = InterlockedCompareExchange(tailPtr, 0, 0);
+
+    if (outHeadBefore != nullptr)
+    {
+        *outHeadBefore = headBefore;
+    }
+    if (outTailBefore != nullptr)
+    {
+        *outTailBefore = tailBefore;
+    }
+
+    if (headBefore == tailBefore)
+    {
+        return false;
+    }
+
+    // Consume the pending graceful-quit signal once we decide to replace
+    // Revival's patched-out quitMem -> ExitProcess path on the host side.
+    InterlockedExchange(headPtr, tailBefore);
+    MemoryBarrier();
+    return true;
+}
+
+static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore)
+{
+    const int deadRole = g_localRoleFlag;
+    const DWORD deadPid = g_revivalProcessId;
+    LogSessionDiagnosticState("TickHook_gracefulQuit_entry");
+    mod::Log(
+        "TICK_HOOK: *** %s GRACEFUL SESSION END *** frameTick=%u "
+        "role=%d pid=%lu quitHead=%ld quitTail=%ld — synthesizing exit interception",
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        g_frameTick,
+        deadRole,
+        static_cast<unsigned long>(deadPid),
+        static_cast<long>(quitHeadBefore),
+        static_cast<long>(quitTailBefore));
+
+    InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
+    InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+    NeutralizeRevivalSessionVtable();
+
+    const bool initOk = ForceLocalPlayInit();
+    mod::Log(
+        "TICK_HOOK: graceful-quit step 1 ForceLocalPlayInit result=%d",
+        initOk ? 1 : 0);
+
+    if (g_revivalProcess != nullptr)
+    {
+        const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+        const DWORD termErr = termOk ? 0 : GetLastError();
+        CloseHandle(g_revivalProcess);
+        g_revivalProcess = nullptr;
+        g_revivalProcessId = 0;
+        mod::Log(
+            "TICK_HOOK: graceful-quit step 2 helper terminated "
+            "(pid=%lu termOk=%d err=%lu)",
+            static_cast<unsigned long>(deadPid),
+            termOk ? 1 : 0,
+            static_cast<unsigned long>(termErr));
+    }
+
+    const bool patchOk = RestoreDllExitProcessPatches();
+    mod::Log(
+        "TICK_HOOK: graceful-quit step 3 RestoreDllExitProcessPatches result=%d",
+        patchOk ? 1 : 0);
+
+    const bool textOk = DisableRevivalTextRendering();
+    mod::Log(
+        "TICK_HOOK: graceful-quit step 4 DisableRevivalTextRendering result=%d",
+        textOk ? 1 : 0);
+
+    mod::ResetCrashRecoveryState();
+    ResetGameModeValidation();
+    mod::Log("TICK_HOOK: graceful-quit step 5 crash/validation state reset");
+
+    const bool modeOk = ForceGameModeToTitle();
+    mod::Log(
+        "TICK_HOOK: graceful-quit step 6 ForceGameModeToTitle result=%d",
+        modeOk ? 1 : 0);
+
+    g_localInitAppliedForSession = false;
+    mod::Log(
+        "TICK_HOOK: graceful-quit recovery complete (was role=%d), "
+        "next title-screen frame will consume exit interception",
+        deadRole);
+    LogSessionDiagnosticState("TickHook_gracefulQuit_exit");
+    return 0;
+}
+
 // Reset the per-frame validator state.  Called when a session ends so the
 // next session gets fresh validation.
 void ResetGameModeValidation()
@@ -4852,6 +5029,7 @@ void ResetGameModeValidation()
     g_toggleSameCount = 0;
     g_toggleDiagLogged = false;
     ResetOnlineMatchEscGracefulQuit();
+    ReleaseQuitRingHeader();
 
     // Increment session number and reset cross-session change-detection state.
     ++g_sessionNumber;
