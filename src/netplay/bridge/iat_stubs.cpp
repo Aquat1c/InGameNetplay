@@ -1468,14 +1468,23 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         continue;
                     }
 
-                    // Timed out waiting for user — default to "No" (2)
+                    int defaultChoice = 2;
+                    const int promptKind = block->spectateConfirmPromptKind;
+                    if (promptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoice = 3;
+                    }
+                    char defaultLine[16] = {};
+                    std::snprintf(defaultLine, sizeof(defaultLine), "%d\r\n", defaultChoice);
                     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerial);
                     InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerial);
                     g_injectedSpectateConfirmPromptWaitStartTick = 0;
                     mod::Log(
-                        "Takeover: spectate confirm prompt timed out; falling back to No promptSerial=%ld",
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoice,
+                        promptKind,
                         static_cast<long>(scPromptSerial));
-                    return serveScriptedInput(block, "2\r\n", sourceTag, "prompt_spectate_confirm_default", scPromptSerial, true);
+                    return serveScriptedInput(block, defaultLine, sourceTag, "prompt_spectate_confirm_default", scPromptSerial, true);
                 }
 
                 // --- Delay prompt handling ---
@@ -1773,13 +1782,23 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         continue;
                     }
 
+                    int defaultChoiceW = 2;
+                    const int promptKindW = block->spectateConfirmPromptKind;
+                    if (promptKindW == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoiceW = 3;
+                    }
+                    char defaultLineW[16] = {};
+                    std::snprintf(defaultLineW, sizeof(defaultLineW), "%d\r\n", defaultChoiceW);
                     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerialW);
                     InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerialW);
                     g_injectedSpectateConfirmPromptWaitStartTick = 0;
                     mod::Log(
-                        "Takeover: spectate confirm prompt timed out; falling back to No promptSerial=%ld",
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoiceW,
+                        promptKindW,
                         static_cast<long>(scPromptSerialW));
-                    return serveScriptedInput(block, "2\r\n", sourceTag, "prompt_spectate_confirm_default", scPromptSerialW, true);
+                    return serveScriptedInput(block, defaultLineW, sourceTag, "prompt_spectate_confirm_default", scPromptSerialW, true);
                 }
 
                 // --- Delay prompt handling (W) ---

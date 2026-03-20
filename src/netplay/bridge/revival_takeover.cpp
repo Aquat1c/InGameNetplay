@@ -75,6 +75,7 @@ DWORD g_lastSessionPointerMismatchTick = 0;
 DWORD g_lastRuntimeReadyProbeLogTick = 0;
 uint32_t g_lastRuntimeReadyProbeMask = 0;
 bool g_lastRuntimeReadyProbeMaskValid = false;
+DWORD g_lastSpectateConsoleSnapshotTick = 0;
 bool g_localInitAppliedForSession = false;
 uintptr_t g_remoteInjectedSelfBase = 0;
 DWORD g_lastLatePatchRetryTick = 0;
@@ -121,6 +122,80 @@ std::string g_configuredHolePunchServer;
 // which kills every process assigned to it — ensuring EfzRevival.exe and
 // any grandchildren (cmd.exe / conhost.exe) never linger in the background.
 static HANDLE g_childJobObject = nullptr;
+
+namespace
+{
+std::string TrimAsciiCopy(const std::string& text)
+{
+    size_t start = 0;
+    while (start < text.size()
+        && (text[start] == ' ' || text[start] == '\t' || text[start] == '\r' || text[start] == '\n'))
+    {
+        ++start;
+    }
+    size_t end = text.size();
+    while (end > start
+        && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r' || text[end - 1] == '\n'))
+    {
+        --end;
+    }
+    return text.substr(start, end - start);
+}
+
+void AppendConsolePreview(std::string* out, const char* tag, const std::string& text)
+{
+    if (out == nullptr || tag == nullptr)
+    {
+        return;
+    }
+
+    const std::string trimmed = TrimAsciiCopy(text);
+    if (trimmed.empty())
+    {
+        return;
+    }
+
+    if (!out->empty())
+    {
+        out->append(" | ");
+    }
+    out->append(tag);
+    out->push_back('=');
+    out->push_back('\'');
+    constexpr size_t kMaxPreviewLen = 80;
+    if (trimmed.size() > kMaxPreviewLen)
+    {
+        out->append(trimmed.substr(0, kMaxPreviewLen));
+        out->append("...");
+    }
+    else
+    {
+        out->append(trimmed);
+    }
+    out->push_back('\'');
+}
+
+void LogPendingSpectateConsoleSnapshot()
+{
+    std::string summary;
+    {
+        std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+        AppendConsolePreview(&summary, "WriteFile", g_consolePendingWriteFile);
+        AppendConsolePreview(&summary, "WriteFileDisk", g_consolePendingWriteFileDisk);
+        AppendConsolePreview(&summary, "WriteConsoleA", g_consolePendingWriteConsoleA);
+        AppendConsolePreview(&summary, "WriteConsoleW", g_consolePendingWriteConsoleW);
+        AppendConsolePreview(&summary, "WriteConsoleOutputCharacterA", g_consolePendingWriteConsoleOutputCharacterA);
+        AppendConsolePreview(&summary, "WriteConsoleOutputCharacterW", g_consolePendingWriteConsoleOutputCharacterW);
+        AppendConsolePreview(&summary, "OutputDebugStringA", g_consolePendingOutputDebugStringA);
+        AppendConsolePreview(&summary, "OutputDebugStringW", g_consolePendingOutputDebugStringW);
+    }
+
+    if (!summary.empty())
+    {
+        mod::Log("Takeover: spectate console snapshot %s", summary.c_str());
+    }
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Version detection
@@ -385,16 +460,24 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     RefreshRuntimeStatus(ioStatus);
 }
 
-bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname, NetbridgeStatus* ioStatus, uint32_t* outConnectStartTick)
+bool StartSession(
+    NetbridgeRole role,
+    uint16_t port,
+    const char* address,
+    const char* nickname,
+    bool writeNicknameToIni,
+    NetbridgeStatus* ioStatus,
+    uint32_t* outConnectStartTick)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     mod::Log(
-        "Takeover: StartSession role=%d port=%u address='%s' nickname='%s'",
+        "Takeover: StartSession role=%d port=%u address='%s' nickname='%s' writeNicknameToIni=%d",
         static_cast<int>(role),
         static_cast<unsigned>(port),
         (address != nullptr) ? address : "",
-        (nickname != nullptr) ? nickname : "");
+        (nickname != nullptr) ? nickname : "",
+        writeNicknameToIni ? 1 : 0);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
@@ -510,7 +593,7 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     }
 
     const std::string gameDir = GameDirectory();
-    if (!WriteIni(gameDir, static_cast<int>(role), port, address, nickname))
+    if (!WriteIni(gameDir, static_cast<int>(role), port, address, nickname, writeNicknameToIni))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
         return false;
@@ -737,6 +820,7 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     ResetNativeWorkflowFlags();
     g_holePunchServerConfigLoaded = false;
     g_configuredHolePunchServer.clear();
+    g_lastSpectateConsoleSnapshotTick = 0;
     InterlockedExchange(&g_injectedFingerprintReadHits, 0);
     {
         std::lock_guard<std::mutex> consoleLock(g_consoleLogMutex);
@@ -799,13 +883,14 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     }
     else if (role == NetbridgeRole::JoinSpectate)
     {
-        // Join (choice 3) then auto-accept spectate redirect ("1" = Yes).
-        // This is the correct flow when the lobby shows players already in a
-        // match — we connect via join and Revival will prompt "Host already
-        // playing, join as a spectator?" which we answer automatically.
+        // Join (choice 3). Prompt handling is done from the host-side UI based
+        // on the detected prompt kind:
+        // - "Host already playing, join as a spectator?" -> answer Yes (1)
+        // - "Host not yet playing, join as a player?"   -> answer Wait (3)
+        // This avoids blindly feeding "1" into the wrong prompt when lobby
+        // state is stale and the target match has already ended.
         menuChoice = 3;
         primaryInput = "3\r\n";
-        auxInput = "1\r\n";
 
         if (address != nullptr && address[0] != '\0')
         {
@@ -1128,41 +1213,59 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
     return true;
 }
 
-bool AnswerSpectateConfirm(bool acceptSpectate, NetbridgeStatus* ioStatus)
+bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     LONG promptSerial = 0;
     LONG promptServedSerial = 0;
-    ReadSpectateConfirmPromptSignal(&promptSerial, &promptServedSerial);
+    int promptKind = static_cast<int>(NetbridgeSpectatePromptKind::None);
+    ReadSpectateConfirmPromptSignal(&promptSerial, &promptServedSerial, &promptKind);
     const bool promptPending = promptSerial > 0 && promptServedSerial < promptSerial;
 
     if (!promptPending)
     {
-        mod::Log("Takeover: AnswerSpectateConfirm rejected (no pending prompt serial=%ld served=%ld)",
-                 static_cast<long>(promptSerial), static_cast<long>(promptServedSerial));
+        mod::Log(
+            "Takeover: AnswerSpectatePromptChoice rejected (no pending prompt serial=%ld served=%ld)",
+            static_cast<long>(promptSerial),
+            static_cast<long>(promptServedSerial));
         RefreshRuntimeStatus(ioStatus);
         return false;
     }
 
     if (g_hostBlock == nullptr)
     {
-        mod::Log("Takeover: AnswerSpectateConfirm rejected (no shared block)");
+        mod::Log("Takeover: AnswerSpectatePromptChoice rejected (no shared block)");
         RefreshRuntimeStatus(ioStatus);
         return false;
     }
 
-    const int value = acceptSpectate ? 1 : 2;
-    g_hostBlock->spectateConfirmInputValue = value;
+    int maxChoice = 2;
+    if (promptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+    {
+        maxChoice = 3;
+    }
+    if (choice < 1 || choice > maxChoice)
+    {
+        mod::Log(
+            "Takeover: AnswerSpectatePromptChoice rejected (invalid choice=%d kind=%d maxChoice=%d)",
+            choice,
+            promptKind,
+            maxChoice);
+        RefreshRuntimeStatus(ioStatus);
+        return false;
+    }
+
+    g_hostBlock->spectateConfirmInputValue = choice;
     const LONG inputSerial = InterlockedIncrement(&g_hostBlock->spectateConfirmInputSerial);
     if (g_hostConsoleEvent != nullptr)
     {
         SetEvent(g_hostConsoleEvent);
     }
     mod::Log(
-        "Takeover: AnswerSpectateConfirm queued input accept=%d value=%d promptSerial=%ld inputSerial=%ld",
-        acceptSpectate ? 1 : 0,
-        value,
+        "Takeover: AnswerSpectatePromptChoice queued choice=%d kind=%d promptSerial=%ld inputSerial=%ld",
+        choice,
+        promptKind,
         static_cast<long>(promptSerial),
         static_cast<long>(inputSerial));
     RefreshRuntimeStatus(ioStatus);
@@ -1426,6 +1529,16 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(cpHits),
                 static_cast<long>(wpmHits),
                 static_cast<long>(crtHits));
+        }
+
+        const bool spectateRoleActive =
+            g_hostBlock != nullptr && g_hostBlock->initParams[0] == kLocalRoleSpectate;
+        if (spectateRoleActive
+            && (g_lastSpectateConsoleSnapshotTick == 0
+                || now - g_lastSpectateConsoleSnapshotTick >= 4000))
+        {
+            g_lastSpectateConsoleSnapshotTick = now;
+            LogPendingSpectateConsoleSnapshot();
         }
     }
 
@@ -2014,6 +2127,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_hostBlock->delayRangeMax = 20;
         InterlockedExchange(&g_hostBlock->spectateConfirmPromptSerial, 0);
         InterlockedExchange(&g_hostBlock->spectateConfirmPromptServedSerial, 0);
+        g_hostBlock->spectateConfirmPromptKind = 0;
         InterlockedExchange(&g_hostBlock->spectateConfirmInputSerial, 0);
         InterlockedExchange(&g_hostBlock->spectateConfirmInputServedSerial, 0);
         g_hostBlock->spectateConfirmInputValue = 0;
@@ -2022,6 +2136,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     }
     ResetNativeWorkflowFlags();
     g_lastConnectingDiagnosticTick = 0;
+    g_lastSpectateConsoleSnapshotTick = 0;
     g_lastSessionPtrOffset = 0;
     g_lastValidatedSessionPtr = 0;
     g_lastSessionPointerMismatchTick = 0;

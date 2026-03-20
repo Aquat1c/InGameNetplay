@@ -1481,7 +1481,16 @@ void ApplyRuntimeNetplaySettings()
 
         if (item.keyName == "Name")
         {
+            if (hooks::g_netplayMenuState.nickname != item.currentValue
+                || hooks::g_netplayMenuState.nicknameSource != hooks::NetplayNicknameSource::UserProvided)
+            {
+                mod::Log(
+                    "OptionsMenu: applied Network.Name='%s' source=%s->user",
+                    item.currentValue.c_str(),
+                    hooks::NetplayNicknameSourceToString(hooks::g_netplayMenuState.nicknameSource));
+            }
             hooks::g_netplayMenuState.nickname = item.currentValue;
+            hooks::g_netplayMenuState.nicknameSource = hooks::NetplayNicknameSource::UserProvided;
         }
         else if (item.keyName == "Port")
         {

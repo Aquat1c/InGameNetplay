@@ -13,6 +13,13 @@ enum class NetbridgeRole : int
     JoinSpectate = 3,   // Join (choice 3) with auto-accept spectate redirect
 };
 
+enum class NetbridgeSpectatePromptKind : int
+{
+    None = 0,
+    HostAlreadyPlaying = 1,
+    HostNotYetPlaying = 2,
+};
+
 enum class NetbridgePhase : int
 {
     Idle = 0,
@@ -39,6 +46,7 @@ struct NetbridgeStatus
     int delayPromptServedSerial = 0;
     int spectateConfirmPromptSerial = 0;
     int spectateConfirmPromptServedSerial = 0;
+    int spectateConfirmPromptKind = static_cast<int>(NetbridgeSpectatePromptKind::None);
     int localInitApplied = 0;
     int delaySetupReady = 0;
     int vsHumanSyncReady = 0;
@@ -87,9 +95,14 @@ void Tick();
 // the current g_status snapshot without calling takeover::Tick().  Safe to
 // call from any game thread context (loading screen, battle, frame hook).
 void TickExportOnly();
-bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname);
+bool StartSession(
+    NetbridgeRole role,
+    uint16_t port,
+    const char* address,
+    const char* nickname,
+    bool writeNicknameToIni = true);
 bool ApplyInputDelay(int delayFrames);
-bool AnswerSpectateConfirm(bool acceptSpectate);
+bool AnswerSpectatePromptChoice(int choice);
 bool PrepareVsHumanHandoff();
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);

@@ -553,6 +553,7 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     ioStatus->delayPromptServedSerial = 0;
     ioStatus->spectateConfirmPromptSerial = 0;
     ioStatus->spectateConfirmPromptServedSerial = 0;
+    ioStatus->spectateConfirmPromptKind = static_cast<int>(NetbridgeSpectatePromptKind::None);
     ioStatus->localInitApplied = g_localInitAppliedForSession ? 1 : 0;
     ioStatus->delaySetupReady = 0;
     ioStatus->vsHumanSyncReady = 0;
@@ -567,9 +568,11 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
 
     LONG spectateConfirmSerial = 0;
     LONG spectateConfirmServedSerial = 0;
-    ReadSpectateConfirmPromptSignal(&spectateConfirmSerial, &spectateConfirmServedSerial);
+    int spectateConfirmPromptKind = static_cast<int>(NetbridgeSpectatePromptKind::None);
+    ReadSpectateConfirmPromptSignal(&spectateConfirmSerial, &spectateConfirmServedSerial, &spectateConfirmPromptKind);
     ioStatus->spectateConfirmPromptSerial = static_cast<int>(spectateConfirmSerial);
     ioStatus->spectateConfirmPromptServedSerial = static_cast<int>(spectateConfirmServedSerial);
+    ioStatus->spectateConfirmPromptKind = spectateConfirmPromptKind;
 
     LONG consoleErrorSerial = 0;
     ReadConsoleError(&consoleErrorSerial, ioStatus->consoleErrorText, sizeof(ioStatus->consoleErrorText));
@@ -2135,6 +2138,7 @@ void ResetDebugCounters(SharedBlock* block)
     block->delayInputValue = -1;
     block->spectateConfirmPromptSerial = 0;
     block->spectateConfirmPromptServedSerial = 0;
+    block->spectateConfirmPromptKind = 0;
     block->spectateConfirmInputSerial = 0;
     block->spectateConfirmInputServedSerial = 0;
     block->spectateConfirmInputValue = 0;

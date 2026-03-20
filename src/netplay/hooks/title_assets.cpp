@@ -245,19 +245,27 @@ void LoadNetplayMenuSettingsFromIni()
         if (IsValidNickname(nickname))
         {
             g_netplayMenuState.nickname = nickname;
-            mod::Log("LoadNetplayMenuSettingsFromIni: loaded Network.Name='%s'", g_netplayMenuState.nickname.c_str());
+            g_netplayMenuState.nicknameSource = NetplayNicknameSource::LoadedFromIni;
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: loaded Network.Name='%s' source=%s",
+                g_netplayMenuState.nickname.c_str(),
+                NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
         }
         else
         {
             mod::Log(
-                "LoadNetplayMenuSettingsFromIni: invalid Network.Name='%s' (keeping '%s')",
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Name='%s' (keeping '%s' source=%s)",
                 nickname.c_str(),
-                g_netplayMenuState.nickname.c_str());
+                g_netplayMenuState.nickname.c_str(),
+                NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
         }
     }
     else
     {
-        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Name missing/empty (keeping '%s')", g_netplayMenuState.nickname.c_str());
+        mod::Log(
+            "LoadNetplayMenuSettingsFromIni: Network.Name missing/empty (keeping '%s' source=%s)",
+            g_netplayMenuState.nickname.c_str(),
+            NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
     }
 
     char portBuffer[32] = {};

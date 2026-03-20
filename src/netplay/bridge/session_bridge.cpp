@@ -215,7 +215,12 @@ void TickExportOnly()
     state_export::Update(g_status);
 }
 
-bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const char* nickname)
+bool StartSession(
+    NetbridgeRole role,
+    uint16_t port,
+    const char* address,
+    const char* nickname,
+    bool writeNicknameToIni)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
@@ -237,11 +242,12 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     g_status.role = static_cast<int>(role);
     g_status.port = port;
     mod::Log(
-        "SessionBridge: StartSession role=%d port=%u address='%s' nickname='%s'",
+        "SessionBridge: StartSession role=%d port=%u address='%s' nickname='%s' writeNicknameToIni=%d",
         static_cast<int>(role),
         static_cast<unsigned>(port),
         addressCopy.c_str(),
-        nicknameCopy.c_str());
+        nicknameCopy.c_str(),
+        writeNicknameToIni ? 1 : 0);
 #if defined(_MSC_VER)
     strncpy_s(g_status.address, sizeof(g_status.address), addressCopy.c_str(), _TRUNCATE);
     strncpy_s(g_status.nickname, sizeof(g_status.nickname), nicknameCopy.c_str(), _TRUNCATE);
@@ -256,7 +262,7 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
     const uint32_t requestSerial = ++g_startRequestSerial;
     g_startWorkerRunning = true;
 
-    g_startWorker = std::thread([requestSerial, role, port, addressCopy, nicknameCopy]() {
+    g_startWorker = std::thread([requestSerial, role, port, addressCopy, nicknameCopy, writeNicknameToIni]() {
         NetbridgeStatus workerStatus = {};
         workerStatus.role = static_cast<int>(role);
         workerStatus.port = port;
@@ -274,6 +280,7 @@ bool StartSession(NetbridgeRole role, uint16_t port, const char* address, const 
             port,
             addressCopy.c_str(),
             nicknameCopy.c_str(),
+            writeNicknameToIni,
             &workerStatus,
             &workerConnectStartTick);
 
@@ -349,7 +356,7 @@ bool ApplyInputDelay(int delayFrames)
     return applied;
 }
 
-bool AnswerSpectateConfirm(bool acceptSpectate)
+bool AnswerSpectatePromptChoice(int choice)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
@@ -360,7 +367,7 @@ bool AnswerSpectateConfirm(bool acceptSpectate)
     JoinFinishedWorkerUnlocked();
     if (g_startWorkerRunning)
     {
-        mod::Log("SessionBridge: AnswerSpectateConfirm rejected (start worker running)");
+        mod::Log("SessionBridge: AnswerSpectatePromptChoice rejected (start worker running)");
         return false;
     }
 
@@ -370,16 +377,16 @@ bool AnswerSpectateConfirm(bool acceptSpectate)
         && phase != NetbridgePhase::Connected)
     {
         mod::Log(
-            "SessionBridge: AnswerSpectateConfirm ignored (phase=%s accept=%d)",
+            "SessionBridge: AnswerSpectatePromptChoice ignored (phase=%s choice=%d)",
             PhaseToString(phase),
-            acceptSpectate ? 1 : 0);
+            choice);
         return false;
     }
 
-    const bool answered = takeover::AnswerSpectateConfirm(acceptSpectate, &g_status);
+    const bool answered = takeover::AnswerSpectatePromptChoice(choice, &g_status);
     mod::Log(
-        "SessionBridge: AnswerSpectateConfirm accept=%d result=%d phase=%s",
-        acceptSpectate ? 1 : 0,
+        "SessionBridge: AnswerSpectatePromptChoice choice=%d result=%d phase=%s",
+        choice,
         answered ? 1 : 0,
         PhaseToString(static_cast<NetbridgePhase>(g_status.phase)));
     return answered;
@@ -652,5 +659,3 @@ uintptr_t GetRevivalSessionPtrOffset()
         ? profile->sessionPtrOffsets[0] : 0;
 }
 } // namespace netplay::bridge
-
-

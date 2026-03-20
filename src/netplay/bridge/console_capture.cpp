@@ -559,17 +559,42 @@ void NoteConsolePromptLine(const std::string& text)
         return;
     }
 
-    const bool isSpectateConfirmPrompt =
+    const bool isJoinAsSpectatorPrompt =
         ContainsCaseInsensitive(text, "Host already playing, join as a spectator");
-
-    if (isSpectateConfirmPrompt)
+    if (isJoinAsSpectatorPrompt)
     {
         const LONG serial = InterlockedIncrement(&g_injectedSpectateConfirmPromptSerial);
-        PublishSpectateConfirmPromptSerial(serial);
+        PublishSpectateConfirmPromptSerial(
+            serial,
+            static_cast<int>(NetbridgeSpectatePromptKind::HostAlreadyPlaying));
         g_injectedSpectateConfirmPromptWaitStartTick = GetTickCount();
         mod::Log(
-            "Takeover: console prompt detected type=spectate_confirm serial=%ld text='%s'",
+            "Takeover: console prompt detected type=join_as_spectator serial=%ld text='%s'",
             static_cast<long>(serial),
+            text.c_str());
+        return;
+    }
+
+    const bool isHostNotYetPlayingPrompt =
+        ContainsCaseInsensitive(text, "Host not yet playing, join as a player");
+    if (isHostNotYetPlayingPrompt)
+    {
+        const LONG serial = InterlockedIncrement(&g_injectedSpectateConfirmPromptSerial);
+        PublishSpectateConfirmPromptSerial(
+            serial,
+            static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying));
+        g_injectedSpectateConfirmPromptWaitStartTick = GetTickCount();
+        mod::Log(
+            "Takeover: console prompt detected type=host_not_yet_playing serial=%ld text='%s'",
+            static_cast<long>(serial),
+            text.c_str());
+        return;
+    }
+
+    if (ContainsCaseInsensitive(text, "Waiting for game to begin"))
+    {
+        mod::Log(
+            "Takeover: console state detected type=waiting_for_game_begin text='%s'",
             text.c_str());
         return;
     }
@@ -580,6 +605,26 @@ void NoteConsolePromptLine(const std::string& text)
 
     if (!isDelayPrompt)
     {
+        static DWORD s_lastUnknownSpectateConsoleLogTick = 0;
+        static std::string s_lastUnknownSpectateConsoleLine;
+        const DWORD now = GetTickCount();
+        const bool spectateConsoleActive =
+            g_revivalProcess != nullptr
+            && g_hostBlock != nullptr
+            && g_hostBlock->initParams[0] == kLocalRoleSpectate;
+        const bool shouldLogUnknownSpectateLine =
+            spectateConsoleActive
+            && (!s_lastUnknownSpectateConsoleLine.empty()
+                ? s_lastUnknownSpectateConsoleLine != text || now - s_lastUnknownSpectateConsoleLogTick >= 3000
+                : true);
+        if (shouldLogUnknownSpectateLine)
+        {
+            s_lastUnknownSpectateConsoleLogTick = now;
+            s_lastUnknownSpectateConsoleLine = text;
+            mod::Log(
+                "Takeover: spectate console raw line='%s'",
+                text.c_str());
+        }
         return;
     }
 
@@ -758,18 +803,25 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     }
 
     // Revival writes characters without newlines via WriteConsoleOutputCharacterW
-    // (newlines are cursor moves only).  Check for known error keywords in the
-    // partially-accumulated buffer and flush immediately so the error is
-    // published to IPC before Revival blocks in system("pause").
+    // (newlines are cursor moves only). Check for known workflow/error keywords
+    // in the partially-accumulated buffer and flush immediately so prompts and
+    // failures are visible to the bridge without waiting for a newline.
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
-        static const char* kErrorKeywords[] = {
+        static const char* kImmediateFlushKeywords[] = {
             "Connection timed out",
             "Source quit or timed out",
+            "Host timed out",
+            "Remote timed out",
             "Spectators have been disabled",
             "Socket error",
+            "Host already playing, join as a spectator",
+            "Host not yet playing, join as a player",
+            "Waiting for game to begin",
+            "Enter the initial input delay",
+            "Enter the input delay to use",
         };
-        for (const char* kw : kErrorKeywords)
+        for (const char* kw : kImmediateFlushKeywords)
         {
             if (line->find(kw) != std::string::npos)
             {
@@ -906,10 +958,6 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
 
     const char* text = reinterpret_cast<const char*>(lpBuffer);
     const size_t textLen = static_cast<size_t>(nBytes);
@@ -999,10 +1047,6 @@ void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
 
     LogConsoleTextChunk("WriteConsoleA", reinterpret_cast<const char*>(lpBuffer), static_cast<size_t>(nChars));
 }
@@ -1010,10 +1054,6 @@ void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars)
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars)
 {
     if (lpBuffer == nullptr || nChars == 0)
-    {
-        return;
-    }
-    if (!CaptureRevivalNativeLogsEnabled())
     {
         return;
     }
@@ -1119,10 +1159,6 @@ void MaybeLogOutputDebugStringA(LPCSTR lpOutputString)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
 
     const size_t len = std::strlen(lpOutputString);
     if (len == 0)
@@ -1136,10 +1172,6 @@ void MaybeLogOutputDebugStringA(LPCSTR lpOutputString)
 void MaybeLogOutputDebugStringW(LPCWSTR lpOutputString)
 {
     if (lpOutputString == nullptr || lpOutputString[0] == L'\0')
-    {
-        return;
-    }
-    if (!CaptureRevivalNativeLogsEnabled())
     {
         return;
     }
