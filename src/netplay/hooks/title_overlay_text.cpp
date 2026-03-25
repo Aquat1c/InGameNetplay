@@ -1028,49 +1028,71 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     const uint8_t hlColor = netplay::draw::ResolveBestPaletteColor(screenContext, 40, 100, 96);
     const uint8_t errorColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 130, 130);
 
+    const bool hostNotYetPlayingPrompt =
+        g_spectateConfirmOverlay.promptKind
+            == static_cast<int>(netplay::bridge::NetbridgeSpectatePromptKind::HostNotYetPlaying);
+
     // Panel background and frame — centered on 320x240 surface
-    constexpr int specPanelW = 200;
-    constexpr int specPanelH = 100;
+    constexpr int specPanelW = 220;
+    const int specPanelH = hostNotYetPlayingPrompt ? 118 : 100;
     constexpr int specPanelX = (320 - specPanelW) / 2;
-    constexpr int specPanelY = (240 - specPanelH) / 2;
+    const int specPanelY = (240 - specPanelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, specPanelX, specPanelY, specPanelW, specPanelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, specPanelX, specPanelY, specPanelW, specPanelH, frameColor);
 
     const int sTextL = specPanelX + 6;
     const int sTextR = specPanelX + specPanelW - 6;
 
-    // Title: "SPECTATE?"
-    netplay::font::DrawTextCentered5x7(sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
-
-    // Question lines
-    netplay::font::DrawTextCentered5x7(sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
-    netplay::font::DrawTextCentered5x7(sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40, 1, 1, textColor);
-
-    // Option: Yes (index 0)
-    const bool yesSelected = (g_spectateConfirmOverlay.selectedOption == 0);
-    if (yesSelected)
+    auto drawOption = [&](int optionIndex, const char* label, int y)
     {
-        netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, specPanelY + 58, 120, 12, hlColor);
-    }
-    netplay::font::DrawTextCentered5x7(
-        sv, yesSelected ? "> Yes" : "  Yes", specPanelX + 40, specPanelX + specPanelW - 40, specPanelY + 60, 1, 1,
-        yesSelected ? brightColor : dimColor);
+        const bool selected = (g_spectateConfirmOverlay.selectedOption == optionIndex);
+        if (selected)
+        {
+            netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, y - 2, specPanelW - 80, 12, hlColor);
+        }
+        char optionText[40] = {};
+        std::snprintf(optionText, sizeof(optionText), "%s %s", selected ? ">" : " ", label);
+        netplay::font::DrawTextCentered5x7(
+            sv,
+            optionText,
+            specPanelX + 40,
+            specPanelX + specPanelW - 40,
+            y,
+            1,
+            1,
+            selected ? brightColor : dimColor);
+    };
 
-    // Option: No (index 1)
-    const bool noSelected = (g_spectateConfirmOverlay.selectedOption == 1);
-    if (noSelected)
+    if (hostNotYetPlayingPrompt)
     {
-        netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, specPanelY + 74, 120, 12, hlColor);
+        netplay::font::DrawTextCentered5x7(sv, "HOST NOT PLAYING", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
+        netplay::font::DrawTextCentered5x7(sv, "Host is not in a match yet.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
+        netplay::font::DrawTextCentered5x7(sv, "Choose what to do:", sTextL, sTextR, specPanelY + 38, 1, 1, textColor);
+        drawOption(0, "Join", specPanelY + 56);
+        drawOption(1, "Wait", specPanelY + 70);
+        drawOption(2, "Cancel", specPanelY + 84);
     }
-    netplay::font::DrawTextCentered5x7(
-        sv, noSelected ? "> No" : "  No", specPanelX + 40, specPanelX + specPanelW - 40, specPanelY + 76, 1, 1,
-        noSelected ? brightColor : dimColor);
+    else
+    {
+        netplay::font::DrawTextCentered5x7(sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
+        netplay::font::DrawTextCentered5x7(sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
+        netplay::font::DrawTextCentered5x7(sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40, 1, 1, textColor);
+        drawOption(0, "Yes", specPanelY + 60);
+        drawOption(1, "No", specPanelY + 76);
+    }
 
     // Error message if any
     if (g_spectateConfirmOverlay.errorMessage[0] != '\0')
     {
         netplay::font::DrawTextCentered5x7(
-            sv, g_spectateConfirmOverlay.errorMessage, sTextL, sTextR, specPanelY + 90, 1, 1, errorColor);
+            sv,
+            g_spectateConfirmOverlay.errorMessage,
+            sTextL,
+            sTextR,
+            hostNotYetPlayingPrompt ? specPanelY + 100 : specPanelY + 90,
+            1,
+            1,
+            errorColor);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);

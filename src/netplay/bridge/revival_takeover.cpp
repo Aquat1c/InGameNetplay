@@ -885,10 +885,10 @@ bool StartSession(
     {
         // Join (choice 3). Prompt handling is done from the host-side UI based
         // on the detected prompt kind:
-        // - "Host already playing, join as a spectator?" -> answer Yes (1)
-        // - "Host not yet playing, join as a player?"   -> answer Wait (3)
-        // This avoids blindly feeding "1" into the wrong prompt when lobby
-        // state is stale and the target match has already ended.
+        // - "Host already playing, join as a spectator?" -> auto-answer Yes (1)
+        // - "Host not yet playing, join as a player?"   -> show Join/Wait/Cancel
+        //   in the in-game overlay and let the host-side UI decide whether to
+        //   keep waiting, restart as a normal Join, or cancel cleanly.
         menuChoice = 3;
         primaryInput = "3\r\n";
 

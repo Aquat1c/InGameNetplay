@@ -92,7 +92,9 @@ struct DelaySetupOverlayState
 struct SpectateConfirmOverlayState
 {
     bool active = false;
-    int selectedOption = 0; // 0 = Yes, 1 = No
+    int selectedOption = 0;
+    int optionCount = 2;
+    int promptKind = 0;
     char errorMessage[96] = {};
 };
 
