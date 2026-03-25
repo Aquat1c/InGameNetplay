@@ -3072,6 +3072,76 @@ char UpdateNetplayMenu(uint32_t screenContext)
             g_lobbySession->NotifyEndMatch();
         }
     };
+    auto promoteTerminalBridgeFailureToJoiningOverlay = [&](const netplay::bridge::NetbridgeStatus& status, NetbridgePhase phase) {
+        if (g_joiningOverlay.active)
+        {
+            return;
+        }
+        if (!g_delaySetupOverlay.active && !g_spectateConfirmOverlay.active && !g_hostingOverlay.active)
+        {
+            return;
+        }
+
+        const bool hadDelayOverlay = g_delaySetupOverlay.active;
+        const bool hadSpectateConfirmOverlay = g_spectateConfirmOverlay.active;
+        const bool hadHostingOverlay = g_hostingOverlay.active;
+        const char* failureText =
+            status.errorMsg[0] != '\0'
+                ? status.errorMsg
+                : (phase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error");
+
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+        g_joiningOverlay.active = true;
+        g_joiningOverlay.failed = true;
+        strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText), failureText, _TRUNCATE);
+        g_joiningOverlay.errorText[sizeof(g_joiningOverlay.errorText) - 1] = '\0';
+
+        mod::Log(
+            "NetplayTerminal: promoted transient overlay to failure dialog phase=%s delay=%d spectateConfirm=%d hosting=%d error='%s'",
+            netplay::bridge::PhaseToString(phase),
+            hadDelayOverlay ? 1 : 0,
+            hadSpectateConfirmOverlay ? 1 : 0,
+            hadHostingOverlay ? 1 : 0,
+            g_joiningOverlay.errorText);
+    };
+    auto abortPendingTransitionIfSessionLost = [&](int nextState, const char* abortReason, bool disarmSpectateReplayBypass) {
+        const netplay::bridge::NetbridgeStatus latestStatus = netplay::bridge::GetStatus();
+        const NetbridgePhase latestPhase = static_cast<NetbridgePhase>(latestStatus.phase);
+        if (latestPhase == NetbridgePhase::Failed || latestPhase == NetbridgePhase::SessionEnded)
+        {
+            mod::Log(
+                "NetplayTransition: ABORT — bridge entered terminal phase=%s before state=%d error='%s', re-entering netplay menu",
+                netplay::bridge::PhaseToString(latestPhase),
+                nextState,
+                latestStatus.errorMsg[0] != '\0' ? latestStatus.errorMsg : "");
+            if (disarmSpectateReplayBypass)
+            {
+                DisarmSpectateReplayBypass();
+            }
+            netplay::bridge::CancelSession(abortReason);
+            notifyLobbySessionEndedForCurrentBridgeRole(true);
+            ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
+            return true;
+        }
+        if (!netplay::bridge::IsPeerProcessAlive())
+        {
+            mod::Log(
+                "NetplayTransition: ABORT — peer exited before state=%d, re-entering netplay menu",
+                nextState);
+            if (disarmSpectateReplayBypass)
+            {
+                DisarmSpectateReplayBypass();
+            }
+            netplay::bridge::CancelSession(abortReason);
+            notifyLobbySessionEndedForCurrentBridgeRole(true);
+            ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
+            return true;
+        }
+        return false;
+    };
 
     if (g_lobbySession && g_lobbySession->ConsumeAbandonedOutgoingChallenge())
     {
@@ -3091,6 +3161,11 @@ char UpdateNetplayMenu(uint32_t screenContext)
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         ++(*inactivityCounter);
         return 0;
+    }
+
+    if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
+    {
+        promoteTerminalBridgeFailureToJoiningOverlay(bridgeStatus, bridgePhase);
     }
 
     if (g_pendingLobbySpectateWait.active
@@ -3145,19 +3220,14 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            // Pre-flight: if the peer exited during the handoff/fade-out, abort
-            // the state transition.  Without this check, EFZ.exe's state-1 init
-            // calls the DLL rollback tick immediately, which fires ExitProcess on
-            // the main game thread where no setjmp recovery point is active.
-            if (!netplay::bridge::IsPeerProcessAlive())
+            // Pre-flight: if the helper died or the bridge already entered a
+            // terminal failure/session-ended phase during the handoff/fade-out,
+            // abort the state transition. Without this check, EFZ.exe's
+            // state-1 init calls the DLL rollback tick immediately, which can
+            // fire ExitProcess on the main game thread where no setjmp recovery
+            // point is active.
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3301,16 +3371,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition", true))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT — peer exited before spectate state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                DisarmSpectateReplayBypass();
-                netplay::bridge::CancelSession("peer_died_before_spectate_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_spectate_transition");
                 return 0;
             }
             mod::Log(
@@ -3429,17 +3491,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 const int nextState = g_pendingGlobalStateTransition;
                 g_pendingGlobalStateTransition = -1;
-                if (!netplay::bridge::IsPeerProcessAlive())
+                if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
                 {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
-                return 0;
-            }
+                    return 0;
+                }
                 mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
                 return static_cast<char>(nextState);
             }
@@ -3451,15 +3506,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3489,15 +3537,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT — peer exited before auto-handoff state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3564,6 +3605,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         ResetJoiningOverlayState();
         ClearPendingLobbySpectateWait("session_ended");
         DisarmSpectateReplayBypass();
+        if (bridgeStatus.errorMsg[0] != '\0')
+        {
+            SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);
+        }
         netplay::bridge::CancelSession("no_overlay_session_ended");
         notifyLobbySessionEndedForCurrentBridgeRole(false);
     }
