@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <intrin.h>
+#include <string>
 
 #include <windows.h>
 
@@ -1907,6 +1908,42 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
+    std::string logEfzPath;
+    if (!IsManagedLogEfzWriteActive() && TryGetLogEfzDiskPath(hFile, &logEfzPath))
+    {
+        static std::string s_suppressedPath;
+        static uint64_t s_suppressedWrites = 0;
+        static uint64_t s_suppressedBytes = 0;
+
+        if (s_suppressedPath != logEfzPath)
+        {
+            s_suppressedPath = logEfzPath;
+            s_suppressedWrites = 0;
+            s_suppressedBytes = 0;
+        }
+
+        ++s_suppressedWrites;
+        s_suppressedBytes += static_cast<uint64_t>(nNumberOfBytesToWrite);
+        if (s_suppressedWrites == 1 || (s_suppressedWrites % 256ull) == 0)
+        {
+            mod::Log(
+                "CAPTURE_LOG: suppressing native logEfz WriteFile path='%s' writes=%llu bytes=%llu lastWrite=%lu overlapped=%d",
+                logEfzPath.c_str(),
+                static_cast<unsigned long long>(s_suppressedWrites),
+                static_cast<unsigned long long>(s_suppressedBytes),
+                static_cast<unsigned long>(nNumberOfBytesToWrite),
+                lpOverlapped != nullptr ? 1 : 0);
+        }
+
+        MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
+        if (lpNumberOfBytesWritten != nullptr)
+        {
+            *lpNumberOfBytesWritten = nNumberOfBytesToWrite;
+        }
+        SetLastError(NO_ERROR);
+        return TRUE;
+    }
+
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
     MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
     return result;

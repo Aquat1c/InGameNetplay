@@ -260,6 +260,12 @@ bool ExtractIntAfterToken(const std::string& text, const char* token, int* outVa
 bool ExtractDelayRange(const std::string& text, int* outMin, int* outMax);
 DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool* outHasMetrics);
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
+bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
+bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath);
+void PrimeManagedLogEfzHistory();
+void BeginManagedLogEfzWrite();
+void EndManagedLogEfzWrite();
+bool IsManagedLogEfzWriteActive();
 void ResetNativeWorkflowFlags();
 void NoteConsolePromptLine(const std::string& text);
 std::string* SelectPendingConsoleLine(const char* sourceTag);

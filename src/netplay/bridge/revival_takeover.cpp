@@ -311,6 +311,7 @@ static void CloseChildJobObject()
 void InitializeHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    PrimeManagedLogEfzHistory();
     (void)EnsureHostIpc();
     if (!EnsureLocalRevivalLoaded())
     {
@@ -322,6 +323,26 @@ void InitializeHost()
         // before any profile-dependent operations (frame hook, etc.).
         (void)SetLocalRoleFlag(kLocalRoleLocalPlay, "host_initialize");
     }
+
+    {
+        const auto selfPatches = BuildPatchMap(reinterpret_cast<uintptr_t>(SelfModule()));
+        std::unordered_map<std::string, uint32_t> hostLogPatches;
+        const auto writeFileIt = selfPatches.find("WriteFile");
+        if (writeFileIt != selfPatches.end())
+        {
+            hostLogPatches.emplace(writeFileIt->first, writeFileIt->second);
+            const bool patchedHostLogIat =
+                PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, true);
+            mod::Log(
+                "Takeover: host logEfz WriteFile IAT patch result=%d",
+                patchedHostLogIat ? 1 : 0);
+        }
+        else
+        {
+            mod::Log("Takeover: host logEfz WriteFile IAT patch unavailable (missing stub)");
+        }
+    }
+
     mod::Log("Takeover: host initialized");
 }
 

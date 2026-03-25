@@ -383,6 +383,7 @@ bool PatchIatModule(
                     || _stricmp(name, "TerminateProcess") == 0
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
+                    || _stricmp(name, "WriteFile") == 0
                     || _stricmp(name, "WriteConsoleOutputCharacterW") == 0
                     || _stricmp(name, "OutputDebugStringW") == 0;
             };
@@ -488,6 +489,19 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
         if (module.moduleLower == "efzrevival.dll")
         {
             pushUniqueTarget(module);
+        }
+    }
+
+    if (process == GetCurrentProcess())
+    {
+        const uintptr_t hostExeBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+        for (const RemoteModuleRecord& module : modules)
+        {
+            if (module.base == hostExeBase)
+            {
+                pushUniqueTarget(module);
+                break;
+            }
         }
     }
 
