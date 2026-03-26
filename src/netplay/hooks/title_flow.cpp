@@ -58,6 +58,9 @@ constexpr uint32_t kGameSystemOffsetMode = 4964;
 constexpr uint32_t kGameSystemOffsetSecondaryModeFlag = 4965;
 constexpr uint32_t kGameSystemOffsetContinueFlag = 4984;
 constexpr uint32_t kGameSystemOffsetStageSelection = 4985;
+constexpr uint32_t kGameSystemOffsetStageAnimState = 3884;
+constexpr uint32_t kGameSystemOffsetStageAnim = 3888;
+constexpr uint32_t kGameSystemOffsetStageCursor = 3890;
 constexpr uint32_t kGameSystemOffsetReplaySessionFlag = 82563;
 constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
 constexpr uint8_t kGameModeVsHuman = 4;
@@ -1562,6 +1565,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
     state[kGameSystemOffsetMatchCounter] = 0;
     state[kGameSystemOffsetContinueFlag] = 0;
     state[kGameSystemOffsetStageSelection] = 0;
+    *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetStageAnimState) = 0;
+    *reinterpret_cast<uint16_t*>(gameSystem + kGameSystemOffsetStageAnim) = 0;
+    state[kGameSystemOffsetStageCursor] = 0;
 
     // Force the charselect screen object to re-initialise next time it
     // runs (reset cursor positions, cameras, selection state, unlock
@@ -1654,7 +1660,7 @@ void PrepareVsHumanGameState(uint32_t screenContext)
 
     mod::Log(
         "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u "
-        "wins=%u/%u match=%u continue=%u stage=%u",
+        "wins=%u/%u match=%u continue=%u stage=%u gameStageCursor=%u gameStageAnim=%u",
         static_cast<unsigned>(state[kGameSystemOffsetMode]),
         static_cast<unsigned>(state[kGameSystemOffsetSecondaryModeFlag]),
         static_cast<unsigned>(state[kGameSystemOffsetReplaySessionFlag]),
@@ -1665,7 +1671,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
         *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState),
         static_cast<unsigned>(state[kGameSystemOffsetMatchCounter]),
         static_cast<unsigned>(state[kGameSystemOffsetContinueFlag]),
-        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]));
+        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]),
+        static_cast<unsigned>(state[kGameSystemOffsetStageCursor]),
+        static_cast<unsigned>(*reinterpret_cast<uint16_t*>(gameSystem + kGameSystemOffsetStageAnim)));
 }
 
 // ---------------------------------------------------------------------------
