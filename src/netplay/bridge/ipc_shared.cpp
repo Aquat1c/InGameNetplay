@@ -1045,10 +1045,16 @@ bool WriteIni(
 
     // Keep user INI intact. Update only the settings currently supported by
     // InGameNetplay menu integration.
+    bool wroteAddress = false;
+    if (safeAddress[0] != '\0')
+    {
+        wroteAddress = writeIniKeyA("Network", "Address", safeAddress);
+        ok = wroteAddress && ok;
+    }
     ok = writeIniKeyA("Network", "Port", portText) && ok;
 
     mod::Log(
-        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wrotePort=1",
+        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",
         iniPath.c_str(),
         existed ? 1 : 0,
         role,
@@ -1057,7 +1063,8 @@ bool WriteIni(
         safeAddress,
         ok ? 1 : 0,
         writeNicknameToIni ? 1 : 0,
-        wroteNickname ? 1 : 0);
+        wroteNickname ? 1 : 0,
+        wroteAddress ? 1 : 0);
     return ok;
 }
 

@@ -271,6 +271,7 @@ void RunTransitionFadeIn(uint32_t screenContext);
 bool LoadTitleAssets(uint32_t screenContext);
 bool LoadNetplayAssets(uint32_t screenContext);
 void LoadNetplayMenuSettingsFromIni();
+void SaveNetplayJoinAddressToIni();
 const char* NetplayNicknameSourceToString(NetplayNicknameSource source);
 bool ShouldWriteNicknameToRevivalIni();
 

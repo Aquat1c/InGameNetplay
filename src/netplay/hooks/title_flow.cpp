@@ -3012,6 +3012,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                         {
                             g_netplayMenuState.joinAddress = ipPart;
                             g_netplayMenuState.joinPort = static_cast<uint16_t>(parsedPort);
+                            SaveNetplayJoinAddressToIni();
                             PlayUiSound(screenContext, kSfxConfirm);
                             mod::Log("JoinPaste: pasted address='%s' port=%u from clipboard",
                                 ipPart.c_str(), static_cast<unsigned>(parsedPort));
