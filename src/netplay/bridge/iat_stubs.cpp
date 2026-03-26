@@ -396,17 +396,19 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             g_netplayFrameJmpActive ? 1 : 0,
             g_netplayUiJmpActive ? 1 : 0);
 
-        if (ConsumeOnlineMatchEscGracefulQuit())
+        const DWORD escGraceDelayMs = ConsumeOnlineMatchEscGracefulQuitDelayMs();
+        if (escGraceDelayMs > 0)
         {
             // Match-local ESC already queued a graceful Quit packet from the
             // live battle screen. Give the helper a moment to flush it to the
             // peer before we tear the process down.
             mod::Log(
                 "NeutralizeExitProcess: online match ESC graceful quit already primed "
-                "caller=%s+0x%lX — sleeping 100ms before cleanup",
+                "caller=%s+0x%lX — sleeping %lums before cleanup",
                 callerModule,
-                static_cast<unsigned long>(callerRva));
-            Sleep(100u);
+                static_cast<unsigned long>(callerRva),
+                static_cast<unsigned long>(escGraceDelayMs));
+            Sleep(escGraceDelayMs);
         }
 
         if (role == kLocalRoleTournament)
@@ -796,6 +798,93 @@ static bool ResolveHostProcessForRedirect(HANDLE* outProcessHandle, uint32_t* ou
         *outSource = RedirectHostSource::TempIpc;
     }
     return true;
+}
+
+static volatile LONG g_injectedHostQuitSpoofLoggedSerial = 0;
+
+static bool ShouldSpoofHostProcessDeath(
+    HANDLE hHandle,
+    uint32_t* outTargetPid,
+    LONG* outRequestSerial,
+    const char** outReasonText)
+{
+    if (hHandle == nullptr || hHandle == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+
+    if (g_injectedBlock == nullptr || g_injectedBlock->hostPid == 0)
+    {
+        return false;
+    }
+
+    const DWORD targetPid = GetProcessId(hHandle);
+    if (targetPid == 0 || targetPid != g_injectedBlock->hostPid)
+    {
+        return false;
+    }
+
+    const LONG requestSerial =
+        InterlockedCompareExchange(&g_injectedBlock->hostQuitRequestSerial, 0, 0);
+    if (requestSerial <= 0)
+    {
+        return false;
+    }
+
+    const LONG servedSerial =
+        InterlockedCompareExchange(&g_injectedBlock->hostQuitRequestServedSerial, 0, 0);
+    if (requestSerial > servedSerial)
+    {
+        InterlockedExchange(&g_injectedBlock->hostQuitRequestServedSerial, requestSerial);
+    }
+
+    if (outTargetPid != nullptr)
+    {
+        *outTargetPid = static_cast<uint32_t>(targetPid);
+    }
+    if (outRequestSerial != nullptr)
+    {
+        *outRequestSerial = requestSerial;
+    }
+    if (outReasonText != nullptr)
+    {
+        *outReasonText = g_injectedBlock->hostQuitRequestText;
+    }
+    return true;
+}
+
+static void MaybeLogHostQuitSpoof(
+    const char* apiName,
+    uint32_t targetPid,
+    LONG requestSerial,
+    const char* reasonText)
+{
+    const LONG previousLoggedSerial =
+        InterlockedCompareExchange(&g_injectedHostQuitSpoofLoggedSerial, 0, 0);
+    if (requestSerial <= previousLoggedSerial)
+    {
+        return;
+    }
+
+    if (InterlockedCompareExchange(
+            &g_injectedHostQuitSpoofLoggedSerial,
+            requestSerial,
+            previousLoggedSerial) != previousLoggedSerial)
+    {
+        return;
+    }
+
+    mod::Log(
+        "Takeover: helper spoofing host exit api=%s pid=%lu requestSerial=%ld reason='%s'",
+        apiName != nullptr ? apiName : "unknown",
+        static_cast<unsigned long>(targetPid),
+        static_cast<long>(requestSerial),
+        reasonText != nullptr ? reasonText : "");
 }
 
 static uintptr_t ResolveInjectedInitAddress()
@@ -2085,7 +2174,7 @@ BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, 
         if (s_suppressedWrites == 1 || (s_suppressedWrites % 256ull) == 0)
         {
             mod::Log(
-                "CAPTURE_LOG: suppressing native logEfz WriteFile path='%s' writes=%llu bytes=%llu lastWrite=%lu overlapped=%d",
+                "CAPTURE_LOG: mirroring native logEfz WriteFile path='%s' writes=%llu bytes=%llu lastWrite=%lu overlapped=%d",
                 logEfzPath.c_str(),
                 static_cast<unsigned long long>(s_suppressedWrites),
                 static_cast<unsigned long long>(s_suppressedBytes),
@@ -2093,13 +2182,9 @@ BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, 
                 lpOverlapped != nullptr ? 1 : 0);
         }
 
+        const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
         MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
-        if (lpNumberOfBytesWritten != nullptr)
-        {
-            *lpNumberOfBytesWritten = nNumberOfBytesToWrite;
-        }
-        SetLastError(NO_ERROR);
-        return TRUE;
+        return result;
     }
 
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
@@ -2173,7 +2258,6 @@ HANDLE StubCreateFileA(
             hTemplateFile);
     }
 
-    RegisterRedirectedNativeLogEfzHandle(handle, originalPath);
     mod::Log(
         "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' shadow='%s' handle=0x%p disposition=%lu",
         originalPath.c_str(),
@@ -2250,7 +2334,6 @@ HANDLE StubCreateFileW(
             hTemplateFile);
     }
 
-    RegisterRedirectedNativeLogEfzHandle(handle, originalPath);
     mod::Log(
         "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' shadow='%s' handle=0x%p disposition=%lu",
         originalPath.c_str(),
@@ -2262,12 +2345,7 @@ HANDLE StubCreateFileW(
 
 BOOL StubCloseHandle(HANDLE hObject)
 {
-    const BOOL result = CloseHandle(hObject);
-    if (result)
-    {
-        UnregisterRedirectedNativeLogEfzHandle(hObject);
-    }
-    return result;
+    return CloseHandle(hObject);
 }
 
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
@@ -2312,6 +2390,23 @@ VOID StubOutputDebugStringW(LPCWSTR lpOutputString)
 
 DWORD StubWaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
 {
+    uint32_t targetPid = 0;
+    LONG requestSerial = 0;
+    const char* reasonText = nullptr;
+    if (ShouldSpoofHostProcessDeath(
+            hHandle,
+            &targetPid,
+            &requestSerial,
+            &reasonText))
+    {
+        MaybeLogHostQuitSpoof(
+            "WaitForSingleObject",
+            targetPid,
+            requestSerial,
+            reasonText);
+        return WAIT_OBJECT_0;
+    }
+
     DWORD fakeExit = 0;
     if (LookupFakeThread(hHandle, &fakeExit))
     {
@@ -2333,6 +2428,32 @@ BOOL StubGetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode)
         return TRUE;
     }
     return GetExitCodeThread(hThread, lpExitCode);
+}
+
+BOOL StubGetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)
+{
+    uint32_t targetPid = 0;
+    LONG requestSerial = 0;
+    const char* reasonText = nullptr;
+    if (ShouldSpoofHostProcessDeath(
+            hProcess,
+            &targetPid,
+            &requestSerial,
+            &reasonText))
+    {
+        MaybeLogHostQuitSpoof(
+            "GetExitCodeProcess",
+            targetPid,
+            requestSerial,
+            reasonText);
+        if (lpExitCode != nullptr)
+        {
+            *lpExitCode = 0;
+        }
+        return TRUE;
+    }
+
+    return GetExitCodeProcess(hProcess, lpExitCode);
 }
 
 DWORD StubResumeThread(HANDLE hThread)
@@ -2504,6 +2625,11 @@ extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_WaitForSingleObject(HANDLE
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode)
 {
     return netplay::bridge::takeover::StubGetExitCodeThread(hThread, lpExitCode);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)
+{
+    return netplay::bridge::takeover::StubGetExitCodeProcess(hProcess, lpExitCode);
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_ResumeThread(HANDLE hThread)

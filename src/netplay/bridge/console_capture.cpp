@@ -548,6 +548,8 @@ bool IsInterestingNativeDebugLine(const std::string& text)
         "Remote timed out",
         "Peer died",
         "Socket error",
+        "Close Efz",
+        "Efz died",
         "Received quit from:",
         "Recv quit from:",
         "Remote is using a deprecated version",
@@ -826,6 +828,52 @@ void NoteConsolePromptLine(const std::string& text)
             // later, but this ensures immediate detection).
             PublishConsoleError("Peer died");
         }
+    }
+
+    const bool helperQuitCloseEfz =
+        ContainsCaseInsensitive(text, "Close Efz");
+    const bool helperQuitEfzDied =
+        ContainsCaseInsensitive(text, "Efz died");
+    const bool helperQuitPeerReceived =
+        ContainsCaseInsensitive(text, "Received quit from:")
+        || ContainsCaseInsensitive(text, "Recv quit from:");
+    if (helperQuitCloseEfz || helperQuitEfzDied || helperQuitPeerReceived)
+    {
+        int helperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::None);
+        const char* helperQuitLabel = nullptr;
+        if (helperQuitCloseEfz)
+        {
+            helperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::CloseEfz);
+            helperQuitLabel = "Close Efz";
+        }
+        else if (helperQuitEfzDied)
+        {
+            helperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::EfzDied);
+            helperQuitLabel = "Efz died";
+        }
+        else
+        {
+            helperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::PeerQuitReceived);
+            helperQuitLabel = ContainsCaseInsensitive(text, "Received quit from:")
+                ? "Received quit from:"
+                : "Recv quit from:";
+        }
+
+        mod::Log(
+            "Takeover: helper native quit detected kind=%s text='%s'",
+            HelperNativeQuitKindToString(helperQuitKind),
+            text.c_str());
+        LogLastNativeMatchStateContext(helperQuitLabel);
+        LogRecentNativeInterestingContext(helperQuitLabel);
+        if (g_injectedBlock != nullptr)
+        {
+            PublishHelperNativeQuit(helperQuitKind, text.c_str());
+        }
+        if (helperQuitPeerReceived)
+        {
+            PublishConsoleError("Peer quit");
+        }
+        return;
     }
 
     // --- Connection error detection ---
@@ -1120,15 +1168,6 @@ bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath)
 bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
 {
     std::string pathText;
-    if (TryGetRedirectedNativeLogEfzHandlePath(hFile, &pathText))
-    {
-        if (outPath != nullptr)
-        {
-            *outPath = pathText;
-        }
-        return true;
-    }
-
     if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
     {
         return false;
@@ -1140,7 +1179,7 @@ bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
 
     const size_t slash = lowerPath.find_last_of("\\/");
     const std::string baseName = (slash == std::string::npos) ? lowerPath : lowerPath.substr(slash + 1);
-    if (baseName != "logefz.txt")
+    if (baseName != "logefz.txt" && baseName != "logefz_native_shadow.txt")
     {
         return false;
     }

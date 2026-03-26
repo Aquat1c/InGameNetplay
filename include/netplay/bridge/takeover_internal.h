@@ -53,6 +53,30 @@ constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
 constexpr int kNetplayRoleClient    = 2;  // joined (P2 side — inputs swapped)
 constexpr int kNetplayRoleSpectator = 3;  // spectating
 
+enum class NetbridgeHelperQuitKind : int
+{
+    None = 0,
+    CloseEfz = 1,
+    EfzDied = 2,
+    PeerQuitReceived = 3,
+};
+
+inline const char* HelperNativeQuitKindToString(int kind)
+{
+    switch (static_cast<NetbridgeHelperQuitKind>(kind))
+    {
+    case NetbridgeHelperQuitKind::CloseEfz:
+        return "close_efz";
+    case NetbridgeHelperQuitKind::EfzDied:
+        return "efz_died";
+    case NetbridgeHelperQuitKind::PeerQuitReceived:
+        return "peer_quit_received";
+    case NetbridgeHelperQuitKind::None:
+    default:
+        return "none";
+    }
+}
+
 inline const char* SafeRiskyPathLabel(const char* path)
 {
     return (path != nullptr && path[0] != '\0') ? path : "unnamed";
@@ -181,6 +205,12 @@ struct SharedBlock
     volatile LONG dbgCreateRemoteThreadHits = 0;
     volatile LONG consoleErrorSerial = 0;
     char consoleErrorText[128] = {};
+    volatile LONG hostQuitRequestSerial = 0;
+    volatile LONG hostQuitRequestServedSerial = 0;
+    char hostQuitRequestText[64] = {};
+    volatile LONG helperQuitSerial = 0;
+    int helperQuitKind = 0;
+    char helperQuitText[128] = {};
 };
 #pragma pack(pop)
 
@@ -491,11 +521,12 @@ void RequestDeferredCancelCleanup();
 
 // Arm/consume the one-shot "online match ESC already queued a graceful quit"
 // marker. The per-frame tick sets it when it detects a local Esc edge on the
-// live battle screen, and ExitProcess interception consumes it to wait briefly
-// before tearing the helper down.
+// live battle screen, and ExitProcess interception consumes it to wait only
+// for the remaining grace window before tearing the helper down.
 void ArmOnlineMatchEscGracefulQuit();
-bool ConsumeOnlineMatchEscGracefulQuit();
+DWORD ConsumeOnlineMatchEscGracefulQuitDelayMs();
 void ResetOnlineMatchEscGracefulQuit();
+void MarkExitInterceptGracefulHelperShutdownPending();
 
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
@@ -525,6 +556,9 @@ void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
+bool PublishHostQuitRequest(const char* reasonText);
+void PublishHelperNativeQuit(int kind, const char* text);
+void ReadHelperNativeQuit(LONG* outSerial, int* outKind, char* outText, int outTextSize);
 HMODULE SelfModule();
 std::string ModulePath(HMODULE module);
 bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag);
@@ -587,7 +621,12 @@ bool PatchIatModule(
     int* outPatched,
     bool verboseLogs);
 std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase);
-bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs);
+bool PatchIat(
+    HANDLE process,
+    DWORD processId,
+    const std::unordered_map<std::string, uint32_t>& patchMap,
+    bool verboseLogs,
+    bool includeRuntimeModules = true);
 // In-process IAT patching for Wine — safe to call from DllMain.
 // Returns number of entries patched, or -1 on error.
 int SelfPatchIat();
@@ -625,6 +664,7 @@ VOID StubOutputDebugStringA(LPCSTR lpOutputString);
 VOID StubOutputDebugStringW(LPCWSTR lpOutputString);
 DWORD StubWaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
 BOOL StubGetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode);
+BOOL StubGetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode);
 DWORD StubResumeThread(HANDLE hThread);
 
 } // namespace netplay::bridge::takeover

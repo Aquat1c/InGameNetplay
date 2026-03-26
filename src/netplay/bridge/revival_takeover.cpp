@@ -305,7 +305,9 @@ static void CloseChildJobObject()
 }
 
 static constexpr DWORD kGracefulHelperShutdownWaitMs = 150;
+static constexpr DWORD kExitInterceptGracefulHelperShutdownWaitMs = 500;
 static constexpr DWORD kHardHelperTerminateWaitMs = 50;
+static volatile LONG g_exitInterceptGracefulHelperShutdownPending = 0;
 
 struct HelperShutdownTrace
 {
@@ -558,6 +560,11 @@ static HelperShutdownTrace TryGracefulHelperShutdownLocked(
     return trace;
 }
 
+void MarkExitInterceptGracefulHelperShutdownPending()
+{
+    InterlockedExchange(&g_exitInterceptGracefulHelperShutdownPending, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle functions (public API from revival_takeover.h).
 // ---------------------------------------------------------------------------
@@ -582,7 +589,7 @@ void InitializeHost()
     {
         const auto selfPatches = BuildPatchMap(reinterpret_cast<uintptr_t>(SelfModule()));
         std::unordered_map<std::string, uint32_t> hostLogPatches;
-        for (const char* name : {"WriteFile", "CreateFileA", "CreateFileW", "CloseHandle"})
+        for (const char* name : {"WriteFile", "CreateFileA", "CreateFileW"})
         {
             const auto it = selfPatches.find(name);
             if (it != selfPatches.end())
@@ -594,7 +601,12 @@ void InitializeHost()
         if (!hostLogPatches.empty())
         {
             const bool patchedHostLogIat =
-                PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, true);
+                PatchIat(
+                    GetCurrentProcess(),
+                    GetCurrentProcessId(),
+                    hostLogPatches,
+                    true,
+                    false);
             mod::Log(
                 "Takeover: host logEfz IAT patch result=%d patchCount=%lu",
                 patchedHostLogIat ? 1 : 0,
@@ -818,6 +830,11 @@ bool StartSession(
                  static_cast<long>(g_revivalExitMode));
         InterlockedExchange(&g_revivalExitIntercepted, 0);
         InterlockedExchange(&g_revivalExitMode, -1);
+    }
+    if (InterlockedCompareExchange(&g_exitInterceptGracefulHelperShutdownPending, 0, 0) != 0)
+    {
+        mod::Log("StartSession: clearing stale graceful-exit helper shutdown pending flag");
+        InterlockedExchange(&g_exitInterceptGracefulHelperShutdownPending, 0);
     }
 
     LogSessionDiagnosticState("StartSession_entry");
@@ -2316,6 +2333,10 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     const DWORD processIdSnapshot = g_revivalProcessId;
     const bool hadProcess = ProcessAlive(ioStatus);
+    const bool gracefulExitInterceptShutdown =
+        reason != nullptr
+        && std::strcmp(reason, "exit_intercepted") == 0
+        && InterlockedExchange(&g_exitInterceptGracefulHelperShutdownPending, 0) != 0;
     HelperShutdownTrace helperShutdownTrace = {};
     helperShutdownTrace.processId = processIdSnapshot;
     helperShutdownTrace.phase =
@@ -2323,16 +2344,63 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
             ? static_cast<NetbridgePhase>(ioStatus->phase)
             : NetbridgePhase::Idle;
     helperShutdownTrace.userInitiatedCancel =
-        reason != nullptr
-        && (std::strcmp(reason, "user_cancel") == 0
-            || std::strcmp(reason, "leave_menu") == 0
-            || std::strcmp(reason, "external_cancel") == 0
-            || std::strcmp(reason, "shutdown") == 0);
+        gracefulExitInterceptShutdown
+        || (reason != nullptr
+            && (std::strcmp(reason, "user_cancel") == 0
+                || std::strcmp(reason, "leave_menu") == 0
+                || std::strcmp(reason, "external_cancel") == 0
+                || std::strcmp(reason, "shutdown") == 0));
     helperShutdownTrace.dllExitPatchesSaved = AreDllExitPatchesSaved();
     helperShutdownTrace.jobObjectPresent = (g_childJobObject != nullptr);
     if (hadProcess && g_revivalProcess != nullptr)
     {
-        helperShutdownTrace = TryGracefulHelperShutdownLocked(reason, ioStatus);
+        if (gracefulExitInterceptShutdown)
+        {
+            helperShutdownTrace.method = "quit_ring_already_requested";
+            helperShutdownTrace.requested = true;
+            helperShutdownTrace.waitIssued = true;
+            helperShutdownTrace.waitResult =
+                WaitForSingleObject(g_revivalProcess, kExitInterceptGracefulHelperShutdownWaitMs);
+            if (helperShutdownTrace.waitResult == WAIT_OBJECT_0)
+            {
+                helperShutdownTrace.gracefulCompleted = true;
+                CaptureHelperExitSnapshot(g_revivalProcess, &helperShutdownTrace);
+                mod::Log(
+                    "Takeover: graceful helper shutdown completed reason='%s' "
+                    "method=%s wait=%lums exitCodeKnown=%d exitCode=%lu aliveAfter=%d",
+                    reason != nullptr ? reason : "",
+                    helperShutdownTrace.method,
+                    static_cast<unsigned long>(kExitInterceptGracefulHelperShutdownWaitMs),
+                    helperShutdownTrace.exitCodeKnown ? 1 : 0,
+                    static_cast<unsigned long>(helperShutdownTrace.exitCode),
+                    helperShutdownTrace.processAliveAfter ? 1 : 0);
+            }
+            else if (helperShutdownTrace.waitResult == WAIT_TIMEOUT)
+            {
+                mod::Log(
+                    "Takeover: graceful helper shutdown timed out reason='%s' "
+                    "method=%s wait=%lums",
+                    reason != nullptr ? reason : "",
+                    helperShutdownTrace.method,
+                    static_cast<unsigned long>(kExitInterceptGracefulHelperShutdownWaitMs));
+                CaptureHelperExitSnapshot(g_revivalProcess, &helperShutdownTrace);
+            }
+            else
+            {
+                helperShutdownTrace.waitError = GetLastError();
+                mod::Log(
+                    "Takeover: graceful helper shutdown wait failed reason='%s' "
+                    "method=%s err=%lu",
+                    reason != nullptr ? reason : "",
+                    helperShutdownTrace.method,
+                    static_cast<unsigned long>(helperShutdownTrace.waitError));
+                CaptureHelperExitSnapshot(g_revivalProcess, &helperShutdownTrace);
+            }
+        }
+        else
+        {
+            helperShutdownTrace = TryGracefulHelperShutdownLocked(reason, ioStatus);
+        }
         if (!helperShutdownTrace.gracefulCompleted)
         {
             helperShutdownTrace.hardFallbackAttempted = true;

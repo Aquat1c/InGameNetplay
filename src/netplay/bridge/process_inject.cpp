@@ -32,6 +32,7 @@ extern "C" __declspec(dllexport) VOID WINAPI nb_stub_OutputDebugStringA(LPCSTR);
 extern "C" __declspec(dllexport) VOID WINAPI nb_stub_OutputDebugStringW(LPCWSTR);
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_WaitForSingleObject(HANDLE, DWORD);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeThread(HANDLE, LPDWORD);
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeProcess(HANDLE, LPDWORD);
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_ResumeThread(HANDLE);
 
 namespace netplay::bridge::takeover
@@ -249,6 +250,7 @@ std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
     patches["OutputDebugStringW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_OutputDebugStringW));
     patches["WaitForSingleObject"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WaitForSingleObject));
     patches["GetExitCodeThread"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_GetExitCodeThread));
+    patches["GetExitCodeProcess"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_GetExitCodeProcess));
     patches["ResumeThread"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ResumeThread));
     return patches;
 }
@@ -390,6 +392,8 @@ bool PatchIatModule(
                     || _stricmp(name, "OpenProcess") == 0
                     || _stricmp(name, "CloseHandle") == 0
                     || _stricmp(name, "TerminateProcess") == 0
+                    || _stricmp(name, "GetExitCodeProcess") == 0
+                    || _stricmp(name, "WaitForSingleObject") == 0
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
                     || _stricmp(name, "WriteFile") == 0
@@ -419,7 +423,12 @@ bool PatchIatModule(
     return true;
 }
 
-bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs)
+bool PatchIat(
+    HANDLE process,
+    DWORD processId,
+    const std::unordered_map<std::string, uint32_t>& patchMap,
+    bool verboseLogs,
+    bool includeRuntimeModules)
 {
     char riskyDetail[96] = {};
     std::snprintf(
@@ -548,11 +557,14 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
 
     // Runtime CRT modules often own WriteConsole*/WriteFile paths used by
     // ostream/log output; patch them too so prompt detection sees console text.
-    for (const RemoteModuleRecord& module : modules)
+    if (includeRuntimeModules)
     {
-        if (isRuntimePatchModule(module.moduleLower))
+        for (const RemoteModuleRecord& module : modules)
         {
-            pushUniqueTarget(module);
+            if (isRuntimePatchModule(module.moduleLower))
+            {
+                pushUniqueTarget(module);
+            }
         }
     }
 
@@ -857,6 +869,7 @@ int SelfPatchIat()
         { "OutputDebugStringW",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_OutputDebugStringW)) },
         { "WaitForSingleObject",            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WaitForSingleObject)) },
         { "GetExitCodeThread",              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_GetExitCodeThread)) },
+        { "GetExitCodeProcess",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_GetExitCodeProcess)) },
         { "ResumeThread",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ResumeThread)) },
     };
     constexpr int kEntryCount = sizeof(entries) / sizeof(entries[0]);

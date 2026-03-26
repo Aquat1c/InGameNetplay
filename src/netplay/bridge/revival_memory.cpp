@@ -3382,7 +3382,12 @@ static bool    g_perFrameMismatchLogged     = false;
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
+static volatile LONG g_onlineMatchEscGracefulQuitArmedTick = 0;
+static volatile LONG g_onlineMatchEscGracefulQuitWaitLogged = 0;
+static volatile LONG g_onlineMatchEscGracefulQuitElapsedLogged = 0;
+static volatile LONG g_onlineMatchEscFallbackQuitRingQueued = 0;
 static volatile LONG* g_quitRingHeader = nullptr;
+static constexpr DWORD kOnlineMatchEscGracefulQuitGraceMs = 150;
 
 // Spectator tick holdoff: when true, the per-frame tick hook will not
 // call RunPerFrameTickDispatch while the spectator session is active on
@@ -3414,8 +3419,14 @@ static uint32_t g_frameTick = 0;           // monotonic per-frame counter
 
 static bool EnsureQuitRingHeader();
 static void ReleaseQuitRingHeader();
+static DWORD GetOnlineMatchEscGracefulQuitRemainingMs();
 static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefore);
 static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore);
+static char RecoverFromHelperQuitSignal(
+    const char* phaseTag,
+    LONG helperQuitSerial,
+    int helperQuitKind,
+    const char* helperQuitText);
 
 // --- Double-speed diagnostics -------------------------------------------
 // Wall-clock time tracking: measure actual FPS by comparing timeGetTime()
@@ -3760,11 +3771,79 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // side, and keep the existing console-error short-circuit as well.
     bool preTickDisconnect = false;
     bool preTickGracefulQuit = false;
+    bool preTickHelperQuit = false;
     LONG preTickQuitHead = 0;
     LONG preTickQuitTail = 0;
-    if (g_dllExitProcessPatchesSaved
-        && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
+    LONG preTickHelperQuitSerial = 0;
+    int preTickHelperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::None);
+    char preTickHelperQuitText[128] = {};
+    const DWORD onlineMatchEscQuitRemainingMs =
+        GetOnlineMatchEscGracefulQuitRemainingMs();
+    if (onlineMatchEscQuitRemainingMs > 0
+        && InterlockedExchange(&g_onlineMatchEscGracefulQuitWaitLogged, 1) == 0)
     {
+        mod::Log(
+            "TICK_HOOK: online match ESC graceful quit waiting for helper flush "
+            "frameTick=%u remainingMs=%lu",
+            g_frameTick,
+            static_cast<unsigned long>(onlineMatchEscQuitRemainingMs));
+    }
+    else if (onlineMatchEscQuitRemainingMs == 0
+             && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) != 0
+             && InterlockedExchange(&g_onlineMatchEscGracefulQuitElapsedLogged, 1) == 0)
+    {
+        const DWORD armedTick = static_cast<DWORD>(
+            InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmedTick, 0, 0));
+        const DWORD elapsedMs =
+            armedTick != 0 ? (GetTickCount() - armedTick) : 0;
+        mod::Log(
+            "TICK_HOOK: online match ESC graceful quit window elapsed "
+            "frameTick=%u elapsedMs=%lu — allowing local quit-ring recovery",
+            g_frameTick,
+            static_cast<unsigned long>(elapsedMs));
+    }
+
+    if (g_dllExitProcessPatchesSaved
+        && g_hostBlock != nullptr)
+    {
+        ReadHelperNativeQuit(
+            &preTickHelperQuitSerial,
+            &preTickHelperQuitKind,
+            preTickHelperQuitText,
+            sizeof(preTickHelperQuitText));
+        if (preTickHelperQuitSerial > 0)
+        {
+            mod::Log(
+                "TICK_HOOK: *** PRE-TICK HELPER NATIVE QUIT *** frameTick=%u "
+                "serial=%ld kind=%s text='%s' — skipping DLL tick",
+                g_frameTick,
+                static_cast<long>(preTickHelperQuitSerial),
+                HelperNativeQuitKindToString(preTickHelperQuitKind),
+                preTickHelperQuitText);
+            preTickDisconnect = true;
+            preTickHelperQuit = true;
+        }
+    }
+
+    if (!preTickDisconnect
+        && g_dllExitProcessPatchesSaved
+        && onlineMatchEscQuitRemainingMs == 0)
+    {
+        if (InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) != 0
+            && InterlockedCompareExchange(&g_onlineMatchEscFallbackQuitRingQueued, 0, 0) == 0)
+        {
+            const bool fallbackQuitQueued =
+                SignalGracefulQuitRing("online_match_esc_fallback", 0);
+            if (fallbackQuitQueued)
+            {
+                InterlockedExchange(&g_onlineMatchEscFallbackQuitRingQueued, 1);
+            }
+            mod::Log(
+                "TICK_HOOK: online match ESC fallback quit-ring request frameTick=%u queued=%d",
+                g_frameTick,
+                fallbackQuitQueued ? 1 : 0);
+        }
+
         if (ConsumeGracefulQuitRingSignal(&preTickQuitHead, &preTickQuitTail))
         {
             mod::Log(
@@ -3819,16 +3898,22 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (escRisingEdge)
         {
+            const bool hostQuitRequested =
+                PublishHostQuitRequest("online_match_esc_key");
             const bool quitQueued =
-                SignalGracefulQuitRing("online_match_esc_key", 0);
+                hostQuitRequested
+                    ? false
+                    : SignalGracefulQuitRing("online_match_esc_key", 0);
             mod::Log(
                 "TICK_HOOK: online match ESC detected frameTick=%u screen=%u "
-                "session=0x%08lX quitQueued=%d",
+                "session=0x%08lX hostQuitRequested=%d fallbackQuitRing=%d graceMs=%lu",
                 g_frameTick,
                 static_cast<unsigned>(escScreen),
                 static_cast<unsigned long>(currentSession),
-                quitQueued ? 1 : 0);
-            if (quitQueued)
+                hostQuitRequested ? 1 : 0,
+                quitQueued ? 1 : 0,
+                static_cast<unsigned long>(kOnlineMatchEscGracefulQuitGraceMs));
+            if (hostQuitRequested || quitQueued)
             {
                 ArmOnlineMatchEscGracefulQuit();
             }
@@ -4617,21 +4702,58 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         return 0;
     }
 
+    if (preTickHelperQuit)
+    {
+        ResetOnlineMatchEscGracefulQuit();
+        return RecoverFromHelperQuitSignal(
+            "PRE-TICK",
+            preTickHelperQuitSerial,
+            preTickHelperQuitKind,
+            preTickHelperQuitText);
+    }
+
     if (preTickGracefulQuit)
     {
+        ResetOnlineMatchEscGracefulQuit();
         return RecoverFromQuitRingSignal("PRE-TICK", preTickQuitHead, preTickQuitTail);
+    }
+
+    // Prefer an explicit native helper quit signal over locally consuming the
+    // quit ring. This gives Revival a chance to send its peer-quit message
+    // before we synthesize recovery on the host side.
+    if (g_dllExitProcessPatchesSaved
+        && g_hostBlock != nullptr)
+    {
+        LONG helperQuitSerial = 0;
+        int helperQuitKind = static_cast<int>(NetbridgeHelperQuitKind::None);
+        char helperQuitText[128] = {};
+        ReadHelperNativeQuit(
+            &helperQuitSerial,
+            &helperQuitKind,
+            helperQuitText,
+            sizeof(helperQuitText));
+        if (helperQuitSerial > 0)
+        {
+            ResetOnlineMatchEscGracefulQuit();
+            return RecoverFromHelperQuitSignal(
+                "POST-TICK",
+                helperQuitSerial,
+                helperQuitKind,
+                helperQuitText);
+        }
     }
 
     // ---- Proactive graceful session-end detection -------------------------
     // Also catch Quit-ring signals that were published during the current
     // DLL tick, not just between frames.
     if (g_dllExitProcessPatchesSaved
-        && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
+        && GetOnlineMatchEscGracefulQuitRemainingMs() == 0)
     {
         LONG quitHeadAfter = 0;
         LONG quitTailAfter = 0;
         if (ConsumeGracefulQuitRingSignal(&quitHeadAfter, &quitTailAfter))
         {
+            ResetOnlineMatchEscGracefulQuit();
             return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
         }
     }
@@ -5025,19 +5147,77 @@ void RequestDeferredCancelCleanup()
     g_deferredCancelCleanup = true;
 }
 
+static DWORD GetOnlineMatchEscGracefulQuitRemainingMs()
+{
+    if (InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
+    {
+        return 0;
+    }
+
+    const DWORD armedTick = static_cast<DWORD>(
+        InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmedTick, 0, 0));
+    if (armedTick == 0)
+    {
+        return 0;
+    }
+
+    const DWORD elapsedMs = GetTickCount() - armedTick;
+    if (elapsedMs >= kOnlineMatchEscGracefulQuitGraceMs)
+    {
+        return 0;
+    }
+
+    return kOnlineMatchEscGracefulQuitGraceMs - elapsedMs;
+}
+
 void ArmOnlineMatchEscGracefulQuit()
 {
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitArmedTick,
+                        static_cast<LONG>(GetTickCount()));
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitWaitLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitElapsedLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscFallbackQuitRingQueued, 0);
     InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 1);
 }
 
-bool ConsumeOnlineMatchEscGracefulQuit()
+DWORD ConsumeOnlineMatchEscGracefulQuitDelayMs()
 {
-    return InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0) != 0;
+    if (InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0) == 0)
+    {
+        InterlockedExchange(&g_onlineMatchEscGracefulQuitArmedTick, 0);
+        InterlockedExchange(&g_onlineMatchEscGracefulQuitWaitLogged, 0);
+        InterlockedExchange(&g_onlineMatchEscGracefulQuitElapsedLogged, 0);
+        InterlockedExchange(&g_onlineMatchEscFallbackQuitRingQueued, 0);
+        return 0;
+    }
+
+    const DWORD armedTick = static_cast<DWORD>(
+        InterlockedExchange(&g_onlineMatchEscGracefulQuitArmedTick, 0));
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitWaitLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitElapsedLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscFallbackQuitRingQueued, 0);
+
+    if (armedTick == 0)
+    {
+        return kOnlineMatchEscGracefulQuitGraceMs;
+    }
+
+    const DWORD elapsedMs = GetTickCount() - armedTick;
+    if (elapsedMs >= kOnlineMatchEscGracefulQuitGraceMs)
+    {
+        return 0;
+    }
+
+    return kOnlineMatchEscGracefulQuitGraceMs - elapsedMs;
 }
 
 void ResetOnlineMatchEscGracefulQuit()
 {
     InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0);
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitArmedTick, 0);
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitWaitLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscGracefulQuitElapsedLogged, 0);
+    InterlockedExchange(&g_onlineMatchEscFallbackQuitRingQueued, 0);
 }
 
 static bool EnsureQuitRingHeader()
@@ -5144,17 +5324,29 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
 
     if (g_revivalProcess != nullptr)
     {
-        const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
-        const DWORD termErr = termOk ? 0 : GetLastError();
-        CloseHandle(g_revivalProcess);
-        g_revivalProcess = nullptr;
-        g_revivalProcessId = 0;
-        mod::Log(
-            "TICK_HOOK: graceful-quit step 2 helper terminated "
-            "(pid=%lu termOk=%d err=%lu)",
-            static_cast<unsigned long>(deadPid),
-            termOk ? 1 : 0,
-            static_cast<unsigned long>(termErr));
+        const DWORD waitResult = WaitForSingleObject(g_revivalProcess, 0);
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            CloseHandle(g_revivalProcess);
+            g_revivalProcess = nullptr;
+            g_revivalProcessId = 0;
+            mod::Log(
+                "TICK_HOOK: graceful-quit step 2 helper already exited "
+                "(pid=%lu)",
+                static_cast<unsigned long>(deadPid));
+        }
+        else
+        {
+            const DWORD waitErr =
+                (waitResult == WAIT_FAILED) ? GetLastError() : 0;
+            MarkExitInterceptGracefulHelperShutdownPending();
+            mod::Log(
+                "TICK_HOOK: graceful-quit step 2 deferring helper termination "
+                "(pid=%lu wait=%lu err=%lu) — exit interception will allow native shutdown first",
+                static_cast<unsigned long>(deadPid),
+                static_cast<unsigned long>(waitResult),
+                static_cast<unsigned long>(waitErr));
+        }
     }
 
     const bool patchOk = RestoreDllExitProcessPatches();
@@ -5180,6 +5372,31 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
         deadRole);
     LogSessionDiagnosticState("TickHook_gracefulQuit_exit");
     return 0;
+}
+
+static char RecoverFromHelperQuitSignal(
+    const char* phaseTag,
+    LONG helperQuitSerial,
+    int helperQuitKind,
+    const char* helperQuitText)
+{
+    const int deadRole = g_localRoleFlag;
+    const DWORD deadPid = g_revivalProcessId;
+    LogSessionDiagnosticState("TickHook_helperQuit_entry");
+    mod::Log(
+        "TICK_HOOK: *** %s HELPER NATIVE QUIT *** frameTick=%u "
+        "role=%d pid=%lu serial=%ld kind=%s text='%s' — synthesizing exit interception",
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        g_frameTick,
+        deadRole,
+        static_cast<unsigned long>(deadPid),
+        static_cast<long>(helperQuitSerial),
+        HelperNativeQuitKindToString(helperQuitKind),
+        helperQuitText != nullptr ? helperQuitText : "");
+    return RecoverFromQuitRingSignal(
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        0,
+        0);
 }
 
 // Reset the per-frame validator state.  Called when a session ends so the

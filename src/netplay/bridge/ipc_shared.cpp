@@ -279,6 +279,94 @@ void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize)
     }
 }
 
+bool PublishHostQuitRequest(const char* reasonText)
+{
+    const char* text =
+        (reasonText != nullptr && reasonText[0] != '\0')
+            ? reasonText
+            : "host_quit_requested";
+
+    auto writeRequest = [&](SharedBlock* block)
+    {
+        CopyString(block->hostQuitRequestText, sizeof(block->hostQuitRequestText), text);
+        InterlockedIncrement(&block->hostQuitRequestSerial);
+    };
+
+    if (g_hostBlock != nullptr)
+    {
+        writeRequest(g_hostBlock);
+        return true;
+    }
+
+    TempIpcContext temp = {};
+    const bool ok = OpenTempIpcContext(&temp, false, false) && temp.block != nullptr;
+    if (ok)
+    {
+        writeRequest(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+    return ok;
+}
+
+void PublishHelperNativeQuit(int kind, const char* text)
+{
+    if (kind == static_cast<int>(NetbridgeHelperQuitKind::None))
+    {
+        return;
+    }
+
+    auto writeQuit = [&](SharedBlock* block)
+    {
+        block->helperQuitKind = kind;
+        CopyString(block->helperQuitText, sizeof(block->helperQuitText), text);
+        InterlockedIncrement(&block->helperQuitSerial);
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        writeQuit(g_injectedBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        writeQuit(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ReadHelperNativeQuit(LONG* outSerial, int* outKind, char* outText, int outTextSize)
+{
+    LONG serial = 0;
+    int kind = static_cast<int>(NetbridgeHelperQuitKind::None);
+    const char* text = nullptr;
+
+    if (g_hostBlock != nullptr)
+    {
+        serial = InterlockedCompareExchange(&g_hostBlock->helperQuitSerial, 0, 0);
+        kind = g_hostBlock->helperQuitKind;
+        text = g_hostBlock->helperQuitText;
+    }
+
+    if (outSerial != nullptr)
+    {
+        *outSerial = serial;
+    }
+    if (outKind != nullptr)
+    {
+        *outKind = (serial > 0) ? kind : static_cast<int>(NetbridgeHelperQuitKind::None);
+    }
+    if (outText != nullptr && outTextSize > 0 && text != nullptr && serial > 0)
+    {
+        CopyString(outText, outTextSize, text);
+    }
+    else if (outText != nullptr && outTextSize > 0)
+    {
+        outText[0] = '\0';
+    }
+}
+
 HMODULE SelfModule()
 {
     HMODULE module = nullptr;
