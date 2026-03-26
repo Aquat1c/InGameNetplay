@@ -99,6 +99,10 @@ void Reload()
     }
     loaded.writeLogFile =
         ReadBoolValue(L"Others", L"WriteLogFile", true, iniPath);
+    loaded.preserveModLogAcrossLaunches =
+        ReadBoolValue(L"Others", L"PreserveModLogAcrossLaunches", false, iniPath);
+    loaded.preserveLogEfzAcrossLaunches =
+        ReadBoolValue(L"Others", L"PreserveLogEfzAcrossLaunches", false, iniPath);
     loaded.enableConsole =
         ReadBoolValue(L"Others", L"EnableConsole", false, iniPath);
     loaded.enableDebugMenu =
@@ -122,6 +126,16 @@ bool UseTournamentModeForOfflineVsHuman()
 bool IsFileLoggingEnabled()
 {
     return g_settings.writeLogFile;
+}
+
+bool PreserveModLogAcrossLaunches()
+{
+    return g_settings.preserveModLogAcrossLaunches;
+}
+
+bool PreserveLogEfzAcrossLaunches()
+{
+    return g_settings.preserveLogEfzAcrossLaunches;
 }
 
 bool IsConsoleEnabled()

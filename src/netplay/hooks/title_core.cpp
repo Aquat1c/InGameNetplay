@@ -246,9 +246,18 @@ InlineEditValues GetInlineEditValuesSnapshot()
 
 void ApplyInlineEditValues(const InlineEditValues& values)
 {
+    const std::string previousJoinAddress = g_netplayMenuState.joinAddress;
     g_netplayMenuState.hostPort = values.hostPort;
     g_netplayMenuState.joinAddress = values.joinAddress;
     g_netplayMenuState.joinPort = values.joinPort;
+    if (previousJoinAddress != values.joinAddress)
+    {
+        mod::Log(
+            "NetplayJoinAddress: inline edit '%s' -> '%s'",
+            previousJoinAddress.c_str(),
+            values.joinAddress.c_str());
+        (void)SaveNetplayJoinAddressToIni(values.joinAddress);
+    }
     if (g_netplayMenuState.nickname != values.nickname)
     {
         mod::Log(

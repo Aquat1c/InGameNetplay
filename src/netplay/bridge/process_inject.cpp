@@ -21,6 +21,9 @@ extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD, BOOL, 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_CloseHandle(HANDLE);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleA(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleW(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleOutputCharacterA(HANDLE, LPCSTR, DWORD, COORD, LPDWORD);
@@ -235,6 +238,9 @@ std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
     patches["ReadConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleA));
     patches["ReadConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleW));
     patches["WriteFile"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteFile));
+    patches["CreateFileA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileA));
+    patches["CreateFileW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileW));
+    patches["CloseHandle"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CloseHandle));
     patches["WriteConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleA));
     patches["WriteConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleW));
     patches["WriteConsoleOutputCharacterA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleOutputCharacterA));
@@ -379,7 +385,10 @@ bool PatchIatModule(
                     return false;
                 }
                 return _stricmp(name, "CreateProcessA") == 0
+                    || _stricmp(name, "CreateFileA") == 0
+                    || _stricmp(name, "CreateFileW") == 0
                     || _stricmp(name, "OpenProcess") == 0
+                    || _stricmp(name, "CloseHandle") == 0
                     || _stricmp(name, "TerminateProcess") == 0
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
@@ -412,6 +421,27 @@ bool PatchIatModule(
 
 bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs)
 {
+    char riskyDetail[96] = {};
+    std::snprintf(
+        riskyDetail,
+        sizeof(riskyDetail),
+        "pid=%lu patchCount=%zu verbose=%d",
+        static_cast<unsigned long>(processId),
+        static_cast<size_t>(patchMap.size()),
+        verboseLogs ? 1 : 0);
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("PatchIat", riskyDetail);
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "PatchIat",
+            riskyStartTick,
+            50,
+            outcome,
+            true);
+        return value;
+    };
+
     auto isRuntimePatchModule = [](const std::string& moduleLower) -> bool {
         if (moduleLower.empty())
         {
@@ -460,7 +490,7 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
     if (modules.empty())
     {
         mod::Log("Takeover: PatchIat failed to enumerate remote modules");
-        return false;
+        return finishRisky("enumerate_modules_failed", false);
     }
 
     std::vector<RemoteModuleRecord> targets;
@@ -543,7 +573,7 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
         mod::Log(
             "Takeover: PatchIat refused - no target modules found (first='%s')",
             modules.front().moduleLower.c_str());
-        return false;
+        return finishRisky("no_target_modules", false);
     }
 
     int totalPatched = 0;
@@ -573,7 +603,7 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
                 "Takeover: PatchIatModule failed module='%s' base=0x%08lX",
                 module.moduleLower.c_str(),
                 static_cast<unsigned long>(module.base));
-            return false;
+            return finishRisky("patch_module_failed", false);
         }
         totalPatched += patched;
     }
@@ -585,7 +615,8 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
             totalPatched,
             static_cast<size_t>(targets.size()));
     }
-    return totalPatched > 0;
+    const bool anyPatched = totalPatched > 0;
+    return finishRisky(anyPatched ? "patched" : "no_imports_patched", anyPatched);
 }
 
 HANDLE CreateFakeThread(DWORD exitCode)
@@ -815,6 +846,9 @@ int SelfPatchIat()
         { "ReadConsoleA",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleA)) },
         { "ReadConsoleW",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleW)) },
         { "WriteFile",                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)) },
+        { "CreateFileA",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)) },
+        { "CreateFileW",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)) },
+        { "CloseHandle",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CloseHandle)) },
         { "WriteConsoleA",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleA)) },
         { "WriteConsoleW",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleW)) },
         { "WriteConsoleOutputCharacterA",   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleOutputCharacterA)) },

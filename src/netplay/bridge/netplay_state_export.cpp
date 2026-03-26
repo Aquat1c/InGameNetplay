@@ -54,6 +54,10 @@ int32_t g_prevSessionPhase = 0;
 uint32_t g_stateSeq = 0;
 uint32_t g_sessionId = 0;
 uint32_t g_setId = 0;
+uint32_t g_lastNetworkLogSeq = 0;
+int g_lastNetworkLogPingMs = -1;
+int g_lastNetworkLogRollbackFrames = -1;
+constexpr int kNetworkLogPingDeltaMs = 8;
 
 // Latched end reason — persists until next session starts.
 uint8_t g_latchedEndReason = EFZ_END_NONE;
@@ -487,6 +491,9 @@ void Update(const NetbridgeStatus& status)
             g_latchedP2Wins = 0;
             g_prevP1Wins = 0;
             g_prevP2Wins = 0;
+            g_lastNetworkLogSeq = 0;
+            g_lastNetworkLogPingMs = -1;
+            g_lastNetworkLogRollbackFrames = -1;
             mod::Log("StateExport: new session sessionId=%u", g_sessionId);
         }
 
@@ -600,14 +607,42 @@ void Update(const NetbridgeStatus& status)
     if (s.pingMs >= 0 || s.rollbackFrames >= 0)
         caps |= EFZ_CAP_NETWORK;
 
-    // Log when ping or delay changes by more than 1 ms / 1 frame.
+    // Log network changes only when the rollback delay changes or the ping
+    // meaningfully shifts. The old per-change logging was flooding the main
+    // mod log with thousands of tiny 1 ms oscillations during long matches.
     if (s.pingMs != g_prevPingMs || s.rollbackFrames != g_prevRollbackFrames)
     {
-        mod::Log(
-            "StateExport: network ping=%d->%d delay=%d->%d seq=%u",
-            g_prevPingMs,         s.pingMs,
-            g_prevRollbackFrames, s.rollbackFrames,
-            s.stateSeq);
+        bool shouldLog = false;
+        if (g_lastNetworkLogSeq == 0)
+        {
+            shouldLog = true;
+        }
+        else if (s.rollbackFrames != g_lastNetworkLogRollbackFrames)
+        {
+            shouldLog = true;
+        }
+        else if (s.pingMs < 0 || g_lastNetworkLogPingMs < 0)
+        {
+            shouldLog = true;
+        }
+        else
+        {
+            const int pingDelta = s.pingMs - g_lastNetworkLogPingMs;
+            const int pingDeltaAbs = pingDelta < 0 ? -pingDelta : pingDelta;
+            shouldLog = pingDeltaAbs >= kNetworkLogPingDeltaMs;
+        }
+
+        if (shouldLog)
+        {
+            mod::Log(
+                "StateExport: network ping=%d->%d delay=%d->%d seq=%u",
+                g_prevPingMs,         s.pingMs,
+                g_prevRollbackFrames, s.rollbackFrames,
+                s.stateSeq);
+            g_lastNetworkLogSeq = s.stateSeq;
+            g_lastNetworkLogPingMs = s.pingMs;
+            g_lastNetworkLogRollbackFrames = s.rollbackFrames;
+        }
         g_prevPingMs         = s.pingMs;
         g_prevRollbackFrames = s.rollbackFrames;
     }

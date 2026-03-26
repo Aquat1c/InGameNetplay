@@ -8,6 +8,8 @@ struct Settings
 {
     std::string offlineVsHumanMode = "Tournament";
     bool writeLogFile = true;
+    bool preserveModLogAcrossLaunches = false;
+    bool preserveLogEfzAcrossLaunches = false;
     bool enableConsole = false;
     bool enableDebugMenu = false;
     bool hideEmptySetsInBattleLog = true;
@@ -18,6 +20,8 @@ const Settings& Get();
 
 bool UseTournamentModeForOfflineVsHuman();
 bool IsFileLoggingEnabled();
+bool PreserveModLogAcrossLaunches();
+bool PreserveLogEfzAcrossLaunches();
 bool IsConsoleEnabled();
 bool IsDebugMenuEnabled();
 bool HideEmptySetsInBattleLogByDefault();

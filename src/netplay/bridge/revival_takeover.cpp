@@ -304,12 +304,267 @@ static void CloseChildJobObject()
     }
 }
 
+static constexpr DWORD kGracefulHelperShutdownWaitMs = 150;
+static constexpr DWORD kHardHelperTerminateWaitMs = 50;
+
+struct HelperShutdownTrace
+{
+    DWORD processId = 0;
+    NetbridgePhase phase = NetbridgePhase::Idle;
+    bool userInitiatedCancel = false;
+    bool dllExitPatchesSaved = false;
+    bool jobObjectPresent = false;
+    const char* method = "none";
+    bool requested = false;
+    bool gracefulCompleted = false;
+    bool waitIssued = false;
+    DWORD waitResult = 0;
+    DWORD waitError = 0;
+    bool hardFallbackAttempted = false;
+    bool hardFallbackSucceeded = false;
+    DWORD hardTerminateError = 0;
+    bool hardWaitIssued = false;
+    DWORD hardWaitResult = 0;
+    DWORD hardWaitError = 0;
+    bool exitCodeKnown = false;
+    DWORD exitCode = 0;
+    bool processAliveAfter = false;
+};
+
+static const char* DescribeWaitResult(bool issued, DWORD waitResult)
+{
+    if (!issued)
+    {
+        return "not_issued";
+    }
+    switch (waitResult)
+    {
+    case WAIT_OBJECT_0:
+        return "signaled";
+    case WAIT_TIMEOUT:
+        return "timeout";
+    case WAIT_FAILED:
+        return "failed";
+    default:
+        return "other";
+    }
+}
+
+static void CaptureHelperExitSnapshot(HANDLE process, HelperShutdownTrace* trace)
+{
+    if (process == nullptr || trace == nullptr)
+    {
+        return;
+    }
+
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(process, &exitCode) == FALSE)
+    {
+        trace->exitCodeKnown = false;
+        trace->exitCode = 0;
+        trace->processAliveAfter = false;
+        return;
+    }
+
+    trace->exitCodeKnown = true;
+    trace->exitCode = exitCode;
+    trace->processAliveAfter = (exitCode == STILL_ACTIVE);
+}
+
+static void LogHelperShutdownSummary(
+    const char* reason,
+    const NetbridgeStatus* ioStatus,
+    const HelperShutdownTrace& trace,
+    bool hadProcess)
+{
+    mod::Log(
+        "Takeover: helper shutdown summary reason='%s' phase=%s "
+        "statusErr='%s' pid=%lu hadProcess=%d userInitiated=%d "
+        "exitPatchesSaved=%d jobObject=%d method=%s requested=%d "
+        "gracefulComplete=%d gracefulWait=%s gracefulWaitErr=%lu "
+        "hardFallback=%d hardTerminateOk=%d hardTerminateErr=%lu "
+        "hardWait=%s hardWaitErr=%lu exitCodeKnown=%d exitCode=%lu aliveAfter=%d",
+        reason != nullptr ? reason : "",
+        PhaseToString(trace.phase),
+        (ioStatus != nullptr && ioStatus->errorMsg[0] != '\0') ? ioStatus->errorMsg : "",
+        static_cast<unsigned long>(trace.processId),
+        hadProcess ? 1 : 0,
+        trace.userInitiatedCancel ? 1 : 0,
+        trace.dllExitPatchesSaved ? 1 : 0,
+        trace.jobObjectPresent ? 1 : 0,
+        trace.method,
+        trace.requested ? 1 : 0,
+        trace.gracefulCompleted ? 1 : 0,
+        DescribeWaitResult(trace.waitIssued, trace.waitResult),
+        static_cast<unsigned long>(trace.waitError),
+        trace.hardFallbackAttempted ? 1 : 0,
+        trace.hardFallbackSucceeded ? 1 : 0,
+        static_cast<unsigned long>(trace.hardTerminateError),
+        DescribeWaitResult(trace.hardWaitIssued, trace.hardWaitResult),
+        static_cast<unsigned long>(trace.hardWaitError),
+        trace.exitCodeKnown ? 1 : 0,
+        static_cast<unsigned long>(trace.exitCode),
+        trace.processAliveAfter ? 1 : 0);
+}
+
+static bool QueueHelperConsoleInputLocked(const char* input, const char* reason)
+{
+    if (g_hostBlock == nullptr || g_hostConsoleEvent == nullptr)
+    {
+        mod::Log(
+            "Takeover: helper console input skipped reason='%s' "
+            "(hostBlock=%d consoleEvent=%d)",
+            reason != nullptr ? reason : "",
+            g_hostBlock != nullptr ? 1 : 0,
+            g_hostConsoleEvent != nullptr ? 1 : 0);
+        return false;
+    }
+
+    if (input == nullptr || input[0] == '\0')
+    {
+        mod::Log(
+            "Takeover: helper console input skipped reason='%s' "
+            "(empty input)",
+            reason != nullptr ? reason : "");
+        return false;
+    }
+
+    CopyString(g_hostBlock->consoleInput, sizeof(g_hostBlock->consoleInput), input);
+    const LONG serial = InterlockedIncrement(&g_hostBlock->consoleSerial);
+    SetEvent(g_hostConsoleEvent);
+    mod::Log(
+        "Takeover: helper console input queued reason='%s' serial=%ld value='%s'",
+        reason != nullptr ? reason : "",
+        static_cast<long>(serial),
+        input);
+    return true;
+}
+
+static HelperShutdownTrace TryGracefulHelperShutdownLocked(
+    const char* reason,
+    const NetbridgeStatus* ioStatus)
+{
+    HelperShutdownTrace trace = {};
+    trace.processId = g_revivalProcessId;
+    trace.dllExitPatchesSaved = AreDllExitPatchesSaved();
+    trace.jobObjectPresent = (g_childJobObject != nullptr);
+
+    if (g_revivalProcess == nullptr)
+    {
+        return trace;
+    }
+
+    trace.phase =
+        (ioStatus != nullptr)
+            ? static_cast<NetbridgePhase>(ioStatus->phase)
+            : NetbridgePhase::Idle;
+    trace.userInitiatedCancel =
+        reason != nullptr
+        && (std::strcmp(reason, "user_cancel") == 0
+            || std::strcmp(reason, "leave_menu") == 0
+            || std::strcmp(reason, "external_cancel") == 0
+            || std::strcmp(reason, "shutdown") == 0);
+
+    if (trace.userInitiatedCancel
+        && trace.phase == NetbridgePhase::Connected
+        && trace.dllExitPatchesSaved)
+    {
+        // Native Revival uses the Quit ring for graceful shutdown once the
+        // connected session is alive. Reuse the same path before any hard kill.
+        trace.requested = SignalGracefulQuitRing(
+            reason != nullptr ? reason : "cancel_session",
+            0);
+        trace.method = "quit_ring";
+    }
+    else if (trace.userInitiatedCancel
+             && (trace.phase == NetbridgePhase::Connecting
+                 || trace.phase == NetbridgePhase::DelaySetup))
+    {
+        // During host/join/spectate setup the helper still expects console
+        // input for native cancel flows, so drive the same path instead of
+        // killing the process immediately.
+        trace.requested = QueueHelperConsoleInputLocked("2\r\n", reason);
+        trace.method = "console_cancel";
+    }
+    else if (trace.userInitiatedCancel && trace.dllExitPatchesSaved)
+    {
+        // If the phase snapshot is stale but we still have a live connected
+        // DLL session, prefer the graceful Quit-ring path.
+        trace.requested = SignalGracefulQuitRing(
+            reason != nullptr ? reason : "cancel_session",
+            0);
+        trace.method = "quit_ring_fallback";
+    }
+
+    mod::Log(
+        "Takeover: graceful helper shutdown reason='%s' phase=%s "
+        "role=%d userInitiated=%d requested=%d method=%s "
+        "statusErr='%s' exitPatchesSaved=%d jobObject=%d pid=%lu",
+        reason != nullptr ? reason : "",
+        PhaseToString(trace.phase),
+        g_localRoleFlag,
+        trace.userInitiatedCancel ? 1 : 0,
+        trace.requested ? 1 : 0,
+        trace.method,
+        (ioStatus != nullptr && ioStatus->errorMsg[0] != '\0') ? ioStatus->errorMsg : "",
+        trace.dllExitPatchesSaved ? 1 : 0,
+        trace.jobObjectPresent ? 1 : 0,
+        static_cast<unsigned long>(trace.processId));
+
+    if (!trace.requested)
+    {
+        return trace;
+    }
+
+    trace.waitIssued = true;
+    trace.waitResult = WaitForSingleObject(g_revivalProcess, kGracefulHelperShutdownWaitMs);
+    if (trace.waitResult == WAIT_OBJECT_0)
+    {
+        trace.gracefulCompleted = true;
+        CaptureHelperExitSnapshot(g_revivalProcess, &trace);
+        mod::Log(
+            "Takeover: graceful helper shutdown completed reason='%s' "
+            "method=%s wait=%lums exitCodeKnown=%d exitCode=%lu aliveAfter=%d",
+            reason != nullptr ? reason : "",
+            trace.method,
+            static_cast<unsigned long>(kGracefulHelperShutdownWaitMs),
+            trace.exitCodeKnown ? 1 : 0,
+            static_cast<unsigned long>(trace.exitCode),
+            trace.processAliveAfter ? 1 : 0);
+        return trace;
+    }
+
+    if (trace.waitResult == WAIT_TIMEOUT)
+    {
+        mod::Log(
+            "Takeover: graceful helper shutdown timed out reason='%s' "
+            "method=%s wait=%lums",
+            reason != nullptr ? reason : "",
+            trace.method,
+            static_cast<unsigned long>(kGracefulHelperShutdownWaitMs));
+    }
+    else
+    {
+        trace.waitError = GetLastError();
+        mod::Log(
+            "Takeover: graceful helper shutdown wait failed reason='%s' "
+            "method=%s err=%lu",
+            reason != nullptr ? reason : "",
+            trace.method,
+            static_cast<unsigned long>(trace.waitError));
+    }
+
+    CaptureHelperExitSnapshot(g_revivalProcess, &trace);
+    return trace;
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle functions (public API from revival_takeover.h).
 // ---------------------------------------------------------------------------
 
 void InitializeHost()
 {
+    const DWORD riskyStartTick = BeginRiskyPathTiming("InitializeHost");
     std::lock_guard<std::mutex> lock(g_mutex);
     PrimeManagedLogEfzHistory();
     (void)EnsureHostIpc();
@@ -327,23 +582,32 @@ void InitializeHost()
     {
         const auto selfPatches = BuildPatchMap(reinterpret_cast<uintptr_t>(SelfModule()));
         std::unordered_map<std::string, uint32_t> hostLogPatches;
-        const auto writeFileIt = selfPatches.find("WriteFile");
-        if (writeFileIt != selfPatches.end())
+        for (const char* name : {"WriteFile", "CreateFileA", "CreateFileW", "CloseHandle"})
         {
-            hostLogPatches.emplace(writeFileIt->first, writeFileIt->second);
+            const auto it = selfPatches.find(name);
+            if (it != selfPatches.end())
+            {
+                hostLogPatches.emplace(it->first, it->second);
+            }
+        }
+
+        if (!hostLogPatches.empty())
+        {
             const bool patchedHostLogIat =
                 PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, true);
             mod::Log(
-                "Takeover: host logEfz WriteFile IAT patch result=%d",
-                patchedHostLogIat ? 1 : 0);
+                "Takeover: host logEfz IAT patch result=%d patchCount=%lu",
+                patchedHostLogIat ? 1 : 0,
+                static_cast<unsigned long>(hostLogPatches.size()));
         }
         else
         {
-            mod::Log("Takeover: host logEfz WriteFile IAT patch unavailable (missing stub)");
+            mod::Log("Takeover: host logEfz IAT patch unavailable (missing stub)");
         }
     }
 
     mod::Log("Takeover: host initialized");
+    EndRiskyPathTiming("InitializeHost", riskyStartTick, 100, "ok", true);
 }
 
 void ShutdownHost()
@@ -490,6 +754,27 @@ bool StartSession(
     NetbridgeStatus* ioStatus,
     uint32_t* outConnectStartTick)
 {
+    char riskyDetail[128] = {};
+    std::snprintf(
+        riskyDetail,
+        sizeof(riskyDetail),
+        "role=%d port=%u address=%s",
+        static_cast<int>(role),
+        static_cast<unsigned>(port),
+        (address != nullptr && address[0] != '\0') ? address : "<empty>");
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("StartSession", riskyDetail);
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "StartSession",
+            riskyStartTick,
+            250,
+            outcome,
+            true);
+        return value;
+    };
+
     std::lock_guard<std::mutex> lock(g_mutex);
 
     mod::Log(
@@ -542,7 +827,7 @@ bool StartSession(
     if (!EnsureHostIpc())
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "IPC setup failed");
-        return false;
+        return finishRisky("ipc_setup_failed", false);
     }
 
     // Zero the entire shared block to prevent stale data from session 1
@@ -575,7 +860,7 @@ bool StartSession(
     if (!EnsureLocalRevivalLoaded())
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
-        return false;
+        return finishRisky("revival_unavailable", false);
     }
 
     // Save the EfzRender* pointer now so that ClearRevivalText /
@@ -588,7 +873,7 @@ bool StartSession(
     if (ProcessAlive(ioStatus))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "Session already active");
-        return false;
+        return finishRisky("session_already_active", false);
     }
 
     CloseProcessHandle(ioStatus);
@@ -617,7 +902,7 @@ bool StartSession(
     if (!WriteIni(gameDir, static_cast<int>(role), port, address, nickname, writeNicknameToIni))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
-        return false;
+        return finishRisky("write_ini_failed", false);
     }
 
     STARTUPINFOA si = {};
@@ -660,7 +945,7 @@ bool StartSession(
         if (selfPath.empty())
         {
             SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] failed to get self module path");
-            return false;
+            return finishRisky("wine_self_module_path_failed", false);
         }
 
         // Build the override string: "efz_netplay_mod=n"
@@ -741,7 +1026,7 @@ bool StartSession(
             mod::Log("Takeover [Wine]: CreateProcess failed err=%lu",
                      static_cast<unsigned long>(GetLastError()));
             SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] CreateProcess(EfzRevival.exe) failed");
-            return false;
+            return finishRisky("wine_createprocess_failed", false);
         }
 
         mod::Log("Takeover [Wine]: spawned EfzRevival suspended pid=%lu (DLL override active)",
@@ -765,7 +1050,7 @@ bool StartSession(
         if (!created)
         {
             SetPhase(ioStatus, NetbridgePhase::Failed, "CreateProcess(EfzRevival.exe) failed");
-            return false;
+            return finishRisky("createprocess_failed", false);
         }
 
         mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
@@ -805,7 +1090,7 @@ bool StartSession(
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        return false;
+        return finishRisky("inject_self_failed", false);
     }
 
     std::unordered_map<std::string, uint32_t> patches = BuildPatchMap(remoteBase);
@@ -816,7 +1101,7 @@ bool StartSession(
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        return false;
+        return finishRisky("patch_iat_failed", false);
     }
 
     int localRoleMode = kLocalRoleOnline;
@@ -1123,7 +1408,7 @@ bool StartSession(
     SetPhase(ioStatus, NetbridgePhase::Connecting, "awaiting handshake");
     RefreshRuntimeStatus(ioStatus);
     mod::Log("Takeover: start session armed (asynchronous handshake via Tick)");
-    return true;
+    return finishRisky("armed", true);
 }
 
 bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
@@ -1981,6 +2266,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("CancelSessionUnlocked", reason);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_entry");
     mod::Log(
@@ -2027,11 +2314,63 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
 
+    const DWORD processIdSnapshot = g_revivalProcessId;
     const bool hadProcess = ProcessAlive(ioStatus);
+    HelperShutdownTrace helperShutdownTrace = {};
+    helperShutdownTrace.processId = processIdSnapshot;
+    helperShutdownTrace.phase =
+        (ioStatus != nullptr)
+            ? static_cast<NetbridgePhase>(ioStatus->phase)
+            : NetbridgePhase::Idle;
+    helperShutdownTrace.userInitiatedCancel =
+        reason != nullptr
+        && (std::strcmp(reason, "user_cancel") == 0
+            || std::strcmp(reason, "leave_menu") == 0
+            || std::strcmp(reason, "external_cancel") == 0
+            || std::strcmp(reason, "shutdown") == 0);
+    helperShutdownTrace.dllExitPatchesSaved = AreDllExitPatchesSaved();
+    helperShutdownTrace.jobObjectPresent = (g_childJobObject != nullptr);
     if (hadProcess && g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        helperShutdownTrace = TryGracefulHelperShutdownLocked(reason, ioStatus);
+        if (!helperShutdownTrace.gracefulCompleted)
+        {
+            helperShutdownTrace.hardFallbackAttempted = true;
+            helperShutdownTrace.hardFallbackSucceeded =
+                (TerminateProcess(g_revivalProcess, 0) != FALSE);
+            if (!helperShutdownTrace.hardFallbackSucceeded)
+            {
+                helperShutdownTrace.hardTerminateError = GetLastError();
+            }
+            else
+            {
+                helperShutdownTrace.hardWaitIssued = true;
+                helperShutdownTrace.hardWaitResult =
+                    WaitForSingleObject(g_revivalProcess, kHardHelperTerminateWaitMs);
+                if (helperShutdownTrace.hardWaitResult == WAIT_FAILED)
+                {
+                    helperShutdownTrace.hardWaitError = GetLastError();
+                }
+            }
+            CaptureHelperExitSnapshot(g_revivalProcess, &helperShutdownTrace);
+            mod::Log(
+                "Takeover: hard helper shutdown reason='%s' phase=%s "
+                "terminateOk=%d terminateErr=%lu wait=%s waitErr=%lu "
+                "exitCodeKnown=%d exitCode=%lu aliveAfter=%d",
+                reason != nullptr ? reason : "",
+                PhaseToString(helperShutdownTrace.phase),
+                helperShutdownTrace.hardFallbackSucceeded ? 1 : 0,
+                static_cast<unsigned long>(helperShutdownTrace.hardTerminateError),
+                DescribeWaitResult(
+                    helperShutdownTrace.hardWaitIssued,
+                    helperShutdownTrace.hardWaitResult),
+                static_cast<unsigned long>(helperShutdownTrace.hardWaitError),
+                helperShutdownTrace.exitCodeKnown ? 1 : 0,
+                static_cast<unsigned long>(helperShutdownTrace.exitCode),
+                helperShutdownTrace.processAliveAfter ? 1 : 0);
+        }
     }
+    LogHelperShutdownSummary(reason, ioStatus, helperShutdownTrace, hadProcess);
     CloseProcessHandle(ioStatus);
     // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
     // spawned by EfzRevival.exe are also terminated.  A fresh job will be
@@ -2199,6 +2538,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     // --- Diagnostic dump after teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_exit");
+    EndRiskyPathTiming("CancelSessionUnlocked", riskyStartTick, 250, "ok", true);
 }
 
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus)
@@ -2215,6 +2555,8 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
         return false;
     }
 
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("ConsumeRevivalExitInterception");
     LogSessionDiagnosticState("ConsumeExitInterception_entry");
 
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -2222,6 +2564,12 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // Double-check under lock and atomically clear the flag.
     if (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 1) != 1)
     {
+        EndRiskyPathTiming(
+            "ConsumeRevivalExitInterception",
+            riskyStartTick,
+            250,
+            "lost_race",
+            true);
         return false;
     }
 
@@ -2295,6 +2643,12 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
 
     mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
     LogSessionDiagnosticState("ConsumeExitInterception_exit");
+    EndRiskyPathTiming(
+        "ConsumeRevivalExitInterception",
+        riskyStartTick,
+        250,
+        "consumed",
+        true);
     return true;
 }
 

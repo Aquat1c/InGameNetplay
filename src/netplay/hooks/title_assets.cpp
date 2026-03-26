@@ -22,6 +22,7 @@ using netplay::assets::ResolveNetplayBackgroundPath;
 using netplay::assets::ResolveNetplayObjectsPath;
 using netplay::assets::ResolveTitleObjectsPath;
 using netplay::assets::NetplayObjectProfile;
+using netplay::validation::IsValidJoinAddress;
 using netplay::validation::IsValidNickname;
 using netplay::validation::ParsePort;
 
@@ -296,6 +297,62 @@ void LoadNetplayMenuSettingsFromIni()
             static_cast<unsigned>(g_netplayMenuState.hostPort),
             static_cast<unsigned>(g_netplayMenuState.joinPort));
     }
+
+    char addressBuffer[128] = {};
+    (void)GetPrivateProfileStringA("Network", "Address", "", addressBuffer, static_cast<DWORD>(std::size(addressBuffer)), iniPath.c_str());
+    const std::string addressText = TrimAscii(addressBuffer);
+    if (!addressText.empty())
+    {
+        if (IsValidJoinAddress(addressText))
+        {
+            g_netplayMenuState.joinAddress = addressText;
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: loaded Network.Address='%s'",
+                g_netplayMenuState.joinAddress.c_str());
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Address='%s' (keeping '%s')",
+                addressText.c_str(),
+                g_netplayMenuState.joinAddress.c_str());
+        }
+    }
+    else
+    {
+        mod::Log(
+            "LoadNetplayMenuSettingsFromIni: Network.Address missing/empty (keeping '%s')",
+            g_netplayMenuState.joinAddress.c_str());
+    }
+}
+
+bool SaveNetplayJoinAddressToIni(const std::string& address)
+{
+    const std::string trimmedAddress = TrimAscii(address);
+    if (!IsValidJoinAddress(trimmedAddress))
+    {
+        mod::Log(
+            "SaveNetplayJoinAddressToIni: skipped invalid Network.Address='%s'",
+            trimmedAddress.c_str());
+        return false;
+    }
+
+    const std::string iniPath = ResolveRevivalIniPath();
+    if (WritePrivateProfileStringA("Network", "Address", trimmedAddress.c_str(), iniPath.c_str()) == FALSE)
+    {
+        mod::Log(
+            "SaveNetplayJoinAddressToIni: failed Network.Address='%s' path='%s' winerr=%lu",
+            trimmedAddress.c_str(),
+            iniPath.c_str(),
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    mod::Log(
+        "SaveNetplayJoinAddressToIni: wrote Network.Address='%s' path='%s'",
+        trimmedAddress.c_str(),
+        iniPath.c_str());
+    return true;
 }
 
 bool LoadNetplayAssets(uint32_t screenContext)

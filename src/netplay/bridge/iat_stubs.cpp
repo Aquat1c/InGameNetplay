@@ -3,16 +3,168 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "crash_handler.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstring>
 #include <intrin.h>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <windows.h>
 
 namespace netplay::bridge::takeover
 {
+
+static std::mutex g_redirectedLogEfzHandleMutex;
+static std::unordered_map<uintptr_t, std::string> g_redirectedLogEfzHandles;
+
+static std::string ToLowerPathAscii(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+static std::string BaseNameLowerFromPath(const std::string& path)
+{
+    const std::string lower = ToLowerPathAscii(path);
+    const size_t slash = lower.find_last_of("\\/");
+    return (slash == std::string::npos) ? lower : lower.substr(slash + 1);
+}
+
+static std::string WideToAnsiString(LPCWSTR text)
+{
+    if (text == nullptr || text[0] == L'\0')
+    {
+        return {};
+    }
+
+    const int needed = WideCharToMultiByte(CP_ACP, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1)
+    {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(
+        CP_ACP,
+        0,
+        text,
+        -1,
+        result.data(),
+        needed,
+        nullptr,
+        nullptr);
+    if (!result.empty() && result.back() == '\0')
+    {
+        result.pop_back();
+    }
+    return result;
+}
+
+static std::wstring AnsiToWideString(const std::string& text)
+{
+    if (text.empty())
+    {
+        return {};
+    }
+
+    const int needed = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, nullptr, 0);
+    if (needed <= 1)
+    {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, result.data(), needed);
+    if (!result.empty() && result.back() == L'\0')
+    {
+        result.pop_back();
+    }
+    return result;
+}
+
+static bool IsLogEfzPathText(const std::string& path)
+{
+    return !path.empty() && BaseNameLowerFromPath(path) == "logefz.txt";
+}
+
+static void EnsureParentDirectoryExists(const std::string& path)
+{
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos)
+    {
+        return;
+    }
+
+    const std::string parent = path.substr(0, slash);
+    if (parent.empty())
+    {
+        return;
+    }
+
+    if (!CreateDirectoryA(parent.c_str(), nullptr))
+    {
+        const DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS)
+        {
+            char detail[512] = {};
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "parent='%s' winerr=%lu",
+                parent.c_str(),
+                static_cast<unsigned long>(err));
+            LogRiskyPathEvent("RedirectLogEfzDir", detail);
+        }
+    }
+}
+
+void RegisterRedirectedNativeLogEfzHandle(HANDLE hFile, const std::string& originalPath)
+{
+    if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_redirectedLogEfzHandleMutex);
+    g_redirectedLogEfzHandles[reinterpret_cast<uintptr_t>(hFile)] = originalPath;
+}
+
+void UnregisterRedirectedNativeLogEfzHandle(HANDLE hFile)
+{
+    if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_redirectedLogEfzHandleMutex);
+    g_redirectedLogEfzHandles.erase(reinterpret_cast<uintptr_t>(hFile));
+}
+
+bool TryGetRedirectedNativeLogEfzHandlePath(HANDLE hFile, std::string* outPath)
+{
+    if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_redirectedLogEfzHandleMutex);
+    const auto it = g_redirectedLogEfzHandles.find(reinterpret_cast<uintptr_t>(hFile));
+    if (it == g_redirectedLogEfzHandles.end())
+    {
+        return false;
+    }
+
+    if (outPath != nullptr)
+    {
+        *outPath = it->second;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Dummy vtable for neutralized Revival session objects.
@@ -347,8 +499,8 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "NeutralizeExitProcess: TOCTOU step 3 RestoreDllExitProcessPatches=%d",
             patchOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
+        // Step 4: Clear stale text and disable any lingering text rendering.
+        BestEffortCleanupRevivalText("NeutralizeExitProcess: TOCTOU step 4");
 
         // Step 5: Reset VEH one-shot guard.
         mod::ResetCrashRecoveryState();
@@ -408,8 +560,8 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "NeutralizeExitProcess: tournament step 3 ForceLocalPlayInit=%d",
             initOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
+        // Step 4: Clear stale text and disable any lingering text rendering.
+        BestEffortCleanupRevivalText("NeutralizeExitProcess: tournament step 4");
 
         // Step 5: Reset VEH one-shot guard and game-mode validation.
         mod::ResetCrashRecoveryState();
@@ -1909,7 +2061,13 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
     std::string logEfzPath;
-    if (!IsManagedLogEfzWriteActive() && TryGetLogEfzDiskPath(hFile, &logEfzPath))
+    const bool isLogEfz = TryGetLogEfzDiskPath(hFile, &logEfzPath);
+    if (isLogEfz && IsManagedLogEfzWriteActive())
+    {
+        return WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+    }
+
+    if (isLogEfz)
     {
         static std::string s_suppressedPath;
         static uint64_t s_suppressedWrites = 0;
@@ -1946,6 +2104,169 @@ BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, 
 
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
     MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
+    return result;
+}
+
+HANDLE StubCreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    const std::string originalPath = (lpFileName != nullptr) ? std::string(lpFileName) : std::string();
+    if (!IsLogEfzPathText(originalPath))
+    {
+        return CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    const std::string shadowPath = GetNativeLogEfzShadowPath();
+    if (shadowPath.empty())
+    {
+        LogRiskyPathEvent("RedirectLogEfzOpen", "variant=A outcome=shadow_path_empty fallback=original");
+        return CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    EnsureParentDirectoryExists(shadowPath);
+    HANDLE handle = CreateFileA(
+        shadowPath.c_str(),
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        char detail[768] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "variant=A outcome=shadow_open_failed original='%s' shadow='%s' winerr=%lu fallback=original",
+            originalPath.c_str(),
+            shadowPath.c_str(),
+            static_cast<unsigned long>(GetLastError()));
+        LogRiskyPathEvent("RedirectLogEfzOpen", detail);
+        return CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    RegisterRedirectedNativeLogEfzHandle(handle, originalPath);
+    mod::Log(
+        "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' shadow='%s' handle=0x%p disposition=%lu",
+        originalPath.c_str(),
+        shadowPath.c_str(),
+        handle,
+        static_cast<unsigned long>(dwCreationDisposition));
+    return handle;
+}
+
+HANDLE StubCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    const std::string originalPath = WideToAnsiString(lpFileName);
+    if (!IsLogEfzPathText(originalPath))
+    {
+        return CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    const std::string shadowPathAnsi = GetNativeLogEfzShadowPath();
+    const std::wstring shadowPath = AnsiToWideString(shadowPathAnsi);
+    if (shadowPath.empty())
+    {
+        LogRiskyPathEvent("RedirectLogEfzOpen", "variant=W outcome=shadow_path_empty fallback=original");
+        return CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    EnsureParentDirectoryExists(shadowPathAnsi);
+    HANDLE handle = CreateFileW(
+        shadowPath.c_str(),
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        char detail[768] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "variant=W outcome=shadow_open_failed original='%s' shadow='%s' winerr=%lu fallback=original",
+            originalPath.c_str(),
+            shadowPathAnsi.c_str(),
+            static_cast<unsigned long>(GetLastError()));
+        LogRiskyPathEvent("RedirectLogEfzOpen", detail);
+        return CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    RegisterRedirectedNativeLogEfzHandle(handle, originalPath);
+    mod::Log(
+        "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' shadow='%s' handle=0x%p disposition=%lu",
+        originalPath.c_str(),
+        shadowPathAnsi.c_str(),
+        handle,
+        static_cast<unsigned long>(dwCreationDisposition));
+    return handle;
+}
+
+BOOL StubCloseHandle(HANDLE hObject)
+{
+    const BOOL result = CloseHandle(hObject);
+    if (result)
+    {
+        UnregisterRedirectedNativeLogEfzHandle(hObject);
+    }
     return result;
 }
 
@@ -2100,6 +2421,49 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsol
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
     return netplay::bridge::takeover::StubWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileA(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_CloseHandle(HANDLE hObject)
+{
+    return netplay::bridge::takeover::StubCloseHandle(hObject);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)

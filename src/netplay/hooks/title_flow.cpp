@@ -57,7 +57,9 @@ constexpr uint32_t kGameSystemOffsetMatchCounter = 4952;
 constexpr uint32_t kGameSystemOffsetMode = 4964;
 constexpr uint32_t kGameSystemOffsetSecondaryModeFlag = 4965;
 constexpr uint32_t kGameSystemOffsetContinueFlag = 4984;
-constexpr uint32_t kGameSystemOffsetStageSelection = 4985;
+constexpr uint32_t kGameSystemOffsetP2SelectionFlag = 4985;
+constexpr uint32_t kGameSystemOffsetStageAnimId = 3888;
+constexpr uint32_t kGameSystemOffsetStageCursor = 3890;
 constexpr uint32_t kGameSystemOffsetReplaySessionFlag = 82563;
 constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
 constexpr uint8_t kGameModeVsHuman = 4;
@@ -1561,7 +1563,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
     *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState) = 0;
     state[kGameSystemOffsetMatchCounter] = 0;
     state[kGameSystemOffsetContinueFlag] = 0;
-    state[kGameSystemOffsetStageSelection] = 0;
+    state[kGameSystemOffsetP2SelectionFlag] = 0;
+    *reinterpret_cast<uint16_t*>(gameSystem + kGameSystemOffsetStageAnimId) = 0;
+    state[kGameSystemOffsetStageCursor] = 0;
 
     // Force the charselect screen object to re-initialise next time it
     // runs (reset cursor positions, cameras, selection state, unlock
@@ -1606,9 +1610,33 @@ void PrepareVsHumanGameState(uint32_t screenContext)
             {
                 g_charSelectResetPending = false;
 
-                // The reinit does NOT reset grid col/row — those are only set
-                // by the constructor.  Explicitly reset them to the constructor
-                // defaults so both players start at a known position every time.
+                // The reinit does NOT fully restore the constructor-owned
+                // state we care about here. Reset the stage-select state and
+                // cursor/selection fields explicitly so both players and the
+                // later stage select start from a clean baseline every time.
+                *reinterpret_cast<uint32_t*>(charSelectObj + kOffsetCharSelectStageId) =
+                    kCharSelectDefaultStageId;
+                *reinterpret_cast<uint32_t*>(charSelectObj + kOffsetCharSelectStageState) =
+                    kCharSelectDefaultStageState;
+                *reinterpret_cast<uint32_t*>(charSelectObj + kOffsetCharSelectStageTimer) =
+                    kCharSelectDefaultStageTimer;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP1CursorX) =
+                    kCharSelectDefaultCursorX;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP2CursorX) =
+                    kCharSelectDefaultCursorX;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP1CursorY) =
+                    kCharSelectDefaultCursorY;
+                *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP2CursorY) =
+                    kCharSelectDefaultCursorY;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1InputLock) =
+                    kCharSelectDefaultInputLock;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2InputLock) =
+                    kCharSelectDefaultInputLock;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1State) =
+                    kCharSelectDefaultP1State;
+                *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2State) =
+                    kCharSelectDefaultP2State;
+
                 *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1GridCol) = kCharSelectDefaultP1Col;
                 *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP2GridCol) = kCharSelectDefaultP2Col;
                 *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1GridRow) = kCharSelectDefaultP1Row;
@@ -1630,9 +1658,24 @@ void PrepareVsHumanGameState(uint32_t screenContext)
                 *reinterpret_cast<uint16_t*>(charSelectObj + kOffsetCharSelectP2Timer) = 0;
 
                 mod::Log("PrepareVsHumanGameState: charselect full reset "
-                    "grid p1(%u,%u) p2(%u,%u) color=0/0 (obj=0x%08lX)",
+                    "grid p1(%u,%u) p2(%u,%u) color=0/0 "
+                    "cursor p1(%u,%u) p2(%u,%u) state=%u/%u "
+                    "stage(id=%u state=%u timer=%u) "
+                    "gameStageCursor=%u gameStageAnim=%u "
+                    "(obj=0x%08lX)",
                     kCharSelectDefaultP1Col, kCharSelectDefaultP1Row,
                     kCharSelectDefaultP2Col, kCharSelectDefaultP2Row,
+                    static_cast<unsigned>(kCharSelectDefaultCursorX),
+                    static_cast<unsigned>(kCharSelectDefaultCursorY),
+                    static_cast<unsigned>(kCharSelectDefaultCursorX),
+                    static_cast<unsigned>(kCharSelectDefaultCursorY),
+                    static_cast<unsigned>(kCharSelectDefaultP1State),
+                    static_cast<unsigned>(kCharSelectDefaultP2State),
+                    static_cast<unsigned>(kCharSelectDefaultStageId),
+                    static_cast<unsigned>(kCharSelectDefaultStageState),
+                    static_cast<unsigned>(kCharSelectDefaultStageTimer),
+                    static_cast<unsigned>(state[kGameSystemOffsetStageCursor]),
+                    static_cast<unsigned>(*reinterpret_cast<const uint16_t*>(gameSystem + kGameSystemOffsetStageAnimId)),
                     static_cast<unsigned long>(charSelectObj));
             }
             else
@@ -1654,7 +1697,7 @@ void PrepareVsHumanGameState(uint32_t screenContext)
 
     mod::Log(
         "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u "
-        "wins=%u/%u match=%u continue=%u stage=%u",
+        "wins=%u/%u match=%u continue=%u stageCursor=%u stageAnim=%u p2SelectFlag=%u",
         static_cast<unsigned>(state[kGameSystemOffsetMode]),
         static_cast<unsigned>(state[kGameSystemOffsetSecondaryModeFlag]),
         static_cast<unsigned>(state[kGameSystemOffsetReplaySessionFlag]),
@@ -1665,7 +1708,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
         *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState),
         static_cast<unsigned>(state[kGameSystemOffsetMatchCounter]),
         static_cast<unsigned>(state[kGameSystemOffsetContinueFlag]),
-        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]));
+        static_cast<unsigned>(state[kGameSystemOffsetStageCursor]),
+        static_cast<unsigned>(*reinterpret_cast<const uint16_t*>(gameSystem + kGameSystemOffsetStageAnimId)),
+        static_cast<unsigned>(state[kGameSystemOffsetP2SelectionFlag]));
 }
 
 // ---------------------------------------------------------------------------
@@ -3002,8 +3047,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
                         const unsigned long parsedPort = std::strtoul(portPart.c_str(), nullptr, 10);
                         if (parsedPort > 0 && parsedPort <= 65535 && !ipPart.empty())
                         {
+                            const std::string previousJoinAddress = g_netplayMenuState.joinAddress;
                             g_netplayMenuState.joinAddress = ipPart;
                             g_netplayMenuState.joinPort = static_cast<uint16_t>(parsedPort);
+                            if (previousJoinAddress != ipPart)
+                            {
+                                (void)SaveNetplayJoinAddressToIni(ipPart);
+                            }
                             PlayUiSound(screenContext, kSfxConfirm);
                             mod::Log("JoinPaste: pasted address='%s' port=%u from clipboard",
                                 ipPart.c_str(), static_cast<unsigned>(parsedPort));

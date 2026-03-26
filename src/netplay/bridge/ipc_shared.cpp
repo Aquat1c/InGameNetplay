@@ -45,15 +45,28 @@ void* EnsureRevivalErrorCodeNullGuardStub()
 
 bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsoleEvent)
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("OpenTempIpcContext", nullptr, false);
+    auto finishRisky = [&](const char* outcome, bool value, bool alwaysLog) -> bool
+    {
+        EndRiskyPathTiming(
+            "OpenTempIpcContext",
+            riskyStartTick,
+            15,
+            outcome,
+            alwaysLog);
+        return value;
+    };
+
     if (ctx == nullptr)
     {
-        return false;
+        return finishRisky("invalid_ctx", false, true);
     }
 
     ctx->mapHandle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, kSharedBlockName);
     if (ctx->mapHandle == nullptr)
     {
-        return false;
+        return finishRisky("open_mapping_failed", false, true);
     }
 
     ctx->block = static_cast<SharedBlock*>(MapViewOfFile(ctx->mapHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock)));
@@ -61,19 +74,33 @@ bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsol
     {
         CloseHandle(ctx->mapHandle);
         ctx->mapHandle = nullptr;
-        return false;
+        return finishRisky("map_view_failed", false, true);
     }
 
+    const char* outcome = "ok";
+    bool alwaysLog = false;
     if (needInitEvent)
     {
         ctx->initEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kInitReadyEventName);
+        if (ctx->initEvent == nullptr)
+        {
+            outcome = "init_event_missing";
+            alwaysLog = true;
+        }
     }
     if (needConsoleEvent)
     {
         ctx->consoleEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kConsoleReadyEventName);
+        if (ctx->consoleEvent == nullptr)
+        {
+            outcome = (needInitEvent && ctx->initEvent == nullptr)
+                ? "init_console_events_missing"
+                : "console_event_missing";
+            alwaysLog = true;
+        }
     }
 
-    return true;
+    return finishRisky(outcome, true, alwaysLog);
 }
 
 void CloseTempIpcContext(TempIpcContext* ctx)
@@ -657,9 +684,21 @@ uint32_t BuildRuntimeReadyProbeMask(const RuntimeReadyProbe& probe)
 
 bool EnsureHostIpc()
 {
+    const DWORD riskyStartTick = BeginRiskyPathTiming("EnsureHostIpc");
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "EnsureHostIpc",
+            riskyStartTick,
+            25,
+            outcome,
+            true);
+        return value;
+    };
+
     if (g_hostBlock != nullptr && g_hostInitEvent != nullptr && g_hostConsoleEvent != nullptr)
     {
-        return true;
+        return finishRisky("already_ready", true);
     }
 
     if (g_hostMapHandle == nullptr)
@@ -668,7 +707,7 @@ bool EnsureHostIpc()
         if (g_hostMapHandle == nullptr)
         {
             mod::Log("Takeover: CreateFileMapping failed: %s", ErrorString(GetLastError()).c_str());
-            return false;
+            return finishRisky("create_mapping_failed", false);
         }
     }
     if (g_hostBlock == nullptr)
@@ -677,7 +716,7 @@ bool EnsureHostIpc()
         if (g_hostBlock == nullptr)
         {
             mod::Log("Takeover: MapViewOfFile failed: %s", ErrorString(GetLastError()).c_str());
-            return false;
+            return finishRisky("map_view_failed", false);
         }
     }
 
@@ -686,7 +725,7 @@ bool EnsureHostIpc()
         g_hostInitEvent = CreateEventA(nullptr, FALSE, FALSE, kInitReadyEventName);
         if (g_hostInitEvent == nullptr)
         {
-            return false;
+            return finishRisky("init_event_failed", false);
         }
     }
     if (g_hostConsoleEvent == nullptr)
@@ -694,7 +733,7 @@ bool EnsureHostIpc()
         g_hostConsoleEvent = CreateEventA(nullptr, FALSE, FALSE, kConsoleReadyEventName);
         if (g_hostConsoleEvent == nullptr)
         {
-            return false;
+            return finishRisky("console_event_failed", false);
         }
     }
 
@@ -702,7 +741,7 @@ bool EnsureHostIpc()
     g_hostBlock->version = kIpcVersion;
     g_hostBlock->hostPid = GetCurrentProcessId();
     g_hostBlock->hostRevivalBase = static_cast<uint32_t>(g_hostRevivalBase);
-    return true;
+    return finishRisky("ok", true);
 }
 
 void CloseHostIpc()
@@ -732,6 +771,19 @@ void CloseHostIpc()
 
 bool EnsureLocalRevivalLoaded()
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("EnsureLocalRevivalLoaded");
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "EnsureLocalRevivalLoaded",
+            riskyStartTick,
+            100,
+            outcome,
+            true);
+        return value;
+    };
+
     if (g_localInitFn != nullptr)
     {
         PublishHostRevivalBase();
@@ -743,7 +795,7 @@ bool EnsureLocalRevivalLoaded()
         {
             g_localRoleFlag = kLocalRoleLocalPlay;
         }
-        return true;
+        return finishRisky("already_loaded", true);
     }
 
     if (g_localRevivalModule == nullptr)
@@ -757,7 +809,7 @@ bool EnsureLocalRevivalLoaded()
     if (g_localRevivalModule == nullptr)
     {
         mod::Log("Takeover: LoadLibrary(EfzRevival.dll) failed");
-        return false;
+        return finishRisky("loadlibrary_failed", false);
     }
 
     // Detect the DLL version BEFORE any profile-dependent operations.
@@ -775,7 +827,7 @@ bool EnsureLocalRevivalLoaded()
     if (g_localInitFn == nullptr)
     {
         mod::Log("Takeover: GetProcAddress(init) failed");
-        return false;
+        return finishRisky("getprocaddress_failed", false);
     }
 
     int localParams[2] = {2, 102};
@@ -796,7 +848,7 @@ bool EnsureLocalRevivalLoaded()
         mod::Log("Takeover: warning — failed to install netplay frame hook");
     }
 
-    return true;
+    return finishRisky("ok", true);
 }
 
 void ReinitLocalPlay()

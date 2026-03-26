@@ -53,6 +53,92 @@ constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
 constexpr int kNetplayRoleClient    = 2;  // joined (P2 side — inputs swapped)
 constexpr int kNetplayRoleSpectator = 3;  // spectating
 
+inline const char* SafeRiskyPathLabel(const char* path)
+{
+    return (path != nullptr && path[0] != '\0') ? path : "unnamed";
+}
+
+inline DWORD BeginRiskyPathTiming(
+    const char* path,
+    const char* detail = nullptr,
+    bool logBegin = true)
+{
+    const DWORD startTick = GetTickCount();
+    if (logBegin)
+    {
+        if (detail != nullptr && detail[0] != '\0')
+        {
+            mod::Log(
+                "RISKY_PATH: path=%s stage=begin tid=%lu detail=%s",
+                SafeRiskyPathLabel(path),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                detail);
+        }
+        else
+        {
+            mod::Log(
+                "RISKY_PATH: path=%s stage=begin tid=%lu",
+                SafeRiskyPathLabel(path),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+    }
+    return startTick;
+}
+
+inline void LogRiskyPathEvent(const char* path, const char* detail)
+{
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        mod::Log(
+            "RISKY_PATH: path=%s stage=event tid=%lu detail=%s",
+            SafeRiskyPathLabel(path),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            detail);
+    }
+    else
+    {
+        mod::Log(
+            "RISKY_PATH: path=%s stage=event tid=%lu",
+            SafeRiskyPathLabel(path),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+}
+
+inline void EndRiskyPathTiming(
+    const char* path,
+    DWORD startTick,
+    DWORD slowThresholdMs,
+    const char* outcome = nullptr,
+    bool alwaysLog = true)
+{
+    const DWORD elapsedMs = GetTickCount() - startTick;
+    const bool slow = elapsedMs >= slowThresholdMs;
+    if (!alwaysLog && !slow)
+    {
+        return;
+    }
+
+    if (outcome != nullptr && outcome[0] != '\0')
+    {
+        mod::Log(
+            "RISKY_PATH: path=%s stage=end tid=%lu elapsed=%lums slow=%d outcome=%s",
+            SafeRiskyPathLabel(path),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long>(elapsedMs),
+            slow ? 1 : 0,
+            outcome);
+    }
+    else
+    {
+        mod::Log(
+            "RISKY_PATH: path=%s stage=end tid=%lu elapsed=%lums slow=%d",
+            SafeRiskyPathLabel(path),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long>(elapsedMs),
+            slow ? 1 : 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared structures
 // ---------------------------------------------------------------------------
@@ -262,6 +348,11 @@ DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
 bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
 bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath);
+std::string GetManagedLogEfzPath();
+std::string GetNativeLogEfzShadowPath();
+void RegisterRedirectedNativeLogEfzHandle(HANDLE hFile, const std::string& originalPath);
+void UnregisterRedirectedNativeLogEfzHandle(HANDLE hFile);
+bool TryGetRedirectedNativeLogEfzHandlePath(HANDLE hFile, std::string* outPath);
 void PrimeManagedLogEfzHistory();
 void BeginManagedLogEfzWrite();
 void EndManagedLogEfzWrite();
@@ -316,6 +407,7 @@ bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
 bool DisableRevivalTextRendering();
+void BestEffortCleanupRevivalText(const char* contextTag);
 
 // Reverse the P1/P2 input-config swap that Revival applied when we joined
 // as client (P2).  No-op unless g_netplayRole == kNetplayRoleClient.

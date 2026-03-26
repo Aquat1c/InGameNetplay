@@ -76,6 +76,17 @@ inline constexpr uint32_t kOffsetScreenExitState = 45;
 // Character-select screen object offsets (relative to the screen object).
 // Grid col/row are only set by the constructor (Ex), NOT by the per-entry
 // reinit at 0x7597D0, so they must be explicitly zeroed for a clean start.
+inline constexpr uint32_t kOffsetCharSelectStageId      = 1084;
+inline constexpr uint32_t kOffsetCharSelectStageState   = 1092;
+inline constexpr uint32_t kOffsetCharSelectStageTimer   = 1096;
+inline constexpr uint32_t kOffsetCharSelectP1CursorY    = 1172;
+inline constexpr uint32_t kOffsetCharSelectP2CursorY    = 1174;
+inline constexpr uint32_t kOffsetCharSelectP1CursorX    = 1176;
+inline constexpr uint32_t kOffsetCharSelectP2CursorX    = 1178;
+inline constexpr uint32_t kOffsetCharSelectP1InputLock  = 1180;
+inline constexpr uint32_t kOffsetCharSelectP2InputLock  = 1181;
+inline constexpr uint32_t kOffsetCharSelectP1State      = 1182;
+inline constexpr uint32_t kOffsetCharSelectP2State      = 1183;
 inline constexpr uint32_t kOffsetCharSelectP1GridCol   = 1336;
 inline constexpr uint32_t kOffsetCharSelectP2GridCol   = 1337;
 inline constexpr uint32_t kOffsetCharSelectP1GridRow   = 1338;
@@ -91,6 +102,14 @@ inline constexpr uint8_t  kCharSelectDefaultP1Col = 0;  // leftmost column
 inline constexpr uint8_t  kCharSelectDefaultP1Row = 0;  // top row
 inline constexpr uint8_t  kCharSelectDefaultP2Col = 2;  // third column
 inline constexpr uint8_t  kCharSelectDefaultP2Row = 0;  // top row
+inline constexpr uint16_t kCharSelectDefaultCursorX = 300;
+inline constexpr uint16_t kCharSelectDefaultCursorY = 180;
+inline constexpr uint8_t  kCharSelectDefaultInputLock = 0;
+inline constexpr uint8_t  kCharSelectDefaultP1State = 5;
+inline constexpr uint8_t  kCharSelectDefaultP2State = 5;
+inline constexpr uint32_t kCharSelectDefaultStageId = 0;
+inline constexpr uint32_t kCharSelectDefaultStageState = 0;
+inline constexpr uint32_t kCharSelectDefaultStageTimer = 0;
 // Grid map starts at screen object + 1209; charId = gridMap[row*3 + col].
 inline constexpr uint32_t kOffsetCharSelectGridMap = 1209;
 inline constexpr uint32_t kOffsetGraphicsPrimarySurface = 33283u * sizeof(uint32_t);

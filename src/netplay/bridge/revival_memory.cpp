@@ -1181,6 +1181,19 @@ static uint8_t g_savedDllExitNearJccBytes[RevivalAddressProfile::kMaxExitProcess
 
 bool SaveAndApplyDllExitProcessPatches()
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("SaveAndApplyDllExitProcessPatches");
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "SaveAndApplyDllExitProcessPatches",
+            riskyStartTick,
+            15,
+            outcome,
+            true);
+        return value;
+    };
+
     if (g_dllExitProcessPatchesSaved)
     {
         // H4 diagnostic: this early-out means the next restore will use
@@ -1188,17 +1201,17 @@ bool SaveAndApplyDllExitProcessPatches()
         // warning so we can detect this in the trace.
         mod::Log("SaveAndApplyDllExitProcessPatches: SKIPPED (flag already true) "
                  "— H4: next restore will use previously saved bytes!");
-        return true; // Already applied — don't overwrite saved originals.
+        return finishRisky("skip_already_saved", true); // Already applied — don't overwrite saved originals.
     }
     if (g_activeRevival == nullptr || g_activeRevival->exitProcessPatchCount == 0)
     {
-        return false;
+        return finishRisky("skip_no_profile", false);
     }
 
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
-        return false;
+        return finishRisky("skip_no_module", false);
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
@@ -1346,17 +1359,35 @@ bool SaveAndApplyDllExitProcessPatches()
         mod::Log("SaveAndApplyDllExitProcessPatches: all patches verified OK");
     }
 
-    return (applied + nearApplied) > 0;
+    const bool anyPatched = (applied + nearApplied) > 0;
+    if (verifyFail > 0)
+    {
+        return finishRisky("verify_fail", anyPatched);
+    }
+    return finishRisky(anyPatched ? "patched" : "no_patches", anyPatched);
 }
 
 bool RestoreDllExitProcessPatches()
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("RestoreDllExitProcessPatches");
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "RestoreDllExitProcessPatches",
+            riskyStartTick,
+            15,
+            outcome,
+            true);
+        return value;
+    };
+
     if (!g_dllExitProcessPatchesSaved || g_activeRevival == nullptr)
     {
         mod::Log("RestoreDllExitProcessPatches: SKIPPED (saved=%d profile=%p)",
                  g_dllExitProcessPatchesSaved ? 1 : 0,
                  static_cast<const void*>(g_activeRevival));
-        return false;
+        return finishRisky("skip_not_saved", false);
     }
 
     // Log the saved bytes we're about to restore (H4 diagnostic)
@@ -1385,7 +1416,7 @@ bool RestoreDllExitProcessPatches()
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
-        return false;
+        return finishRisky("skip_no_module", false);
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
@@ -1439,7 +1470,8 @@ bool RestoreDllExitProcessPatches()
              "%d/%zu near-Jcc patches",
              restored, g_activeRevival->exitProcessPatchCount,
              nearRestored, g_activeRevival->exitProcessNearJccCount);
-    return (restored + nearRestored) > 0;
+    const bool anyRestored = (restored + nearRestored) > 0;
+    return finishRisky(anyRestored ? "restored" : "no_restore", anyRestored);
 }
 
 bool AreDllExitPatchesSaved()
@@ -1484,13 +1516,26 @@ bool AreDllExitPatchesSaved()
 // ---------------------------------------------------------------------------
 bool DestroyCurrentSession(const char* caller)
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("DestroyCurrentSession", caller);
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "DestroyCurrentSession",
+            riskyStartTick,
+            25,
+            outcome,
+            true);
+        return value;
+    };
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr
         || g_activeRevival == nullptr
         || g_activeRevival->sessionPtrOffsetCount == 0)
     {
         mod::Log("%s: DestroyCurrentSession skipped (DLL not loaded)", caller);
-        return false;
+        return finishRisky("skip_no_dll", false);
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
@@ -1504,10 +1549,11 @@ bool DestroyCurrentSession(const char* caller)
         || sessionPtr == 0)
     {
         mod::Log("%s: DestroyCurrentSession skipped (session NULL)", caller);
-        return false;
+        return finishRisky("skip_no_session", false);
     }
 
     const int currentRole = g_localRoleFlag;
+    const char* outcome = "destroyed";
 
     mod::Log(
         "%s: DestroyCurrentSession starting session=0x%08lX role=%d",
@@ -1543,6 +1589,7 @@ bool DestroyCurrentSession(const char* caller)
     if (!SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtablePtr)
         || vtablePtr == 0)
     {
+        outcome = "zero_globals_vtable_null";
         mod::Log(
             "%s: DestroyCurrentSession WARN vtable NULL session=0x%08lX, zeroing ptr only",
             caller,
@@ -1563,6 +1610,7 @@ bool DestroyCurrentSession(const char* caller)
                          &vtableSlot0)
             || vtableSlot0 == 0)
         {
+            outcome = "zero_globals_vtable0_null";
             mod::Log(
                 "%s: DestroyCurrentSession WARN vtable[0] NULL vtable=0x%08lX, zeroing ptr only",
                 caller,
@@ -1576,6 +1624,7 @@ bool DestroyCurrentSession(const char* caller)
         {
             if (vtableSlot0 < revBase || vtableSlot0 >= revEnd)
             {
+                outcome = "zero_globals_vtable0_outside_module";
                 mod::Log(
                     "%s: DestroyCurrentSession SKIPPED — vtable[0]=0x%08lX "
                     "outside DLL [0x%08lX..0x%08lX], zeroing ptr only",
@@ -1637,7 +1686,7 @@ zero_globals:
         currentRole,
         zeroed);
 
-    return true;
+    return finishRisky(outcome, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,10 +1768,23 @@ bool InvokeSessionVtableInit(const char* caller)
 
 bool ForceLocalPlayInit()
 {
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("ForceLocalPlayInit");
+    auto finishRisky = [&](const char* outcome, bool value) -> bool
+    {
+        EndRiskyPathTiming(
+            "ForceLocalPlayInit",
+            riskyStartTick,
+            50,
+            outcome,
+            true);
+        return value;
+    };
+
     if (g_localInitFn == nullptr)
     {
         mod::Log("ForceLocalPlayInit: init function not available");
-        return false;
+        return finishRisky("skip_no_init_fn", false);
     }
 
     IncrementForceLocalPlayInitCount();
@@ -1831,7 +1893,7 @@ bool ForceLocalPlayInit()
     // --- Full snapshot AFTER vtable[1] init ---
     LogInitWriteSnapshot("ForceLocalPlayInit_post_vtable1");
 
-    return true;
+    return finishRisky("ok", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1903,10 +1965,11 @@ bool ReverseInputSwapIfClient()
 // ---------------------------------------------------------------------------
 // SaveRenderContext / RestoreRenderContext — saves the EfzRender* pointer
 // (dword_100A0778) before entering tournament mode, and writes it back when
-// needed.  Tournament cleanup code (sub_1006CC30) zeros this global before
-// calling ExitProcess, and init(2,102) can zero it again.  The EfzRender
-// object itself lives in EFZ.exe and its pointer never changes, so
-// restoring the saved value is always safe.
+// needed. Tournament cleanup code (sub_1006CC30) zeros this global before
+// calling ExitProcess, and init(2,102) can zero it again. The EfzRender
+// object itself lives in EFZ.exe and its pointer never changes for the life
+// of the process, so the saved pointer is intentionally reusable across
+// multiple cleanup attempts in the same session-end chain.
 // ---------------------------------------------------------------------------
 static uintptr_t g_savedRenderContext = 0;
 static bool      g_renderContextSaved = false;
@@ -1960,7 +2023,14 @@ bool SaveRenderContext()
 
 bool RestoreRenderContext()
 {
-    if (!g_renderContextSaved || g_savedRenderContext == 0)
+    if (g_savedRenderContext == 0)
+    {
+        // Self-heal when cleanup runs before the usual session-start save or
+        // after an earlier restore already used the cached pointer once.
+        (void)SaveRenderContext();
+    }
+
+    if (g_savedRenderContext == 0)
     {
         return false;
     }
@@ -1995,7 +2065,7 @@ bool RestoreRenderContext()
                                    : (currentRenderCtx == g_savedRenderContext
                                           ? "unchanged"
                                           : "was different"));
-    g_renderContextSaved = false;
+    g_renderContextSaved = true;
     return true;
 }
 
@@ -2116,6 +2186,43 @@ bool DisableRevivalTextRendering()
 
     mod::Log("DisableRevivalTextRendering: text rendering disabled");
     return true;
+}
+
+void BestEffortCleanupRevivalText(const char* contextTag)
+{
+    const DWORD riskyStartTick =
+        BeginRiskyPathTiming("BestEffortCleanupRevivalText", contextTag);
+    const char* tag =
+        (contextTag != nullptr && contextTag[0] != '\0')
+            ? contextTag
+            : "Revival text cleanup";
+
+    const bool clearOk = ClearRevivalText();
+    const bool disableOk = DisableRevivalTextRendering();
+    const char* outcome = "clear_fail_disable_fail";
+    if (clearOk && disableOk)
+    {
+        outcome = "clear_ok_disable_ok";
+    }
+    else if (clearOk)
+    {
+        outcome = "clear_ok_disable_fail";
+    }
+    else if (disableOk)
+    {
+        outcome = "clear_fail_disable_ok";
+    }
+    mod::Log(
+        "%s ClearRevivalText=%d DisableRevivalTextRendering=%d",
+        tag,
+        clearOk ? 1 : 0,
+        disableOk ? 1 : 0);
+    EndRiskyPathTiming(
+        "BestEffortCleanupRevivalText",
+        riskyStartTick,
+        15,
+        outcome,
+        true);
 }
 
 void ResetDebugCounters(SharedBlock* block)
@@ -3165,6 +3272,9 @@ static volatile bool g_frameRecoveryPending = false;
 // point (sub_1006E570 → vtable[2] → RollbackLoopTick).  ExitProcess most
 // commonly fires here when the peer process dies mid-match.
 static volatile bool g_tickRecoveryPending = false;
+static DWORD g_lastFrameDispatchSlowLogTick = 0;
+static DWORD g_lastPerFrameTickSlowLogTick = 0;
+static constexpr DWORD kHotPathSlowLogIntervalMs = 1000;
 
 // RunFrameDispatch — MSVC C4611 guard: no C++ objects with destructors in scope.
 // Only POD types here.
@@ -3174,6 +3284,8 @@ static volatile bool g_tickRecoveryPending = false;
 #endif
 static void RunFrameDispatch()
 {
+    const volatile DWORD riskyStartTick =
+        BeginRiskyPathTiming("RunFrameDispatch", nullptr, false);
     g_netplayFrameJmpActive = true;
     if (setjmp(g_netplayFrameJmpBuf) != 0)
     {
@@ -3181,6 +3293,12 @@ static void RunFrameDispatch()
         // Signal OurFrameDispatch to execute C++ recovery outside setjmp scope.
         g_netplayFrameJmpActive = false;
         g_frameRecoveryPending = true;
+        EndRiskyPathTiming(
+            "RunFrameDispatch",
+            riskyStartTick,
+            8,
+            "longjmp_recovery",
+            true);
         return;
     }
     // Normal path: dispatch through the original sub_1006E590 trampoline.
@@ -3189,6 +3307,33 @@ static void RunFrameDispatch()
         g_origFrameDispatch();
     }
     g_netplayFrameJmpActive = false;
+    if (g_origFrameDispatch == nullptr)
+    {
+        EndRiskyPathTiming(
+            "RunFrameDispatch",
+            riskyStartTick,
+            8,
+            "skip_no_orig",
+            true);
+        return;
+    }
+
+    const DWORD elapsedMs = GetTickCount() - riskyStartTick;
+    if (elapsedMs >= 8)
+    {
+        const DWORD now = GetTickCount();
+        if (g_lastFrameDispatchSlowLogTick == 0
+            || (now - g_lastFrameDispatchSlowLogTick) >= kHotPathSlowLogIntervalMs)
+        {
+            g_lastFrameDispatchSlowLogTick = now;
+            EndRiskyPathTiming(
+                "RunFrameDispatch",
+                riskyStartTick,
+                8,
+                "slow_frame_dispatch",
+                true);
+        }
+    }
 }
 
 #if defined(_MSC_VER)
@@ -3443,6 +3588,8 @@ static void MonitorScreenIndexChange()
 #endif
 static int RunPerFrameTickDispatch(void* fixedThis)
 {
+    const volatile DWORD riskyStartTick =
+        BeginRiskyPathTiming("RunPerFrameTickDispatch", nullptr, false);
     g_netplayFrameJmpActive = true;
     if (setjmp(g_netplayFrameJmpBuf) != 0)
     {
@@ -3450,12 +3597,46 @@ static int RunPerFrameTickDispatch(void* fixedThis)
         g_netplayFrameJmpActive = false;
         g_insideFrameTick = false;
         g_tickRecoveryPending = true;
+        EndRiskyPathTiming(
+            "RunPerFrameTickDispatch",
+            riskyStartTick,
+            8,
+            "longjmp_recovery",
+            true);
         return 0;
     }
     g_insideFrameTick = true;
+    if (g_origPerFrameTick == nullptr)
+    {
+        g_insideFrameTick = false;
+        g_netplayFrameJmpActive = false;
+        EndRiskyPathTiming(
+            "RunPerFrameTickDispatch",
+            riskyStartTick,
+            8,
+            "skip_no_orig",
+            true);
+        return 0;
+    }
     const int result = g_origPerFrameTick(fixedThis);
     g_insideFrameTick = false;
     g_netplayFrameJmpActive = false;
+    const DWORD elapsedMs = GetTickCount() - riskyStartTick;
+    if (elapsedMs >= 8)
+    {
+        const DWORD now = GetTickCount();
+        if (g_lastPerFrameTickSlowLogTick == 0
+            || (now - g_lastPerFrameTickSlowLogTick) >= kHotPathSlowLogIntervalMs)
+        {
+            g_lastPerFrameTickSlowLogTick = now;
+            EndRiskyPathTiming(
+                "RunPerFrameTickDispatch",
+                riskyStartTick,
+                8,
+                "slow_tick_dispatch",
+                true);
+        }
+    }
     return result;
 }
 #if defined(_MSC_VER)
@@ -4412,11 +4593,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             "TICK_HOOK: recovery step 3 RestoreDllExitProcessPatches result=%d",
             patchOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        const bool textOk = DisableRevivalTextRendering();
-        mod::Log(
-            "TICK_HOOK: recovery step 4 DisableRevivalTextRendering result=%d",
-            textOk ? 1 : 0);
+        // Step 4: Clear stale text and disable any lingering text rendering.
+        BestEffortCleanupRevivalText("TICK_HOOK: recovery step 4");
 
         // Step 5: Reset crash/validation state.
         mod::ResetCrashRecoveryState();
@@ -4538,11 +4716,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 "TICK_HOOK: disconnect step 3 RestoreDllExitProcessPatches result=%d",
                 patchOk ? 1 : 0);
 
-            // Step 4: Disable stale text overlays.
-            const bool textOk = DisableRevivalTextRendering();
-            mod::Log(
-                "TICK_HOOK: disconnect step 4 DisableRevivalTextRendering result=%d",
-                textOk ? 1 : 0);
+            // Step 4: Clear stale text and disable any lingering text rendering.
+            BestEffortCleanupRevivalText("TICK_HOOK: disconnect step 4");
 
             // Step 5: Reset crash/validation state.
             mod::ResetCrashRecoveryState();
@@ -4626,10 +4801,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 "TICK_HOOK: spectator-esc step 3 RestoreDllExitProcessPatches result=%d",
                 patchOk ? 1 : 0);
 
-            const bool textOk = DisableRevivalTextRendering();
-            mod::Log(
-                "TICK_HOOK: spectator-esc step 4 DisableRevivalTextRendering result=%d",
-                textOk ? 1 : 0);
+            BestEffortCleanupRevivalText("TICK_HOOK: spectator-esc step 4");
 
             mod::ResetCrashRecoveryState();
             ResetGameModeValidation();
@@ -4758,12 +4930,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                         "RestoreDllExitProcessPatches result=%d",
                         patchOk ? 1 : 0);
 
-                    // Step 4: Disable stale text overlays.
-                    const bool textOk = DisableRevivalTextRendering();
-                    mod::Log(
-                        "TICK_HOOK: hard-fallback step 4 "
-                        "DisableRevivalTextRendering result=%d",
-                        textOk ? 1 : 0);
+                    // Step 4: Clear stale text and disable any lingering
+                    // text rendering.
+                    BestEffortCleanupRevivalText(
+                        "TICK_HOOK: hard-fallback step 4");
 
                     // Step 5: Reset crash/validation state.
                     mod::ResetCrashRecoveryState();
@@ -4825,9 +4995,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             "TICK_HOOK: deferred ForceLocalPlayInit result=%d",
             initOk ? 1 : 0);
 
-        (void)ClearRevivalText();
-        (void)RestoreRenderContext();
-        (void)DisableRevivalTextRendering();
+        BestEffortCleanupRevivalText("TICK_HOOK: deferred cancel cleanup");
         mod::ResetCrashRecoveryState();
         ResetGameModeValidation();
 
@@ -4994,10 +5162,7 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
         "TICK_HOOK: graceful-quit step 3 RestoreDllExitProcessPatches result=%d",
         patchOk ? 1 : 0);
 
-    const bool textOk = DisableRevivalTextRendering();
-    mod::Log(
-        "TICK_HOOK: graceful-quit step 4 DisableRevivalTextRendering result=%d",
-        textOk ? 1 : 0);
+    BestEffortCleanupRevivalText("TICK_HOOK: graceful-quit step 4");
 
     mod::ResetCrashRecoveryState();
     ResetGameModeValidation();
@@ -5155,14 +5320,9 @@ static void OurFrameDispatch()
             "OurFrameDispatch: step 3 RestoreDllExitProcessPatches result=%d",
             patchOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays left by the online session
-        // (nicknames, ping, delay).  ClearRevivalText is unsafe here
-        // (ForceLocalPlayInit may have zeroed the render context pointer)
-        // so we only disable the rendering hook.
-        const bool textOk = DisableRevivalTextRendering();
-        mod::Log(
-            "OurFrameDispatch: step 4 DisableRevivalTextRendering result=%d",
-            textOk ? 1 : 0);
+        // Step 4: Clear stale text and disable any lingering text rendering
+        // left by the online session (nicknames, ping, delay).
+        BestEffortCleanupRevivalText("OurFrameDispatch: step 4");
 
         // Step 5: Reset the one-shot VEH TOCTOU recovery guard so a
         // subsequent session can still be recovered if needed.

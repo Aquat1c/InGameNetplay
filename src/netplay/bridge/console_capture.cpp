@@ -1,12 +1,15 @@
 // Console I/O text capture and delay prompt parsing for the Revival takeover.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/mod_settings.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <share.h>
 
 #include <windows.h>
@@ -430,6 +433,283 @@ void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial)
 // ("Average Ping:", "Min Ping:", etc.) are available when the delay prompt
 // line is detected.  Cleared on consumption and on session reset.
 static std::string g_delayMetricsAccumulator;
+struct NativeMatchStateSnapshot
+{
+    bool valid;
+    int matchIndex;
+    int currentFrame;
+    int currentState;
+    int inputSizeA;
+    int inputSizeB;
+    int inputDelay;
+    int maxRoll;
+    DWORD updateTick;
+};
+
+static NativeMatchStateSnapshot g_lastNativeMatchState = {};
+static DWORD g_lastNativeMatchStateLogTick = 0;
+constexpr DWORD kNativeMatchStateLogIntervalMs = 30000u;
+struct NativeInterestingLine
+{
+    DWORD tick;
+    std::string text;
+};
+
+static std::deque<NativeInterestingLine> g_recentNativeInterestingLines;
+constexpr size_t kMaxRecentNativeInterestingLines = 64u;
+constexpr size_t kMaxLoggedNativeInterestingContextLines = 12u;
+
+bool ContainsAnyCaseInsensitive(
+    const std::string& text,
+    const char* const* needles,
+    size_t needleCount)
+{
+    if (needles == nullptr || needleCount == 0)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < needleCount; ++i)
+    {
+        const char* needle = needles[i];
+        if (needle != nullptr && needle[0] != '\0'
+            && ContainsCaseInsensitive(text, needle))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* MatchNativeDesyncSignal(const std::string& text)
+{
+    static const char* kSignals[] = {
+        "Desync detected",
+        "header crc mismatch",
+        "state not recoverable",
+    };
+
+    for (const char* signal : kSignals)
+    {
+        if (ContainsCaseInsensitive(text, signal))
+        {
+            return signal;
+        }
+    }
+    return nullptr;
+}
+
+const char* MatchNativeDesyncWarning(const std::string& text)
+{
+    static const char* kWarnings[] = {
+        "CurrentFrame > playerInput.size",
+        "Passing null state",
+        "Remote is using a deprecated version",
+    };
+
+    for (const char* warning : kWarnings)
+    {
+        if (ContainsCaseInsensitive(text, warning))
+        {
+            return warning;
+        }
+    }
+    return nullptr;
+}
+
+bool IsInterestingNativeDebugLine(const std::string& text)
+{
+    static const char* kKeywords[] = {
+        "Desync detected",
+        "header crc mismatch",
+        "state not recoverable",
+        "CurrentFrame > playerInput.size",
+        "Passing null state",
+        "CurrentFrame",
+        "Current State",
+        "StateP1",
+        "StateP2",
+        "Frame Step:",
+        "inputDelay",
+        "MaxRollback",
+        "Frames to log:",
+        "Loc Frame",
+        "Rem Frame",
+        "Render Frame",
+        "Add frame, remote is ahead",
+        "Pause, need more remote frames",
+        "Pause, too few remote inputs, ping",
+        "Pause, too little inputDelay",
+        "Full Sync queue",
+        "Update, available frames",
+        "Connection timed out",
+        "Source quit or timed out",
+        "Host timed out",
+        "Remote timed out",
+        "Peer died",
+        "Socket error",
+        "Received quit from:",
+        "Recv quit from:",
+        "Remote is using a deprecated version",
+    };
+    return ContainsAnyCaseInsensitive(
+        text,
+        kKeywords,
+        sizeof(kKeywords) / sizeof(kKeywords[0]));
+}
+
+void RememberNativeInterestingLine(const std::string& text)
+{
+    if (text.empty() || !IsInterestingNativeDebugLine(text))
+    {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (!g_recentNativeInterestingLines.empty()
+        && g_recentNativeInterestingLines.back().text == text)
+    {
+        g_recentNativeInterestingLines.back().tick = now;
+        return;
+    }
+
+    g_recentNativeInterestingLines.push_back({now, text});
+    while (g_recentNativeInterestingLines.size() > kMaxRecentNativeInterestingLines)
+    {
+        g_recentNativeInterestingLines.pop_front();
+    }
+}
+
+void LogRecentNativeInterestingContext(const char* reason)
+{
+    if (g_recentNativeInterestingLines.empty())
+    {
+        return;
+    }
+
+    const size_t total = g_recentNativeInterestingLines.size();
+    const size_t start =
+        (total > kMaxLoggedNativeInterestingContextLines)
+            ? (total - kMaxLoggedNativeInterestingContextLines)
+            : 0u;
+
+    mod::Log(
+        "Takeover: native debug context before '%s' lines=%lu showing=%lu",
+        reason != nullptr ? reason : "",
+        static_cast<unsigned long>(total),
+        static_cast<unsigned long>(total - start));
+
+    const DWORD now = GetTickCount();
+    for (size_t i = start; i < total; ++i)
+    {
+        const NativeInterestingLine& entry = g_recentNativeInterestingLines[i];
+        const DWORD ageMs = (entry.tick != 0) ? (now - entry.tick) : 0;
+        mod::Log(
+            "Takeover: native debug[%lu/%lu] ageMs=%lu text='%s'",
+            static_cast<unsigned long>(i - start + 1),
+            static_cast<unsigned long>(total - start),
+            static_cast<unsigned long>(ageMs),
+            entry.text.c_str());
+    }
+}
+
+bool TryParseNativeMatchStateLine(
+    const std::string& text,
+    NativeMatchStateSnapshot* outSnapshot)
+{
+    if (outSnapshot == nullptr)
+    {
+        return false;
+    }
+
+    NativeMatchStateSnapshot snapshot = {};
+    snapshot.valid = false;
+    snapshot.matchIndex = -1;
+    snapshot.currentFrame = -1;
+    snapshot.currentState = -1;
+    snapshot.inputSizeA = -1;
+    snapshot.inputSizeB = -1;
+    snapshot.inputDelay = -1;
+    snapshot.maxRoll = -1;
+    snapshot.updateTick = GetTickCount();
+
+    if (!ContainsCaseInsensitive(text, "CurrentFrame")
+        || !ContainsCaseInsensitive(text, "Current State"))
+    {
+        return false;
+    }
+
+    if (!ExtractIntAfterToken(text, "Match", &snapshot.matchIndex)
+        || !ExtractIntAfterToken(text, "CurrentFrame", &snapshot.currentFrame)
+        || !ExtractIntAfterToken(text, "Current State:", &snapshot.currentState))
+    {
+        return false;
+    }
+
+    const size_t inputSizesPos = text.find("input sizes");
+    if (inputSizesPos != std::string::npos)
+    {
+        size_t afterFirst = 0;
+        if (ParseIntAt(text,
+                       inputSizesPos + std::strlen("input sizes"),
+                       &snapshot.inputSizeA,
+                       &afterFirst))
+        {
+            (void)ParseIntAt(text, afterFirst, &snapshot.inputSizeB, nullptr);
+        }
+    }
+
+    (void)ExtractIntAfterToken(text, "inputDelay", &snapshot.inputDelay);
+    (void)ExtractIntAfterToken(text, "MaxRoll", &snapshot.maxRoll);
+    snapshot.valid = true;
+    *outSnapshot = snapshot;
+    return true;
+}
+
+void LogNativeMatchStateSnapshot(
+    const char* prefix,
+    const NativeMatchStateSnapshot& snapshot,
+    const std::string& rawText)
+{
+    mod::Log(
+        "%s match=%d frame=%d state=%d input=%d/%d delay=%d maxRoll=%d text='%s'",
+        prefix != nullptr ? prefix : "Takeover: native match snapshot",
+        snapshot.matchIndex,
+        snapshot.currentFrame,
+        snapshot.currentState,
+        snapshot.inputSizeA,
+        snapshot.inputSizeB,
+        snapshot.inputDelay,
+        snapshot.maxRoll,
+        rawText.c_str());
+}
+
+void LogLastNativeMatchStateContext(const char* reason)
+{
+    if (!g_lastNativeMatchState.valid)
+    {
+        return;
+    }
+
+    DWORD ageMs = 0;
+    if (g_lastNativeMatchState.updateTick != 0)
+    {
+        ageMs = GetTickCount() - g_lastNativeMatchState.updateTick;
+    }
+
+    mod::Log(
+        "Takeover: native match context before '%s' match=%d frame=%d "
+        "state=%d input=%d/%d delay=%d maxRoll=%d ageMs=%lu",
+        reason != nullptr ? reason : "",
+        g_lastNativeMatchState.matchIndex,
+        g_lastNativeMatchState.currentFrame,
+        g_lastNativeMatchState.currentState,
+        g_lastNativeMatchState.inputSizeA,
+        g_lastNativeMatchState.inputSizeB,
+        g_lastNativeMatchState.inputDelay,
+        g_lastNativeMatchState.maxRoll,
+        static_cast<unsigned long>(ageMs));
+}
 
 void ResetNativeWorkflowFlags()
 {
@@ -441,6 +721,9 @@ void ResetNativeWorkflowFlags()
     g_holePunchServerConfigLoaded = false;
     g_configuredHolePunchServer.clear();
     g_delayMetricsAccumulator.clear();
+    g_lastNativeMatchState = {};
+    g_lastNativeMatchStateLogTick = 0;
+    g_recentNativeInterestingLines.clear();
 }
 
 void NoteConsolePromptLine(const std::string& text)
@@ -449,6 +732,8 @@ void NoteConsolePromptLine(const std::string& text)
     {
         return;
     }
+
+    RememberNativeInterestingLine(text);
 
     // Accumulate lines for delay prompt metrics parsing.  EfzRevival.exe prints
     // "Average Ping:", "Min Ping:" etc. on separate lines BEFORE the prompt.
@@ -468,12 +753,40 @@ void NoteConsolePromptLine(const std::string& text)
         g_nativeWorkflowLoadedSeen = true;
         mod::Log("Takeover: native workflow event=helper_loaded text='%s'", text.c_str());
     }
-    if (!g_nativeWorkflowMatchLoopSeen
-        && ContainsCaseInsensitive(text, "CurrentFrame")
-        && ContainsCaseInsensitive(text, "Current State"))
+    NativeMatchStateSnapshot nativeMatchState = {};
+    if (TryParseNativeMatchStateLine(text, &nativeMatchState))
     {
+        const bool firstMatchLoop = !g_nativeWorkflowMatchLoopSeen;
+        const bool hadPreviousSnapshot = g_lastNativeMatchState.valid;
+        const bool stateChanged =
+            !hadPreviousSnapshot
+            || nativeMatchState.currentState != g_lastNativeMatchState.currentState;
+        const bool frameRestarted =
+            hadPreviousSnapshot
+            && nativeMatchState.currentFrame < g_lastNativeMatchState.currentFrame;
+
         g_nativeWorkflowMatchLoopSeen = true;
-        mod::Log("Takeover: native workflow event=match_loop_started text='%s'", text.c_str());
+        g_lastNativeMatchState = nativeMatchState;
+
+        if (firstMatchLoop)
+        {
+            mod::Log(
+                "Takeover: native workflow event=match_loop_started text='%s'",
+                text.c_str());
+        }
+
+        if (firstMatchLoop
+            || stateChanged
+            || frameRestarted
+            || nativeMatchState.updateTick - g_lastNativeMatchStateLogTick
+                   >= kNativeMatchStateLogIntervalMs)
+        {
+            LogNativeMatchStateSnapshot(
+                "Takeover: native match snapshot",
+                nativeMatchState,
+                text);
+            g_lastNativeMatchStateLogTick = nativeMatchState.updateTick;
+        }
     }
     if (!g_nativeWorkflowTournamentSeen && ContainsCaseInsensitive(text, "Starting Tournament Mode"))
     {
@@ -505,6 +818,8 @@ void NoteConsolePromptLine(const std::string& text)
                 "Takeover: native workflow event=peer_died endpoint='%s' text='%s'",
                 diedEndpoint.c_str(),
                 text.c_str());
+            LogLastNativeMatchStateContext("Peer died");
+            LogRecentNativeInterestingContext("Peer died");
             // Also publish through IPC as a backup signal so the host process
             // can detect the disconnect even if no explicit timeout message
             // follows (e.g. "Host timed out" or "Remote timed out" may arrive
@@ -519,24 +834,32 @@ void NoteConsolePromptLine(const std::string& text)
     if (ContainsCaseInsensitive(text, "Connection timed out"))
     {
         mod::Log("Takeover: console error detected='Connection timed out' text='%s'", text.c_str());
+        LogLastNativeMatchStateContext("Connection timed out");
+        LogRecentNativeInterestingContext("Connection timed out");
         PublishConsoleError("Connection timed out");
         return;
     }
     if (ContainsCaseInsensitive(text, "Source quit or timed out"))
     {
         mod::Log("Takeover: console error detected='Source quit or timed out' text='%s'", text.c_str());
+        LogLastNativeMatchStateContext("Source quit or timed out");
+        LogRecentNativeInterestingContext("Source quit or timed out");
         PublishConsoleError("Source quit or timed out");
         return;
     }
     if (ContainsCaseInsensitive(text, "Host timed out"))
     {
         mod::Log("Takeover: console error detected='Host timed out' text='%s'", text.c_str());
+        LogLastNativeMatchStateContext("Host timed out");
+        LogRecentNativeInterestingContext("Host timed out");
         PublishConsoleError("Host timed out");
         return;
     }
     if (ContainsCaseInsensitive(text, "Remote timed out"))
     {
         mod::Log("Takeover: console error detected='Remote timed out' text='%s'", text.c_str());
+        LogLastNativeMatchStateContext("Remote timed out");
+        LogRecentNativeInterestingContext("Remote timed out");
         PublishConsoleError("Remote timed out");
         return;
     }
@@ -549,6 +872,8 @@ void NoteConsolePromptLine(const std::string& text)
     if (ContainsCaseInsensitive(text, "Socket error"))
     {
         mod::Log("Takeover: console error detected='Socket error' text='%s'", text.c_str());
+        LogLastNativeMatchStateContext("Socket error");
+        LogRecentNativeInterestingContext("Socket error");
         // Use the full text since it includes the socket error details
         std::string errorMsg = text;
         if (errorMsg.size() > 120)
@@ -556,6 +881,29 @@ void NoteConsolePromptLine(const std::string& text)
             errorMsg.resize(120);
         }
         PublishConsoleError(errorMsg.c_str());
+        return;
+    }
+
+    if (const char* desyncSignal = MatchNativeDesyncSignal(text))
+    {
+        mod::Log(
+            "Takeover: native desync signal detected='%s' text='%s'",
+            desyncSignal,
+            text.c_str());
+        LogLastNativeMatchStateContext(desyncSignal);
+        LogRecentNativeInterestingContext(desyncSignal);
+        PublishConsoleError(desyncSignal);
+        return;
+    }
+
+    if (const char* warningSignal = MatchNativeDesyncWarning(text))
+    {
+        mod::Log(
+            "Takeover: native desync warning detected='%s' text='%s'",
+            warningSignal,
+            text.c_str());
+        LogLastNativeMatchStateContext(warningSignal);
+        LogRecentNativeInterestingContext(warningSignal);
         return;
     }
 
@@ -772,6 +1120,15 @@ bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath)
 bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
 {
     std::string pathText;
+    if (TryGetRedirectedNativeLogEfzHandlePath(hFile, &pathText))
+    {
+        if (outPath != nullptr)
+        {
+            *outPath = pathText;
+        }
+        return true;
+    }
+
     if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
     {
         return false;
@@ -893,6 +1250,12 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
             "Remote timed out",
             "Spectators have been disabled",
             "Socket error",
+            "Desync detected",
+            "header crc mismatch",
+            "state not recoverable",
+            "CurrentFrame > playerInput.size",
+            "Passing null state",
+            "Remote is using a deprecated version",
             "Host already playing, join as a spectator",
             "Host not yet playing, join as a player",
             "Waiting for game to begin",
@@ -959,9 +1322,7 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
 // the file remains readable across reconnects/restarts.
 // ---------------------------------------------------------------------------
 static std::mutex g_ownedLogEfzMutex;
-static std::mutex g_ownedLogEfzWriteGuardMutex;
-static std::unordered_map<DWORD, LONG> g_ownedLogEfzWriteGuardDepths;
-static FILE* g_ownedLogEfzCurrentFile = nullptr;
+static HANDLE g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
 static std::string g_ownedLogEfzCurrentPath;
 static std::string g_ownedLogEfzHistory;
 static std::string g_ownedLogEfzHistoryPath;
@@ -1006,7 +1367,7 @@ static std::string ParentDirectory(const std::string& path)
     return {};
 }
 
-static std::string GetOwnedLogEfzPath()
+std::string GetManagedLogEfzPath()
 {
     const std::string modDir = GetConsoleCaptureModuleDirectory();
     if (modDir.empty())
@@ -1018,6 +1379,47 @@ static std::string GetOwnedLogEfzPath()
     const std::string gameRoot = ParentDirectory(modsDir.empty() ? modDir : modsDir);
     const std::string rootDir = gameRoot.empty() ? modDir : gameRoot;
     return rootDir + "\\logEfz.txt";
+}
+
+std::string GetNativeLogEfzShadowPath()
+{
+    const std::string modDir = GetConsoleCaptureModuleDirectory();
+    if (modDir.empty())
+    {
+        return {};
+    }
+    return modDir + "\\logs\\logEfz_native_shadow.txt";
+}
+
+static unsigned long long QueryExistingFileSize(const std::string& path, bool* outExists)
+{
+    if (outExists != nullptr)
+    {
+        *outExists = false;
+    }
+
+    if (path.empty())
+    {
+        return 0;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs))
+    {
+        return 0;
+    }
+    if ((attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        return 0;
+    }
+
+    if (outExists != nullptr)
+    {
+        *outExists = true;
+    }
+
+    return (static_cast<unsigned long long>(attrs.nFileSizeHigh) << 32)
+        | static_cast<unsigned long long>(attrs.nFileSizeLow);
 }
 
 static std::string FormatOwnedLogEfzTimestamp()
@@ -1041,17 +1443,135 @@ static std::string FormatOwnedLogEfzTimestamp()
     return buffer;
 }
 
-static void WriteOwnedLogEfzBytes(FILE* file, const char* data, size_t size)
+static void LogOwnedLogEfzIntegrityIssue(
+    const char* outcome,
+    const std::string& path,
+    const char* detail)
 {
-    if (file == nullptr || data == nullptr || size == 0)
+    if (outcome == nullptr || outcome[0] == '\0')
+    {
+        outcome = "unknown";
+    }
+
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s' %s",
+            outcome,
+            path.c_str(),
+            detail);
+    }
+    else
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s'",
+            outcome,
+            path.c_str());
+    }
+
+    char riskyDetail[640] = {};
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        std::snprintf(
+            riskyDetail,
+            sizeof(riskyDetail),
+            "outcome=%s current='%s' %s",
+            outcome,
+            path.c_str(),
+            detail);
+    }
+    else
+    {
+        std::snprintf(
+            riskyDetail,
+            sizeof(riskyDetail),
+            "outcome=%s current='%s'",
+            outcome,
+            path.c_str());
+    }
+    LogRiskyPathEvent("ManagedLogEfz", riskyDetail);
+}
+
+static bool WriteOwnedLogEfzBytes(
+    const std::string& path,
+    const char* reason,
+    const char* data,
+    size_t size)
+{
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE || data == nullptr || size == 0)
+    {
+        return true;
+    }
+
+    const DWORD requested = static_cast<DWORD>(size);
+    DWORD written = 0;
+    SetLastError(NO_ERROR);
+    const BOOL writeOk = WriteFile(
+        g_ownedLogEfzCurrentHandle,
+        data,
+        requested,
+        &written,
+        nullptr);
+    const DWORD writeError = GetLastError();
+    if (!writeOk || written != requested)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s short_write requested=%lu written=%lu winerr=%lu ok=%d",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(size),
+            static_cast<unsigned long>(written),
+            static_cast<unsigned long>(writeError),
+            writeOk ? 1 : 0);
+        LogOwnedLogEfzIntegrityIssue("short_write", path, detail);
+        return false;
+    }
+
+    return true;
+}
+
+static void CloseOwnedLogEfzCurrentFileLocked(const char* reason)
+{
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
     {
         return;
     }
 
-    BeginManagedLogEfzWrite();
-    std::fwrite(data, 1, size, file);
-    std::fflush(file);
-    EndManagedLogEfzWrite();
+    const HANDLE handle = g_ownedLogEfzCurrentHandle;
+    g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
+
+    SetLastError(NO_ERROR);
+    const BOOL flushOk = FlushFileBuffers(handle);
+    const DWORD flushError = GetLastError();
+    SetLastError(NO_ERROR);
+    const BOOL closeOk = CloseHandle(handle);
+    const DWORD closeError = GetLastError();
+
+    if (!flushOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_flush_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(flushError));
+        LogOwnedLogEfzIntegrityIssue("close_flush_failed", g_ownedLogEfzCurrentPath, detail);
+    }
+
+    if (!closeOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(closeError));
+        LogOwnedLogEfzIntegrityIssue("close_failed", g_ownedLogEfzCurrentPath, detail);
+    }
 }
 
 static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
@@ -1073,6 +1593,65 @@ static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
     return buffer;
 }
 
+static void SanitizeOwnedLogEfzHistoryLocked(const std::string& path)
+{
+    if (g_ownedLogEfzHistory.empty())
+    {
+        return;
+    }
+
+    const size_t bytesBefore = g_ownedLogEfzHistory.size();
+    const size_t firstNonNul = g_ownedLogEfzHistory.find_first_not_of('\0');
+    if (firstNonNul == std::string::npos)
+    {
+        mod::Log(
+            "CAPTURE_LOG: discarded all-zero managed logEfz history current='%s' bytes=%lu",
+            path.c_str(),
+            static_cast<unsigned long>(bytesBefore));
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=all_zero_history bytesDiscarded=%lu",
+            static_cast<unsigned long>(bytesBefore));
+        LogOwnedLogEfzIntegrityIssue("discarded_history", path, detail);
+        g_ownedLogEfzHistory.clear();
+        return;
+    }
+
+    size_t trimmedLeadingNuls = 0;
+    if (firstNonNul > 0)
+    {
+        trimmedLeadingNuls = firstNonNul;
+        g_ownedLogEfzHistory.erase(0, firstNonNul);
+    }
+
+    const auto newEnd = std::remove(g_ownedLogEfzHistory.begin(), g_ownedLogEfzHistory.end(), '\0');
+    const size_t removedEmbeddedNuls = static_cast<size_t>(g_ownedLogEfzHistory.end() - newEnd);
+    g_ownedLogEfzHistory.erase(newEnd, g_ownedLogEfzHistory.end());
+
+    if (trimmedLeadingNuls > 0 || removedEmbeddedNuls > 0)
+    {
+        mod::Log(
+            "CAPTURE_LOG: sanitized managed logEfz history current='%s' bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+            path.c_str(),
+            static_cast<unsigned long>(bytesBefore),
+            static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+            static_cast<unsigned long>(trimmedLeadingNuls),
+            static_cast<unsigned long>(removedEmbeddedNuls));
+        char detail[320] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=nul_sanitized bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+            static_cast<unsigned long>(bytesBefore),
+            static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+            static_cast<unsigned long>(trimmedLeadingNuls),
+            static_cast<unsigned long>(removedEmbeddedNuls));
+        LogOwnedLogEfzIntegrityIssue("history_sanitized", path, detail);
+    }
+}
+
 static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
 {
     if (path.empty())
@@ -1086,6 +1665,21 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
     }
 
     g_ownedLogEfzHistory.clear();
+    if (!netplay::mod_settings::PreserveLogEfzAcrossLaunches())
+    {
+        bool existed = false;
+        const unsigned long long previousBytes = QueryExistingFileSize(path, &existed);
+        g_ownedLogEfzHistoryPath = path;
+        g_ownedLogEfzHistoryPrimed = true;
+
+        mod::Log(
+            "CAPTURE_LOG: starting fresh managed logEfz current='%s' preserveAcrossLaunches=0 previousExists=%d previousBytes=%llu",
+            path.c_str(),
+            existed ? 1 : 0,
+            previousBytes);
+        return;
+    }
+
     FILE* file = _fsopen(path.c_str(), "rb", _SH_DENYNO);
     if (file != nullptr)
     {
@@ -1101,10 +1695,24 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
                     g_ownedLogEfzHistory.size(),
                     file);
                 g_ownedLogEfzHistory.resize(read);
+                if (read != static_cast<size_t>(size))
+                {
+                    char detail[256] = {};
+                    std::snprintf(
+                        detail,
+                        sizeof(detail),
+                        "reason=prime_short_read expected=%lu read=%lu ferror=%d",
+                        static_cast<unsigned long>(size),
+                        static_cast<unsigned long>(read),
+                        std::ferror(file) ? 1 : 0);
+                    LogOwnedLogEfzIntegrityIssue("prime_short_read", path, detail);
+                }
             }
         }
         std::fclose(file);
     }
+
+    SanitizeOwnedLogEfzHistoryLocked(path);
 
     g_ownedLogEfzHistoryPath = path;
     g_ownedLogEfzHistoryPrimed = true;
@@ -1117,47 +1725,77 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
 
 static bool EnsureOwnedLogEfzFilesOpenLocked()
 {
-    if (g_ownedLogEfzCurrentFile != nullptr)
+    if (g_ownedLogEfzCurrentHandle != INVALID_HANDLE_VALUE)
     {
         return true;
     }
 
-    g_ownedLogEfzCurrentPath = GetOwnedLogEfzPath();
+    g_ownedLogEfzCurrentPath = GetManagedLogEfzPath();
     if (g_ownedLogEfzCurrentPath.empty())
     {
         return false;
     }
 
     PrimeOwnedLogEfzHistoryLocked(g_ownedLogEfzCurrentPath);
-    g_ownedLogEfzCurrentFile = _fsopen(g_ownedLogEfzCurrentPath.c_str(), "wb", _SH_DENYNO);
+    g_ownedLogEfzCurrentHandle = CreateFileA(
+        g_ownedLogEfzCurrentPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
 
-    if (g_ownedLogEfzCurrentFile == nullptr)
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
     {
         mod::Log(
             "CAPTURE_LOG: failed to open managed logEfz current='%s'",
             g_ownedLogEfzCurrentPath.c_str());
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=rebuild_open_failed winerr=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        LogOwnedLogEfzIntegrityIssue("open_failed", g_ownedLogEfzCurrentPath, detail);
         g_ownedLogEfzCurrentPath.clear();
         return false;
     }
 
     if (!g_ownedLogEfzHistory.empty())
     {
-        WriteOwnedLogEfzBytes(
-            g_ownedLogEfzCurrentFile,
+        if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "rebuild_history",
             g_ownedLogEfzHistory.data(),
-            g_ownedLogEfzHistory.size());
+            g_ownedLogEfzHistory.size()))
+        {
+            CloseOwnedLogEfzCurrentFileLocked("rebuild_history_failed");
+            return false;
+        }
     }
 
-    ++g_ownedLogEfzSessionOrdinal;
-    const std::string header = BuildOwnedLogEfzHeader(g_ownedLogEfzSessionOrdinal);
+    const uint32_t sessionOrdinal = g_ownedLogEfzSessionOrdinal + 1;
+    const std::string header = BuildOwnedLogEfzHeader(sessionOrdinal);
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "session_header",
+            header.data(),
+            header.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("session_header_failed");
+        return false;
+    }
+
+    g_ownedLogEfzSessionOrdinal = sessionOrdinal;
     g_ownedLogEfzHistory.append(header);
-    WriteOwnedLogEfzBytes(g_ownedLogEfzCurrentFile, header.data(), header.size());
 
     mod::Log(
-        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu",
+        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu preserveAcrossLaunches=%d",
         g_ownedLogEfzCurrentPath.c_str(),
         static_cast<unsigned long>(g_ownedLogEfzSessionOrdinal),
-        static_cast<unsigned long>(g_ownedLogEfzHistory.size()));
+        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+        netplay::mod_settings::PreserveLogEfzAcrossLaunches() ? 1 : 0);
     return true;
 }
 
@@ -1192,24 +1830,20 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
     entry.append(line);
     entry.append("\r\n");
     g_ownedLogEfzHistory.append(entry);
-    WriteOwnedLogEfzBytes(g_ownedLogEfzCurrentFile, entry.data(), entry.size());
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "append_entry",
+            entry.data(),
+            entry.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("append_entry_failed");
+    }
 }
 
 void CloseMirrorLogFiles()
 {
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-
-    auto closeOne = [](FILE** file) {
-        if (file == nullptr || *file == nullptr)
-        {
-            return;
-        }
-        std::fflush(*file);
-        std::fclose(*file);
-        *file = nullptr;
-    };
-
-    closeOne(&g_ownedLogEfzCurrentFile);
+    CloseOwnedLogEfzCurrentFileLocked("close_mirror_logs");
 
     if (!g_ownedLogEfzCurrentPath.empty())
     {
@@ -1224,37 +1858,20 @@ void CloseMirrorLogFiles()
 void PrimeManagedLogEfzHistory()
 {
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-    PrimeOwnedLogEfzHistoryLocked(GetOwnedLogEfzPath());
+    PrimeOwnedLogEfzHistoryLocked(GetManagedLogEfzPath());
 }
 
 void BeginManagedLogEfzWrite()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    ++g_ownedLogEfzWriteGuardDepths[tid];
 }
 
 void EndManagedLogEfzWrite()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    const auto it = g_ownedLogEfzWriteGuardDepths.find(tid);
-    if (it == g_ownedLogEfzWriteGuardDepths.end())
-    {
-        return;
-    }
-    if (--it->second <= 0)
-    {
-        g_ownedLogEfzWriteGuardDepths.erase(it);
-    }
 }
 
 bool IsManagedLogEfzWriteActive()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    const auto it = g_ownedLogEfzWriteGuardDepths.find(tid);
-    return it != g_ownedLogEfzWriteGuardDepths.end() && it->second > 0;
+    return false;
 }
 
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
