@@ -1,10 +1,12 @@
 #include "logger.h"
 #include "mod_version.h"
+#include "netplay/core/mod_settings.h"
 
 #include <windows.h>
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <share.h>
 #include <string>
@@ -16,6 +18,62 @@ bool g_consoleReady = false;
 FILE* g_logFile = nullptr;
 bool g_fileLoggingEnabled = true;
 std::string g_logPath;
+bool g_logFilePrimedForProcess = false;
+bool g_logFileLastOpenStartedFresh = false;
+bool g_logFileLastOpenPreviousExists = false;
+unsigned long long g_logFileLastOpenPreviousBytes = 0;
+
+bool IsRevivalHelperProcess()
+{
+    char exePath[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+    {
+        return false;
+    }
+
+    const char* baseName = exePath;
+    for (const char* p = exePath; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "efzrevival.exe") == 0;
+}
+
+unsigned long long QueryExistingFileSizeUnlocked(const std::string& path, bool* outExists)
+{
+    if (outExists != nullptr)
+    {
+        *outExists = false;
+    }
+
+    if (path.empty())
+    {
+        return 0;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs))
+    {
+        return 0;
+    }
+    if ((attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        return 0;
+    }
+
+    if (outExists != nullptr)
+    {
+        *outExists = true;
+    }
+
+    return (static_cast<unsigned long long>(attrs.nFileSizeHigh) << 32)
+        | static_cast<unsigned long long>(attrs.nFileSizeLow);
+}
 
 std::string BuildLogPathFromModule(HMODULE moduleHandle)
 {
@@ -62,10 +120,22 @@ void OpenLogFileUnlocked()
         return;
     }
 
-    FILE* file = _fsopen(g_logPath.c_str(), "a", _SH_DENYNO);
+    const bool preserveAcrossLaunches = netplay::mod_settings::PreserveModLogAcrossLaunches();
+    bool previousExists = false;
+    const unsigned long long previousBytes = QueryExistingFileSizeUnlocked(g_logPath, &previousExists);
+    const bool startFresh =
+        !g_logFilePrimedForProcess
+        && !preserveAcrossLaunches
+        && !IsRevivalHelperProcess();
+
+    FILE* file = _fsopen(g_logPath.c_str(), startFresh ? "w" : "a", _SH_DENYNO);
     if (file != nullptr)
     {
         g_logFile = file;
+        g_logFilePrimedForProcess = true;
+        g_logFileLastOpenStartedFresh = startFresh;
+        g_logFileLastOpenPreviousExists = previousExists;
+        g_logFileLastOpenPreviousBytes = previousBytes;
     }
 }
 
@@ -118,6 +188,17 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile
         netplay::build_info::kVersion,
         netplay::build_info::kBuildTimestamp);
     WriteLineUnlocked(versionLine);
+    char logModeLine[512] = {};
+    std::snprintf(
+        logModeLine,
+        sizeof(logModeLine),
+        "[efz_netplay_mod] logger file path='%s' startedFresh=%d preserveAcrossLaunches=%d previousExists=%d previousBytes=%llu\n",
+        g_logPath.c_str(),
+        g_logFileLastOpenStartedFresh ? 1 : 0,
+        netplay::mod_settings::PreserveModLogAcrossLaunches() ? 1 : 0,
+        g_logFileLastOpenPreviousExists ? 1 : 0,
+        g_logFileLastOpenPreviousBytes);
+    WriteLineUnlocked(logModeLine);
     WriteLineUnlocked("[efz_netplay_mod] logger initialized\n");
     return true;
 }

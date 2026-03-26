@@ -901,6 +901,7 @@ bool SetLocalRoleFlag(int roleFlag, const char* reason)
     int localParams[2] = {roleFlag, 102};
     mod::Log("SetLocalRoleFlag: calling init(mode=%d, magic=%d)",
              localParams[0], localParams[1]);
+    CloseMirrorLogFiles();
     const int result = g_localInitFn(localParams);
 
     // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
@@ -1775,6 +1776,7 @@ bool ForceLocalPlayInit()
     int localParams[2] = {kLocalRoleLocalPlay, 102};
     mod::Log("ForceLocalPlayInit: calling init(mode=%d, magic=%d)",
              localParams[0], localParams[1]);
+    CloseMirrorLogFiles();
     const int result = g_localInitFn(localParams);
 
     // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.

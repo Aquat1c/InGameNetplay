@@ -18,6 +18,29 @@
 
 #include <windows.h>
 
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
+    LPCSTR,
+    DWORD,
+    DWORD,
+    LPSECURITY_ATTRIBUTES,
+    DWORD,
+    DWORD,
+    HANDLE);
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
+    LPCWSTR,
+    DWORD,
+    DWORD,
+    LPSECURITY_ATTRIBUTES,
+    DWORD,
+    DWORD,
+    HANDLE);
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(
+    HANDLE,
+    LPCVOID,
+    DWORD,
+    LPDWORD,
+    LPOVERLAPPED);
+
 namespace netplay::bridge::takeover
 {
 
@@ -125,6 +148,8 @@ static HANDLE g_childJobObject = nullptr;
 
 namespace
 {
+bool g_hostLogEfzIatPatched = false;
+
 std::string TrimAsciiCopy(const std::string& text)
 {
     size_t start = 0;
@@ -195,7 +220,38 @@ void LogPendingSpectateConsoleSnapshot()
         mod::Log("Takeover: spectate console snapshot %s", summary.c_str());
     }
 }
+
 } // namespace
+
+void EnsureHostLogEfzIatPatched(bool verboseLogs)
+{
+    if (g_hostLogEfzIatPatched)
+    {
+        return;
+    }
+
+    std::unordered_map<std::string, uint32_t> hostLogPatches;
+    hostLogPatches.emplace(
+        "WriteFile",
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)));
+    hostLogPatches.emplace(
+        "CreateFileA",
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)));
+    hostLogPatches.emplace(
+        "CreateFileW",
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)));
+
+    const bool patchedHostLogIat =
+        PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, verboseLogs);
+    mod::Log(
+        "Takeover: host logEfz IAT patch result=%d patchCount=%lu stage=pre_init",
+        patchedHostLogIat ? 1 : 0,
+        static_cast<unsigned long>(hostLogPatches.size()));
+    if (patchedHostLogIat)
+    {
+        g_hostLogEfzIatPatched = true;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Version detection
@@ -322,25 +378,6 @@ void InitializeHost()
         // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
         // before any profile-dependent operations (frame hook, etc.).
         (void)SetLocalRoleFlag(kLocalRoleLocalPlay, "host_initialize");
-    }
-
-    {
-        const auto selfPatches = BuildPatchMap(reinterpret_cast<uintptr_t>(SelfModule()));
-        std::unordered_map<std::string, uint32_t> hostLogPatches;
-        const auto writeFileIt = selfPatches.find("WriteFile");
-        if (writeFileIt != selfPatches.end())
-        {
-            hostLogPatches.emplace(writeFileIt->first, writeFileIt->second);
-            const bool patchedHostLogIat =
-                PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, true);
-            mod::Log(
-                "Takeover: host logEfz WriteFile IAT patch result=%d",
-                patchedHostLogIat ? 1 : 0);
-        }
-        else
-        {
-            mod::Log("Takeover: host logEfz WriteFile IAT patch unavailable (missing stub)");
-        }
     }
 
     mod::Log("Takeover: host initialized");
@@ -1625,6 +1662,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             mod::Log("Tick_init_handshake: calling init(mode=%d, magic=%d)",
                      initParams[0], initParams[1]);
+            CloseMirrorLogFiles();
             const int initResult = g_localInitFn(initParams);
 
             // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.

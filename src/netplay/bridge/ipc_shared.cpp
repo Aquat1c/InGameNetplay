@@ -734,6 +734,7 @@ bool EnsureLocalRevivalLoaded()
 {
     if (g_localInitFn != nullptr)
     {
+        EnsureHostLogEfzIatPatched(true);
         PublishHostRevivalBase();
         if (!PatchRevivalErrorCodeNullGuard())
         {
@@ -777,6 +778,16 @@ bool EnsureLocalRevivalLoaded()
         mod::Log("Takeover: GetProcAddress(init) failed");
         return false;
     }
+
+    // Patch logEfz interception before the first Revival init() call.
+    // All supported Revival versions open logEfz.txt inside init(), so any
+    // later patch point leaves behind a real-file handle we can no longer
+    // safely take away from native code.
+    EnsureHostLogEfzIatPatched(true);
+    // Each Revival init() should start a fresh logical session section in
+    // the managed root logEfz.txt. Closing here lets the first native log
+    // line from this init reopen the file and emit a new SESSION header.
+    CloseMirrorLogFiles();
 
     int localParams[2] = {2, 102};
     const int initResult = g_localInitFn(localParams);

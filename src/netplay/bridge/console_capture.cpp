@@ -1,6 +1,7 @@
 // Console I/O text capture and delay prompt parsing for the Revival takeover.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/mod_settings.h"
 
 #include <algorithm>
 #include <cctype>
@@ -959,14 +960,71 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
 // the file remains readable across reconnects/restarts.
 // ---------------------------------------------------------------------------
 static std::mutex g_ownedLogEfzMutex;
-static std::mutex g_ownedLogEfzWriteGuardMutex;
-static std::unordered_map<DWORD, LONG> g_ownedLogEfzWriteGuardDepths;
-static FILE* g_ownedLogEfzCurrentFile = nullptr;
+static HANDLE g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
 static std::string g_ownedLogEfzCurrentPath;
 static std::string g_ownedLogEfzHistory;
 static std::string g_ownedLogEfzHistoryPath;
 static bool g_ownedLogEfzHistoryPrimed = false;
 static uint32_t g_ownedLogEfzSessionOrdinal = 0;
+static bool g_ownedLogEfzPrimedForProcess = false;
+
+static unsigned long long QueryExistingOwnedLogEfzSize(const std::string& path, bool* outExists)
+{
+    if (outExists != nullptr)
+    {
+        *outExists = false;
+    }
+
+    if (path.empty())
+    {
+        return 0;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs))
+    {
+        return 0;
+    }
+    if ((attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        return 0;
+    }
+
+    if (outExists != nullptr)
+    {
+        *outExists = true;
+    }
+
+    return (static_cast<unsigned long long>(attrs.nFileSizeHigh) << 32)
+        | static_cast<unsigned long long>(attrs.nFileSizeLow);
+}
+
+static void LogOwnedLogEfzIntegrityIssue(
+    const char* outcome,
+    const std::string& path,
+    const char* detail)
+{
+    if (outcome == nullptr || outcome[0] == '\0')
+    {
+        outcome = "unknown";
+    }
+
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s' %s",
+            outcome,
+            path.c_str(),
+            detail);
+    }
+    else
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s'",
+            outcome,
+            path.c_str());
+    }
+}
 
 static std::string GetConsoleCaptureModuleDirectory()
 {
@@ -1041,17 +1099,86 @@ static std::string FormatOwnedLogEfzTimestamp()
     return buffer;
 }
 
-static void WriteOwnedLogEfzBytes(FILE* file, const char* data, size_t size)
+static bool WriteOwnedLogEfzBytes(
+    const std::string& path,
+    const char* reason,
+    const char* data,
+    size_t size)
 {
-    if (file == nullptr || data == nullptr || size == 0)
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE || data == nullptr || size == 0)
+    {
+        return true;
+    }
+
+    const DWORD requested = static_cast<DWORD>(size);
+    DWORD written = 0;
+    SetLastError(NO_ERROR);
+    const BOOL writeOk = WriteFile(
+        g_ownedLogEfzCurrentHandle,
+        data,
+        requested,
+        &written,
+        nullptr);
+    const DWORD writeError = GetLastError();
+    if (!writeOk || written != requested)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s short_write requested=%lu written=%lu winerr=%lu ok=%d",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(size),
+            static_cast<unsigned long>(written),
+            static_cast<unsigned long>(writeError),
+            writeOk ? 1 : 0);
+        LogOwnedLogEfzIntegrityIssue("short_write", path, detail);
+        return false;
+    }
+
+    return true;
+}
+
+static void CloseOwnedLogEfzCurrentFileLocked(const char* reason)
+{
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
     {
         return;
     }
 
-    BeginManagedLogEfzWrite();
-    std::fwrite(data, 1, size, file);
-    std::fflush(file);
-    EndManagedLogEfzWrite();
+    const HANDLE handle = g_ownedLogEfzCurrentHandle;
+    g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
+
+    SetLastError(NO_ERROR);
+    const BOOL flushOk = FlushFileBuffers(handle);
+    const DWORD flushError = GetLastError();
+    SetLastError(NO_ERROR);
+    const BOOL closeOk = CloseHandle(handle);
+    const DWORD closeError = GetLastError();
+
+    if (!flushOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_flush_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(flushError));
+        LogOwnedLogEfzIntegrityIssue("close_flush_failed", g_ownedLogEfzCurrentPath, detail);
+    }
+
+    if (!closeOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(closeError));
+        LogOwnedLogEfzIntegrityIssue("close_failed", g_ownedLogEfzCurrentPath, detail);
+    }
 }
 
 static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
@@ -1085,6 +1212,26 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
         return;
     }
 
+    const bool preserveAcrossLaunches = netplay::mod_settings::PreserveRevivalLogsAcrossLaunches();
+    const bool firstPrimeThisProcess = !g_ownedLogEfzPrimedForProcess;
+    bool previousExists = false;
+    const unsigned long long previousBytes = QueryExistingOwnedLogEfzSize(path, &previousExists);
+
+    if (firstPrimeThisProcess && !preserveAcrossLaunches)
+    {
+        g_ownedLogEfzHistory.clear();
+        g_ownedLogEfzHistoryPath = path;
+        g_ownedLogEfzHistoryPrimed = true;
+        g_ownedLogEfzPrimedForProcess = true;
+
+        mod::Log(
+            "CAPTURE_LOG: starting fresh managed logEfz current='%s' preserveAcrossLaunches=0 previousExists=%d previousBytes=%llu",
+            path.c_str(),
+            previousExists ? 1 : 0,
+            previousBytes);
+        return;
+    }
+
     g_ownedLogEfzHistory.clear();
     FILE* file = _fsopen(path.c_str(), "rb", _SH_DENYNO);
     if (file != nullptr)
@@ -1100,14 +1247,82 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
                     1,
                     g_ownedLogEfzHistory.size(),
                     file);
+                if (read != g_ownedLogEfzHistory.size())
+                {
+                    char detail[256] = {};
+                    std::snprintf(
+                        detail,
+                        sizeof(detail),
+                        "requested=%lu read=%lu",
+                        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                        static_cast<unsigned long>(read));
+                    LogOwnedLogEfzIntegrityIssue("prime_short_read", path, detail);
+                }
                 g_ownedLogEfzHistory.resize(read);
             }
         }
         std::fclose(file);
     }
 
+    if (!g_ownedLogEfzHistory.empty())
+    {
+        const size_t bytesBefore = g_ownedLogEfzHistory.size();
+        const size_t firstNonNul = g_ownedLogEfzHistory.find_first_not_of('\0');
+        if (firstNonNul == std::string::npos)
+        {
+            mod::Log(
+                "CAPTURE_LOG: discarded all-zero managed logEfz history current='%s' bytes=%lu",
+                path.c_str(),
+                static_cast<unsigned long>(bytesBefore));
+            char detail[256] = {};
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "reason=all_zero_history bytesDiscarded=%lu",
+                static_cast<unsigned long>(bytesBefore));
+            LogOwnedLogEfzIntegrityIssue("discarded_history", path, detail);
+            g_ownedLogEfzHistory.clear();
+        }
+        else
+        {
+            size_t trimmedLeadingNuls = 0;
+            if (firstNonNul > 0)
+            {
+                trimmedLeadingNuls = firstNonNul;
+                g_ownedLogEfzHistory.erase(0, firstNonNul);
+            }
+
+            const auto newEnd = std::remove(g_ownedLogEfzHistory.begin(), g_ownedLogEfzHistory.end(), '\0');
+            const size_t removedEmbeddedNuls =
+                static_cast<size_t>(g_ownedLogEfzHistory.end() - newEnd);
+            g_ownedLogEfzHistory.erase(newEnd, g_ownedLogEfzHistory.end());
+
+            if (trimmedLeadingNuls > 0 || removedEmbeddedNuls > 0)
+            {
+                mod::Log(
+                    "CAPTURE_LOG: sanitized managed logEfz history current='%s' bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+                    path.c_str(),
+                    static_cast<unsigned long>(bytesBefore),
+                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                    static_cast<unsigned long>(trimmedLeadingNuls),
+                    static_cast<unsigned long>(removedEmbeddedNuls));
+                char detail[320] = {};
+                std::snprintf(
+                    detail,
+                    sizeof(detail),
+                    "reason=nul_sanitized bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+                    static_cast<unsigned long>(bytesBefore),
+                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                    static_cast<unsigned long>(trimmedLeadingNuls),
+                    static_cast<unsigned long>(removedEmbeddedNuls));
+                LogOwnedLogEfzIntegrityIssue("history_sanitized", path, detail);
+            }
+        }
+    }
+
     g_ownedLogEfzHistoryPath = path;
     g_ownedLogEfzHistoryPrimed = true;
+    g_ownedLogEfzPrimedForProcess = true;
 
     mod::Log(
         "CAPTURE_LOG: primed managed logEfz history current='%s' bytes=%lu",
@@ -1117,7 +1332,7 @@ static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
 
 static bool EnsureOwnedLogEfzFilesOpenLocked()
 {
-    if (g_ownedLogEfzCurrentFile != nullptr)
+    if (g_ownedLogEfzCurrentHandle != INVALID_HANDLE_VALUE)
     {
         return true;
     }
@@ -1129,35 +1344,65 @@ static bool EnsureOwnedLogEfzFilesOpenLocked()
     }
 
     PrimeOwnedLogEfzHistoryLocked(g_ownedLogEfzCurrentPath);
-    g_ownedLogEfzCurrentFile = _fsopen(g_ownedLogEfzCurrentPath.c_str(), "wb", _SH_DENYNO);
+    g_ownedLogEfzCurrentHandle = CreateFileA(
+        g_ownedLogEfzCurrentPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
 
-    if (g_ownedLogEfzCurrentFile == nullptr)
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
     {
         mod::Log(
             "CAPTURE_LOG: failed to open managed logEfz current='%s'",
             g_ownedLogEfzCurrentPath.c_str());
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=rebuild_open_failed winerr=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        LogOwnedLogEfzIntegrityIssue("open_failed", g_ownedLogEfzCurrentPath, detail);
         g_ownedLogEfzCurrentPath.clear();
         return false;
     }
 
     if (!g_ownedLogEfzHistory.empty())
     {
-        WriteOwnedLogEfzBytes(
-            g_ownedLogEfzCurrentFile,
-            g_ownedLogEfzHistory.data(),
-            g_ownedLogEfzHistory.size());
+        if (!WriteOwnedLogEfzBytes(
+                g_ownedLogEfzCurrentPath,
+                "rebuild_history",
+                g_ownedLogEfzHistory.data(),
+                g_ownedLogEfzHistory.size()))
+        {
+            CloseOwnedLogEfzCurrentFileLocked("rebuild_history_failed");
+            return false;
+        }
     }
 
-    ++g_ownedLogEfzSessionOrdinal;
-    const std::string header = BuildOwnedLogEfzHeader(g_ownedLogEfzSessionOrdinal);
+    const uint32_t sessionOrdinal = g_ownedLogEfzSessionOrdinal + 1;
+    const std::string header = BuildOwnedLogEfzHeader(sessionOrdinal);
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "session_header",
+            header.data(),
+            header.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("session_header_failed");
+        return false;
+    }
+
+    g_ownedLogEfzSessionOrdinal = sessionOrdinal;
     g_ownedLogEfzHistory.append(header);
-    WriteOwnedLogEfzBytes(g_ownedLogEfzCurrentFile, header.data(), header.size());
 
     mod::Log(
-        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu",
+        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu preserveAcrossLaunches=%d",
         g_ownedLogEfzCurrentPath.c_str(),
         static_cast<unsigned long>(g_ownedLogEfzSessionOrdinal),
-        static_cast<unsigned long>(g_ownedLogEfzHistory.size()));
+        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+        netplay::mod_settings::PreserveRevivalLogsAcrossLaunches() ? 1 : 0);
     return true;
 }
 
@@ -1192,24 +1437,20 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
     entry.append(line);
     entry.append("\r\n");
     g_ownedLogEfzHistory.append(entry);
-    WriteOwnedLogEfzBytes(g_ownedLogEfzCurrentFile, entry.data(), entry.size());
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "append_entry",
+            entry.data(),
+            entry.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("append_entry_failed");
+    }
 }
 
 void CloseMirrorLogFiles()
 {
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-
-    auto closeOne = [](FILE** file) {
-        if (file == nullptr || *file == nullptr)
-        {
-            return;
-        }
-        std::fflush(*file);
-        std::fclose(*file);
-        *file = nullptr;
-    };
-
-    closeOne(&g_ownedLogEfzCurrentFile);
+    CloseOwnedLogEfzCurrentFileLocked("close_mirror_logs");
 
     if (!g_ownedLogEfzCurrentPath.empty())
     {
@@ -1229,32 +1470,15 @@ void PrimeManagedLogEfzHistory()
 
 void BeginManagedLogEfzWrite()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    ++g_ownedLogEfzWriteGuardDepths[tid];
 }
 
 void EndManagedLogEfzWrite()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    const auto it = g_ownedLogEfzWriteGuardDepths.find(tid);
-    if (it == g_ownedLogEfzWriteGuardDepths.end())
-    {
-        return;
-    }
-    if (--it->second <= 0)
-    {
-        g_ownedLogEfzWriteGuardDepths.erase(it);
-    }
 }
 
 bool IsManagedLogEfzWriteActive()
 {
-    const DWORD tid = GetCurrentThreadId();
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzWriteGuardMutex);
-    const auto it = g_ownedLogEfzWriteGuardDepths.find(tid);
-    return it != g_ownedLogEfzWriteGuardDepths.end() && it->second > 0;
+    return false;
 }
 
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)

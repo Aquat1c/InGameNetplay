@@ -258,6 +258,7 @@ bool ContainsCaseInsensitive(const std::string& text, const char* needle);
 bool ParseIntAt(const std::string& text, size_t start, int* outValue, size_t* outEnd);
 bool ExtractIntAfterToken(const std::string& text, const char* token, int* outValue);
 bool ExtractDelayRange(const std::string& text, int* outMin, int* outMax);
+void EnsureHostLogEfzIatPatched(bool verboseLogs);
 DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool* outHasMetrics);
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
 bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
