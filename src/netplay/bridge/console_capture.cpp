@@ -1413,6 +1413,10 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
         return;
     }
 
+    // --- Timing guard: detect slow logEfz appends -------------------------
+    LARGE_INTEGER appendQpcStart = {};
+    QueryPerformanceCounter(&appendQpcStart);
+
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
     if (!EnsureOwnedLogEfzFilesOpenLocked())
     {
@@ -1437,6 +1441,30 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
     entry.append(line);
     entry.append("\r\n");
     g_ownedLogEfzHistory.append(entry);
+
+    // Cap the in-memory history to prevent unbounded growth over long
+    // sessions.  When the cap is exceeded, discard the oldest half of the
+    // buffer.  The disk file is **not** truncated — only the in-memory
+    // history used for session-rebuild is pruned.
+    static constexpr size_t kHistoryCapBytes = 2u * 1024u * 1024u; // 2 MB
+    if (g_ownedLogEfzHistory.size() > kHistoryCapBytes)
+    {
+        const size_t oldSize = g_ownedLogEfzHistory.size();
+        const size_t trimTo = kHistoryCapBytes / 2;
+        const size_t eraseBytes = oldSize - trimTo;
+        // Find the next newline after the erase point to keep lines intact.
+        size_t newlinePos = g_ownedLogEfzHistory.find('\n', eraseBytes);
+        if (newlinePos != std::string::npos && newlinePos + 1 < oldSize)
+            g_ownedLogEfzHistory.erase(0, newlinePos + 1);
+        else
+            g_ownedLogEfzHistory.erase(0, eraseBytes);
+        mod::Log(
+            "CAPTURE_LOG: pruned logEfz history %lu -> %lu bytes (cap=%lu)",
+            static_cast<unsigned long>(oldSize),
+            static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+            static_cast<unsigned long>(kHistoryCapBytes));
+    }
+
     if (!WriteOwnedLogEfzBytes(
             g_ownedLogEfzCurrentPath,
             "append_entry",
@@ -1445,7 +1473,31 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
     {
         CloseOwnedLogEfzCurrentFileLocked("append_entry_failed");
     }
+
+    // --- End timing guard ---------------------------------------------------
+    {
+        static uint32_t s_appendSlowCount = 0;
+        LARGE_INTEGER appendQpcEnd = {}, freq = {};
+        QueryPerformanceCounter(&appendQpcEnd);
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(appendQpcEnd.QuadPart - appendQpcStart.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 5.0)
+        {
+            ++s_appendSlowCount;
+            if (s_appendSlowCount <= 5 || (s_appendSlowCount % 500 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: AppendOwnedLogEfzLine took %.1fms "
+                    "(slowCount=%u) — logEfz disk write stalling",
+                    elapsedMs, s_appendSlowCount);
+            }
+        }
+    }
 }
+
+static void ResetLogEfzDiskHandleCache(); // forward declaration
 
 void CloseMirrorLogFiles()
 {
@@ -1460,6 +1512,7 @@ void CloseMirrorLogFiles()
     }
 
     g_ownedLogEfzCurrentPath.clear();
+    ResetLogEfzDiskHandleCache();
 }
 
 void PrimeManagedLogEfzHistory()
@@ -1481,6 +1534,20 @@ bool IsManagedLogEfzWriteActive()
     return false;
 }
 
+// --- Handle cache for logEfz disk writes --------------------------------
+// GetFileType + TryGetDiskFilePathFromHandle are expensive to call on every
+// WriteFile invocation.  Once we've identified a handle as the logEfz disk
+// file, cache it and skip the path resolution on subsequent calls.  Reset
+// when the managed log session is closed (file handle may change).
+static HANDLE g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
+
+static void ResetLogEfzDiskHandleCache()
+{
+    g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
+    g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
+}
+
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
 {
     if (lpBuffer == nullptr || nBytes == 0)
@@ -1495,6 +1562,17 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
         return;
     }
 
+    // Fast path: if we already identified this handle, skip expensive checks.
+    if (hFile == g_cachedLogEfzDiskHandle)
+    {
+        LogConsoleTextChunk("WriteFileDisk", text, textLen);
+        return;
+    }
+    if (hFile == g_cachedNonLogDiskHandle)
+    {
+        return; // Known non-logEfz disk handle, skip entirely.
+    }
+
     // Console output can flow through redirected handles (pipes/unknown).
     // Keep console/pipe traffic visible, and selectively forward disk-backed
     // Revival text logs without enabling noisy binary file dumps.
@@ -1505,12 +1583,17 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
         std::string pathText;
         if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
         {
+            g_cachedNonLogDiskHandle = hFile;
             return;
         }
         if (!IsLikelyRevivalDiskLogPath(pathText))
         {
+            g_cachedNonLogDiskHandle = hFile;
             return;
         }
+
+        // Cache this as the logEfz handle for fast-path on subsequent calls.
+        g_cachedLogEfzDiskHandle = hFile;
 
         bool announcePath = false;
         LONG pathHitCount = 0;

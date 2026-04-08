@@ -86,6 +86,19 @@ char g_prevP2Name[64] = {};
 int g_prevPingMs = -1;
 int g_prevRollbackFrames = -1;
 
+// --- Ping drift tracking ---------------------------------------------------
+// Track Revival's reported ping over time to detect progressive drift that
+// doesn't correspond to real network changes.  Logs a warning when the
+// rolling average diverges significantly from the initial baseline.
+static constexpr int kPingWindowSize = 64;
+static int g_pingWindow[kPingWindowSize] = {};
+static int g_pingWindowPos = 0;
+static int g_pingWindowCount = 0;
+static int g_pingBaseline = -1;         // avg of first window fill
+static bool g_pingBaselineLocked = false;
+static uint32_t g_pingDriftWarnings = 0; // limit log spam
+static uint32_t g_lastPingDriftLogSeq = 0;
+
 // Previous-tick charselect context for change detection.
 uint8_t g_prevP1CharId = 0xFF;
 uint8_t g_prevP2CharId = 0xFF;
@@ -385,6 +398,15 @@ void Initialize()
     {
         g_shmView = static_cast<EFZNetplayState*>(
             MapViewOfFile(g_shmHandle, FILE_MAP_WRITE, 0, 0, sizeof(EFZNetplayState)));
+
+        // Fix leak: if MapViewOfFile fails, the handle is orphaned.
+        if (g_shmView == nullptr)
+        {
+            mod::Log("StateExport: MapViewOfFile failed (err=%lu), closing orphaned handle",
+                     static_cast<unsigned long>(GetLastError()));
+            CloseHandle(g_shmHandle);
+            g_shmHandle = nullptr;
+        }
     }
 
     // Initialise both the shared mapping and the local copy.
@@ -431,6 +453,10 @@ void Shutdown()
 
 void Update(const NetbridgeStatus& status)
 {
+    // --- Timing guard: detect when Update() itself takes too long ----------
+    LARGE_INTEGER updateQpcStart = {};
+    QueryPerformanceCounter(&updateQpcStart);
+
     EFZNetplayState s = {};
 
     // Header
@@ -487,6 +513,13 @@ void Update(const NetbridgeStatus& status)
             g_latchedP2Wins = 0;
             g_prevP1Wins = 0;
             g_prevP2Wins = 0;
+            // Reset ping drift tracking for the new session.
+            g_pingWindowPos = 0;
+            g_pingWindowCount = 0;
+            g_pingBaseline = -1;
+            g_pingBaselineLocked = false;
+            g_pingDriftWarnings = 0;
+            g_lastPingDriftLogSeq = 0;
             mod::Log("StateExport: new session sessionId=%u", g_sessionId);
         }
 
@@ -610,6 +643,53 @@ void Update(const NetbridgeStatus& status)
             s.stateSeq);
         g_prevPingMs         = s.pingMs;
         g_prevRollbackFrames = s.rollbackFrames;
+    }
+
+    // ---- Ping drift detection ------------------------------------------------
+    // Track Revival's reported ping in a rolling window and compare to the
+    // baseline (average of the first full window).  Log a warning when the
+    // 64-sample rolling average drifts >25% from baseline.
+    if (s.pingMs > 0)
+    {
+        g_pingWindow[g_pingWindowPos] = s.pingMs;
+        g_pingWindowPos = (g_pingWindowPos + 1) % kPingWindowSize;
+        if (g_pingWindowCount < kPingWindowSize)
+            ++g_pingWindowCount;
+
+        if (g_pingWindowCount == kPingWindowSize)
+        {
+            int sum = 0;
+            for (int pi = 0; pi < kPingWindowSize; ++pi)
+                sum += g_pingWindow[pi];
+            const int rollingAvg = sum / kPingWindowSize;
+
+            if (!g_pingBaselineLocked)
+            {
+                g_pingBaseline = rollingAvg;
+                g_pingBaselineLocked = true;
+                mod::Log(
+                    "PING_TRACK: baseline established avg=%dms seq=%u",
+                    g_pingBaseline, s.stateSeq);
+            }
+            else if (g_pingBaseline > 0)
+            {
+                const int drift = rollingAvg - g_pingBaseline;
+                const int driftPct = (drift * 100) / g_pingBaseline;
+                // Log when drift exceeds 25%, but cap log frequency.
+                if ((driftPct > 25 || driftPct < -25)
+                    && (g_pingDriftWarnings < 10
+                        || (s.stateSeq - g_lastPingDriftLogSeq > 5000)))
+                {
+                    ++g_pingDriftWarnings;
+                    g_lastPingDriftLogSeq = s.stateSeq;
+                    mod::Log(
+                        "PING_TRACK: *** DRIFT *** baseline=%dms current=%dms "
+                        "drift=%+d%%  warnings=%u seq=%u",
+                        g_pingBaseline, rollingAvg, driftPct,
+                        g_pingDriftWarnings, s.stateSeq);
+                }
+            }
+        }
     }
 
     // Read the EFZ screen index once here; used by menu reconciliation,
@@ -907,6 +987,28 @@ void Update(const NetbridgeStatus& status)
     }
     g_localCopy = s;
     g_lastExportTickMs = s.lastUpdateTick;
+
+    // --- End timing guard ---------------------------------------------------
+    {
+        static uint32_t s_updateSlowCount = 0;
+        LARGE_INTEGER updateQpcEnd = {}, freq = {};
+        QueryPerformanceCounter(&updateQpcEnd);
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(updateQpcEnd.QuadPart - updateQpcStart.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 2.0)
+        {
+            ++s_updateSlowCount;
+            if (s_updateSlowCount <= 10 || (s_updateSlowCount % 200 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: StateExport::Update took %.2fms "
+                    "(slowCount=%u seq=%u) — export path is slow",
+                    elapsedMs, s_updateSlowCount, s.stateSeq);
+            }
+        }
+    }
 }
 
 const EFZNetplayState* GetExportedState()

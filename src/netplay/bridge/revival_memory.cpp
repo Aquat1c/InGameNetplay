@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <intrin.h>
 
 #include <windows.h>
+#include <psapi.h>  // For PROCESS_MEMORY_COUNTERS type only; psapi.dll loaded at runtime
 
 namespace netplay::bridge::takeover
 {
@@ -542,6 +544,10 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         return;
     }
 
+    // --- Timing guard: detect slow reads from Revival session memory ------
+    LARGE_INTEGER rrsQpcStart = {}, rrsQpcEnd = {};
+    QueryPerformanceCounter(&rrsQpcStart);
+
     ioStatus->syncGameMode = -1;
     ioStatus->syncMode0Flag1084 = -1;
     ioStatus->syncSessionByte = -1;
@@ -850,6 +856,28 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         (ioStatus->delayPromptSerial > 0 || ioStatus->delayPromptServedSerial > 0)
             ? 1
             : 0;
+
+    // --- End timing guard ---------------------------------------------------
+    QueryPerformanceCounter(&rrsQpcEnd);
+    {
+        static uint32_t s_rrsSlowCount = 0;
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(rrsQpcEnd.QuadPart - rrsQpcStart.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 2.0)
+        {
+            ++s_rrsSlowCount;
+            if (s_rrsSlowCount <= 10 || (s_rrsSlowCount % 200 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: RefreshRuntimeStatus took %.2fms "
+                    "(slowCount=%u) — reading session memory is slow",
+                    elapsedMs, s_rrsSlowCount);
+            }
+        }
+    }
 }
 
 bool SetLocalRoleFlag(int roleFlag, const char* reason)
@@ -3287,6 +3315,12 @@ static uint32_t g_lastToggleValue = 0xFFFFFFFFu;
 static uint32_t g_toggleSameCount = 0;  // consecutive same-toggle detections
 static bool     g_toggleDiagLogged = false;
 
+// Return-address tracking: capture distinct call sites that invoke the
+// per-frame hook so we can identify which EXE code paths fire it.
+static constexpr int kMaxRetAddrSlots = 8;
+static uintptr_t g_retAddrSlots[kMaxRetAddrSlots] = {};
+static int       g_retAddrSlotCount = 0;
+
 // Session number: incremented each time ResetGameModeValidation is called
 // (i.e. each new session).  Logged in every SPEED_DIAG line so we can
 // immediately tell which session produced a given log entry.
@@ -3322,6 +3356,19 @@ static bool     g_sessionPtrTracked     = false;
 // intervals during the first 30 ticks to detect doubled rate from tick 1.
 static LARGE_INTEGER g_prevFrameQpc     = {};
 static bool     g_prevFrameQpcValid     = false;
+
+// --- FPS drop detection & tick cost tracking ----------------------------
+// Fires whenever the measured inter-frame interval exceeds 33.3ms (< 30 fps)
+// or when the mod's own per-frame tick processing exceeds a budget.
+static LARGE_INTEGER g_fpsDropPrevQpc       = {};   // QPC at start of previous tick
+static bool     g_fpsDropPrevQpcValid       = false;
+static uint32_t g_fpsDropCount              = 0;    // total drops in session
+static uint32_t g_fpsDropLastLogTick        = 0;    // throttle: last frameTick logged
+static uint32_t g_tickBudgetExceededCount   = 0;    // frames where mod cost > budget
+static constexpr double kFpsDropThresholdMs = 33.33; // 30 fps
+static constexpr double kTickBudgetMs       = 5.0;   // mod processing budget per frame
+static LARGE_INTEGER g_qpcFreqCached        = {};    // cached once
+static bool     g_qpcFreqValid              = false;
 
 // Read the raw session pointer from dword_100A02CC without heuristic
 // validation.  Used in the per-frame tick hot path.
@@ -3469,7 +3516,128 @@ static int RunPerFrameTickDispatch(void* fixedThis)
 // before calling the original sub_1006E570.
 static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 {
+    // --- gameSys+4968 toggle double-tick detection & SKIP -------------------
+    // The EXE main loop toggles gameSys+4968 once per iteration.  If we see
+    // the same value on two consecutive calls, the per-frame tick hook is
+    // running more than once per main loop frame.  This MUST be checked
+    // BEFORE incrementing g_frameTick or doing any frame work — a double
+    // invocation processes the same frame's input twice, causing one-frame
+    // state divergence between peers (desync).
+    //
+    // When detected, we log the event and call the original function (so the
+    // EXE doesn't stall) but skip ALL mod-side per-frame processing.
+    {
+        constexpr uintptr_t kGameSystemPtr = 0x0079010C;
+        uint32_t toggleVal = 0xFFFFFFFFu;
+        __try {
+            const uint32_t gameSys =
+                *reinterpret_cast<const volatile uint32_t*>(kGameSystemPtr);
+            if (gameSys != 0)
+                toggleVal =
+                    *reinterpret_cast<const volatile uint32_t*>(gameSys + 4968);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        const bool isDoubleTick =
+            toggleVal != 0xFFFFFFFFu
+            && g_lastToggleValue != 0xFFFFFFFFu
+            && toggleVal == g_lastToggleValue;
+
+        if (isDoubleTick)
+        {
+            ++g_toggleSameCount;
+
+            // Capture the return address so we can identify WHICH code path
+            // triggered the duplicate invocation.
+            const void* retAddr = _ReturnAddress();
+
+            if (g_toggleSameCount <= 5 || (g_toggleSameCount % 300 == 0))
+            {
+                mod::Log(
+                    "TICK_HOOK: *** DOUBLE TICK SKIPPED *** frameTick=%u "
+                    "toggleVal=%u toggleSameCount=%u retAddr=0x%08lX — "
+                    "skipping duplicate frame to prevent desync",
+                    g_frameTick,
+                    toggleVal,
+                    g_toggleSameCount,
+                    static_cast<unsigned long>(
+                        reinterpret_cast<uintptr_t>(retAddr)));
+            }
+
+            // Still call the original so the DLL's internal state machine
+            // doesn't stall, but use the EXE's own this-pointer (unchanged)
+            // to avoid our mod doing any additional processing.
+            // The key insight: we skip g_frameTick++, MonitorScreenIndexChange,
+            // heartbeat, StateExport, disconnect checks, etc.
+            const uintptr_t currentSession = ReadSessionPtrRaw();
+            void* fixedThis = (currentSession != 0)
+                ? reinterpret_cast<void*>(currentSession)
+                : exeThis;
+            return g_origPerFrameTick(fixedThis);
+        }
+
+        // Not a double tick — update toggle tracking.
+        g_lastToggleValue = toggleVal;
+    }
+
+    // Track distinct return addresses (call sites) for diagnostics.
+    {
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        bool known = false;
+        for (int ri = 0; ri < g_retAddrSlotCount; ++ri)
+        {
+            if (g_retAddrSlots[ri] == ra) { known = true; break; }
+        }
+        if (!known && g_retAddrSlotCount < kMaxRetAddrSlots)
+        {
+            g_retAddrSlots[g_retAddrSlotCount++] = ra;
+            mod::Log(
+                "TICK_HOOK: new caller detected retAddr=0x%08lX "
+                "(slot %d/%d) frameTick=%u",
+                static_cast<unsigned long>(ra),
+                g_retAddrSlotCount, kMaxRetAddrSlots,
+                g_frameTick);
+        }
+    }
+
     ++g_frameTick;
+
+    // --- FPS drop detection (measured at the tick entry point) ---------------
+    // Capture QPC at the very start of per-frame processing.  Compare against
+    // the previous frame's timestamp to detect genuine FPS drops (>33.3ms
+    // between frames = below 30fps).  This catches stalls from ANY source:
+    // game logic, Revival DLL, our mod, OS scheduling, disk I/O, etc.
+    LARGE_INTEGER tickEntryQpc = {};
+    QueryPerformanceCounter(&tickEntryQpc);
+    if (!g_qpcFreqValid)
+    {
+        QueryPerformanceFrequency(&g_qpcFreqCached);
+        g_qpcFreqValid = true;
+    }
+    if (g_fpsDropPrevQpcValid)
+    {
+        const double frameDeltaMs =
+            static_cast<double>(tickEntryQpc.QuadPart - g_fpsDropPrevQpc.QuadPart)
+            * 1000.0 / static_cast<double>(g_qpcFreqCached.QuadPart);
+        if (frameDeltaMs > kFpsDropThresholdMs)
+        {
+            ++g_fpsDropCount;
+            // Throttle: log at most once per 60 frames and always on the first.
+            if (g_fpsDropCount <= 3
+                || (g_frameTick - g_fpsDropLastLogTick > 60))
+            {
+                const double measuredFps = (frameDeltaMs > 0.0)
+                    ? 1000.0 / frameDeltaMs : 0.0;
+                mod::Log(
+                    "FPS_WARN: *** FRAME DROP *** tick=%u deltaMs=%.1f "
+                    "fps=%.1f drops=%u — game running below 30fps",
+                    g_frameTick, frameDeltaMs, measuredFps, g_fpsDropCount);
+                g_fpsDropLastLogTick = g_frameTick;
+            }
+        }
+    }
+    g_fpsDropPrevQpc = tickEntryQpc;
+    g_fpsDropPrevQpcValid = true;
+
     MonitorScreenIndexChange();
 
     const uintptr_t exeThisAddr = reinterpret_cast<uintptr_t>(exeThis);
@@ -3512,8 +3680,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     }
 
     // Periodic heartbeat every 600 frames (~10s at 60fps).
+    // Extended to log continuously (removed the g_frameTick <= 6000 cap)
+    // so we can observe FPS and toggleSame throughout long sessions.
     if (g_frameTick == 1
-        || (g_frameTick % 600 == 0 && g_frameTick <= 6000))
+        || (g_frameTick % 600 == 0))
     {
         const DWORD nowMs = GetTickCount();
         DWORD elapsedMs = 0;
@@ -3540,40 +3710,58 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             static_cast<unsigned long>(elapsedMs),
             measuredFps,
             g_toggleSameCount);
-    }
 
-    // --- gameSys+4968 toggle double-tick detection --------------------------
-    // The EXE main loop toggles gameSys+4968 once per iteration.  If we see
-    // the same value on two consecutive calls, the per-frame tick hook is
-    // running more than once per main loop frame.
-    {
-        constexpr uintptr_t kGameSystemPtr = 0x0079010C;
-        uint32_t toggleVal = 0xFFFFFFFFu;
-        __try {
-            const uint32_t gameSys =
-                *reinterpret_cast<const volatile uint32_t*>(kGameSystemPtr);
-            if (gameSys != 0)
-                toggleVal =
-                    *reinterpret_cast<const volatile uint32_t*>(gameSys + 4968);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (toggleVal != 0xFFFFFFFFu
-            && g_lastToggleValue != 0xFFFFFFFFu
-            && toggleVal == g_lastToggleValue)
+        // --- Resource leak tracking (every heartbeat = ~10s) ----------------
+        // Log the process's handle count and memory usage so we can spot
+        // leaks over time.  A steadily growing handle count or working set
+        // indicates the mod (or Revival) is leaking resources.
+        //
+        // GetProcessHandleCount requires XP SP1+; GetProcessMemoryInfo lives
+        // in psapi.dll which may not be loaded on minimal Wine prefixes.
+        // Resolve both at runtime to keep the DLL loadable everywhere.
         {
-            ++g_toggleSameCount;
-            if (!g_toggleDiagLogged)
+            typedef BOOL (WINAPI *PFN_GetProcessHandleCount)(HANDLE, PDWORD);
+            typedef BOOL (WINAPI *PFN_GetProcessMemoryInfo)(
+                HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+
+            static PFN_GetProcessHandleCount s_pfnHandleCount = nullptr;
+            static PFN_GetProcessMemoryInfo  s_pfnMemInfo = nullptr;
+            static bool s_resolved = false;
+            if (!s_resolved)
             {
-                g_toggleDiagLogged = true;
-                mod::Log(
-                    "TICK_HOOK: *** DOUBLE TICK DETECTED *** frameTick=%u "
-                    "toggleVal=%u — per-frame hook fired twice in same "
-                    "main loop iteration",
-                    g_frameTick,
-                    toggleVal);
+                s_resolved = true;
+                HMODULE k32 = GetModuleHandleA("kernel32.dll");
+                if (k32 != nullptr)
+                    s_pfnHandleCount = reinterpret_cast<PFN_GetProcessHandleCount>(
+                        GetProcAddress(k32, "GetProcessHandleCount"));
+                HMODULE psapi = LoadLibraryA("psapi.dll");
+                if (psapi != nullptr)
+                    s_pfnMemInfo = reinterpret_cast<PFN_GetProcessMemoryInfo>(
+                        GetProcAddress(psapi, "GetProcessMemoryInfo"));
+                // Intentionally leak the psapi HMODULE — we need it for the
+                // lifetime of the process and it's tiny.
             }
+
+            DWORD handleCount = 0;
+            if (s_pfnHandleCount != nullptr)
+                s_pfnHandleCount(GetCurrentProcess(), &handleCount);
+
+            PROCESS_MEMORY_COUNTERS pmc = {};
+            pmc.cb = sizeof(pmc);
+            if (s_pfnMemInfo != nullptr)
+                s_pfnMemInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+
+            mod::Log(
+                "RESOURCE_TRACK: handles=%lu workingSetMB=%.1f "
+                "commitMB=%.1f peakWorkingSetMB=%.1f "
+                "fpsDrops=%u tickOverBudget=%u",
+                static_cast<unsigned long>(handleCount),
+                static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0),
+                static_cast<double>(pmc.PagefileUsage) / (1024.0 * 1024.0),
+                static_cast<double>(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0),
+                g_fpsDropCount,
+                g_tickBudgetExceededCount);
         }
-        g_lastToggleValue = toggleVal;
     }
 
     // ---- Pre-tick graceful-end / disconnect detection --------------------
@@ -4364,6 +4552,87 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
+    // ====================================================================
+    // Desync detection — periodic game-state snapshot logging
+    // ====================================================================
+    // During active online matches, periodically log key game state values
+    // that BOTH peers should agree on.  If logs from both sides are compared
+    // and these values diverge, the exact frame of desync can be identified.
+    //
+    // Fires every 120 frames (~2s at 60fps) during online matches.  Also
+    // fires on the first frame of each match and whenever the frame counter
+    // crosses a round boundary (every 3600 frames = ~60s).
+    // ====================================================================
+    if (g_localRoleFlag == kLocalRoleOnline
+        && g_localInitAppliedForSession
+        && currentSession != 0
+        && g_activeRevival != nullptr
+        && !preTickDisconnect
+        && !spectateTickHoldoff)
+    {
+        const bool isDesyncCheckFrame =
+            (g_frameTick == 1)
+            || (g_frameTick % 120 == 0)
+            || (g_frameTick % 3600 == 0);
+
+        if (isDesyncCheckFrame)
+        {
+            // Read the critical game state that must be in sync between peers.
+            int dsCurrentFrame = -1;
+            int dsInputDelay = -1;
+            int dsMatchId = -1;
+            int dsActivePlayer = -1;
+            int dsAdvanceCounter = -1;
+            int dsSyncFrame = -1;
+            int dsPingMs = -1;
+            uint32_t dsSentinel = 0;
+            uint8_t dsScreen = 0xFF;
+
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetCurrentFrame), &dsCurrentFrame);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetInputDelay), &dsInputDelay);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetMatchId), &dsMatchId);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetActivePlayer), &dsActivePlayer);
+            (void)SafeReadDword(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetSentinel), &dsSentinel);
+            (void)SafeReadInt(reinterpret_cast<const void*>(
+                currentSession + g_activeRevival->sessionOffsetPingMs), &dsPingMs);
+
+            // Game mode fields
+            const uintptr_t dsGmBase = currentSession + g_activeRevival->sessionOffsetGameModeSnapshot;
+            (void)SafeReadInt(reinterpret_cast<const void*>(dsGmBase + 12), &dsAdvanceCounter);
+            (void)SafeReadInt(reinterpret_cast<const void*>(dsGmBase + 20), &dsSyncFrame);
+
+            __try {
+                dsScreen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+            // Compute a lightweight checksum of the state snapshot.
+            // Both peers should produce the same checksum if in sync.
+            const uint32_t stateChecksum =
+                static_cast<uint32_t>(dsCurrentFrame)
+                ^ (static_cast<uint32_t>(dsAdvanceCounter) * 2654435761u)
+                ^ (static_cast<uint32_t>(dsSyncFrame) * 40503u)
+                ^ (static_cast<uint32_t>(dsMatchId) << 16)
+                ^ dsSentinel;
+
+            mod::Log(
+                "DESYNC_CHECK: S#%u tick=%u screen=%u frame=%d advCtr=%d "
+                "syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
+                "sentinel=0x%08lX chk=0x%08lX",
+                g_sessionNumber, g_frameTick,
+                static_cast<unsigned>(dsScreen),
+                dsCurrentFrame, dsAdvanceCounter,
+                dsSyncFrame, dsMatchId,
+                dsInputDelay, dsPingMs, dsActivePlayer,
+                static_cast<unsigned long>(dsSentinel),
+                static_cast<unsigned long>(stateChecksum));
+        }
+    }
+
     // ---- ExitProcess recovery path -----------------------------------------
     // If ExitProcess fired during the per-frame tick, NeutralizeExitProcess
     // longjmp'd back through RunPerFrameTickDispatch, which set
@@ -4844,6 +5113,36 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // bridge mutex; it does NOT call takeover::Tick() and is safe here.
     netplay::bridge::TickExportOnly();
 
+    // --- Tick cost measurement (mod overhead budget) -------------------------
+    // Measure total time our hook spent AFTER entering the tick.  Warn when
+    // the mod's own processing exceeds the per-frame budget, which could be
+    // the cause of stalls that slow the game.
+    {
+        LARGE_INTEGER tickExitQpc = {};
+        QueryPerformanceCounter(&tickExitQpc);
+        if (g_qpcFreqValid)
+        {
+            const double tickCostMs =
+                static_cast<double>(tickExitQpc.QuadPart - tickEntryQpc.QuadPart)
+                * 1000.0 / static_cast<double>(g_qpcFreqCached.QuadPart);
+            if (tickCostMs > kTickBudgetMs)
+            {
+                ++g_tickBudgetExceededCount;
+                // Log first 5 and then every 300th to avoid spamming.
+                if (g_tickBudgetExceededCount <= 5
+                    || (g_tickBudgetExceededCount % 300 == 0))
+                {
+                    mod::Log(
+                        "PERF_WARN: *** TICK OVER BUDGET *** tick=%u "
+                        "costMs=%.2f budget=%.1fms exceeded=%u — mod "
+                        "processing is stalling the game",
+                        g_frameTick, tickCostMs, kTickBudgetMs,
+                        g_tickBudgetExceededCount);
+                }
+            }
+        }
+    }
+
     return result;
 }
 
@@ -5034,6 +5333,8 @@ void ResetGameModeValidation()
     g_lastToggleValue = 0xFFFFFFFFu;
     g_toggleSameCount = 0;
     g_toggleDiagLogged = false;
+    g_retAddrSlotCount = 0;
+    std::memset(g_retAddrSlots, 0, sizeof(g_retAddrSlots));
     ResetOnlineMatchEscGracefulQuit();
     ReleaseQuitRingHeader();
 
@@ -5051,6 +5352,13 @@ void ResetGameModeValidation()
     g_lastSessionPtrInTick  = 0;
     g_prevFrameQpcValid     = false;
     memset(&g_prevFrameQpc, 0, sizeof(g_prevFrameQpc));
+
+    // Reset FPS drop / tick cost tracking for the new session.
+    g_fpsDropPrevQpcValid       = false;
+    memset(&g_fpsDropPrevQpc, 0, sizeof(g_fpsDropPrevQpc));
+    g_fpsDropCount              = 0;
+    g_fpsDropLastLogTick        = 0;
+    g_tickBudgetExceededCount   = 0;
 
     mod::Log("ResetGameModeValidation: session #%u starting", g_sessionNumber);
 

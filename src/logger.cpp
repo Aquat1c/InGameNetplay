@@ -275,6 +275,14 @@ void ShutdownLogger()
 
 void Log(const char* fmt, ...)
 {
+    // --- Lock contention + I/O timing guard ---------------------------------
+    // Measure how long the whole Log() call takes (mutex acquire + format +
+    // fputs + fflush).  If it exceeds 3ms, the logger itself is stalling the
+    // game thread.  Uses OutputDebugStringA (lock-free) for the warning so
+    // it doesn't recurse into the same mutex.
+    LARGE_INTEGER logQpcStart = {};
+    QueryPerformanceCounter(&logQpcStart);
+
     std::lock_guard<std::mutex> lock(g_logMutex);
 
     char message[1024];
@@ -296,5 +304,32 @@ void Log(const char* fmt, ...)
         static_cast<unsigned long>(GetCurrentProcessId()),
         message);
     WriteLineUnlocked(line);
+
+    // Check total Log() duration (including mutex wait + I/O).
+    {
+        static unsigned long s_logSlowCount = 0;
+        LARGE_INTEGER logQpcEnd = {}, freq = {};
+        QueryPerformanceCounter(&logQpcEnd);
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(logQpcEnd.QuadPart - logQpcStart.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 3.0)
+        {
+            ++s_logSlowCount;
+            // Output via OutputDebugString to avoid re-entering the mutex.
+            if (s_logSlowCount <= 10 || (s_logSlowCount % 500 == 0))
+            {
+                char warn[256];
+                snprintf(warn, sizeof(warn),
+                         "[efz_netplay_mod] PERF_WARN: Log() took %.1fms "
+                         "(slowCount=%lu) — logger stalling game thread\n",
+                         elapsedMs, s_logSlowCount);
+                OutputDebugStringA(warn);
+                // Also write it to the log file directly while we hold the lock.
+                WriteLineUnlocked(warn);
+            }
+        }
+    }
 }
 }

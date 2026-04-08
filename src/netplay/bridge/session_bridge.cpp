@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <windows.h>
 
 namespace netplay::bridge
 {
@@ -172,6 +173,9 @@ void ShutdownInjectedProcess()
 
 void Tick()
 {
+    LARGE_INTEGER tickQpcPre = {};
+    QueryPerformanceCounter(&tickQpcPre);
+
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
     {
@@ -187,6 +191,28 @@ void Tick()
     JoinFinishedWorkerUnlocked();
     takeover::Tick(&g_status, &g_connectStartTick);
     state_export::Update(g_status);
+
+    // --- Timing guard on full Tick (includes takeover::Tick + State Export) --
+    {
+        static uint32_t s_tickSlowCount = 0;
+        LARGE_INTEGER tickQpcPost = {}, freq = {};
+        QueryPerformanceCounter(&tickQpcPost);
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(tickQpcPost.QuadPart - tickQpcPre.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 5.0)
+        {
+            ++s_tickSlowCount;
+            if (s_tickSlowCount <= 10 || (s_tickSlowCount % 200 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: session_bridge::Tick took %.2fms "
+                    "(slowCount=%u) — full tick is slow",
+                    elapsedMs, s_tickSlowCount);
+            }
+        }
+    }
 }
 
 void TickExportOnly()
@@ -206,13 +232,44 @@ void TickExportOnly()
     // this, those fields stay stale at whatever value they had when the last
     // full Tick() ran — typically during connection, before any match was
     // played — so wins would read 0-0 even after a match ends.
+
+    // --- Mutex contention guard: detect if acquiring g_mutex blocks -------
+    LARGE_INTEGER teoQpcPre = {};
+    QueryPerformanceCounter(&teoQpcPre);
+
     std::lock_guard<std::mutex> lock(g_mutex);
+
+    LARGE_INTEGER teoQpcPost = {};
+    QueryPerformanceCounter(&teoQpcPost);
+
     if (!g_initialized)
     {
         return;
     }
     takeover::RefreshRuntimeStatus(&g_status);
     state_export::Update(g_status);
+
+    // Check mutex wait time — long waits indicate the worker thread holds
+    // the lock for extended periods (network I/O, process launch, etc.).
+    {
+        static uint32_t s_teoMutexSlowCount = 0;
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        const double waitMs =
+            static_cast<double>(teoQpcPost.QuadPart - teoQpcPre.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (waitMs > 2.0)
+        {
+            ++s_teoMutexSlowCount;
+            if (s_teoMutexSlowCount <= 10 || (s_teoMutexSlowCount % 300 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: TickExportOnly mutex wait %.2fms "
+                    "(slowCount=%u) — bridge lock contention",
+                    waitMs, s_teoMutexSlowCount);
+            }
+        }
+    }
 }
 
 bool StartSession(
