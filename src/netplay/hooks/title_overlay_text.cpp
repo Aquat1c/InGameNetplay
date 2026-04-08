@@ -925,7 +925,12 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const int tL = panelX + 6;
     const int tR = panelX + panelW - 4;
 
-    netplay::font::DrawTextLeft5x7(sv, "JOINING", tL, tR, panelY + 4, 1, 1, titleColor);
+    const char* panelTitle = "JOINING";
+    if (g_joiningOverlay.spectateMode)
+    {
+        panelTitle = g_joiningOverlay.waitingForGameBegin ? "WAIT TO SPECTATE" : "SPECTATING";
+    }
+    netplay::font::DrawTextLeft5x7(sv, panelTitle, tL, tR, panelY + 4, 1, 1, titleColor);
 
     char line[192] = {};
     if (g_joiningOverlay.failed)
@@ -940,19 +945,41 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     }
     else
     {
-        // Connecting state
-        if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
+        if (g_joiningOverlay.waitingForGameBegin)
+        {
+            if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
+            {
+                std::snprintf(line, sizeof(line), "%s is not in a match yet.", g_joiningOverlay.targetName);
+            }
+            else
+            {
+                std::snprintf(line, sizeof(line), "Host is not in a match yet.");
+            }
+            netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 18, 1, 1, textColor);
+            netplay::font::DrawTextLeft5x7(
+                sv,
+                "Waiting for game to begin...",
+                tL,
+                tR,
+                panelY + 32,
+                1,
+                1,
+                dimColor);
+            netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);
+        }
+        else if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
         {
             std::snprintf(line, sizeof(line), "Connecting to %s ...", g_joiningOverlay.targetName);
+            netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, textColor);
+            netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);
         }
         else
         {
             std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
                 g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
+            netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, textColor);
+            netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);
         }
-        netplay::font::DrawTextLeft5x7(sv, line, tL, tR, panelY + 22, 1, 1, textColor);
-
-        netplay::font::DrawTextLeft5x7(sv, "ESC/BACK=Cancel", tL, tR, panelY + 50, 1, 1, dimColor);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
@@ -1001,49 +1028,71 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     const uint8_t hlColor = netplay::draw::ResolveBestPaletteColor(screenContext, 40, 100, 96);
     const uint8_t errorColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 130, 130);
 
+    const bool hostNotYetPlayingPrompt =
+        g_spectateConfirmOverlay.promptKind
+            == static_cast<int>(netplay::bridge::NetbridgeSpectatePromptKind::HostNotYetPlaying);
+
     // Panel background and frame — centered on 320x240 surface
-    constexpr int specPanelW = 200;
-    constexpr int specPanelH = 100;
+    constexpr int specPanelW = 220;
+    const int specPanelH = hostNotYetPlayingPrompt ? 118 : 100;
     constexpr int specPanelX = (320 - specPanelW) / 2;
-    constexpr int specPanelY = (240 - specPanelH) / 2;
+    const int specPanelY = (240 - specPanelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, specPanelX, specPanelY, specPanelW, specPanelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, specPanelX, specPanelY, specPanelW, specPanelH, frameColor);
 
     const int sTextL = specPanelX + 6;
     const int sTextR = specPanelX + specPanelW - 6;
 
-    // Title: "SPECTATE?"
-    netplay::font::DrawTextCentered5x7(sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
-
-    // Question lines
-    netplay::font::DrawTextCentered5x7(sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
-    netplay::font::DrawTextCentered5x7(sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40, 1, 1, textColor);
-
-    // Option: Yes (index 0)
-    const bool yesSelected = (g_spectateConfirmOverlay.selectedOption == 0);
-    if (yesSelected)
+    auto drawOption = [&](int optionIndex, const char* label, int y)
     {
-        netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, specPanelY + 58, 120, 12, hlColor);
-    }
-    netplay::font::DrawTextCentered5x7(
-        sv, yesSelected ? "> Yes" : "  Yes", specPanelX + 40, specPanelX + specPanelW - 40, specPanelY + 60, 1, 1,
-        yesSelected ? brightColor : dimColor);
+        const bool selected = (g_spectateConfirmOverlay.selectedOption == optionIndex);
+        if (selected)
+        {
+            netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, y - 2, specPanelW - 80, 12, hlColor);
+        }
+        char optionText[40] = {};
+        std::snprintf(optionText, sizeof(optionText), "%s %s", selected ? ">" : " ", label);
+        netplay::font::DrawTextCentered5x7(
+            sv,
+            optionText,
+            specPanelX + 40,
+            specPanelX + specPanelW - 40,
+            y,
+            1,
+            1,
+            selected ? brightColor : dimColor);
+    };
 
-    // Option: No (index 1)
-    const bool noSelected = (g_spectateConfirmOverlay.selectedOption == 1);
-    if (noSelected)
+    if (hostNotYetPlayingPrompt)
     {
-        netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, specPanelY + 74, 120, 12, hlColor);
+        netplay::font::DrawTextCentered5x7(sv, "HOST NOT PLAYING", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
+        netplay::font::DrawTextCentered5x7(sv, "Host is not in a match yet.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
+        netplay::font::DrawTextCentered5x7(sv, "Choose what to do:", sTextL, sTextR, specPanelY + 38, 1, 1, textColor);
+        drawOption(0, "Join", specPanelY + 56);
+        drawOption(1, "Wait", specPanelY + 70);
+        drawOption(2, "Cancel", specPanelY + 84);
     }
-    netplay::font::DrawTextCentered5x7(
-        sv, noSelected ? "> No" : "  No", specPanelX + 40, specPanelX + specPanelW - 40, specPanelY + 76, 1, 1,
-        noSelected ? brightColor : dimColor);
+    else
+    {
+        netplay::font::DrawTextCentered5x7(sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
+        netplay::font::DrawTextCentered5x7(sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
+        netplay::font::DrawTextCentered5x7(sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40, 1, 1, textColor);
+        drawOption(0, "Yes", specPanelY + 60);
+        drawOption(1, "No", specPanelY + 76);
+    }
 
     // Error message if any
     if (g_spectateConfirmOverlay.errorMessage[0] != '\0')
     {
         netplay::font::DrawTextCentered5x7(
-            sv, g_spectateConfirmOverlay.errorMessage, sTextL, sTextR, specPanelY + 90, 1, 1, errorColor);
+            sv,
+            g_spectateConfirmOverlay.errorMessage,
+            sTextL,
+            sTextR,
+            hostNotYetPlayingPrompt ? specPanelY + 100 : specPanelY + 90,
+            1,
+            1,
+            errorColor);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);

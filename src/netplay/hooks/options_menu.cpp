@@ -1454,6 +1454,14 @@ void AppendSyntheticItems()
         true,
         "Write efz_netplay_mod.log to disk while the mod is running.");
     upsertBoolIntItem(
+        "PreserveModLogAcrossLaunches",
+        false,
+        "Keep previous efz_netplay_mod.log content across full game relaunches. Off starts a fresh mod log each launch.");
+    upsertBoolIntItem(
+        "PreserveRevivalLogsAcrossLaunches",
+        false,
+        "Keep previous Revival log content across full game relaunches. Off starts a fresh logEfz.txt each launch.");
+    upsertBoolIntItem(
         "EnableConsole",
         false,
         "Open the logger console window automatically when the mod starts.");
@@ -1481,7 +1489,16 @@ void ApplyRuntimeNetplaySettings()
 
         if (item.keyName == "Name")
         {
+            if (hooks::g_netplayMenuState.nickname != item.currentValue
+                || hooks::g_netplayMenuState.nicknameSource != hooks::NetplayNicknameSource::UserProvided)
+            {
+                mod::Log(
+                    "OptionsMenu: applied Network.Name='%s' source=%s->user",
+                    item.currentValue.c_str(),
+                    hooks::NetplayNicknameSourceToString(hooks::g_netplayMenuState.nicknameSource));
+            }
             hooks::g_netplayMenuState.nickname = item.currentValue;
+            hooks::g_netplayMenuState.nicknameSource = hooks::NetplayNicknameSource::UserProvided;
         }
         else if (item.keyName == "Port")
         {
@@ -1490,6 +1507,13 @@ void ApplyRuntimeNetplaySettings()
             {
                 hooks::g_netplayMenuState.hostPort = port;
                 hooks::g_netplayMenuState.joinPort = port;
+            }
+        }
+        else if (item.keyName == "Address")
+        {
+            if (netplay::validation::IsValidJoinAddress(item.currentValue))
+            {
+                hooks::g_netplayMenuState.joinAddress = item.currentValue;
             }
         }
     }

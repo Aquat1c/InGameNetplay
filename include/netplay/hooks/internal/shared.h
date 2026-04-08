@@ -17,6 +17,13 @@
 
 namespace netplay::hooks::internal
 {
+enum class NetplayNicknameSource : uint8_t
+{
+    Placeholder = 0,
+    LoadedFromIni,
+    UserProvided,
+};
+
 struct NetplayMenuState
 {
     bool active = false;
@@ -30,6 +37,7 @@ struct NetplayMenuState
     std::string joinAddress = "127.0.0.1";
     uint16_t joinPort = netplay::constants::kDefaultNetplayPort;
     std::string nickname = "Player";
+    NetplayNicknameSource nicknameSource = NetplayNicknameSource::Placeholder;
     uint8_t paletteStart = 193;
     uint8_t paletteCount = 48;
     netplay::constants::NetplayRenderLayout renderLayout = {};
@@ -84,7 +92,9 @@ struct DelaySetupOverlayState
 struct SpectateConfirmOverlayState
 {
     bool active = false;
-    int selectedOption = 0; // 0 = Yes, 1 = No
+    int selectedOption = 0;
+    int optionCount = 2;
+    int promptKind = 0;
     char errorMessage[96] = {};
 };
 
@@ -106,6 +116,8 @@ struct JoiningOverlayState
     bool active = false;
     uint16_t port = 0;
     bool displayTargetName = false;
+    bool spectateMode = false;
+    bool waitingForGameBegin = false;
     char address[128] = {};         // target address
     char targetName[64] = {};
     char errorText[128] = {};       // populated when bridge reports failure
@@ -259,6 +271,9 @@ void RunTransitionFadeIn(uint32_t screenContext);
 bool LoadTitleAssets(uint32_t screenContext);
 bool LoadNetplayAssets(uint32_t screenContext);
 void LoadNetplayMenuSettingsFromIni();
+void SaveNetplayJoinAddressToIni();
+const char* NetplayNicknameSourceToString(NetplayNicknameSource source);
+bool ShouldWriteNicknameToRevivalIni();
 
 std::string BuildMenuHeaderText();
 std::string BuildRowLabel(const netplay::menu::NetplayMenuEntry& entry);

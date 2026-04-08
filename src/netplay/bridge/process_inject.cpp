@@ -20,6 +20,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_TerminateProcess(HANDLE, UI
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD, BOOL, DWORD);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleA(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleW(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
@@ -234,6 +236,8 @@ std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
     patches["TerminateProcess"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_TerminateProcess));
     patches["ReadConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleA));
     patches["ReadConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleW));
+    patches["CreateFileA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileA));
+    patches["CreateFileW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileW));
     patches["WriteFile"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteFile));
     patches["WriteConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleA));
     patches["WriteConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleW));
@@ -383,6 +387,9 @@ bool PatchIatModule(
                     || _stricmp(name, "TerminateProcess") == 0
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
+                    || _stricmp(name, "CreateFileA") == 0
+                    || _stricmp(name, "CreateFileW") == 0
+                    || _stricmp(name, "WriteFile") == 0
                     || _stricmp(name, "WriteConsoleOutputCharacterW") == 0
                     || _stricmp(name, "OutputDebugStringW") == 0;
             };
@@ -488,6 +495,19 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
         if (module.moduleLower == "efzrevival.dll")
         {
             pushUniqueTarget(module);
+        }
+    }
+
+    if (process == GetCurrentProcess())
+    {
+        const uintptr_t hostExeBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+        for (const RemoteModuleRecord& module : modules)
+        {
+            if (module.base == hostExeBase)
+            {
+                pushUniqueTarget(module);
+                break;
+            }
         }
     }
 
@@ -800,6 +820,8 @@ int SelfPatchIat()
         { "TerminateProcess",               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_TerminateProcess)) },
         { "ReadConsoleA",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleA)) },
         { "ReadConsoleW",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleW)) },
+        { "CreateFileA",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)) },
+        { "CreateFileW",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)) },
         { "WriteFile",                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)) },
         { "WriteConsoleA",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleA)) },
         { "WriteConsoleW",                  static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleW)) },

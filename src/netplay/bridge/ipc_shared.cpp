@@ -134,7 +134,7 @@ void PublishDelayPromptSerial(LONG serial)
     CloseTempIpcContext(&temp);
 }
 
-void PublishSpectateConfirmPromptSerial(LONG serial)
+void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind)
 {
     if (serial <= 0)
     {
@@ -146,6 +146,7 @@ void PublishSpectateConfirmPromptSerial(LONG serial)
         const LONG current = InterlockedCompareExchange(&g_injectedBlock->spectateConfirmPromptSerial, 0, 0);
         if (serial > current)
         {
+            g_injectedBlock->spectateConfirmPromptKind = promptKind;
             InterlockedExchange(&g_injectedBlock->spectateConfirmPromptSerial, serial);
         }
         return;
@@ -157,16 +158,18 @@ void PublishSpectateConfirmPromptSerial(LONG serial)
         const LONG current = InterlockedCompareExchange(&temp.block->spectateConfirmPromptSerial, 0, 0);
         if (serial > current)
         {
+            temp.block->spectateConfirmPromptKind = promptKind;
             InterlockedExchange(&temp.block->spectateConfirmPromptSerial, serial);
         }
     }
     CloseTempIpcContext(&temp);
 }
 
-void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial)
+void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind)
 {
     LONG promptSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
     LONG promptServedSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
+    int promptKind = static_cast<int>(netplay::bridge::NetbridgeSpectatePromptKind::None);
 
     if (g_hostBlock != nullptr)
     {
@@ -175,6 +178,7 @@ void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServe
         if (sharedPromptSerial > promptSerial)
         {
             promptSerial = sharedPromptSerial;
+            promptKind = g_hostBlock->spectateConfirmPromptKind;
         }
         if (sharedPromptServedSerial > promptServedSerial)
         {
@@ -189,6 +193,10 @@ void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServe
     if (outPromptServedSerial != nullptr)
     {
         *outPromptServedSerial = promptServedSerial;
+    }
+    if (outPromptKind != nullptr)
+    {
+        *outPromptKind = promptKind;
     }
 }
 
@@ -726,6 +734,7 @@ bool EnsureLocalRevivalLoaded()
 {
     if (g_localInitFn != nullptr)
     {
+        EnsureHostLogEfzIatPatched(true);
         PublishHostRevivalBase();
         if (!PatchRevivalErrorCodeNullGuard())
         {
@@ -769,6 +778,16 @@ bool EnsureLocalRevivalLoaded()
         mod::Log("Takeover: GetProcAddress(init) failed");
         return false;
     }
+
+    // Patch logEfz interception before the first Revival init() call.
+    // All supported Revival versions open logEfz.txt inside init(), so any
+    // later patch point leaves behind a real-file handle we can no longer
+    // safely take away from native code.
+    EnsureHostLogEfzIatPatched(true);
+    // Each Revival init() should start a fresh logical session section in
+    // the managed root logEfz.txt. Closing here lets the first native log
+    // line from this init reopen the file and emit a new SESSION header.
+    CloseMirrorLogFiles();
 
     int localParams[2] = {2, 102};
     const int initResult = g_localInitFn(localParams);
@@ -951,7 +970,13 @@ uintptr_t ResolveInjectedExpectedRevivalBase()
     return base;
 }
 
-bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* address, const char* nickname)
+bool WriteIni(
+    const std::string& gameDir,
+    int role,
+    uint16_t port,
+    const char* address,
+    const char* nickname,
+    bool writeNicknameToIni)
 {
     std::string iniPath = gameDir;
     if (!iniPath.empty())
@@ -963,7 +988,9 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
     const DWORD existingAttrs = GetFileAttributesA(iniPath.c_str());
     const bool existed = (existingAttrs != INVALID_FILE_ATTRIBUTES);
     const char* safeAddress = (address != nullptr) ? address : "";
-    const char* safeNickname = (nickname != nullptr && nickname[0] != '\0') ? nickname : "Player";
+    const char* safeNickname = (nickname != nullptr) ? nickname : "";
+    const bool hasNickname = (safeNickname[0] != '\0');
+    bool wroteNickname = false;
 
     // Use WritePrivateProfileStringW for the nickname so that Unicode
     // characters (CJK, Cyrillic, etc.) survive regardless of system codepage.
@@ -988,8 +1015,9 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
     };
     bool ok = true;
 
-    // Write nickname via W API to preserve Unicode characters.
+    if (writeNicknameToIni && hasNickname)
     {
+        // Write nickname via W API to preserve Unicode characters.
         const int wideLen = MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, nullptr, 0);
         if (wideLen > 0)
         {
@@ -1005,26 +1033,49 @@ bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* a
                     ErrorString(GetLastError()).c_str());
                 ok = false;
             }
+            else
+            {
+                wroteNickname = true;
+            }
         }
         else
         {
-            ok = writeIniKeyA("Network", "Name", safeNickname) && ok;
+            const bool nameWriteOk = writeIniKeyA("Network", "Name", safeNickname);
+            wroteNickname = nameWriteOk;
+            ok = nameWriteOk && ok;
         }
+    }
+    else if (writeNicknameToIni)
+    {
+        mod::Log("Takeover: WriteIni preserving existing Network.Name (empty nickname supplied)");
+    }
+    else
+    {
+        mod::Log("Takeover: WriteIni preserving existing Network.Name (caller disabled nickname sync)");
     }
 
     // Keep user INI intact. Update only the settings currently supported by
     // InGameNetplay menu integration.
+    bool wroteAddress = false;
+    if (safeAddress[0] != '\0')
+    {
+        wroteAddress = writeIniKeyA("Network", "Address", safeAddress);
+        ok = wroteAddress && ok;
+    }
     ok = writeIniKeyA("Network", "Port", portText) && ok;
 
     mod::Log(
-        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d (updated keys: Network.Name, Network.Port)",
+        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",
         iniPath.c_str(),
         existed ? 1 : 0,
         role,
         static_cast<unsigned>(port),
         safeNickname,
         safeAddress,
-        ok ? 1 : 0);
+        ok ? 1 : 0,
+        writeNicknameToIni ? 1 : 0,
+        wroteNickname ? 1 : 0,
+        wroteAddress ? 1 : 0);
     return ok;
 }
 

@@ -84,9 +84,10 @@ struct SharedBlock
     int delayInputValue = -1;
     volatile LONG spectateConfirmPromptSerial = 0;
     volatile LONG spectateConfirmPromptServedSerial = 0;
+    int spectateConfirmPromptKind = 0;
     volatile LONG spectateConfirmInputSerial = 0;
     volatile LONG spectateConfirmInputServedSerial = 0;
-    int spectateConfirmInputValue = 0; // 0 = not set, 1 = Yes, 2 = No
+    int spectateConfirmInputValue = 0; // 0 = not set, otherwise raw Revival menu choice
     volatile LONG dbgReadConsoleHits = 0;
     volatile LONG dbgReadConsoleAutoHits = 0;
     volatile LONG dbgCreateProcessHits = 0;
@@ -257,8 +258,15 @@ bool ContainsCaseInsensitive(const std::string& text, const char* needle);
 bool ParseIntAt(const std::string& text, size_t start, int* outValue, size_t* outEnd);
 bool ExtractIntAfterToken(const std::string& text, const char* token, int* outValue);
 bool ExtractDelayRange(const std::string& text, int* outMin, int* outMax);
+void EnsureHostLogEfzIatPatched(bool verboseLogs);
 DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool* outHasMetrics);
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
+bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
+bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath);
+void PrimeManagedLogEfzHistory();
+void BeginManagedLogEfzWrite();
+void EndManagedLogEfzWrite();
+bool IsManagedLogEfzWriteActive();
 void ResetNativeWorkflowFlags();
 void NoteConsolePromptLine(const std::string& text);
 std::string* SelectPendingConsoleLine(const char* sourceTag);
@@ -422,8 +430,8 @@ bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsol
 void CloseTempIpcContext(TempIpcContext* ctx);
 void PublishDelayPromptSerial(LONG serial);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
-void PublishSpectateConfirmPromptSerial(LONG serial);
-void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
+void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
+void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
 HMODULE SelfModule();
@@ -454,7 +462,13 @@ uintptr_t ResolveHostRevivalBase();
 bool PatchRevivalErrorCodeNullGuard();
 void PublishHostRevivalBase();
 uintptr_t ResolveInjectedExpectedRevivalBase();
-bool WriteIni(const std::string& gameDir, int role, uint16_t port, const char* address, const char* nickname);
+bool WriteIni(
+    const std::string& gameDir,
+    int role,
+    uint16_t port,
+    const char* address,
+    const char* nickname,
+    bool writeNicknameToIni);
 bool IsCurrentProcessRevival();
 bool IsRunningUnderWine();
 void InitializeInjected();

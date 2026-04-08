@@ -35,6 +35,7 @@ using netplay::menu::RowIndexToString;
 using InlineEditInputResult = netplay::inline_edit::InputResult;
 using NetbridgeRole = netplay::bridge::NetbridgeRole;
 using NetbridgePhase = netplay::bridge::NetbridgePhase;
+using NetbridgeSpectatePromptKind = netplay::bridge::NetbridgeSpectatePromptKind;
 
 void HandoffConnectedSessionToVsHumanState(uint32_t screenContext);
 void HandoffSpectateSession(uint32_t screenContext);
@@ -57,6 +58,9 @@ constexpr uint32_t kGameSystemOffsetMode = 4964;
 constexpr uint32_t kGameSystemOffsetSecondaryModeFlag = 4965;
 constexpr uint32_t kGameSystemOffsetContinueFlag = 4984;
 constexpr uint32_t kGameSystemOffsetStageSelection = 4985;
+constexpr uint32_t kGameSystemOffsetStageAnimState = 3884;
+constexpr uint32_t kGameSystemOffsetStageAnim = 3888;
+constexpr uint32_t kGameSystemOffsetStageCursor = 3890;
 constexpr uint32_t kGameSystemOffsetReplaySessionFlag = 82563;
 constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
 constexpr uint8_t kGameModeVsHuman = 4;
@@ -75,6 +79,8 @@ unsigned short g_lobbyChallengeAlertBufferIndex = kInvalidSoundBufferIndex;
 std::array<uint8_t, kFilteredMenuInputBytes> g_filteredMenuInputs = {};
 std::array<uint8_t, kFilteredMenuInputBytes> g_unfocusedHeldMenuInputs = {};
 std::array<uint8_t, 256> g_netplayHotkeyDown = {};
+std::array<uint8_t, 2> g_joinWaitToSpectateButtonDown = {};
+uint64_t g_lastAutoAnsweredSpectatePromptFingerprint = 0;
 std::thread g_lobbySessionShutdownThread;
 std::atomic<bool> g_lobbySessionShutdownInFlight{false};
 std::atomic<bool> g_lobbySessionShutdownCompleted{false};
@@ -119,6 +125,19 @@ void ClearPendingLobbySpectateWait(const char* reason)
             g_pendingLobbySpectateWait.p2Name.c_str());
     }
     g_pendingLobbySpectateWait = {};
+}
+
+bool ShouldWriteNicknameToRevivalIniForSessionStart()
+{
+    const bool shouldWrite = ShouldWriteNicknameToRevivalIni();
+    if (!shouldWrite)
+    {
+        mod::Log(
+            "NetplayNickname: preserving existing EfzRevival.ini Network.Name (current='%s' source=%s)",
+            g_netplayMenuState.nickname.c_str(),
+            NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
+    }
+    return shouldWrite;
 }
 
 void ArmPendingLobbySpectateWait(
@@ -421,6 +440,36 @@ bool ConsumeWindowFocusedHotkeyEdge(bool windowFocused, int virtualKey)
     const bool pressed = windowFocused && down && g_netplayHotkeyDown[index] == 0;
     g_netplayHotkeyDown[index] = down ? 1u : 0u;
     return pressed;
+}
+
+bool ConsumeJoinWaitToSpectateHotkeyEdge(const uint8_t* inputBytes)
+{
+    if (inputBytes == nullptr)
+    {
+        g_joinWaitToSpectateButtonDown = {};
+        return false;
+    }
+
+    bool pressed = false;
+    for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+    {
+        const bool down = inputBytes[playerIndex + 22] != 0;
+        if (down && g_joinWaitToSpectateButtonDown[static_cast<size_t>(playerIndex)] == 0)
+        {
+            pressed = true;
+        }
+        g_joinWaitToSpectateButtonDown[static_cast<size_t>(playerIndex)] = down ? 1u : 0u;
+    }
+
+    return pressed;
+}
+
+bool IsTransientNetplayOverlayActive()
+{
+    return g_joiningOverlay.active
+        || g_hostingOverlay.active
+        || g_delaySetupOverlay.active
+        || g_spectateConfirmOverlay.active;
 }
 
 void ResetLobbyChallengeNotificationState()
@@ -808,6 +857,7 @@ bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string*
     if (started)
     {
         ActivateJoiningOverlay(menuState.joinAddress.c_str(), menuState.joinPort);
+        g_joiningOverlay.spectateMode = true;
         mod::Log(
             "WaitToSpectate: started spectate session -> %s:%u",
             menuState.joinAddress.c_str(),
@@ -859,6 +909,7 @@ bool TryStartWaitToSpectateAtAddress(
     if (started)
     {
         ActivateJoiningOverlay(address, port);
+        g_joiningOverlay.spectateMode = true;
         mod::Log(
             "WaitToSpectate: started spectate session -> %s:%u",
             address,
@@ -883,12 +934,101 @@ bool TryStartWaitToSpectateAtAddress(
 namespace  // reopen anonymous namespace
 {
 
-void ActivateSpectateConfirmOverlay()
+bool IsHostNotYetPlayingSpectatePrompt()
+{
+    return g_spectateConfirmOverlay.promptKind
+        == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying);
+}
+
+void ActivateSpectateConfirmOverlay(int promptKind)
 {
     ResetSpectateConfirmOverlayState();
     g_spectateConfirmOverlay.active = true;
-    g_spectateConfirmOverlay.selectedOption = 0; // default to Yes
-    mod::Log("SpectateConfirmOverlay: activated");
+    g_spectateConfirmOverlay.promptKind = promptKind;
+    if (promptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+    {
+        g_spectateConfirmOverlay.optionCount = 3;
+        g_spectateConfirmOverlay.selectedOption = 1; // default to Wait
+    }
+    else
+    {
+        g_spectateConfirmOverlay.optionCount = 2;
+        g_spectateConfirmOverlay.selectedOption = 0; // default to Yes
+    }
+    mod::Log(
+        "SpectateConfirmOverlay: activated promptKind=%d optionCount=%d defaultSelection=%d",
+        g_spectateConfirmOverlay.promptKind,
+        g_spectateConfirmOverlay.optionCount,
+        g_spectateConfirmOverlay.selectedOption);
+}
+
+void CancelPendingSpectateConfirmSession(const char* reasonTag)
+{
+    ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
+    ClearPendingLobbySpectateWait(reasonTag);
+    DisarmSpectateReplayBypass();
+    netplay::bridge::CancelSession("user_cancel");
+    mod::Log(
+        "SpectateConfirmOverlay: canceled pending spectate reason='%s' -> SessionBridge user_cancel",
+        reasonTag != nullptr ? reasonTag : "");
+}
+
+bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
+{
+    (void)screenContext;
+    const std::string address = g_joiningOverlay.address;
+    const uint16_t port = g_joiningOverlay.port;
+    const bool displayTargetName = g_joiningOverlay.displayTargetName;
+    const std::string targetName = g_joiningOverlay.targetName;
+
+    ResetDelaySetupOverlayState();
+    ResetSpectateConfirmOverlayState();
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
+    ClearPendingLobbySpectateWait("spectate_prompt_join");
+    DisarmSpectateReplayBypass();
+    netplay::bridge::CancelSession("user_cancel");
+
+    const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
+    const bool started = netplay::bridge::StartSession(
+        NetbridgeRole::Join,
+        port,
+        address.c_str(),
+        g_netplayMenuState.nickname.c_str(),
+        writeNicknameToIni);
+    if (started)
+    {
+        ActivateJoiningOverlay(address.c_str(), port);
+        if (displayTargetName && !targetName.empty())
+        {
+            g_joiningOverlay.displayTargetName = true;
+            strncpy_s(g_joiningOverlay.targetName, sizeof(g_joiningOverlay.targetName), targetName.c_str(), _TRUNCATE);
+            g_joiningOverlay.targetName[sizeof(g_joiningOverlay.targetName) - 1] = '\0';
+        }
+        mod::Log(
+            "SpectateConfirmOverlay: restarting pending spectate as Join target=%s:%u started=1",
+            address.c_str(),
+            static_cast<unsigned>(port));
+        return true;
+    }
+
+    const auto status = netplay::bridge::GetStatus();
+    char text[256] = {};
+    std::snprintf(
+        text,
+        sizeof(text),
+        "Join start failed.\n\n%s",
+        status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+    SetNetplayStatusMessage(text);
+    mod::Log(
+        "SpectateConfirmOverlay: restarting pending spectate as Join failed target=%s:%u error='%s'",
+        address.c_str(),
+        static_cast<unsigned>(port),
+        status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+    return false;
 }
 
 bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
@@ -923,8 +1063,11 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
             {
                 const int oldOption = g_spectateConfirmOverlay.selectedOption;
                 int newOption = oldOption + step;
-                if (newOption < 0) newOption = 1;
-                if (newOption > 1) newOption = 0;
+                const int optionCount = (g_spectateConfirmOverlay.optionCount > 0)
+                    ? g_spectateConfirmOverlay.optionCount
+                    : 2;
+                if (newOption < 0) newOption = optionCount - 1;
+                if (newOption >= optionCount) newOption = 0;
                 if (newOption != oldOption)
                 {
                     g_spectateConfirmOverlay.selectedOption = newOption;
@@ -952,20 +1095,66 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
 
     if (cancelRequested)
     {
+        const int promptKind = g_spectateConfirmOverlay.promptKind;
         PlayUiSound(screenContext, kSfxConfirm);
-        ResetSpectateConfirmOverlayState();
-        netplay::bridge::AnswerSpectateConfirm(false);
-        netplay::bridge::CancelSession("spectate_declined");
-        mod::Log("SpectateConfirmOverlay: canceled (escape)");
+        CancelPendingSpectateConfirmSession("spectate_declined_escape");
+        mod::Log(
+            "SpectateConfirmOverlay: canceled via escape promptKind=%d",
+            promptKind);
         return true;
     }
 
     if (confirmRequested)
     {
-        const bool accepted = (g_spectateConfirmOverlay.selectedOption == 0); // 0 = Yes
         PlayUiSound(screenContext, kSfxConfirm);
 
-        const bool answered = netplay::bridge::AnswerSpectateConfirm(accepted);
+        if (IsHostNotYetPlayingSpectatePrompt())
+        {
+            const int selection = g_spectateConfirmOverlay.selectedOption;
+            if (selection == 0)
+            {
+                (void)RestartPendingSpectateSessionAsJoin(screenContext);
+                return true;
+            }
+            if (selection == 2)
+            {
+                CancelPendingSpectateConfirmSession("spectate_host_not_playing_cancel");
+                mod::Log("SpectateConfirmOverlay: canceled via menu choice=Cancel");
+                return true;
+            }
+
+            const int choice = 3; // Wait as spectator for the game to begin.
+            const bool answered = netplay::bridge::AnswerSpectatePromptChoice(choice);
+            if (!answered)
+            {
+                const auto status = netplay::bridge::GetStatus();
+                if (status.errorMsg[0] != '\0')
+                {
+                    std::snprintf(
+                        g_spectateConfirmOverlay.errorMessage,
+                        sizeof(g_spectateConfirmOverlay.errorMessage),
+                        "%s",
+                        status.errorMsg);
+                }
+                else
+                {
+                    std::snprintf(
+                        g_spectateConfirmOverlay.errorMessage,
+                        sizeof(g_spectateConfirmOverlay.errorMessage),
+                        "Failed to send answer");
+                }
+                mod::Log("SpectateConfirmOverlay: answer failed choice=%d promptKind=%d", choice, g_spectateConfirmOverlay.promptKind);
+                return true;
+            }
+
+            mod::Log("SpectateConfirmOverlay: answered choice=%d promptKind=%d", choice, g_spectateConfirmOverlay.promptKind);
+            ResetSpectateConfirmOverlayState();
+            return true;
+        }
+
+        const int choice = (g_spectateConfirmOverlay.selectedOption == 0) ? 1 : 2;
+
+        const bool answered = netplay::bridge::AnswerSpectatePromptChoice(choice);
         if (!answered)
         {
             const auto status = netplay::bridge::GetStatus();
@@ -984,16 +1173,16 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
                     sizeof(g_spectateConfirmOverlay.errorMessage),
                     "Failed to send answer");
             }
-            mod::Log("SpectateConfirmOverlay: answer failed accepted=%d", accepted ? 1 : 0);
+            mod::Log("SpectateConfirmOverlay: answer failed choice=%d", choice);
             return true;
         }
 
-        mod::Log("SpectateConfirmOverlay: answered accepted=%d", accepted ? 1 : 0);
+        mod::Log("SpectateConfirmOverlay: answered choice=%d", choice);
         ResetSpectateConfirmOverlayState();
 
-        if (!accepted)
+        if (choice == 2)
         {
-            netplay::bridge::CancelSession("spectate_declined");
+            CancelPendingSpectateConfirmSession("spectate_declined_confirm_no");
         }
         // If accepted, the session continues — Revival will proceed to delay
         // setup or straight to game. The normal delay/connected flow handles it.
@@ -1376,6 +1565,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
     state[kGameSystemOffsetMatchCounter] = 0;
     state[kGameSystemOffsetContinueFlag] = 0;
     state[kGameSystemOffsetStageSelection] = 0;
+    *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetStageAnimState) = 0;
+    *reinterpret_cast<uint16_t*>(gameSystem + kGameSystemOffsetStageAnim) = 0;
+    state[kGameSystemOffsetStageCursor] = 0;
 
     // Force the charselect screen object to re-initialise next time it
     // runs (reset cursor positions, cameras, selection state, unlock
@@ -1468,7 +1660,7 @@ void PrepareVsHumanGameState(uint32_t screenContext)
 
     mod::Log(
         "PrepareVsHumanGameState: mode=%u secondaryMode=%u replaySession=%u rounds=%u cpuFlags=%u/%u "
-        "wins=%u/%u match=%u continue=%u stage=%u",
+        "wins=%u/%u match=%u continue=%u stage=%u gameStageCursor=%u gameStageAnim=%u",
         static_cast<unsigned>(state[kGameSystemOffsetMode]),
         static_cast<unsigned>(state[kGameSystemOffsetSecondaryModeFlag]),
         static_cast<unsigned>(state[kGameSystemOffsetReplaySessionFlag]),
@@ -1479,7 +1671,9 @@ void PrepareVsHumanGameState(uint32_t screenContext)
         *reinterpret_cast<uint32_t*>(gameSystem + kGameSystemOffsetP2WinState),
         static_cast<unsigned>(state[kGameSystemOffsetMatchCounter]),
         static_cast<unsigned>(state[kGameSystemOffsetContinueFlag]),
-        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]));
+        static_cast<unsigned>(state[kGameSystemOffsetStageSelection]),
+        static_cast<unsigned>(state[kGameSystemOffsetStageCursor]),
+        static_cast<unsigned>(*reinterpret_cast<uint16_t*>(gameSystem + kGameSystemOffsetStageAnim)));
 }
 
 // ---------------------------------------------------------------------------
@@ -2255,11 +2449,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         break;
     case NetplayMenuAction::HostStart:
     {
+        const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
         const bool started = netplay::bridge::StartSession(
             NetbridgeRole::Host,
             g_netplayMenuState.hostPort,
             "",
-            g_netplayMenuState.nickname.c_str());
+            g_netplayMenuState.nickname.c_str(),
+            writeNicknameToIni);
         if (started)
         {
             ActivateHostingOverlay(g_netplayMenuState.hostPort);
@@ -2279,11 +2475,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     }
     case NetplayMenuAction::JoinConnect:
     {
+        const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
         const bool started = netplay::bridge::StartSession(
             NetbridgeRole::Join,
             g_netplayMenuState.joinPort,
             g_netplayMenuState.joinAddress.c_str(),
-            g_netplayMenuState.nickname.c_str());
+            g_netplayMenuState.nickname.c_str(),
+            writeNicknameToIni);
         if (started)
         {
             ActivateJoiningOverlay(
@@ -2497,11 +2695,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             g_lobbySession->AcceptChallenge(entry.playerId);
 
             // Connect to the challenger's address.
+            const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
             const bool started = netplay::bridge::StartSession(
                 NetbridgeRole::Join,
                 challengePort,
                 challengeAddr.c_str(),
-                g_netplayMenuState.nickname.c_str());
+                g_netplayMenuState.nickname.c_str(),
+                writeNicknameToIni);
             if (started)
             {
                 ActivateChallengeJoiningOverlay(entry.name.c_str(), challengeAddr.c_str(), challengePort);
@@ -2544,11 +2744,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 entry.name.c_str(), entry.playerId, ipPortBuf);
 
             // Start hosting first so we're ready to accept connections.
+            const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
             const bool started = netplay::bridge::StartSession(
                 NetbridgeRole::Host,
                 g_netplayMenuState.hostPort,
                 "",
-                g_netplayMenuState.nickname.c_str());
+                g_netplayMenuState.nickname.c_str(),
+                writeNicknameToIni);
             if (started)
             {
                 ActivateChallengeHostingOverlay(entry.name.c_str(), g_netplayMenuState.hostPort);
@@ -2611,6 +2813,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         inputBytes[17],
         inputBytes[19],
     };
+    const bool joinWaitToSpectatePressed = ConsumeJoinWaitToSpectateHotkeyEdge(inputBytes);
 
     auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection);
     auto* const inactivityCounter = reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter);
@@ -2809,6 +3012,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                         {
                             g_netplayMenuState.joinAddress = ipPart;
                             g_netplayMenuState.joinPort = static_cast<uint16_t>(parsedPort);
+                            SaveNetplayJoinAddressToIni();
                             PlayUiSound(screenContext, kSfxConfirm);
                             mod::Log("JoinPaste: pasted address='%s' port=%u from clipboard",
                                 ipPart.c_str(), static_cast<unsigned>(parsedPort));
@@ -2825,8 +3029,20 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 }
                 break;
             }
+        }
 
-            if (!debugMenuEnabled && inputBytes[playerIndex + 22] == 1)
+        if (!debugMenuEnabled && joinWaitToSpectatePressed)
+        {
+            if (IsTransientNetplayOverlayActive())
+            {
+                mod::Log(
+                    "WaitToSpectate: ignored Join D hotkey while transient overlay active joining=%d hosting=%d delay=%d spectateConfirm=%d",
+                    g_joiningOverlay.active ? 1 : 0,
+                    g_hostingOverlay.active ? 1 : 0,
+                    g_delaySetupOverlay.active ? 1 : 0,
+                    g_spectateConfirmOverlay.active ? 1 : 0);
+            }
+            else
             {
                 std::string errorMessage;
                 if (TryStartWaitToSpectateFromJoinSettings(screenContext, &errorMessage))
@@ -2865,6 +3081,76 @@ char UpdateNetplayMenu(uint32_t screenContext)
             g_lobbySession->NotifyEndMatch();
         }
     };
+    auto promoteTerminalBridgeFailureToJoiningOverlay = [&](const netplay::bridge::NetbridgeStatus& status, NetbridgePhase phase) {
+        if (g_joiningOverlay.active)
+        {
+            return;
+        }
+        if (!g_delaySetupOverlay.active && !g_spectateConfirmOverlay.active && !g_hostingOverlay.active)
+        {
+            return;
+        }
+
+        const bool hadDelayOverlay = g_delaySetupOverlay.active;
+        const bool hadSpectateConfirmOverlay = g_spectateConfirmOverlay.active;
+        const bool hadHostingOverlay = g_hostingOverlay.active;
+        const char* failureText =
+            status.errorMsg[0] != '\0'
+                ? status.errorMsg
+                : (phase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error");
+
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+        g_joiningOverlay.active = true;
+        g_joiningOverlay.failed = true;
+        strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText), failureText, _TRUNCATE);
+        g_joiningOverlay.errorText[sizeof(g_joiningOverlay.errorText) - 1] = '\0';
+
+        mod::Log(
+            "NetplayTerminal: promoted transient overlay to failure dialog phase=%s delay=%d spectateConfirm=%d hosting=%d error='%s'",
+            netplay::bridge::PhaseToString(phase),
+            hadDelayOverlay ? 1 : 0,
+            hadSpectateConfirmOverlay ? 1 : 0,
+            hadHostingOverlay ? 1 : 0,
+            g_joiningOverlay.errorText);
+    };
+    auto abortPendingTransitionIfSessionLost = [&](int nextState, const char* abortReason, bool disarmSpectateReplayBypass) {
+        const netplay::bridge::NetbridgeStatus latestStatus = netplay::bridge::GetStatus();
+        const NetbridgePhase latestPhase = static_cast<NetbridgePhase>(latestStatus.phase);
+        if (latestPhase == NetbridgePhase::Failed || latestPhase == NetbridgePhase::SessionEnded)
+        {
+            mod::Log(
+                "NetplayTransition: ABORT — bridge entered terminal phase=%s before state=%d error='%s', re-entering netplay menu",
+                netplay::bridge::PhaseToString(latestPhase),
+                nextState,
+                latestStatus.errorMsg[0] != '\0' ? latestStatus.errorMsg : "");
+            if (disarmSpectateReplayBypass)
+            {
+                DisarmSpectateReplayBypass();
+            }
+            netplay::bridge::CancelSession(abortReason);
+            notifyLobbySessionEndedForCurrentBridgeRole(true);
+            ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
+            return true;
+        }
+        if (!netplay::bridge::IsPeerProcessAlive())
+        {
+            mod::Log(
+                "NetplayTransition: ABORT — peer exited before state=%d, re-entering netplay menu",
+                nextState);
+            if (disarmSpectateReplayBypass)
+            {
+                DisarmSpectateReplayBypass();
+            }
+            netplay::bridge::CancelSession(abortReason);
+            notifyLobbySessionEndedForCurrentBridgeRole(true);
+            ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
+            return true;
+        }
+        return false;
+    };
 
     if (g_lobbySession && g_lobbySession->ConsumeAbandonedOutgoingChallenge())
     {
@@ -2884,6 +3170,11 @@ char UpdateNetplayMenu(uint32_t screenContext)
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         ++(*inactivityCounter);
         return 0;
+    }
+
+    if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
+    {
+        promoteTerminalBridgeFailureToJoiningOverlay(bridgeStatus, bridgePhase);
     }
 
     if (g_pendingLobbySpectateWait.active
@@ -2938,19 +3229,14 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            // Pre-flight: if the peer exited during the handoff/fade-out, abort
-            // the state transition.  Without this check, EFZ.exe's state-1 init
-            // calls the DLL rollback tick immediately, which fires ExitProcess on
-            // the main game thread where no setjmp recovery point is active.
-            if (!netplay::bridge::IsPeerProcessAlive())
+            // Pre-flight: if the helper died or the bridge already entered a
+            // terminal failure/session-ended phase during the handoff/fade-out,
+            // abort the state transition. Without this check, EFZ.exe's
+            // state-1 init calls the DLL rollback tick immediately, which can
+            // fire ExitProcess on the main game thread where no setjmp recovery
+            // point is active.
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -2968,16 +3254,74 @@ char UpdateNetplayMenu(uint32_t screenContext)
     //  - localInitApplied is set (aux auto-answered before overlay tracking,
     //    e.g. JoinSpectate from a lobby session).
     const bool spectateConfirmPending =
+        (bridgePhase == NetbridgePhase::Connecting
+            || bridgePhase == NetbridgePhase::DelaySetup
+            || bridgePhase == NetbridgePhase::Connected)
+        &&
         bridgeStatus.spectateConfirmPromptSerial > 0
         && bridgeStatus.spectateConfirmPromptServedSerial < bridgeStatus.spectateConfirmPromptSerial
         && bridgeStatus.localInitApplied == 0;
-    if (spectateConfirmPending && !g_spectateConfirmOverlay.active)
+    const bool autoJoinSpectatePrompt =
+        spectateConfirmPending
+        && bridgeStatus.role == static_cast<int>(NetbridgeRole::JoinSpectate)
+        && bridgeStatus.spectateConfirmPromptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostAlreadyPlaying);
+    if (autoJoinSpectatePrompt)
     {
-        ActivateSpectateConfirmOverlay();
+        const uint64_t promptFingerprint =
+            (static_cast<uint64_t>(bridgeStatus.processId) << 32)
+            | static_cast<uint32_t>(bridgeStatus.spectateConfirmPromptSerial);
+        if (g_lastAutoAnsweredSpectatePromptFingerprint != promptFingerprint)
+        {
+            const bool answered = netplay::bridge::AnswerSpectatePromptChoice(1);
+            mod::Log(
+                "JoinSpectate: auto-answering host-already-playing prompt with Yes result=%d promptSerial=%d pid=%u",
+                answered ? 1 : 0,
+                bridgeStatus.spectateConfirmPromptSerial,
+                static_cast<unsigned>(bridgeStatus.processId));
+            if (answered)
+            {
+                g_lastAutoAnsweredSpectatePromptFingerprint = promptFingerprint;
+            }
+        }
     }
+    if (spectateConfirmPending
+        && !autoJoinSpectatePrompt
+        && !g_spectateConfirmOverlay.active)
+    {
+        ActivateSpectateConfirmOverlay(bridgeStatus.spectateConfirmPromptKind);
+    }
+
+    const bool joiningOverlayShouldShowWaitForGameBegin =
+        g_joiningOverlay.active
+        && g_joiningOverlay.spectateMode
+        && bridgePhase == NetbridgePhase::Connecting
+        && bridgeStatus.spectateConfirmPromptKind
+            == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying)
+        && bridgeStatus.spectateConfirmPromptSerial > 0
+        && bridgeStatus.spectateConfirmPromptServedSerial >= bridgeStatus.spectateConfirmPromptSerial;
+    if (g_joiningOverlay.waitingForGameBegin != joiningOverlayShouldShowWaitForGameBegin)
+    {
+        g_joiningOverlay.waitingForGameBegin = joiningOverlayShouldShowWaitForGameBegin;
+        mod::Log(
+            "JoiningOverlay: waiting_for_game_begin=%d phase=%s promptSerial=%d served=%d role=%d",
+            g_joiningOverlay.waitingForGameBegin ? 1 : 0,
+            netplay::bridge::PhaseToString(bridgePhase),
+            bridgeStatus.spectateConfirmPromptSerial,
+            bridgeStatus.spectateConfirmPromptServedSerial,
+            bridgeStatus.role);
+    }
+
     if (g_spectateConfirmOverlay.active)
     {
-        if (!spectateConfirmPending)
+        if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
+        {
+            mod::Log(
+                "SpectateConfirmOverlay: dismissed due to terminal bridge phase=%s error='%s'",
+                netplay::bridge::PhaseToString(bridgePhase),
+                bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "");
+            ResetSpectateConfirmOverlayState();
+        }
+        else if (!spectateConfirmPending)
         {
             // Prompt was resolved externally (aux auto-answer / init applied).
             // Dismiss the overlay so it doesn't block the handoff.
@@ -3036,16 +3380,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition", true))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT — peer exited before spectate state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                DisarmSpectateReplayBypass();
-                netplay::bridge::CancelSession("peer_died_before_spectate_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_spectate_transition");
                 return 0;
             }
             mod::Log(
@@ -3164,17 +3500,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 const int nextState = g_pendingGlobalStateTransition;
                 g_pendingGlobalStateTransition = -1;
-                if (!netplay::bridge::IsPeerProcessAlive())
+                if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
                 {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
-                return 0;
-            }
+                    return 0;
+                }
                 mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
                 return static_cast<char>(nextState);
             }
@@ -3186,15 +3515,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT \u2014 peer exited before state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3224,15 +3546,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (!netplay::bridge::IsPeerProcessAlive())
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
             {
-                mod::Log(
-                    "NetplayTransition: ABORT — peer exited before auto-handoff state=%d, "
-                    "re-entering netplay menu",
-                    nextState);
-                netplay::bridge::CancelSession("peer_died_before_transition");
-                notifyLobbySessionEndedForCurrentBridgeRole(true);
-                ReenterNetplayMenuAfterSessionAbort(screenContext, "peer_died_before_transition");
                 return 0;
             }
             mod::Log("NetplayTransition: returning global state=%d from netplay menu", nextState);
@@ -3299,6 +3614,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         ResetJoiningOverlayState();
         ClearPendingLobbySpectateWait("session_ended");
         DisarmSpectateReplayBypass();
+        if (bridgeStatus.errorMsg[0] != '\0')
+        {
+            SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);
+        }
         netplay::bridge::CancelSession("no_overlay_session_ended");
         notifyLobbySessionEndedForCurrentBridgeRole(false);
     }
@@ -3311,6 +3630,16 @@ char UpdateNetplayMenu(uint32_t screenContext)
             if (inputBytes[playerIndex + 18] == 1)
             {
                 cancelRequested = true;
+                break;
+            }
+            if (g_joiningOverlay.active && inputBytes[playerIndex + 22] == 1)
+            {
+                cancelRequested = true;
+                mod::Log(
+                    "JoiningOverlay: D/back pressed during active connect flow player=%d roleFlag=%d phase=%s",
+                    playerIndex,
+                    bridgeStatus.roleFlag,
+                    netplay::bridge::PhaseToString(bridgePhase));
                 break;
             }
         }

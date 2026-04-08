@@ -1,6 +1,7 @@
 // Console I/O text capture and delay prompt parsing for the Revival takeover.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/mod_settings.h"
 
 #include <algorithm>
 #include <cctype>
@@ -559,17 +560,42 @@ void NoteConsolePromptLine(const std::string& text)
         return;
     }
 
-    const bool isSpectateConfirmPrompt =
+    const bool isJoinAsSpectatorPrompt =
         ContainsCaseInsensitive(text, "Host already playing, join as a spectator");
-
-    if (isSpectateConfirmPrompt)
+    if (isJoinAsSpectatorPrompt)
     {
         const LONG serial = InterlockedIncrement(&g_injectedSpectateConfirmPromptSerial);
-        PublishSpectateConfirmPromptSerial(serial);
+        PublishSpectateConfirmPromptSerial(
+            serial,
+            static_cast<int>(NetbridgeSpectatePromptKind::HostAlreadyPlaying));
         g_injectedSpectateConfirmPromptWaitStartTick = GetTickCount();
         mod::Log(
-            "Takeover: console prompt detected type=spectate_confirm serial=%ld text='%s'",
+            "Takeover: console prompt detected type=join_as_spectator serial=%ld text='%s'",
             static_cast<long>(serial),
+            text.c_str());
+        return;
+    }
+
+    const bool isHostNotYetPlayingPrompt =
+        ContainsCaseInsensitive(text, "Host not yet playing, join as a player");
+    if (isHostNotYetPlayingPrompt)
+    {
+        const LONG serial = InterlockedIncrement(&g_injectedSpectateConfirmPromptSerial);
+        PublishSpectateConfirmPromptSerial(
+            serial,
+            static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying));
+        g_injectedSpectateConfirmPromptWaitStartTick = GetTickCount();
+        mod::Log(
+            "Takeover: console prompt detected type=host_not_yet_playing serial=%ld text='%s'",
+            static_cast<long>(serial),
+            text.c_str());
+        return;
+    }
+
+    if (ContainsCaseInsensitive(text, "Waiting for game to begin"))
+    {
+        mod::Log(
+            "Takeover: console state detected type=waiting_for_game_begin text='%s'",
             text.c_str());
         return;
     }
@@ -580,6 +606,26 @@ void NoteConsolePromptLine(const std::string& text)
 
     if (!isDelayPrompt)
     {
+        static DWORD s_lastUnknownSpectateConsoleLogTick = 0;
+        static std::string s_lastUnknownSpectateConsoleLine;
+        const DWORD now = GetTickCount();
+        const bool spectateConsoleActive =
+            g_revivalProcess != nullptr
+            && g_hostBlock != nullptr
+            && g_hostBlock->initParams[0] == kLocalRoleSpectate;
+        const bool shouldLogUnknownSpectateLine =
+            spectateConsoleActive
+            && (!s_lastUnknownSpectateConsoleLine.empty()
+                ? s_lastUnknownSpectateConsoleLine != text || now - s_lastUnknownSpectateConsoleLogTick >= 3000
+                : true);
+        if (shouldLogUnknownSpectateLine)
+        {
+            s_lastUnknownSpectateConsoleLogTick = now;
+            s_lastUnknownSpectateConsoleLine = text;
+            mod::Log(
+                "Takeover: spectate console raw line='%s'",
+                text.c_str());
+        }
         return;
     }
 
@@ -682,6 +728,76 @@ bool IsLikelyRevivalDiskLogPath(const std::string& path)
     return looksRevivalOwned || looksTextFile;
 }
 
+bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath)
+{
+    if (outPath == nullptr || hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    SetLastError(NO_ERROR);
+    const DWORD fileType = GetFileType(hFile);
+    if (fileType != FILE_TYPE_DISK)
+    {
+        return false;
+    }
+
+    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleA)(HANDLE, LPSTR, DWORD, DWORD);
+    static PFN_GetFinalPathNameByHandleA s_pfnGetFinalPath = []() -> PFN_GetFinalPathNameByHandleA {
+        HMODULE kernel = GetModuleHandleA("kernel32.dll");
+        return kernel
+            ? reinterpret_cast<PFN_GetFinalPathNameByHandleA>(GetProcAddress(kernel, "GetFinalPathNameByHandleA"))
+            : nullptr;
+    }();
+
+    if (s_pfnGetFinalPath == nullptr)
+    {
+        return false;
+    }
+
+    char path[1024] = {};
+    const DWORD pathLen = s_pfnGetFinalPath(
+        hFile,
+        path,
+        static_cast<DWORD>(sizeof(path)),
+        FILE_NAME_NORMALIZED);
+    if (pathLen == 0 || pathLen >= sizeof(path))
+    {
+        return false;
+    }
+
+    *outPath = std::string(path, pathLen);
+    return true;
+}
+
+bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
+{
+    std::string pathText;
+    if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
+    {
+        return false;
+    }
+
+    std::string lowerPath = pathText;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    const size_t slash = lowerPath.find_last_of("\\/");
+    const std::string baseName = (slash == std::string::npos) ? lowerPath : lowerPath.substr(slash + 1);
+    if (baseName != "logefz.txt")
+    {
+        return false;
+    }
+
+    if (outPath != nullptr)
+    {
+        *outPath = pathText;
+    }
+    return true;
+}
+
+static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line);
+
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
 {
     if (sourceTag == nullptr)
@@ -719,6 +835,14 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         if (trimmed.empty())
         {
             return;
+        }
+        // logEfz.txt is a host-process disk log. Do not let helper console
+        // prompt/output capture create or overwrite that file.
+        if (!IsCurrentProcessRevival()
+            && sourceTag != nullptr
+            && std::strcmp(sourceTag, "WriteFileDisk") == 0)
+        {
+            AppendOwnedLogEfzLine(sourceTag, trimmed);
         }
         // Parse workflow signals (delay prompt, spectate confirm, peer died)
         // but don't echo Revival's debug text into the mod log — Revival
@@ -758,18 +882,25 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     }
 
     // Revival writes characters without newlines via WriteConsoleOutputCharacterW
-    // (newlines are cursor moves only).  Check for known error keywords in the
-    // partially-accumulated buffer and flush immediately so the error is
-    // published to IPC before Revival blocks in system("pause").
+    // (newlines are cursor moves only). Check for known workflow/error keywords
+    // in the partially-accumulated buffer and flush immediately so prompts and
+    // failures are visible to the bridge without waiting for a newline.
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
-        static const char* kErrorKeywords[] = {
+        static const char* kImmediateFlushKeywords[] = {
             "Connection timed out",
             "Source quit or timed out",
+            "Host timed out",
+            "Remote timed out",
             "Spectators have been disabled",
             "Socket error",
+            "Host already playing, join as a spectator",
+            "Host not yet playing, join as a player",
+            "Waiting for game to begin",
+            "Enter the initial input delay",
+            "Enter the input delay to use",
         };
-        for (const char* kw : kErrorKeywords)
+        for (const char* kw : kImmediateFlushKeywords)
         {
             if (line->find(kw) != std::string::npos)
             {
@@ -821,92 +952,605 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
 }
 
 // ---------------------------------------------------------------------------
-// logEfz mirror capture — saves a clean copy of Revival's disk log output.
+// Managed logEfz capture — host-side ownership of the actual EFZ disk log.
 //
-// Revival's logEfz.txt can become corrupted with large NUL-byte blocks
-// (e.g. 786KB of 0x00 at offset 0) when the process is killed while the
-// DLL's std::ofstream still has unflushed data.  We intercept every
-// WriteFile call to the logEfz path and mirror the data (stripping NUL
-// bytes) to our own clean file in the logs/ directory.
+// Rather than trying to repair a corrupted native logEfz.txt after the fact,
+// we capture the host process's intercepted disk writes and append them to a
+// single clean root logEfz.txt. Each init session writes a clear separator so
+// the file remains readable across reconnects/restarts.
 // ---------------------------------------------------------------------------
-static std::mutex g_mirrorMutex;
-static FILE* g_mirrorLogEfzFile = nullptr;
-static bool g_mirrorLogEfzAnnounced = false;
+static std::mutex g_ownedLogEfzMutex;
+static HANDLE g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
+static std::string g_ownedLogEfzCurrentPath;
+static std::string g_ownedLogEfzHistory;
+static std::string g_ownedLogEfzHistoryPath;
+static bool g_ownedLogEfzHistoryPrimed = false;
+static uint32_t g_ownedLogEfzSessionOrdinal = 0;
+static bool g_ownedLogEfzPrimedForProcess = false;
 
-static FILE* GetOrOpenMirrorLogEfz()
+static unsigned long long QueryExistingOwnedLogEfzSize(const std::string& path, bool* outExists)
 {
-    if (g_mirrorLogEfzFile != nullptr)
-        return g_mirrorLogEfzFile;
+    if (outExists != nullptr)
+    {
+        *outExists = false;
+    }
 
-    // Place mirror file next to the DLL module (same dir as efz_netplay_mod.log).
+    if (path.empty())
+    {
+        return 0;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs))
+    {
+        return 0;
+    }
+    if ((attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        return 0;
+    }
+
+    if (outExists != nullptr)
+    {
+        *outExists = true;
+    }
+
+    return (static_cast<unsigned long long>(attrs.nFileSizeHigh) << 32)
+        | static_cast<unsigned long long>(attrs.nFileSizeLow);
+}
+
+static void LogOwnedLogEfzIntegrityIssue(
+    const char* outcome,
+    const std::string& path,
+    const char* detail)
+{
+    if (outcome == nullptr || outcome[0] == '\0')
+    {
+        outcome = "unknown";
+    }
+
+    if (detail != nullptr && detail[0] != '\0')
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s' %s",
+            outcome,
+            path.c_str(),
+            detail);
+    }
+    else
+    {
+        mod::Log(
+            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s'",
+            outcome,
+            path.c_str());
+    }
+}
+
+static std::string GetConsoleCaptureModuleDirectory()
+{
     char modulePath[MAX_PATH] = {};
     HMODULE selfModule = nullptr;
     GetModuleHandleExA(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&GetOrOpenMirrorLogEfz),
+        reinterpret_cast<LPCSTR>(&GetConsoleCaptureModuleDirectory),
         &selfModule);
-    if (selfModule != nullptr)
+    if (selfModule == nullptr || GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0)
     {
-        GetModuleFileNameA(selfModule, modulePath, MAX_PATH);
+        return {};
     }
 
     std::string dir(modulePath);
     const size_t slash = dir.find_last_of("\\/");
-    if (slash != std::string::npos)
-        dir.resize(slash + 1);
-    else
-        dir = ".\\";
-
-    // Create logs subdirectory if needed.
-    std::string logsDir = dir + "logs";
-    CreateDirectoryA(logsDir.c_str(), nullptr);
-
-    std::string mirrorPath = logsDir + "\\logEfz_mirror.txt";
-    g_mirrorLogEfzFile = _fsopen(mirrorPath.c_str(), "a", _SH_DENYNO);
-    if (g_mirrorLogEfzFile != nullptr && !g_mirrorLogEfzAnnounced)
+    if (slash == std::string::npos)
     {
-        g_mirrorLogEfzAnnounced = true;
-        mod::Log("MIRROR: opened logEfz mirror file '%s'", mirrorPath.c_str());
+        return {};
     }
-    return g_mirrorLogEfzFile;
+    dir.resize(slash);
+    return dir;
 }
 
-static void MirrorRevivalDiskWrite(const char* text, size_t length)
+static std::string ParentDirectory(const std::string& path)
 {
-    std::lock_guard<std::mutex> lock(g_mirrorMutex);
-    FILE* f = GetOrOpenMirrorLogEfz();
-    if (f == nullptr)
-        return;
-
-    // Write data, stripping NUL bytes that cause the corruption pattern.
-    for (size_t i = 0; i < length; ++i)
+    if (path.empty())
     {
-        if (text[i] != '\0')
-            fputc(text[i], f);
+        return {};
     }
-    fflush(f);
+
+    const size_t slash = path.find_last_of("\\/");
+    if (slash != std::string::npos)
+    {
+        return path.substr(0, slash);
+    }
+    return {};
 }
+
+static std::string GetOwnedLogEfzPath()
+{
+    const std::string modDir = GetConsoleCaptureModuleDirectory();
+    if (modDir.empty())
+    {
+        return {};
+    }
+
+    const std::string modsDir = ParentDirectory(modDir);
+    const std::string gameRoot = ParentDirectory(modsDir.empty() ? modDir : modsDir);
+    const std::string rootDir = gameRoot.empty() ? modDir : gameRoot;
+    return rootDir + "\\logEfz.txt";
+}
+
+static std::string FormatOwnedLogEfzTimestamp()
+{
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+
+    char buffer[64] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned>(st.wMilliseconds));
+
+    return buffer;
+}
+
+static bool WriteOwnedLogEfzBytes(
+    const std::string& path,
+    const char* reason,
+    const char* data,
+    size_t size)
+{
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE || data == nullptr || size == 0)
+    {
+        return true;
+    }
+
+    const DWORD requested = static_cast<DWORD>(size);
+    DWORD written = 0;
+    SetLastError(NO_ERROR);
+    const BOOL writeOk = WriteFile(
+        g_ownedLogEfzCurrentHandle,
+        data,
+        requested,
+        &written,
+        nullptr);
+    const DWORD writeError = GetLastError();
+    if (!writeOk || written != requested)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s short_write requested=%lu written=%lu winerr=%lu ok=%d",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(size),
+            static_cast<unsigned long>(written),
+            static_cast<unsigned long>(writeError),
+            writeOk ? 1 : 0);
+        LogOwnedLogEfzIntegrityIssue("short_write", path, detail);
+        return false;
+    }
+
+    return true;
+}
+
+static void CloseOwnedLogEfzCurrentFileLocked(const char* reason)
+{
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    const HANDLE handle = g_ownedLogEfzCurrentHandle;
+    g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
+
+    SetLastError(NO_ERROR);
+    const BOOL flushOk = FlushFileBuffers(handle);
+    const DWORD flushError = GetLastError();
+    SetLastError(NO_ERROR);
+    const BOOL closeOk = CloseHandle(handle);
+    const DWORD closeError = GetLastError();
+
+    if (!flushOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_flush_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(flushError));
+        LogOwnedLogEfzIntegrityIssue("close_flush_failed", g_ownedLogEfzCurrentPath, detail);
+    }
+
+    if (!closeOk)
+    {
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=%s close_failed winerr=%lu",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(closeError));
+        LogOwnedLogEfzIntegrityIssue("close_failed", g_ownedLogEfzCurrentPath, detail);
+    }
+}
+
+static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
+{
+    const std::string timestamp = FormatOwnedLogEfzTimestamp();
+
+    char buffer[256] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "============================================================\r\n"
+        "SESSION %lu  start=%s  pid=%lu\r\n"
+        "============================================================\r\n"
+        "\r\n",
+        static_cast<unsigned long>(sessionOrdinal),
+        timestamp.c_str(),
+        static_cast<unsigned long>(GetCurrentProcessId()));
+
+    return buffer;
+}
+
+static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
+{
+    if (path.empty())
+    {
+        return;
+    }
+
+    if (g_ownedLogEfzHistoryPrimed && _stricmp(g_ownedLogEfzHistoryPath.c_str(), path.c_str()) == 0)
+    {
+        return;
+    }
+
+    const bool preserveAcrossLaunches = netplay::mod_settings::PreserveRevivalLogsAcrossLaunches();
+    const bool firstPrimeThisProcess = !g_ownedLogEfzPrimedForProcess;
+    bool previousExists = false;
+    const unsigned long long previousBytes = QueryExistingOwnedLogEfzSize(path, &previousExists);
+
+    if (firstPrimeThisProcess && !preserveAcrossLaunches)
+    {
+        g_ownedLogEfzHistory.clear();
+        g_ownedLogEfzHistoryPath = path;
+        g_ownedLogEfzHistoryPrimed = true;
+        g_ownedLogEfzPrimedForProcess = true;
+
+        mod::Log(
+            "CAPTURE_LOG: starting fresh managed logEfz current='%s' preserveAcrossLaunches=0 previousExists=%d previousBytes=%llu",
+            path.c_str(),
+            previousExists ? 1 : 0,
+            previousBytes);
+        return;
+    }
+
+    g_ownedLogEfzHistory.clear();
+    FILE* file = _fsopen(path.c_str(), "rb", _SH_DENYNO);
+    if (file != nullptr)
+    {
+        if (std::fseek(file, 0, SEEK_END) == 0)
+        {
+            const long size = std::ftell(file);
+            if (size > 0 && std::fseek(file, 0, SEEK_SET) == 0)
+            {
+                g_ownedLogEfzHistory.resize(static_cast<size_t>(size));
+                const size_t read = std::fread(
+                    g_ownedLogEfzHistory.data(),
+                    1,
+                    g_ownedLogEfzHistory.size(),
+                    file);
+                if (read != g_ownedLogEfzHistory.size())
+                {
+                    char detail[256] = {};
+                    std::snprintf(
+                        detail,
+                        sizeof(detail),
+                        "requested=%lu read=%lu",
+                        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                        static_cast<unsigned long>(read));
+                    LogOwnedLogEfzIntegrityIssue("prime_short_read", path, detail);
+                }
+                g_ownedLogEfzHistory.resize(read);
+            }
+        }
+        std::fclose(file);
+    }
+
+    if (!g_ownedLogEfzHistory.empty())
+    {
+        const size_t bytesBefore = g_ownedLogEfzHistory.size();
+        const size_t firstNonNul = g_ownedLogEfzHistory.find_first_not_of('\0');
+        if (firstNonNul == std::string::npos)
+        {
+            mod::Log(
+                "CAPTURE_LOG: discarded all-zero managed logEfz history current='%s' bytes=%lu",
+                path.c_str(),
+                static_cast<unsigned long>(bytesBefore));
+            char detail[256] = {};
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "reason=all_zero_history bytesDiscarded=%lu",
+                static_cast<unsigned long>(bytesBefore));
+            LogOwnedLogEfzIntegrityIssue("discarded_history", path, detail);
+            g_ownedLogEfzHistory.clear();
+        }
+        else
+        {
+            size_t trimmedLeadingNuls = 0;
+            if (firstNonNul > 0)
+            {
+                trimmedLeadingNuls = firstNonNul;
+                g_ownedLogEfzHistory.erase(0, firstNonNul);
+            }
+
+            const auto newEnd = std::remove(g_ownedLogEfzHistory.begin(), g_ownedLogEfzHistory.end(), '\0');
+            const size_t removedEmbeddedNuls =
+                static_cast<size_t>(g_ownedLogEfzHistory.end() - newEnd);
+            g_ownedLogEfzHistory.erase(newEnd, g_ownedLogEfzHistory.end());
+
+            if (trimmedLeadingNuls > 0 || removedEmbeddedNuls > 0)
+            {
+                mod::Log(
+                    "CAPTURE_LOG: sanitized managed logEfz history current='%s' bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+                    path.c_str(),
+                    static_cast<unsigned long>(bytesBefore),
+                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                    static_cast<unsigned long>(trimmedLeadingNuls),
+                    static_cast<unsigned long>(removedEmbeddedNuls));
+                char detail[320] = {};
+                std::snprintf(
+                    detail,
+                    sizeof(detail),
+                    "reason=nul_sanitized bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
+                    static_cast<unsigned long>(bytesBefore),
+                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+                    static_cast<unsigned long>(trimmedLeadingNuls),
+                    static_cast<unsigned long>(removedEmbeddedNuls));
+                LogOwnedLogEfzIntegrityIssue("history_sanitized", path, detail);
+            }
+        }
+    }
+
+    g_ownedLogEfzHistoryPath = path;
+    g_ownedLogEfzHistoryPrimed = true;
+    g_ownedLogEfzPrimedForProcess = true;
+
+    mod::Log(
+        "CAPTURE_LOG: primed managed logEfz history current='%s' bytes=%lu",
+        path.c_str(),
+        static_cast<unsigned long>(g_ownedLogEfzHistory.size()));
+}
+
+static bool EnsureOwnedLogEfzFilesOpenLocked()
+{
+    if (g_ownedLogEfzCurrentHandle != INVALID_HANDLE_VALUE)
+    {
+        return true;
+    }
+
+    g_ownedLogEfzCurrentPath = GetOwnedLogEfzPath();
+    if (g_ownedLogEfzCurrentPath.empty())
+    {
+        return false;
+    }
+
+    PrimeOwnedLogEfzHistoryLocked(g_ownedLogEfzCurrentPath);
+    g_ownedLogEfzCurrentHandle = CreateFileA(
+        g_ownedLogEfzCurrentPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
+    {
+        mod::Log(
+            "CAPTURE_LOG: failed to open managed logEfz current='%s'",
+            g_ownedLogEfzCurrentPath.c_str());
+        char detail[256] = {};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "reason=rebuild_open_failed winerr=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        LogOwnedLogEfzIntegrityIssue("open_failed", g_ownedLogEfzCurrentPath, detail);
+        g_ownedLogEfzCurrentPath.clear();
+        return false;
+    }
+
+    if (!g_ownedLogEfzHistory.empty())
+    {
+        if (!WriteOwnedLogEfzBytes(
+                g_ownedLogEfzCurrentPath,
+                "rebuild_history",
+                g_ownedLogEfzHistory.data(),
+                g_ownedLogEfzHistory.size()))
+        {
+            CloseOwnedLogEfzCurrentFileLocked("rebuild_history_failed");
+            return false;
+        }
+    }
+
+    const uint32_t sessionOrdinal = g_ownedLogEfzSessionOrdinal + 1;
+    const std::string header = BuildOwnedLogEfzHeader(sessionOrdinal);
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "session_header",
+            header.data(),
+            header.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("session_header_failed");
+        return false;
+    }
+
+    g_ownedLogEfzSessionOrdinal = sessionOrdinal;
+    g_ownedLogEfzHistory.append(header);
+
+    mod::Log(
+        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu preserveAcrossLaunches=%d",
+        g_ownedLogEfzCurrentPath.c_str(),
+        static_cast<unsigned long>(g_ownedLogEfzSessionOrdinal),
+        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+        netplay::mod_settings::PreserveRevivalLogsAcrossLaunches() ? 1 : 0);
+    return true;
+}
+
+static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line)
+{
+    if (line.empty())
+    {
+        return;
+    }
+
+    // --- Timing guard: detect slow logEfz appends -------------------------
+    LARGE_INTEGER appendQpcStart = {};
+    QueryPerformanceCounter(&appendQpcStart);
+
+    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
+    if (!EnsureOwnedLogEfzFilesOpenLocked())
+    {
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+
+    char prefix[96] = {};
+    std::snprintf(
+        prefix,
+        sizeof(prefix),
+        "[%02u:%02u:%02u.%03u][%s] ",
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned>(st.wMilliseconds),
+        sourceTag != nullptr ? sourceTag : "unknown");
+
+    std::string entry(prefix);
+    entry.append(line);
+    entry.append("\r\n");
+    g_ownedLogEfzHistory.append(entry);
+
+    // Cap the in-memory history to prevent unbounded growth over long
+    // sessions.  When the cap is exceeded, discard the oldest half of the
+    // buffer.  The disk file is **not** truncated — only the in-memory
+    // history used for session-rebuild is pruned.
+    static constexpr size_t kHistoryCapBytes = 2u * 1024u * 1024u; // 2 MB
+    if (g_ownedLogEfzHistory.size() > kHistoryCapBytes)
+    {
+        const size_t oldSize = g_ownedLogEfzHistory.size();
+        const size_t trimTo = kHistoryCapBytes / 2;
+        const size_t eraseBytes = oldSize - trimTo;
+        // Find the next newline after the erase point to keep lines intact.
+        size_t newlinePos = g_ownedLogEfzHistory.find('\n', eraseBytes);
+        if (newlinePos != std::string::npos && newlinePos + 1 < oldSize)
+            g_ownedLogEfzHistory.erase(0, newlinePos + 1);
+        else
+            g_ownedLogEfzHistory.erase(0, eraseBytes);
+        mod::Log(
+            "CAPTURE_LOG: pruned logEfz history %lu -> %lu bytes (cap=%lu)",
+            static_cast<unsigned long>(oldSize),
+            static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
+            static_cast<unsigned long>(kHistoryCapBytes));
+    }
+
+    if (!WriteOwnedLogEfzBytes(
+            g_ownedLogEfzCurrentPath,
+            "append_entry",
+            entry.data(),
+            entry.size()))
+    {
+        CloseOwnedLogEfzCurrentFileLocked("append_entry_failed");
+    }
+
+    // --- End timing guard ---------------------------------------------------
+    {
+        static uint32_t s_appendSlowCount = 0;
+        LARGE_INTEGER appendQpcEnd = {}, freq = {};
+        QueryPerformanceCounter(&appendQpcEnd);
+        QueryPerformanceFrequency(&freq);
+        const double elapsedMs =
+            static_cast<double>(appendQpcEnd.QuadPart - appendQpcStart.QuadPart)
+            * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (elapsedMs > 5.0)
+        {
+            ++s_appendSlowCount;
+            if (s_appendSlowCount <= 5 || (s_appendSlowCount % 500 == 0))
+            {
+                mod::Log(
+                    "PERF_WARN: AppendOwnedLogEfzLine took %.1fms "
+                    "(slowCount=%u) — logEfz disk write stalling",
+                    elapsedMs, s_appendSlowCount);
+            }
+        }
+    }
+}
+
+static void ResetLogEfzDiskHandleCache(); // forward declaration
 
 void CloseMirrorLogFiles()
 {
-    std::lock_guard<std::mutex> lock(g_mirrorMutex);
-    if (g_mirrorLogEfzFile != nullptr)
+    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
+    CloseOwnedLogEfzCurrentFileLocked("close_mirror_logs");
+
+    if (!g_ownedLogEfzCurrentPath.empty())
     {
-        fflush(g_mirrorLogEfzFile);
-        fclose(g_mirrorLogEfzFile);
-        g_mirrorLogEfzFile = nullptr;
-        mod::Log("MIRROR: closed logEfz mirror file");
+        mod::Log(
+            "CAPTURE_LOG: closed managed logEfz current='%s'",
+            g_ownedLogEfzCurrentPath.c_str());
     }
-    g_mirrorLogEfzAnnounced = false;
+
+    g_ownedLogEfzCurrentPath.clear();
+    ResetLogEfzDiskHandleCache();
+}
+
+void PrimeManagedLogEfzHistory()
+{
+    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
+    PrimeOwnedLogEfzHistoryLocked(GetOwnedLogEfzPath());
+}
+
+void BeginManagedLogEfzWrite()
+{
+}
+
+void EndManagedLogEfzWrite()
+{
+}
+
+bool IsManagedLogEfzWriteActive()
+{
+    return false;
+}
+
+// --- Handle cache for logEfz disk writes --------------------------------
+// GetFileType + TryGetDiskFilePathFromHandle are expensive to call on every
+// WriteFile invocation.  Once we've identified a handle as the logEfz disk
+// file, cache it and skip the path resolution on subsequent calls.  Reset
+// when the managed log session is closed (file handle may change).
+static HANDLE g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
+
+static void ResetLogEfzDiskHandleCache()
+{
+    g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
+    g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
 }
 
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
 {
     if (lpBuffer == nullptr || nBytes == 0)
-    {
-        return;
-    }
-    if (!CaptureRevivalNativeLogsEnabled())
     {
         return;
     }
@@ -918,6 +1562,17 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
         return;
     }
 
+    // Fast path: if we already identified this handle, skip expensive checks.
+    if (hFile == g_cachedLogEfzDiskHandle)
+    {
+        LogConsoleTextChunk("WriteFileDisk", text, textLen);
+        return;
+    }
+    if (hFile == g_cachedNonLogDiskHandle)
+    {
+        return; // Known non-logEfz disk handle, skip entirely.
+    }
+
     // Console output can flow through redirected handles (pipes/unknown).
     // Keep console/pipe traffic visible, and selectively forward disk-backed
     // Revival text logs without enabling noisy binary file dumps.
@@ -925,39 +1580,20 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
     const DWORD fileType = GetFileType(hFile);
     if (fileType == FILE_TYPE_DISK)
     {
-        // GetFinalPathNameByHandleA is Vista+ (not available on XP).
-        // Resolve it at runtime so the binary links on XP but still uses
-        // the API on newer systems where it exists.
-        typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleA)(HANDLE, LPSTR, DWORD, DWORD);
-        static PFN_GetFinalPathNameByHandleA s_pfnGetFinalPath = []() -> PFN_GetFinalPathNameByHandleA {
-            HMODULE kernel = GetModuleHandleA("kernel32.dll");
-            return kernel
-                ? reinterpret_cast<PFN_GetFinalPathNameByHandleA>(GetProcAddress(kernel, "GetFinalPathNameByHandleA"))
-                : nullptr;
-        }();
-
-        if (s_pfnGetFinalPath == nullptr)
+        std::string pathText;
+        if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
         {
-            // Running on XP — cannot resolve disk paths, skip disk capture.
+            g_cachedNonLogDiskHandle = hFile;
             return;
         }
-
-        char path[1024] = {};
-        const DWORD pathLen = s_pfnGetFinalPath(
-            hFile,
-            path,
-            static_cast<DWORD>(sizeof(path)),
-            FILE_NAME_NORMALIZED);
-        if (pathLen == 0 || pathLen >= sizeof(path))
-        {
-            return;
-        }
-
-        const std::string pathText(path, pathLen);
         if (!IsLikelyRevivalDiskLogPath(pathText))
         {
+            g_cachedNonLogDiskHandle = hFile;
             return;
         }
+
+        // Cache this as the logEfz handle for fast-path on subsequent calls.
+        g_cachedLogEfzDiskHandle = hFile;
 
         bool announcePath = false;
         LONG pathHitCount = 0;
@@ -969,16 +1605,14 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
             announcePath = (hitRef == 1);
         }
         (void)announcePath;
-        (void)pathHitCount;
-
-        // Mirror logEfz writes to a clean file (strips NUL corruption).
+        if (pathHitCount == 1)
         {
-            std::string lowerPath = pathText;
-            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lowerPath.find("logefz") != std::string::npos)
+            std::string logEfzPath;
+            if (TryGetLogEfzDiskPath(hFile, &logEfzPath))
             {
-                MirrorRevivalDiskWrite(text, textLen);
+                mod::Log(
+                    "CAPTURE_LOG: observed native logEfz WriteFile path='%s'",
+                    logEfzPath.c_str());
             }
         }
 
@@ -999,10 +1633,6 @@ void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
 
     LogConsoleTextChunk("WriteConsoleA", reinterpret_cast<const char*>(lpBuffer), static_cast<size_t>(nChars));
 }
@@ -1010,10 +1640,6 @@ void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars)
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars)
 {
     if (lpBuffer == nullptr || nChars == 0)
-    {
-        return;
-    }
-    if (!CaptureRevivalNativeLogsEnabled())
     {
         return;
     }
@@ -1119,10 +1745,6 @@ void MaybeLogOutputDebugStringA(LPCSTR lpOutputString)
     {
         return;
     }
-    if (!CaptureRevivalNativeLogsEnabled())
-    {
-        return;
-    }
 
     const size_t len = std::strlen(lpOutputString);
     if (len == 0)
@@ -1136,10 +1758,6 @@ void MaybeLogOutputDebugStringA(LPCSTR lpOutputString)
 void MaybeLogOutputDebugStringW(LPCWSTR lpOutputString)
 {
     if (lpOutputString == nullptr || lpOutputString[0] == L'\0')
-    {
-        return;
-    }
-    if (!CaptureRevivalNativeLogsEnabled())
     {
         return;
     }

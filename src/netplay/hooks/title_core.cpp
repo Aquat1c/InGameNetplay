@@ -18,6 +18,27 @@ using netplay::menu::RowIndexToString;
 using InlineEditInputResult = netplay::inline_edit::InputResult;
 using InlineEditValues = netplay::inline_edit::Values;
 
+const char* NetplayNicknameSourceToString(NetplayNicknameSource source)
+{
+    switch (source)
+    {
+    case NetplayNicknameSource::Placeholder:
+        return "placeholder";
+    case NetplayNicknameSource::LoadedFromIni:
+        return "ini";
+    case NetplayNicknameSource::UserProvided:
+        return "user";
+    default:
+        return "unknown";
+    }
+}
+
+bool ShouldWriteNicknameToRevivalIni()
+{
+    return g_netplayMenuState.nicknameSource != NetplayNicknameSource::Placeholder
+        && !g_netplayMenuState.nickname.empty();
+}
+
 int GetCurrentMenuEntryCount()
 {
     int count = 0;
@@ -225,10 +246,28 @@ InlineEditValues GetInlineEditValuesSnapshot()
 
 void ApplyInlineEditValues(const InlineEditValues& values)
 {
+    const std::string previousJoinAddress = g_netplayMenuState.joinAddress;
     g_netplayMenuState.hostPort = values.hostPort;
     g_netplayMenuState.joinAddress = values.joinAddress;
     g_netplayMenuState.joinPort = values.joinPort;
+    if (previousJoinAddress != g_netplayMenuState.joinAddress)
+    {
+        mod::Log(
+            "JoinAddress: inline edit '%s' -> '%s'",
+            previousJoinAddress.c_str(),
+            g_netplayMenuState.joinAddress.c_str());
+        SaveNetplayJoinAddressToIni();
+    }
+    if (g_netplayMenuState.nickname != values.nickname)
+    {
+        mod::Log(
+            "NetplayNickname: inline edit '%s' -> '%s' source=%s->user",
+            g_netplayMenuState.nickname.c_str(),
+            values.nickname.c_str(),
+            NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
+    }
     g_netplayMenuState.nickname = values.nickname;
+    g_netplayMenuState.nicknameSource = NetplayNicknameSource::UserProvided;
     netplay::player_rooms::SetRoomCode(values.playerRoomsRoomCode);
 }
 

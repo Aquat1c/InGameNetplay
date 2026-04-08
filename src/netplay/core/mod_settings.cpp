@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cwchar>
 #include <string>
 
 namespace netplay::mod_settings
@@ -84,6 +85,36 @@ bool ReadBoolValue(
 {
     return GetPrivateProfileIntW(sectionName, keyName, defaultValue ? 1 : 0, iniPath.c_str()) != 0;
 }
+
+bool TryReadBoolValue(
+    const wchar_t* sectionName,
+    const wchar_t* keyName,
+    bool* outValue,
+    const std::wstring& iniPath)
+{
+    if (outValue == nullptr)
+    {
+        return false;
+    }
+
+    wchar_t buffer[16] = {};
+    static constexpr wchar_t kMissing[] = L"__missing__";
+    GetPrivateProfileStringW(
+        sectionName,
+        keyName,
+        kMissing,
+        buffer,
+        static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])),
+        iniPath.c_str());
+
+    if (std::wcscmp(buffer, kMissing) == 0)
+    {
+        return false;
+    }
+
+    *outValue = ReadBoolValue(sectionName, keyName, false, iniPath);
+    return true;
+}
 } // namespace
 
 void Reload()
@@ -99,6 +130,17 @@ void Reload()
     }
     loaded.writeLogFile =
         ReadBoolValue(L"Others", L"WriteLogFile", true, iniPath);
+    loaded.preserveModLogAcrossLaunches =
+        ReadBoolValue(L"Others", L"PreserveModLogAcrossLaunches", false, iniPath);
+    if (!TryReadBoolValue(
+            L"Others",
+            L"PreserveRevivalLogsAcrossLaunches",
+            &loaded.preserveRevivalLogsAcrossLaunches,
+            iniPath))
+    {
+        loaded.preserveRevivalLogsAcrossLaunches =
+            ReadBoolValue(L"Others", L"PreserveLogEfzAcrossLaunches", false, iniPath);
+    }
     loaded.enableConsole =
         ReadBoolValue(L"Others", L"EnableConsole", false, iniPath);
     loaded.enableDebugMenu =
@@ -122,6 +164,16 @@ bool UseTournamentModeForOfflineVsHuman()
 bool IsFileLoggingEnabled()
 {
     return g_settings.writeLogFile;
+}
+
+bool PreserveModLogAcrossLaunches()
+{
+    return g_settings.preserveModLogAcrossLaunches;
+}
+
+bool PreserveRevivalLogsAcrossLaunches()
+{
+    return g_settings.preserveRevivalLogsAcrossLaunches;
 }
 
 bool IsConsoleEnabled()

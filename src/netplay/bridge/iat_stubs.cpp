@@ -7,11 +7,165 @@
 #include <cctype>
 #include <cstring>
 #include <intrin.h>
+#include <string>
+#include <cwchar>
 
 #include <windows.h>
 
 namespace netplay::bridge::takeover
 {
+
+static std::string GetTakeoverModuleDirectoryA()
+{
+    char modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&GetTakeoverModuleDirectoryA),
+        &selfModule);
+    if (selfModule == nullptr || GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+
+    std::string dir(modulePath);
+    const size_t slash = dir.find_last_of("\\/");
+    if (slash == std::string::npos)
+    {
+        return {};
+    }
+    dir.resize(slash);
+    return dir;
+}
+
+static std::wstring GetTakeoverModuleDirectoryW()
+{
+    wchar_t modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&GetTakeoverModuleDirectoryW),
+        &selfModule);
+    if (selfModule == nullptr || GetModuleFileNameW(selfModule, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+
+    std::wstring dir(modulePath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+    dir.resize(slash);
+    return dir;
+}
+
+static bool EnsureDirectoryExistsA(const std::string& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    if (CreateDirectoryA(path.c_str(), nullptr) != FALSE)
+    {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    return error == ERROR_ALREADY_EXISTS;
+}
+
+static bool EnsureDirectoryExistsW(const std::wstring& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr) != FALSE)
+    {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    return error == ERROR_ALREADY_EXISTS;
+}
+
+static bool HasLogEfzBaseNameA(LPCSTR path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+
+    const char* baseName = path;
+    for (const char* p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "logEfz.txt") == 0;
+}
+
+static bool HasLogEfzBaseNameW(LPCWSTR path)
+{
+    if (path == nullptr || path[0] == L'\0')
+    {
+        return false;
+    }
+
+    const wchar_t* baseName = path;
+    for (const wchar_t* p = path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _wcsicmp(baseName, L"logEfz.txt") == 0;
+}
+
+static std::string GetNativeShadowLogEfzPathA()
+{
+    const std::string dir = GetTakeoverModuleDirectoryA();
+    if (dir.empty())
+    {
+        return {};
+    }
+
+    const char* const subdir = IsCurrentProcessRevival() ? "native_revival" : "native_host";
+    const std::string shadowDir = dir + "\\" + subdir;
+    if (!EnsureDirectoryExistsA(shadowDir))
+    {
+        return {};
+    }
+
+    return shadowDir + "\\logEfz.txt";
+}
+
+static std::wstring GetNativeShadowLogEfzPathW()
+{
+    const std::wstring dir = GetTakeoverModuleDirectoryW();
+    if (dir.empty())
+    {
+        return {};
+    }
+
+    const wchar_t* const subdir = IsCurrentProcessRevival() ? L"native_revival" : L"native_host";
+    const std::wstring shadowDir = dir + L"\\" + subdir;
+    if (!EnsureDirectoryExistsW(shadowDir))
+    {
+        return {};
+    }
+
+    return shadowDir + L"\\logEfz.txt";
+}
 
 // ---------------------------------------------------------------------------
 // Dummy vtable for neutralized Revival session objects.
@@ -1468,14 +1622,23 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         continue;
                     }
 
-                    // Timed out waiting for user — default to "No" (2)
+                    int defaultChoice = 2;
+                    const int promptKind = block->spectateConfirmPromptKind;
+                    if (promptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoice = 3;
+                    }
+                    char defaultLine[16] = {};
+                    std::snprintf(defaultLine, sizeof(defaultLine), "%d\r\n", defaultChoice);
                     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerial);
                     InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerial);
                     g_injectedSpectateConfirmPromptWaitStartTick = 0;
                     mod::Log(
-                        "Takeover: spectate confirm prompt timed out; falling back to No promptSerial=%ld",
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoice,
+                        promptKind,
                         static_cast<long>(scPromptSerial));
-                    return serveScriptedInput(block, "2\r\n", sourceTag, "prompt_spectate_confirm_default", scPromptSerial, true);
+                    return serveScriptedInput(block, defaultLine, sourceTag, "prompt_spectate_confirm_default", scPromptSerial, true);
                 }
 
                 // --- Delay prompt handling ---
@@ -1773,13 +1936,23 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         continue;
                     }
 
+                    int defaultChoiceW = 2;
+                    const int promptKindW = block->spectateConfirmPromptKind;
+                    if (promptKindW == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoiceW = 3;
+                    }
+                    char defaultLineW[16] = {};
+                    std::snprintf(defaultLineW, sizeof(defaultLineW), "%d\r\n", defaultChoiceW);
                     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerialW);
                     InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerialW);
                     g_injectedSpectateConfirmPromptWaitStartTick = 0;
                     mod::Log(
-                        "Takeover: spectate confirm prompt timed out; falling back to No promptSerial=%ld",
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoiceW,
+                        promptKindW,
                         static_cast<long>(scPromptSerialW));
-                    return serveScriptedInput(block, "2\r\n", sourceTag, "prompt_spectate_confirm_default", scPromptSerialW, true);
+                    return serveScriptedInput(block, defaultLineW, sourceTag, "prompt_spectate_confirm_default", scPromptSerialW, true);
                 }
 
                 // --- Delay prompt handling (W) ---
@@ -1891,6 +2064,88 @@ BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, 
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
     MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
     return result;
+}
+
+HANDLE StubCreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    if (HasLogEfzBaseNameA(lpFileName))
+    {
+        const std::string redirectPath = GetNativeShadowLogEfzPathA();
+        if (!redirectPath.empty())
+        {
+            mod::Log(
+                "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
+                lpFileName,
+                redirectPath.c_str());
+            return CreateFileA(
+                redirectPath.c_str(),
+                dwDesiredAccess,
+                dwShareMode,
+                lpSecurityAttributes,
+                dwCreationDisposition,
+                dwFlagsAndAttributes,
+                hTemplateFile);
+        }
+    }
+
+    return CreateFileA(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+HANDLE StubCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    if (HasLogEfzBaseNameW(lpFileName))
+    {
+        const std::wstring redirectPath = GetNativeShadowLogEfzPathW();
+        if (!redirectPath.empty())
+        {
+            char originalUtf8[MAX_PATH * 2] = {};
+            char redirectUtf8[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, redirectPath.c_str(), -1, redirectUtf8, static_cast<int>(sizeof(redirectUtf8)), nullptr, nullptr);
+            mod::Log(
+                "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' redirect='%s'",
+                originalUtf8,
+                redirectUtf8);
+            return CreateFileW(
+                redirectPath.c_str(),
+                dwDesiredAccess,
+                dwShareMode,
+                lpSecurityAttributes,
+                dwCreationDisposition,
+                dwFlagsAndAttributes,
+                hTemplateFile);
+        }
+    }
+
+    return CreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
 }
 
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
@@ -2044,6 +2299,44 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsol
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
     return netplay::bridge::takeover::StubWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileA(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)

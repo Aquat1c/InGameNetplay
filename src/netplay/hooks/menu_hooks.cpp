@@ -589,10 +589,54 @@ static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
     return g_originalReplayUpdate(screenContext);
 }
 
+// ---------------------------------------------------------------------------
+// HookedReplayScreenUpdateImpl — dispatches to HookedReplayScreenUpdateImplBody.
+//
+// Spectate and join-spectate both pass through the replay screen during the
+// lightweight watcher handoff. ExitProcess can fire here if the spectate
+// session ends or disconnects before the handoff fully completes. Without
+// the UI setjmp guard, NeutralizeExitProcess falls through to the fragile
+// VEH TOCTOU recovery path and EFZ can close outright instead of returning
+// to the netplay menu.
+//
+// Reuse the same g_netplayUiJmpBuf that title/charselect use: only one UI
+// screen update runs at a time, so replay is safe to guard the same way.
+// On longjmp recovery, force game mode 0 and let the title hook consume the
+// exit interception and re-enter the netplay menu cleanly.
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4611) // setjmp / C++ destruction interaction
+#endif
 extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
 {
-    return HookedReplayScreenUpdateImplBody(screenContext);
+    netplay::bridge::takeover::g_netplayUiJmpActive = true;
+    if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
+    {
+        netplay::bridge::takeover::g_netplayUiJmpActive = false;
+
+        mod::Log(
+            "HookedReplayScreenUpdateImpl: recovered from ExitProcess via "
+            "ui longjmp — forcing game mode to title");
+
+        mod::ResetCrashRecoveryState();
+        DisarmSpectateReplayBypass();
+        g_restoreReplaySelectionOnNextTitleUpdate = false;
+        g_replaySelectionGuardFramesRemaining = 0;
+        netplay::bridge::ForceGameModeToTitle();
+
+        // Exit interception is already armed; skip this frame and let the
+        // title-screen update consume/cleanup in a clean state.
+        return 0;
+    }
+
+    const char result = HookedReplayScreenUpdateImplBody(screenContext);
+    netplay::bridge::takeover::g_netplayUiJmpActive = false;
+    return result;
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // ---------------------------------------------------------------------------
 // Charselect intro animation input suppression.
