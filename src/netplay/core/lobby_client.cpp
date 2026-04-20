@@ -2149,6 +2149,47 @@ void LobbySession::NotifyEndMatch()
     }
 }
 
+void LobbySession::FlushDeferredEndOnReturn()
+{
+    const bool hadDeferredEnd = m_endDeferred.exchange(false);
+    const bool wasReturning = m_returningFromMatch.exchange(false);
+
+    if (!hadDeferredEnd && !wasReturning)
+    {
+        return;
+    }
+
+    if (hadDeferredEnd)
+    {
+        bool alreadyQueued = false;
+        m_endPending.store(true);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            alreadyQueued = HasPendingEndActionLocked();
+            if (!alreadyQueued)
+            {
+                PendingAction action;
+                action.type = PendingAction::End;
+                m_pendingActions.push_back(std::move(action));
+            }
+        }
+        mod::Log(
+            "LobbySession::FlushDeferredEndOnReturn: queued deferred End"
+            " (wasReturning=%d alreadyQueued=%d)",
+            wasReturning ? 1 : 0,
+            alreadyQueued ? 1 : 0);
+    }
+    else
+    {
+        mod::Log("LobbySession::FlushDeferredEndOnReturn: cleared returning-from-match (no deferred End)");
+    }
+
+    if (m_wakeEvent != nullptr)
+    {
+        SetEvent(m_wakeEvent);
+    }
+}
+
 void LobbySession::NotifyEndSpectate(bool preserveUntilRefresh)
 {
     const bool wasActive = m_spectateActive.load();
@@ -3558,15 +3599,29 @@ void LobbySession::ProcessPendingActions()
 
         case PendingAction::End:
         {
-            const bool preserveReturningFromMatch = m_returningFromMatch.load();
             mod::Log("LobbySession: processing end");
-            (void)DoEnd();
+            const bool endOk = DoEnd();
             ClearMatchLifecycleState(true);
-            if (preserveReturningFromMatch)
+            if (!endOk && m_joinedRoom.lobbyNumericId != 0)
             {
-                m_returningFromMatch.store(true);
+                // DoEnd failed (network error or server rejection that
+                // wasn't a stale-session failure — HandleServerRemovalFailure
+                // already self-heals that case).  Force a rejoin so our
+                // server-side presence matches the freshly cleared local
+                // state; otherwise we'd keep appearing as "playing" to
+                // other lobby members.
+                mod::Log("LobbySession: end failed, scheduling rejoin to reset server presence");
+                m_rejoinRequested.store(true);
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_status.inBattle = true;
+                m_status.pollState = PollState::Joining;
+                m_status.statusMessage = "Resetting lobby state...";
+            }
+            else
+            {
+                // Kick an immediate status poll so the UI sees the idle
+                // list refreshed within one RTT instead of waiting for
+                // the next poll tick.
+                (void)DoPollStatus();
             }
             break;
         }

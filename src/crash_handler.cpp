@@ -410,6 +410,10 @@ void WriteCrashArtifacts(EXCEPTION_POINTERS* exceptionPointers, const char* reas
         dumpOk ? 1 : 0,
         dmpPath.c_str());
 
+    // Drain the async logger's queue before the process dies so recent
+    // Log() output lands on disk alongside the minidump and crash text.
+    mod::FlushLoggerSync();
+
     WriteCrashInfoText(exceptionPointers, reason, dumpOk ? dmpPath.c_str() : "");
 }
 

@@ -4,16 +4,46 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <share.h>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace
 {
-std::mutex g_logMutex;
+// ---------------------------------------------------------------------------
+// Async logger
+// ---------------------------------------------------------------------------
+// Log() used to do fputs + fflush under a shared mutex on the caller's
+// thread.  With the poll thread and bridge worker all logging through the
+// same mutex, the game thread could stall waiting on a background-thread
+// disk write.  The logger now formats on the caller's stack and hands the
+// finished line off to a dedicated writer thread via a bounded queue.
+// Callers hold g_queueMutex only long enough to push one string.
+
+// Queue side: guards the ring of pending lines, stop signal, CV.
+std::mutex g_queueMutex;
+std::condition_variable g_queueCv;
+std::deque<std::string> g_queue;
+std::atomic<bool> g_writerShouldStop{false};
+std::thread g_writerThread;
+std::atomic<uint64_t> g_droppedLines{0};
+constexpr std::size_t kMaxQueuedLines = 4096;
+
+// File/console side: guards the FILE* and console-attachment state.
+// The writer thread locks this to do fputs/fflush; SetFileLoggingEnabled /
+// SetConsoleVisible / FlushLoggerSync also lock it.  Caller-side Log() never
+// touches this mutex.
+std::mutex g_fileMutex;
 bool g_consoleReady = false;
 FILE* g_logFile = nullptr;
 bool g_fileLoggingEnabled = true;
@@ -96,19 +126,30 @@ std::string BuildLogPathFromModule(HMODULE moduleHandle)
     return path;
 }
 
-void WriteLineUnlocked(const char* line)
+// Caller must hold g_fileMutex.  Writes each line followed by a single
+// fflush at the end so the OS only issues one disk sync per batch.
+void WriteBatchLocked(const std::vector<std::string>& batch)
 {
-    OutputDebugStringA(line);
+    if (batch.empty())
+    {
+        return;
+    }
 
     if (g_consoleReady)
     {
-        fputs(line, stdout);
+        for (const std::string& line : batch)
+        {
+            fputs(line.c_str(), stdout);
+        }
         fflush(stdout);
     }
 
     if (g_logFile != nullptr)
     {
-        fputs(line, g_logFile);
+        for (const std::string& line : batch)
+        {
+            fputs(line.c_str(), g_logFile);
+        }
         fflush(g_logFile);
     }
 }
@@ -149,35 +190,118 @@ void CloseLogFileUnlocked()
     fclose(g_logFile);
     g_logFile = nullptr;
 }
+
+void WriterThreadEntry()
+{
+    std::vector<std::string> batch;
+    batch.reserve(64);
+
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            g_queueCv.wait(lock, []() {
+                return !g_queue.empty() || g_writerShouldStop.load();
+            });
+
+            while (!g_queue.empty())
+            {
+                batch.push_back(std::move(g_queue.front()));
+                g_queue.pop_front();
+            }
+        }
+
+        if (!batch.empty())
+        {
+            std::lock_guard<std::mutex> lock(g_fileMutex);
+            WriteBatchLocked(batch);
+            batch.clear();
+        }
+
+        if (g_writerShouldStop.load())
+        {
+            // Drain one final time in case producers enqueued after our
+            // last wake-up but before they observed the stop flag.
+            {
+                std::lock_guard<std::mutex> lock(g_queueMutex);
+                while (!g_queue.empty())
+                {
+                    batch.push_back(std::move(g_queue.front()));
+                    g_queue.pop_front();
+                }
+            }
+            if (!batch.empty())
+            {
+                std::lock_guard<std::mutex> lock(g_fileMutex);
+                WriteBatchLocked(batch);
+                batch.clear();
+            }
+            return;
+        }
+    }
+}
+
+void StartWriterThreadIfNeeded()
+{
+    if (g_writerThread.joinable())
+    {
+        return;
+    }
+    g_writerShouldStop.store(false);
+    g_writerThread = std::thread(WriterThreadEntry);
+}
+
+// Push a fully-formatted line (already ending with '\n') into the queue.
+// Game-thread callers spend microseconds here: one mutex acquire, one
+// deque push, one CV notify.  When the queue is full we drop the oldest
+// line so recent context is preserved at the cost of losing ancient log
+// history that hasn't been flushed yet.
+void EnqueueLine(std::string line)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        if (g_queue.size() >= kMaxQueuedLines)
+        {
+            g_queue.pop_front();
+            g_droppedLines.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_queue.push_back(std::move(line));
+    }
+    g_queueCv.notify_one();
+}
 }
 
 namespace mod
 {
 bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile)
 {
-    std::lock_guard<std::mutex> lock(g_logMutex);
-
-    g_logPath = BuildLogPathFromModule(moduleHandle);
-    g_fileLoggingEnabled = writeLogFile;
-
-    if (!g_consoleReady && spawnConsole)
     {
-        if (AllocConsole() != FALSE)
+        std::lock_guard<std::mutex> lock(g_fileMutex);
+
+        g_logPath = BuildLogPathFromModule(moduleHandle);
+        g_fileLoggingEnabled = writeLogFile;
+
+        if (!g_consoleReady && spawnConsole)
         {
-            SetConsoleTitleA("In-game Netplay Logger");
+            if (AllocConsole() != FALSE)
+            {
+                SetConsoleTitleA("In-game Netplay Logger");
 
-            FILE* outStream = nullptr;
-            FILE* errStream = nullptr;
-            FILE* inStream = nullptr;
-            freopen_s(&outStream, "CONOUT$", "w", stdout);
-            freopen_s(&errStream, "CONOUT$", "w", stderr);
-            freopen_s(&inStream, "CONIN$", "r", stdin);
+                FILE* outStream = nullptr;
+                FILE* errStream = nullptr;
+                FILE* inStream = nullptr;
+                freopen_s(&outStream, "CONOUT$", "w", stdout);
+                freopen_s(&errStream, "CONOUT$", "w", stderr);
+                freopen_s(&inStream, "CONIN$", "r", stdin);
 
-            g_consoleReady = true;
+                g_consoleReady = true;
+            }
         }
+
+        OpenLogFileUnlocked();
     }
 
-    OpenLogFileUnlocked();
+    StartWriterThreadIfNeeded();
 
     char versionLine[256] = {};
     std::snprintf(
@@ -187,25 +311,34 @@ bool InitializeLogger(HMODULE moduleHandle, bool spawnConsole, bool writeLogFile
         netplay::build_info::kDisplayName,
         netplay::build_info::kVersion,
         netplay::build_info::kBuildTimestamp);
-    WriteLineUnlocked(versionLine);
+    OutputDebugStringA(versionLine);
+    EnqueueLine(versionLine);
+
     char logModeLine[512] = {};
-    std::snprintf(
-        logModeLine,
-        sizeof(logModeLine),
-        "[efz_netplay_mod] logger file path='%s' startedFresh=%d preserveAcrossLaunches=%d previousExists=%d previousBytes=%llu\n",
-        g_logPath.c_str(),
-        g_logFileLastOpenStartedFresh ? 1 : 0,
-        netplay::mod_settings::PreserveModLogAcrossLaunches() ? 1 : 0,
-        g_logFileLastOpenPreviousExists ? 1 : 0,
-        g_logFileLastOpenPreviousBytes);
-    WriteLineUnlocked(logModeLine);
-    WriteLineUnlocked("[efz_netplay_mod] logger initialized\n");
+    {
+        std::lock_guard<std::mutex> lock(g_fileMutex);
+        std::snprintf(
+            logModeLine,
+            sizeof(logModeLine),
+            "[efz_netplay_mod] logger file path='%s' startedFresh=%d preserveAcrossLaunches=%d previousExists=%d previousBytes=%llu\n",
+            g_logPath.c_str(),
+            g_logFileLastOpenStartedFresh ? 1 : 0,
+            netplay::mod_settings::PreserveModLogAcrossLaunches() ? 1 : 0,
+            g_logFileLastOpenPreviousExists ? 1 : 0,
+            g_logFileLastOpenPreviousBytes);
+    }
+    OutputDebugStringA(logModeLine);
+    EnqueueLine(logModeLine);
+
+    const char* kInitLine = "[efz_netplay_mod] logger initialized (async writer)\n";
+    OutputDebugStringA(kInitLine);
+    EnqueueLine(kInitLine);
     return true;
 }
 
 void SetConsoleVisible(bool visible)
 {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::lock_guard<std::mutex> lock(g_fileMutex);
 
     if (visible && !g_consoleReady)
     {
@@ -232,7 +365,7 @@ void SetConsoleVisible(bool visible)
 
 void SetFileLoggingEnabled(HMODULE moduleHandle, bool enabled)
 {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::lock_guard<std::mutex> lock(g_fileMutex);
 
     if (g_logPath.empty() && moduleHandle != nullptr)
     {
@@ -255,12 +388,56 @@ void SetFileLoggingEnabled(HMODULE moduleHandle, bool enabled)
     }
 }
 
+void FlushLoggerSync()
+{
+    // Snapshot the pending queue and write it synchronously.  Taking
+    // g_fileMutex after releasing g_queueMutex means any in-flight batch
+    // the writer thread is currently draining serializes in front of
+    // ours: writer grabbed g_fileMutex first, so we wait; the writer then
+    // releases and we write a strictly-newer batch.  Ordering is
+    // preserved in the output file.
+    std::vector<std::string> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        while (!g_queue.empty())
+        {
+            snapshot.push_back(std::move(g_queue.front()));
+            g_queue.pop_front();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_fileMutex);
+    WriteBatchLocked(snapshot);
+}
+
 void ShutdownLogger()
 {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    // Mark the queue closed, wake the writer, and wait for it to drain.
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_writerShouldStop.store(true);
+    }
+    g_queueCv.notify_all();
+    if (g_writerThread.joinable())
+    {
+        g_writerThread.join();
+    }
+
+    std::lock_guard<std::mutex> lock(g_fileMutex);
 
     if (g_logFile != nullptr)
     {
+        const uint64_t dropped = g_droppedLines.load(std::memory_order_relaxed);
+        if (dropped != 0)
+        {
+            char warn[128] = {};
+            std::snprintf(
+                warn,
+                sizeof(warn),
+                "[efz_netplay_mod] logger dropped %llu line(s) due to queue overflow\n",
+                static_cast<unsigned long long>(dropped));
+            fputs(warn, g_logFile);
+        }
         fputs("[efz_netplay_mod] logger shutting down\n", g_logFile);
         fflush(g_logFile);
         CloseLogFileUnlocked();
@@ -275,16 +452,7 @@ void ShutdownLogger()
 
 void Log(const char* fmt, ...)
 {
-    // --- Lock contention + I/O timing guard ---------------------------------
-    // Measure how long the whole Log() call takes (mutex acquire + format +
-    // fputs + fflush).  If it exceeds 3ms, the logger itself is stalling the
-    // game thread.  Uses OutputDebugStringA (lock-free) for the warning so
-    // it doesn't recurse into the same mutex.
-    LARGE_INTEGER logQpcStart = {};
-    QueryPerformanceCounter(&logQpcStart);
-
-    std::lock_guard<std::mutex> lock(g_logMutex);
-
+    // Format on the caller's stack — no mutex held during vsnprintf.
     char message[1024];
     va_list args;
     va_start(args, fmt);
@@ -297,39 +465,22 @@ void Log(const char* fmt, ...)
     }
 
     char line[1248];
-    snprintf(
+    const int lineLen = std::snprintf(
         line,
         sizeof(line),
         "[efz_netplay_mod][pid=%lu] %s\n",
         static_cast<unsigned long>(GetCurrentProcessId()),
         message);
-    WriteLineUnlocked(line);
-
-    // Check total Log() duration (including mutex wait + I/O).
+    if (lineLen <= 0)
     {
-        static unsigned long s_logSlowCount = 0;
-        LARGE_INTEGER logQpcEnd = {}, freq = {};
-        QueryPerformanceCounter(&logQpcEnd);
-        QueryPerformanceFrequency(&freq);
-        const double elapsedMs =
-            static_cast<double>(logQpcEnd.QuadPart - logQpcStart.QuadPart)
-            * 1000.0 / static_cast<double>(freq.QuadPart);
-        if (elapsedMs > 3.0)
-        {
-            ++s_logSlowCount;
-            // Output via OutputDebugString to avoid re-entering the mutex.
-            if (s_logSlowCount <= 10 || (s_logSlowCount % 500 == 0))
-            {
-                char warn[256];
-                snprintf(warn, sizeof(warn),
-                         "[efz_netplay_mod] PERF_WARN: Log() took %.1fms "
-                         "(slowCount=%lu) — logger stalling game thread\n",
-                         elapsedMs, s_logSlowCount);
-                OutputDebugStringA(warn);
-                // Also write it to the log file directly while we hold the lock.
-                WriteLineUnlocked(warn);
-            }
-        }
+        return;
     }
+
+    // OutputDebugStringA on the caller — lock-free and very fast when no
+    // debugger is attached; callers that attach a debugger get immediate
+    // output without waiting on the writer thread.
+    OutputDebugStringA(line);
+
+    EnqueueLine(std::string(line, static_cast<std::size_t>(lineLen)));
 }
 }

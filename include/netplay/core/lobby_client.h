@@ -184,9 +184,16 @@ public:
     // connection dropped).  Pending challenges that never reached the
     // connected-match state send 'end' immediately so the opponent's
     // client clears the challenge right away.  Connected host matches
-    // still defer 'end' until RequestRefresh() so the playing pair is
-    // preserved until the host returns to the lobby.
+    // defer 'end' until FlushDeferredEndOnReturn() is called (on lobby
+    // re-entry) so the playing pair stays visible during teardown.
     void NotifyEndMatch();
+
+    // Called when the netplay menu is re-entered after a match.  Sends
+    // the deferred host End immediately (if queued) and clears the
+    // returning-from-match latch so the lobby unwedges as soon as we
+    // exit the match back to the menu — regardless of whether
+    // RequestRefresh() fires on this tick.
+    void FlushDeferredEndOnReturn();
 
     // Notify that a spectate session has ended. When |preserveUntilRefresh|
     // is true, the room remains locally busy until RequestRefresh() runs on

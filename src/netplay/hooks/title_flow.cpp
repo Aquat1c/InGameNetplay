@@ -86,6 +86,11 @@ std::atomic<bool> g_lobbySessionShutdownInFlight{false};
 std::atomic<bool> g_lobbySessionShutdownCompleted{false};
 std::atomic<bool> g_lobbySessionShutdownReturnToPlayerRooms{false};
 bool g_deferredLobbyRefreshPending = false;
+// Absolute tick (GetTickCount) after which the deferred-refresh gate is
+// released unconditionally.  Prevents a wedged bridge phase from leaving
+// the lobby list perma-stale with no user-visible escape.
+uint32_t g_deferredLobbyRefreshDeadlineTick = 0;
+constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -1867,6 +1872,17 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     // the lobby and can immediately see the player list / challenge again.
     const bool returnToLobby = (g_lobbySession != nullptr);
     g_deferredLobbyRefreshPending = returnToLobby && skipFadeOut;
+    g_deferredLobbyRefreshDeadlineTick =
+        g_deferredLobbyRefreshPending ? (GetTickCount() + kDeferredLobbyRefreshTimeoutMs) : 0;
+
+    // As soon as we re-enter the menu after a match, flush any deferred
+    // host End so the server drops the playing-pair right away.  This is
+    // independent of the deferred-refresh gate — we want the End to go out
+    // even if the bridge takes a while to reach a terminal phase.
+    if (returnToLobby)
+    {
+        g_lobbySession->FlushDeferredEndOnReturn();
+    }
 
     g_netplayMenuState.active = true;
     g_netplayMenuState.bgmActive = true;
@@ -1997,6 +2013,7 @@ void LeaveNetplayMenu(uint32_t screenContext)
     ClearPendingLobbySpectateWait("leave_netplay_menu");
     ResetLobbyChallengeNotificationState();
     g_deferredLobbyRefreshPending = false;
+    g_deferredLobbyRefreshDeadlineTick = 0;
     RemoveNetplayWindowHook();
 
     (void)LoadTitleAssets(screenContext);
@@ -2154,6 +2171,7 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
     if (previousMenu == NetplayMenuId::Lobby && menuId != NetplayMenuId::Lobby)
     {
         g_deferredLobbyRefreshPending = false;
+        g_deferredLobbyRefreshDeadlineTick = 0;
         if (g_lobbySession)
         {
             const bool returnToPlayerRooms =
@@ -2912,27 +2930,42 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
             const NetbridgePhase bridgePhase = static_cast<NetbridgePhase>(bridgeStatus.phase);
-            if (bridgePhase == NetbridgePhase::Idle
+            const bool terminalPhase =
+                bridgePhase == NetbridgePhase::Idle
                 || bridgePhase == NetbridgePhase::Failed
-                || bridgePhase == NetbridgePhase::SessionEnded)
+                || bridgePhase == NetbridgePhase::SessionEnded;
+            const bool timeoutElapsed =
+                g_deferredLobbyRefreshDeadlineTick != 0
+                && static_cast<int32_t>(GetTickCount() - g_deferredLobbyRefreshDeadlineTick) >= 0;
+            if (terminalPhase || timeoutElapsed)
             {
                 g_deferredLobbyRefreshPending = false;
+                g_deferredLobbyRefreshDeadlineTick = 0;
                 g_lobbySession->RequestRefresh();
                 mod::Log(
-                    "LobbyReturn: deferred refresh released phase=%s selection=%d inactivity=%u",
+                    "LobbyReturn: deferred refresh released phase=%s timeout=%d selection=%d inactivity=%u",
                     netplay::bridge::PhaseToString(bridgePhase),
+                    timeoutElapsed ? 1 : 0,
                     static_cast<int>(*selectionPtr),
                     *inactivityCounter);
             }
         }
     }
 
-    // Lobby: allow R key to trigger an immediate poll refresh.
+    // Lobby: allow R key to trigger an immediate poll refresh.  If we are
+    // still inside the deferred-refresh window, pressing R force-releases
+    // the gate so the user has a manual escape hatch when the bridge is
+    // slow to reach a terminal phase.
     if (g_netplayMenuState.menuId == NetplayMenuId::Lobby
         && g_lobbySession
-        && !g_deferredLobbyRefreshPending
         && ConsumeWindowFocusedHotkeyEdge(windowFocused, 'R'))
     {
+        if (g_deferredLobbyRefreshPending)
+        {
+            g_deferredLobbyRefreshPending = false;
+            g_deferredLobbyRefreshDeadlineTick = 0;
+            mod::Log("LobbyReturn: deferred refresh released by R-key (manual override)");
+        }
         g_lobbySession->RequestRefresh();
     }
 
