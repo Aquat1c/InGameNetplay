@@ -2710,7 +2710,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 challengeAddr.c_str(), static_cast<unsigned>(challengePort));
 
             // Send pre_accept + accept via the lobby session (async on poll thread).
-            g_lobbySession->AcceptChallenge(entry.playerId);
+            g_lobbySession->AcceptChallenge(entry.playerId, entry.name);
 
             // Connect to the challenger's address.
             const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
@@ -3198,6 +3198,26 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
         {
             netplay::bridge::CancelSession("challenge_target_left_lobby");
+        }
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
+    if (g_lobbySession && g_lobbySession->ConsumeAbandonedIncomingChallenge())
+    {
+        mod::Log(
+            "LobbyChallenge: challenger left lobby before connect, canceling local accept phase=%s",
+            netplay::bridge::PhaseToString(bridgePhase));
+        SetNetplayStatusMessage("Challenger left the lobby.");
+        ResetDelaySetupOverlayState();
+        ResetSpectateConfirmOverlayState();
+        ResetHostingOverlayState();
+        ResetJoiningOverlayState();
+        if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
+        {
+            netplay::bridge::CancelSession("challenger_left_lobby");
         }
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;

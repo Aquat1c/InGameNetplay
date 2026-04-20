@@ -1824,6 +1824,7 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     m_returningFromMatch.store(false);
     m_challengePending.store(false);
     m_abandonedOutgoingChallenge.store(false);
+    m_abandonedIncomingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     m_endPending.store(false);
@@ -1837,6 +1838,7 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     std::lock_guard<std::mutex> lock(m_mutex);
     m_pendingChallengeTargetId = 0;
     m_pendingChallengeTargetName.clear();
+    m_pendingAcceptChallengerName.clear();
     if (clearStatusInBattle)
     {
         m_status.inBattle = false;
@@ -1966,16 +1968,23 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetNa
     }
 }
 
-void LobbySession::AcceptChallenge(int challengerPlayerId)
+void LobbySession::AcceptChallenge(int challengerPlayerId, const std::string& challengerName)
 {
     m_spectateActive.store(false);
     m_returningFromSpectate.store(false);
     m_spectateLeavePending.store(false);
     m_spectateDetachedFromRoom.store(false);
     m_isMatchHost.store(false);
-    m_inBattle.store(true);
+    // Do NOT set m_inBattle here. The accepter is still in the pre-connected
+    // challenge window and the poll thread must keep polling so it can detect
+    // the challenger disappearing before the bridge connects. IsInBattle()
+    // still returns true because m_challengePending is set, so challenge
+    // suppression in BuildDisplayEntries and the UI "busy" guard in the menu
+    // layer continue to work as before.
+    m_inBattle.store(false);
     m_challengePending.store(true);
     m_abandonedOutgoingChallenge.store(false);
+    m_abandonedIncomingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     m_endPending.store(false);
@@ -1983,6 +1992,11 @@ void LobbySession::AcceptChallenge(int challengerPlayerId)
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = 0;
         m_pendingChallengeTargetName.clear();
+        m_pendingAcceptChallengerName = challengerName;
+        // Set the target id up front (not just when the poll thread later
+        // processes PreAccept) so DoPollStatus can detect the challenger
+        // disappearing even during the very first poll after this call.
+        m_pendingAcceptTargetId = challengerPlayerId;
         m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::PreAccept;
@@ -1993,6 +2007,11 @@ void LobbySession::AcceptChallenge(int challengerPlayerId)
     {
         SetEvent(m_wakeEvent);
     }
+}
+
+bool LobbySession::ConsumeAbandonedIncomingChallenge()
+{
+    return m_abandonedIncomingChallenge.exchange(false);
 }
 
 void LobbySession::NotifyMatchConnected()
@@ -2702,6 +2721,49 @@ bool LobbySession::DoPollStatus()
         }
     }
 
+    // Mirror of the outgoing-challenge detection above, but for the accepter
+    // side: we called AcceptChallenge (set m_challengePending) and sent
+    // pre_accept to the server, but the bridge hasn't reported a connect yet.
+    // If the challenger disappears from the lobby in this window, cancel our
+    // local accept so the title layer can tear down the bridge and overlay.
+    bool abandonIncomingChallenge = false;
+    int abandonedIncomingId = 0;
+    std::string abandonedIncomingName;
+    if (!m_isMatchHost.load() && m_challengePending.load() && !m_matchConnected.load())
+    {
+        int pendingChallengerId = 0;
+        std::string pendingChallengerName;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pendingChallengerId = m_pendingAcceptTargetId;
+            pendingChallengerName = m_pendingAcceptChallengerName;
+        }
+
+        if (pendingChallengerId != 0
+            && !OutgoingChallengeTargetStillPresent(
+                pendingChallengerId,
+                pendingChallengerName,
+                idlePlayers,
+                challenges,
+                playingPairs))
+        {
+            abandonIncomingChallenge = true;
+            abandonedIncomingId = pendingChallengerId;
+            abandonedIncomingName = std::move(pendingChallengerName);
+            mod::Log(
+                "LobbySession::DoPollStatus: incoming challenger left lobby challenger=%d name='%s' -- canceling local accept",
+                abandonedIncomingId,
+                abandonedIncomingName.c_str());
+
+            m_challengePending.store(false);
+            m_matchConnected.store(false);
+            m_endDeferred.store(false);
+            m_endPending.store(false);
+            m_returningFromMatch.store(false);
+            m_abandonedIncomingChallenge.store(true);
+        }
+    }
+
     std::vector<LobbyDisplayEntry> displayEntries;
     const bool inBattle = m_inBattle.load();
     const bool suppressChallenges = IsInBattle();
@@ -2736,6 +2798,16 @@ bool LobbySession::DoPollStatus()
         action.type = PendingAction::End;
         m_pendingActions.push_back(std::move(action));
     }
+    if (abandonIncomingChallenge)
+    {
+        // We hadn't sent 'accept' yet (we were still waiting on the bridge
+        // to connect), so there's nothing to End on the server — our
+        // pre_accept state will expire naturally once the challenger's
+        // challenge record is gone. Just drop the local pending-accept
+        // target so a late-arriving ConfirmAccept turns into a no-op.
+        m_pendingAcceptTargetId = 0;
+        m_pendingAcceptChallengerName.clear();
+    }
     m_status.pollState = PollState::Polling;
     m_status.idlePlayers = std::move(idlePlayers);
     m_status.challenges = suppressChallenges ? std::vector<LobbyChallenge>{} : std::move(challenges);
@@ -2751,13 +2823,17 @@ bool LobbySession::DoPollStatus()
     {
         m_status.statusMessage = "Challenge canceled: player left lobby";
     }
+    else if (abandonIncomingChallenge)
+    {
+        m_status.statusMessage = "Challenger left the lobby";
+    }
     else
     {
         m_status.statusMessage.clear();
     }
     m_status.lastPollTick = GetTickCount();
     m_status.inBattle = suppressChallenges;
-    if (abandonOutgoingChallenge && m_wakeEvent != nullptr)
+    if ((abandonOutgoingChallenge || abandonIncomingChallenge) && m_wakeEvent != nullptr)
     {
         SetEvent(m_wakeEvent);
     }
@@ -3391,7 +3467,43 @@ bool LobbySession::DoPreAccept(int challengerPlayerId)
     mod::Log("LobbySession::DoPreAccept: challenger=%d response='%s'",
         challengerPlayerId, body.c_str());
 
-    return !body.empty();
+    if (body.empty())
+    {
+        // Network failure. Treat as abandonment so the UI tears down the
+        // join overlay instead of stalling on the pre-connected screen.
+        mod::Log("LobbySession::DoPreAccept: empty response, marking incoming challenge abandoned");
+        m_abandonedIncomingChallenge.store(true);
+        if (m_wakeEvent != nullptr)
+        {
+            SetEvent(m_wakeEvent);
+        }
+        return false;
+    }
+
+    if (HandleServerRemovalFailure("LobbySession::DoPreAccept", body))
+    {
+        return false;
+    }
+
+    if (!IsJsonStatusOk(body))
+    {
+        // Server rejected pre_accept — most commonly because the challenger
+        // already left the lobby or their challenge expired. Signal the
+        // title layer so it can cancel the bridge and close the overlay.
+        mod::Log("LobbySession::DoPreAccept: server rejected pre_accept, marking incoming challenge abandoned");
+        m_abandonedIncomingChallenge.store(true);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_status.statusMessage = ExtractJsonMessage(body, "Challenger left the lobby");
+        }
+        if (m_wakeEvent != nullptr)
+        {
+            SetEvent(m_wakeEvent);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 bool LobbySession::DoAccept(int challengerPlayerId)
@@ -3410,7 +3522,38 @@ bool LobbySession::DoAccept(int challengerPlayerId)
     mod::Log("LobbySession::DoAccept: challenger=%d response='%s'",
         challengerPlayerId, body.c_str());
 
-    return !body.empty();
+    if (body.empty())
+    {
+        mod::Log("LobbySession::DoAccept: empty response, marking incoming challenge abandoned");
+        m_abandonedIncomingChallenge.store(true);
+        if (m_wakeEvent != nullptr)
+        {
+            SetEvent(m_wakeEvent);
+        }
+        return false;
+    }
+
+    if (HandleServerRemovalFailure("LobbySession::DoAccept", body))
+    {
+        return false;
+    }
+
+    if (!IsJsonStatusOk(body))
+    {
+        mod::Log("LobbySession::DoAccept: server rejected accept, marking incoming challenge abandoned");
+        m_abandonedIncomingChallenge.store(true);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_status.statusMessage = ExtractJsonMessage(body, "Challenger left the lobby");
+        }
+        if (m_wakeEvent != nullptr)
+        {
+            SetEvent(m_wakeEvent);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 bool LobbySession::DoEnd()
