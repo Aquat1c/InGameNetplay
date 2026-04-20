@@ -18,3 +18,5 @@ decompilations/
 tools/
 *.log
 /.claude
+/dumpbin
+/logs

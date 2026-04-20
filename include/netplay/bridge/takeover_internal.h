@@ -398,13 +398,22 @@ bool IsInsideFrameTick();
 // current frame tick completes instead of immediately.
 void RequestDeferredCancelCleanup();
 
-// Arm/consume the one-shot "online match ESC already queued a graceful quit"
-// marker. The per-frame tick sets it when it detects a local Esc edge on the
-// live battle screen, and ExitProcess interception consumes it to wait briefly
-// before tearing the helper down.
+// Arm/consume the one-shot "online match ESC should trigger a native peer
+// quit broadcast" marker. The per-frame tick sets it when it detects a local
+// Esc edge on the live battle screen, and ExitProcess interception consumes it
+// to ask the injected helper to send MessageQuit before teardown.
 void ArmOnlineMatchEscGracefulQuit();
 bool ConsumeOnlineMatchEscGracefulQuit();
 void ResetOnlineMatchEscGracefulQuit();
+
+// Ask the injected EfzRevival.exe helper to broadcast its native MessageQuit
+// packet to connected peers before the host tears the helper down locally.
+// This is used for the "press ESC but don't actually exit EFZ.exe" path.
+bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs);
+
+// Helper-process entry point invoked inside EfzRevival.exe. Resolves the live
+// peer manager object and calls the native "send quit to every peer" routine.
+DWORD RunInjectedPeerQuitBroadcast();
 
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();

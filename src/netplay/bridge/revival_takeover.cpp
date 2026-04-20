@@ -40,6 +40,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(
     DWORD,
     LPDWORD,
     LPOVERLAPPED);
+extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_RequestPeerQuitBroadcast(
+    LPVOID);
 
 namespace netplay::bridge::takeover
 {
@@ -310,6 +312,531 @@ void DetectRevivalVersion()
              "Addresses may be wrong!",
              static_cast<unsigned>(timestamp),
              g_activeRevival->versionTag);
+}
+
+static uintptr_t ResolveHelperSendQuitAllRva()
+{
+    // Native helper routine that broadcasts EfzPackets::MessageQuit to every
+    // connected peer. RVAs were confirmed from the 1.02e/h/i decompilations
+    // and resolved for 1.02f/g by matching the helper EXE disassembly.
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return 0;
+    }
+
+    const char* const tag = g_activeRevival->versionTag;
+    if (std::strcmp(tag, "1.02e") == 0)
+    {
+        return 0x41150u;
+    }
+    if (std::strcmp(tag, "1.02f") == 0)
+    {
+        return 0x41190u;
+    }
+    if (std::strcmp(tag, "1.02g") == 0)
+    {
+        return 0x414B0u;
+    }
+    if (std::strcmp(tag, "1.02h") == 0)
+    {
+        return 0x41440u;
+    }
+    if (std::strcmp(tag, "1.02i") == 0)
+    {
+        return 0x425C0u;
+    }
+    return 0;
+}
+
+static bool IsWritableUserRegion(const MEMORY_BASIC_INFORMATION& mbi)
+{
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+    {
+        return false;
+    }
+
+    const DWORD protect = mbi.Protect & 0xFFu;
+    return protect == PAGE_READWRITE
+        || protect == PAGE_WRITECOPY
+        || protect == PAGE_EXECUTE_READWRITE
+        || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool TryGetProcessIdFromHandleCompat(HANDLE processHandle, DWORD* outPid)
+{
+    if (outPid != nullptr)
+    {
+        *outPid = 0;
+    }
+    if (processHandle == nullptr || processHandle == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    typedef DWORD (WINAPI *GetProcessIdFn)(HANDLE);
+    static GetProcessIdFn s_getProcessId = []() -> GetProcessIdFn {
+        HMODULE kernel = GetModuleHandleA("kernel32.dll");
+        return kernel != nullptr
+            ? reinterpret_cast<GetProcessIdFn>(GetProcAddress(kernel, "GetProcessId"))
+            : nullptr;
+    }();
+
+    if (s_getProcessId == nullptr)
+    {
+        return false;
+    }
+
+    const DWORD pid = s_getProcessId(processHandle);
+    if (pid == 0)
+    {
+        return false;
+    }
+
+    if (outPid != nullptr)
+    {
+        *outPid = pid;
+    }
+    return true;
+}
+
+static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStrictHostMatch)
+{
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = false;
+    }
+
+    constexpr size_t kManagerSelfPidOffset = 328u;
+    constexpr size_t kManagerHostHandleOffset = 360u;
+    constexpr size_t kManagerMinScanSpan = kManagerHostHandleOffset + sizeof(HANDLE);
+
+    const DWORD selfPid = GetCurrentProcessId();
+    const bool hostPidKnown = hostPid != 0;
+    bool usedStrictHostMatch = false;
+    SIZE_T regionCount = 0;
+    SIZE_T writableRegionCount = 0;
+    SIZE_T selfPidHits = 0;
+    SIZE_T invalidHandleRejects = 0;
+    SIZE_T handleQueryRejects = 0;
+    SIZE_T strictPidMatches = 0;
+    SIZE_T strictPidMismatches = 0;
+    SIZE_T fallbackAliveMatches = 0;
+    SIZE_T fallbackDeadRejects = 0;
+    std::vector<uintptr_t> candidates;
+
+    mod::Log(
+        "Takeover: injected peer-manager scan start selfPid=%lu hostPid=%lu hostPidKnown=%d version=%s",
+        static_cast<unsigned long>(selfPid),
+        static_cast<unsigned long>(hostPid),
+        hostPidKnown ? 1 : 0,
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown");
+
+    SYSTEM_INFO sysInfo = {};
+    GetSystemInfo(&sysInfo);
+
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(sysInfo.lpMinimumApplicationAddress);
+    const uintptr_t maxAddress = reinterpret_cast<uintptr_t>(sysInfo.lpMaximumApplicationAddress);
+    while (cursor < maxAddress)
+    {
+        ++regionCount;
+        MEMORY_BASIC_INFORMATION mbi = {};
+        const SIZE_T queried = VirtualQuery(
+            reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi));
+        if (queried != sizeof(mbi))
+        {
+            mod::Log(
+                "Takeover: injected peer-manager scan stopped cursor=0x%08lX queried=%lu err=%lu",
+                static_cast<unsigned long>(cursor),
+                static_cast<unsigned long>(queried),
+                static_cast<unsigned long>(GetLastError()));
+            break;
+        }
+
+        if (IsWritableUserRegion(mbi) && mbi.RegionSize >= kManagerMinScanSpan)
+        {
+            ++writableRegionCount;
+            const auto* regionBase = static_cast<const uint8_t*>(mbi.BaseAddress);
+            const SIZE_T limit = mbi.RegionSize - kManagerMinScanSpan;
+            for (SIZE_T off = 0; off <= limit; off += sizeof(uint32_t))
+            {
+                const auto* candidate = regionBase + off;
+                if (*reinterpret_cast<const DWORD*>(candidate + kManagerSelfPidOffset) != selfPid)
+                {
+                    continue;
+                }
+                ++selfPidHits;
+
+                const HANDLE hostProcessHandle =
+                    *reinterpret_cast<HANDLE const*>(candidate + kManagerHostHandleOffset);
+                if (hostProcessHandle == nullptr || hostProcessHandle == INVALID_HANDLE_VALUE)
+                {
+                    ++invalidHandleRejects;
+                    continue;
+                }
+
+                DWORD handleFlags = 0;
+                DWORD exitCode = 0;
+                if (!GetHandleInformation(hostProcessHandle, &handleFlags)
+                    || !GetExitCodeProcess(hostProcessHandle, &exitCode))
+                {
+                    ++handleQueryRejects;
+                    continue;
+                }
+
+                bool accept = false;
+                DWORD handlePid = 0;
+                bool strictCheckUsed = false;
+                if (hostPidKnown && TryGetProcessIdFromHandleCompat(hostProcessHandle, &handlePid))
+                {
+                    strictCheckUsed = true;
+                    accept = (handlePid == hostPid);
+                    usedStrictHostMatch = true;
+                    if (accept)
+                    {
+                        ++strictPidMatches;
+                    }
+                    else
+                    {
+                        ++strictPidMismatches;
+                    }
+                }
+                else
+                {
+                    accept = (exitCode == STILL_ACTIVE);
+                    if (accept)
+                    {
+                        ++fallbackAliveMatches;
+                    }
+                    else
+                    {
+                        ++fallbackDeadRejects;
+                    }
+                }
+
+                if (!accept)
+                {
+                    continue;
+                }
+
+                candidates.push_back(reinterpret_cast<uintptr_t>(candidate));
+                mod::Log(
+                    "Takeover: injected peer-manager candidate ptr=0x%08lX hostHandle=0x%p "
+                    "handlePid=%lu exit=%lu strict=%d flags=0x%08lX",
+                    static_cast<unsigned long>(reinterpret_cast<uintptr_t>(candidate)),
+                    hostProcessHandle,
+                    static_cast<unsigned long>(handlePid),
+                    static_cast<unsigned long>(exitCode),
+                    strictCheckUsed ? 1 : 0,
+                    static_cast<unsigned long>(handleFlags));
+                if (candidates.size() > 8u)
+                {
+                    break;
+                }
+            }
+        }
+
+        const uintptr_t next =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + static_cast<uintptr_t>(mbi.RegionSize);
+        if (next <= cursor)
+        {
+            break;
+        }
+        cursor = next;
+    }
+
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = usedStrictHostMatch;
+    }
+
+    mod::Log(
+        "Takeover: injected peer-manager scan summary regions=%lu writable=%lu "
+        "selfPidHits=%lu invalidHandle=%lu handleQueryFail=%lu strictMatch=%lu "
+        "strictMismatch=%lu fallbackAlive=%lu fallbackDead=%lu candidates=%u",
+        static_cast<unsigned long>(regionCount),
+        static_cast<unsigned long>(writableRegionCount),
+        static_cast<unsigned long>(selfPidHits),
+        static_cast<unsigned long>(invalidHandleRejects),
+        static_cast<unsigned long>(handleQueryRejects),
+        static_cast<unsigned long>(strictPidMatches),
+        static_cast<unsigned long>(strictPidMismatches),
+        static_cast<unsigned long>(fallbackAliveMatches),
+        static_cast<unsigned long>(fallbackDeadRejects),
+        static_cast<unsigned>(candidates.size()));
+
+    if (candidates.size() != 1u)
+    {
+        mod::Log(
+            "Takeover: injected peer-manager scan ambiguous hostPid=%lu strictHostMatch=%d candidates=%u",
+            static_cast<unsigned long>(hostPid),
+            usedStrictHostMatch ? 1 : 0,
+            static_cast<unsigned>(candidates.size()));
+        return 0;
+    }
+
+    mod::Log(
+        "Takeover: injected peer-manager resolved ptr=0x%08lX hostPid=%lu strictHostMatch=%d",
+        static_cast<unsigned long>(candidates.front()),
+        static_cast<unsigned long>(hostPid),
+        usedStrictHostMatch ? 1 : 0);
+    return candidates.front();
+}
+
+DWORD RunInjectedPeerQuitBroadcast()
+{
+    if (!IsCurrentProcessRevival())
+    {
+        mod::Log("Takeover: injected peer-quit broadcast skipped (not in EfzRevival.exe)");
+        return 0;
+    }
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+
+    DetectRevivalVersion();
+
+    const DWORD hostPid =
+        (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
+    const uintptr_t sendQuitAllRva = ResolveHelperSendQuitAllRva();
+    mod::Log(
+        "Takeover: injected peer-quit broadcast begin ready=%d hostPid=%lu version=%s sendQuitAllRva=0x%08lX",
+        HasInjectedContext() ? 1 : 0,
+        static_cast<unsigned long>(hostPid),
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown",
+        static_cast<unsigned long>(sendQuitAllRva));
+    if (sendQuitAllRva == 0)
+    {
+        mod::Log(
+            "Takeover: injected peer-quit broadcast skipped (unsupported helper version=%s)",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown");
+        return 0;
+    }
+
+    bool usedStrictHostMatch = false;
+    const uintptr_t managerPtr =
+        FindInjectedPeerManagerPointer(hostPid, &usedStrictHostMatch);
+    if (managerPtr == 0)
+    {
+        return 0;
+    }
+
+    const uintptr_t helperBase =
+        reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (helperBase == 0)
+    {
+        mod::Log("Takeover: injected peer-quit broadcast failed (helper base unresolved)");
+        return 0;
+    }
+
+    typedef void (__thiscall *SendQuitAllFn)(void*);
+    const auto sendQuitAll =
+        reinterpret_cast<SendQuitAllFn>(helperBase + sendQuitAllRva);
+    mod::Log(
+        "Takeover: injected peer-quit broadcast invoking helperBase=0x%08lX manager=0x%08lX target=0x%08lX",
+        static_cast<unsigned long>(helperBase),
+        static_cast<unsigned long>(managerPtr),
+        static_cast<unsigned long>(helperBase + sendQuitAllRva));
+
+    __try
+    {
+        sendQuitAll(reinterpret_cast<void*>(managerPtr));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log(
+            "Takeover: injected peer-quit broadcast crashed manager=0x%08lX rva=0x%08lX",
+            static_cast<unsigned long>(managerPtr),
+            static_cast<unsigned long>(sendQuitAllRva));
+        return 0;
+    }
+    mod::Log(
+        "Takeover: injected peer-quit broadcast native call returned manager=0x%08lX",
+        static_cast<unsigned long>(managerPtr));
+
+    // Native helper paths send MessageQuit and then immediately continue into
+    // their own shutdown logic. Give the packet a small head start before the
+    // host tears the helper down from the outside.
+    Sleep(100u);
+    mod::Log(
+        "Takeover: injected peer-quit broadcast sent manager=0x%08lX rva=0x%08lX hostPid=%lu strictHostMatch=%d",
+        static_cast<unsigned long>(managerPtr),
+        static_cast<unsigned long>(sendQuitAllRva),
+        static_cast<unsigned long>(hostPid),
+        usedStrictHostMatch ? 1 : 0);
+    return 1;
+}
+
+static uintptr_t ResolveRemoteSelfExportAddress(
+    uintptr_t remoteSelfBase,
+    const void* localExport)
+{
+    if (remoteSelfBase == 0 || localExport == nullptr)
+    {
+        return 0;
+    }
+
+    HMODULE selfModule = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(localExport),
+            &selfModule)
+        || selfModule == nullptr)
+    {
+        return 0;
+    }
+
+    const uintptr_t localBase = reinterpret_cast<uintptr_t>(selfModule);
+    const uintptr_t localAddr = reinterpret_cast<uintptr_t>(localExport);
+    return remoteSelfBase + (localAddr - localBase);
+}
+
+static bool RequestInjectedPeerQuitBroadcastImpl(
+    HANDLE helperProcess,
+    uintptr_t remoteSelfBase,
+    DWORD helperPid,
+    const char* reason,
+    DWORD waitMs)
+{
+    mod::Log(
+        "Takeover: peer-quit broadcast request reason='%s' waitMs=%lu helperPid=%lu helperDup=%p remoteSelfBase=0x%08lX",
+        reason != nullptr ? reason : "",
+        static_cast<unsigned long>(waitMs),
+        static_cast<unsigned long>(helperPid),
+        helperProcess,
+        static_cast<unsigned long>(remoteSelfBase));
+
+    if (helperProcess == nullptr || remoteSelfBase == 0)
+    {
+        if (helperProcess != nullptr)
+        {
+            CloseHandle(helperProcess);
+        }
+        mod::Log(
+            "Takeover: peer-quit broadcast skipped reason='%s' helper=%p remoteSelfBase=0x%08lX",
+            reason != nullptr ? reason : "",
+            helperProcess,
+            static_cast<unsigned long>(remoteSelfBase));
+        return false;
+    }
+
+    const uintptr_t remoteStart =
+        ResolveRemoteSelfExportAddress(
+            remoteSelfBase,
+            reinterpret_cast<const void*>(&nb_stub_RequestPeerQuitBroadcast));
+    if (remoteStart == 0)
+    {
+        CloseHandle(helperProcess);
+        mod::Log(
+            "Takeover: peer-quit broadcast failed reason='%s' (remote export unresolved)",
+            reason != nullptr ? reason : "");
+        return false;
+    }
+    mod::Log(
+        "Takeover: peer-quit broadcast resolved remote export start=0x%08lX helperPid=%lu",
+        static_cast<unsigned long>(remoteStart),
+        static_cast<unsigned long>(helperPid));
+
+    DWORD threadId = 0;
+    HANDLE remoteThread = CreateRemoteThread(
+        helperProcess,
+        nullptr,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteStart),
+        nullptr,
+        0,
+        &threadId);
+    if (remoteThread == nullptr)
+    {
+        const DWORD err = GetLastError();
+        CloseHandle(helperProcess);
+        mod::Log(
+            "Takeover: peer-quit broadcast failed reason='%s' "
+            "CreateRemoteThread err=%lu start=0x%08lX",
+            reason != nullptr ? reason : "",
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long>(remoteStart));
+        return false;
+    }
+    mod::Log(
+        "Takeover: peer-quit broadcast remote thread created handle=%p tid=%lu reason='%s'",
+        remoteThread,
+        static_cast<unsigned long>(threadId),
+        reason != nullptr ? reason : "");
+
+    const DWORD waitResult = WaitForSingleObject(remoteThread, waitMs);
+    DWORD exitCode = 0;
+    if (waitResult == WAIT_OBJECT_0)
+    {
+        (void)GetExitCodeThread(remoteThread, &exitCode);
+    }
+    else if (waitResult == WAIT_TIMEOUT)
+    {
+        mod::Log(
+            "Takeover: peer-quit broadcast wait timed out reason='%s' waitMs=%lu tid=%lu",
+            reason != nullptr ? reason : "",
+            static_cast<unsigned long>(waitMs),
+            static_cast<unsigned long>(threadId));
+    }
+    else
+    {
+        mod::Log(
+            "Takeover: peer-quit broadcast wait failed reason='%s' wait=%lu err=%lu tid=%lu",
+            reason != nullptr ? reason : "",
+            static_cast<unsigned long>(waitResult),
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(threadId));
+    }
+
+    CloseHandle(remoteThread);
+    CloseHandle(helperProcess);
+
+    mod::Log(
+        "Takeover: peer-quit broadcast reason='%s' wait=%lu exit=%lu tid=%lu start=0x%08lX",
+        reason != nullptr ? reason : "",
+        static_cast<unsigned long>(waitResult),
+        static_cast<unsigned long>(exitCode),
+        static_cast<unsigned long>(threadId),
+        static_cast<unsigned long>(remoteStart));
+    return waitResult == WAIT_OBJECT_0 && exitCode == 1;
+}
+
+bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
+{
+    HANDLE helperProcess = nullptr;
+    uintptr_t remoteSelfBase = 0;
+    DWORD helperPid = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        remoteSelfBase = g_remoteInjectedSelfBase;
+        helperPid = g_revivalProcessId;
+        if (g_revivalProcess != nullptr)
+        {
+            (void)DuplicateHandle(
+                GetCurrentProcess(),
+                g_revivalProcess,
+                GetCurrentProcess(),
+                &helperProcess,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS);
+        }
+    }
+
+    return RequestInjectedPeerQuitBroadcastImpl(
+        helperProcess,
+        remoteSelfBase,
+        helperPid,
+        reason,
+        waitMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2064,6 +2591,44 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
+
+    const bool gameplayEscPeerQuitPending =
+        g_localRoleFlag == kLocalRoleOnline
+        && ConsumeOnlineMatchEscGracefulQuit();
+    if (gameplayEscPeerQuitPending)
+    {
+        HANDLE helperProcess = nullptr;
+        if (g_revivalProcess != nullptr)
+        {
+            (void)DuplicateHandle(
+                GetCurrentProcess(),
+                g_revivalProcess,
+                GetCurrentProcess(),
+                &helperProcess,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS);
+        }
+
+        const bool peerQuitSent = RequestInjectedPeerQuitBroadcastImpl(
+            helperProcess,
+            g_remoteInjectedSelfBase,
+            g_revivalProcessId,
+            "cancel_session_gameplay_esc",
+            300u);
+        mod::Log(
+            "Takeover: cancel session gameplay-ESC peer-quit broadcast=%d "
+            "reason='%s' helperPid=%lu",
+            peerQuitSent ? 1 : 0,
+            reason != nullptr ? reason : "",
+            static_cast<unsigned long>(g_revivalProcessId));
+        if (!peerQuitSent)
+        {
+            mod::Log(
+                "Takeover: cancel session gameplay-ESC broadcast failed; "
+                "continuing with local teardown");
+        }
+    }
 
     const bool hadProcess = ProcessAlive(ioStatus);
     if (hadProcess && g_revivalProcess != nullptr)

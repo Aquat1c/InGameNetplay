@@ -3804,10 +3804,12 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     }
 
     // ---- Online match ESC graceful-quit priming --------------------------
-    // Pressing Esc during an active online battle should queue Revival's own
-    // Quit packet before the later ExitProcess interception tears the helper
-    // down. Restrict this to the battle screen so normal post-match cleanup
-    // remains untouched.
+    // Pressing Esc during an active online battle eventually triggers
+    // ExitProcess inside EFZ.exe. We intercept that later, keep EFZ.exe alive,
+    // and ask the injected EfzRevival.exe helper to broadcast its native
+    // MessageQuit packet before we tear the helper down locally. Restrict
+    // this to the battle screen so normal post-match cleanup remains
+    // untouched.
     {
         static bool s_onlineMatchEscWasDown = false;
         const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -3828,19 +3830,18 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (escRisingEdge)
         {
-            const bool quitQueued =
-                SignalGracefulQuitRing("online_match_esc_key", 0);
             mod::Log(
                 "TICK_HOOK: online match ESC detected frameTick=%u screen=%u "
-                "session=0x%08lX quitQueued=%d",
+                "session=0x%08lX role=%d netRole=%d helperPid=%lu "
+                "dllExitPatched=%d peerQuitPrimed=1",
                 g_frameTick,
                 static_cast<unsigned>(escScreen),
                 static_cast<unsigned long>(currentSession),
-                quitQueued ? 1 : 0);
-            if (quitQueued)
-            {
-                ArmOnlineMatchEscGracefulQuit();
-            }
+                g_localRoleFlag,
+                g_netplayRole,
+                static_cast<unsigned long>(g_revivalProcessId),
+                g_dllExitProcessPatchesSaved ? 1 : 0);
+            ArmOnlineMatchEscGracefulQuit();
         }
     }
 
@@ -5267,6 +5268,25 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
 
     InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
     InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+    if (deadRole == kLocalRoleOnline)
+    {
+        // Revival can publish the Quit-ring signal before our later
+        // ExitProcess interception path sees the local ESC. If we convert the
+        // session back to local play and tear the helper down first, the peer
+        // never receives the native MessageQuit packet and has to wait for the
+        // network timeout instead. Send that packet here while the helper is
+        // still alive so the remote side returns immediately.
+        const bool peerQuitSent =
+            RequestInjectedPeerQuitBroadcast("quit_ring_pre_teardown", 300u);
+        mod::Log(
+            "TICK_HOOK: graceful-quit pre-teardown peer-quit broadcast=%d "
+            "phase=%s role=%d pid=%lu",
+            peerQuitSent ? 1 : 0,
+            phaseTag != nullptr ? phaseTag : "POST-TICK",
+            deadRole,
+            static_cast<unsigned long>(deadPid));
+    }
 
     NeutralizeRevivalSessionVtable();
 
