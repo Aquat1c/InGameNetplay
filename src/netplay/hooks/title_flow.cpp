@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +37,9 @@ using InlineEditInputResult = netplay::inline_edit::InputResult;
 using NetbridgeRole = netplay::bridge::NetbridgeRole;
 using NetbridgePhase = netplay::bridge::NetbridgePhase;
 using NetbridgeSpectatePromptKind = netplay::bridge::NetbridgeSpectatePromptKind;
+using ReadConfigByteFn = uint8_t(__cdecl*)(uint8_t);
+using LoadControlBindingsFn = BOOL(__thiscall*)(uint16_t*);
+using LoadControlPresetFn = BOOL(__thiscall*)(uint16_t*, int);
 
 void HandoffConnectedSessionToVsHumanState(uint32_t screenContext);
 void HandoffSpectateSession(uint32_t screenContext);
@@ -105,6 +109,939 @@ struct PendingLobbySpectateWait
 PendingLobbySpectateWait g_pendingLobbySpectateWait;
 
 void PlayLobbyChallengeAlert(uint32_t screenContext);
+
+struct MenuControlBinding
+{
+    uint8_t device = 0;
+    uint8_t code = 0;
+};
+
+struct MenuControlProfile
+{
+    uint8_t profileIndex = 0;
+    std::array<std::array<MenuControlBinding, 8>, 2> players = {};
+    std::array<uint8_t, 2> povMasks = {0, 0};
+    bool hasRuntimeOnlyPadBindings = false;
+    bool hasPovDirectionalOverrides = false;
+};
+
+MenuControlProfile g_menuControlProfile = {};
+bool g_menuControlProfileLoaded = false;
+bool g_menuControlRuntimeCompatActive = false;
+InputSnapshot g_lastCompatInputSnapshot = {};
+bool g_hasLoggedCompatInputSnapshot = false;
+
+constexpr uint8_t kMenuPollMaskRight = 1u << 0u;
+constexpr uint8_t kMenuPollMaskLeft = 1u << 1u;
+constexpr uint8_t kMenuPollMaskDown = 1u << 2u;
+constexpr uint8_t kMenuPollMaskUp = 1u << 3u;
+constexpr uint8_t kMenuDirectionalRuntimeMask =
+    static_cast<uint8_t>(kMenuPollMaskRight | kMenuPollMaskLeft | kMenuPollMaskDown | kMenuPollMaskUp);
+constexpr uint8_t kMenuNativePadButtonMinCode = 0x01u;
+constexpr uint8_t kMenuNativePadButtonMaxCode = 0x10u;
+constexpr uint8_t kMenuNativePadAxisUpCode = 0x11u;
+constexpr uint8_t kMenuNativePadAxisDownCode = 0x12u;
+constexpr uint8_t kMenuNativePadAxisLeftCode = 0x13u;
+constexpr uint8_t kMenuNativePadAxisRightCode = 0x14u;
+constexpr uint8_t kMenuExtendedPadButtonBaseCode = 0x21u;
+constexpr uint8_t kMenuExtendedPadButtonCount = 16u;
+constexpr uint8_t kMenuRightStickUpCode = 0x31u;
+constexpr uint8_t kMenuRightStickDownCode = 0x32u;
+constexpr uint8_t kMenuRightStickLeftCode = 0x33u;
+constexpr uint8_t kMenuRightStickRightCode = 0x34u;
+constexpr uint8_t kMenuZAxisNegativeCode = 0x35u;
+constexpr uint8_t kMenuZAxisPositiveCode = 0x36u;
+constexpr uint8_t kMenuRzAxisNegativeCode = 0x37u;
+constexpr uint8_t kMenuRzAxisPositiveCode = 0x38u;
+constexpr uint8_t kMenuSlider0NegativeCode = 0x39u;
+constexpr uint8_t kMenuSlider0PositiveCode = 0x3Au;
+constexpr uint8_t kMenuSlider1NegativeCode = 0x3Bu;
+constexpr uint8_t kMenuSlider1PositiveCode = 0x3Cu;
+constexpr uintptr_t kGameSystemInputManagerOffset = sizeof(uintptr_t);
+constexpr uintptr_t kInputManagerMappingOffsetBytes = 448u;
+constexpr uintptr_t kInputManagerPad1DeviceOffset = 492u;
+constexpr uintptr_t kInputManagerPad2DeviceOffset = 496u;
+constexpr uintptr_t kPad1StateOffset = 288u;
+constexpr uintptr_t kPad2StateOffset = 368u;
+constexpr uintptr_t kJoyStateZOffset = 8u;
+constexpr uintptr_t kJoyStateRxOffset = 12u;
+constexpr uintptr_t kJoyStateRyOffset = 16u;
+constexpr uintptr_t kJoyStateRzOffset = 20u;
+constexpr uintptr_t kJoyStateSlider0Offset = 24u;
+constexpr uintptr_t kJoyStateSlider1Offset = 28u;
+constexpr uintptr_t kPov0OffsetInJoyState = 32u;
+constexpr uintptr_t kJoyStateButton0Offset = 48u;
+constexpr LONG kMenuPadAxisThreshold = 500;
+constexpr uint8_t kSelectedControlProfileConfigByte = 0x9Cu;
+constexpr size_t kIgcrProfileCount = 6u;
+constexpr size_t kIgcrSlotBytes = 4u + (2u * 8u * 2u);
+constexpr size_t kIgcrHeaderBytes = 10u;
+constexpr size_t kIgcrExpectedFileBytes = kIgcrHeaderBytes + (kIgcrProfileCount * kIgcrSlotBytes);
+constexpr std::array<uint8_t, 8> kIgcrOverrideMagic = {'I', 'G', 'C', 'R', 'O', 'V', 'R', '1'};
+constexpr std::array<int, 8> kMenuActionToRuntimeWordIndex = {3, 2, 1, 0, 4, 5, 6, 7};
+
+uint8_t ClampMenuControlProfileIndex(uint8_t profile)
+{
+    return profile <= 5u ? profile : 0u;
+}
+
+bool IsMenuDirectionalAction(int action)
+{
+    return action >= 0 && action < 4;
+}
+
+uint8_t MenuActionRuntimeBit(int action)
+{
+    if (action < 0 || action >= static_cast<int>(kMenuActionToRuntimeWordIndex.size()))
+    {
+        return 0u;
+    }
+
+    const int runtimeIndex = kMenuActionToRuntimeWordIndex[static_cast<size_t>(action)];
+    return (runtimeIndex >= 0 && runtimeIndex < 8) ? static_cast<uint8_t>(1u << runtimeIndex) : 0u;
+}
+
+uint8_t MenuDirectionalRuntimeBit(int action)
+{
+    return IsMenuDirectionalAction(action) ? MenuActionRuntimeBit(action) : 0u;
+}
+
+bool IsMenuNativePadButtonCode(uint8_t code)
+{
+    return code >= kMenuNativePadButtonMinCode && code <= kMenuNativePadButtonMaxCode;
+}
+
+bool IsMenuNativePadAxisCode(uint8_t code)
+{
+    return code >= kMenuNativePadAxisUpCode && code <= kMenuNativePadAxisRightCode;
+}
+
+bool IsMenuNativePadBinding(const MenuControlBinding& binding)
+{
+    return binding.device >= 1u && binding.device <= 2u &&
+        (IsMenuNativePadButtonCode(binding.code) || IsMenuNativePadAxisCode(binding.code));
+}
+
+bool IsMenuExtendedPadButtonCode(uint8_t code)
+{
+    return code >= kMenuExtendedPadButtonBaseCode &&
+        code < static_cast<uint8_t>(kMenuExtendedPadButtonBaseCode + kMenuExtendedPadButtonCount);
+}
+
+int MenuExtendedPadButtonIndexFromCode(uint8_t code)
+{
+    if (!IsMenuExtendedPadButtonCode(code))
+    {
+        return -1;
+    }
+    return 16 + static_cast<int>(code - kMenuExtendedPadButtonBaseCode);
+}
+
+bool IsMenuKnownExtendedPadCode(uint8_t code)
+{
+    if (IsMenuExtendedPadButtonCode(code))
+    {
+        return true;
+    }
+
+    switch (code)
+    {
+    case kMenuRightStickUpCode:
+    case kMenuRightStickDownCode:
+    case kMenuRightStickLeftCode:
+    case kMenuRightStickRightCode:
+    case kMenuZAxisNegativeCode:
+    case kMenuZAxisPositiveCode:
+    case kMenuRzAxisNegativeCode:
+    case kMenuRzAxisPositiveCode:
+    case kMenuSlider0NegativeCode:
+    case kMenuSlider0PositiveCode:
+    case kMenuSlider1NegativeCode:
+    case kMenuSlider1PositiveCode:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool IsMenuRuntimeOnlyPadBinding(const MenuControlBinding& binding)
+{
+    return binding.device >= 1u && binding.device <= 2u && binding.code != 0u &&
+        !IsMenuNativePadBinding(binding);
+}
+
+bool ProfileUsesExtendedPadAxisBindings(const MenuControlProfile& profile)
+{
+    for (int player = 0; player < 2; ++player)
+    {
+        for (int action = 0; action < 8; ++action)
+        {
+            switch (profile.players[static_cast<size_t>(player)][static_cast<size_t>(action)].code)
+            {
+            case kMenuRightStickUpCode:
+            case kMenuRightStickDownCode:
+            case kMenuRightStickLeftCode:
+            case kMenuRightStickRightCode:
+            case kMenuZAxisNegativeCode:
+            case kMenuZAxisPositiveCode:
+            case kMenuRzAxisNegativeCode:
+            case kMenuRzAxisPositiveCode:
+            case kMenuSlider0NegativeCode:
+            case kMenuSlider0PositiveCode:
+            case kMenuSlider1NegativeCode:
+            case kMenuSlider1PositiveCode:
+                return true;
+            default:
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+uintptr_t TryResolveMenuInputManager(int gameSystem)
+{
+    if (gameSystem == 0)
+    {
+        return 0;
+    }
+
+    __try
+    {
+        return *reinterpret_cast<volatile uintptr_t*>(static_cast<uintptr_t>(gameSystem) + kGameSystemInputManagerOffset);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+uintptr_t ReadMenuInputManagerPointerField(const uint8_t* inputManagerBytes, uintptr_t offset)
+{
+    if (inputManagerBytes == nullptr)
+    {
+        return 0;
+    }
+
+    __try
+    {
+        return *reinterpret_cast<volatile const uintptr_t*>(inputManagerBytes + offset);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+uint8_t MenuPovMaskFromRaw(DWORD raw)
+{
+    if (LOWORD(raw) == 0xFFFFu)
+    {
+        return 0u;
+    }
+
+    const unsigned angle = LOWORD(raw) % 36000u;
+    if (angle < 2250u || angle >= 33750u)
+    {
+        return kMenuPollMaskUp;
+    }
+    if (angle < 6750u)
+    {
+        return static_cast<uint8_t>(kMenuPollMaskUp | kMenuPollMaskRight);
+    }
+    if (angle < 11250u)
+    {
+        return kMenuPollMaskRight;
+    }
+    if (angle < 15750u)
+    {
+        return static_cast<uint8_t>(kMenuPollMaskRight | kMenuPollMaskDown);
+    }
+    if (angle < 20250u)
+    {
+        return kMenuPollMaskDown;
+    }
+    if (angle < 24750u)
+    {
+        return static_cast<uint8_t>(kMenuPollMaskDown | kMenuPollMaskLeft);
+    }
+    if (angle < 29250u)
+    {
+        return kMenuPollMaskLeft;
+    }
+    return static_cast<uint8_t>(kMenuPollMaskLeft | kMenuPollMaskUp);
+}
+
+uint8_t MenuAxisCodeToPollMaskBit(uint8_t code)
+{
+    switch (code)
+    {
+    case kMenuNativePadAxisUpCode:
+        return kMenuPollMaskUp;
+    case kMenuNativePadAxisDownCode:
+        return kMenuPollMaskDown;
+    case kMenuNativePadAxisLeftCode:
+        return kMenuPollMaskLeft;
+    case kMenuNativePadAxisRightCode:
+        return kMenuPollMaskRight;
+    default:
+        return 0u;
+    }
+}
+
+uint8_t ReadMenuPadPovMask(const uint8_t* inputManagerBytes, uintptr_t padStateOffset, bool padPresent)
+{
+    if (inputManagerBytes == nullptr || !padPresent)
+    {
+        return 0u;
+    }
+
+    __try
+    {
+        const DWORD raw = *reinterpret_cast<volatile const DWORD*>(inputManagerBytes + padStateOffset + kPov0OffsetInJoyState);
+        return MenuPovMaskFromRaw(raw);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0u;
+    }
+}
+
+uint16_t EncodeMenuBindingWord(const MenuControlBinding& binding)
+{
+    if (binding.code == 0u)
+    {
+        return 0u;
+    }
+    if (binding.device == 0u)
+    {
+        return static_cast<uint16_t>(binding.code);
+    }
+    if (!IsMenuNativePadBinding(binding))
+    {
+        return 0u;
+    }
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(binding.device) << 8u) | static_cast<uint16_t>(binding.code - 1u));
+}
+
+std::string BuildIgcrOverrideStorePath()
+{
+    char exePath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+    {
+        return {};
+    }
+
+    char* const lastSlash = std::strrchr(exePath, '\\');
+    if (lastSlash == nullptr)
+    {
+        return {};
+    }
+
+    *lastSlash = '\0';
+    std::string path(exePath);
+    path += "\\mods\\InGameControlsRebind\\IGCRProfileOverrides.bin";
+    return path;
+}
+
+bool LoadIgcrOverrideProfile(uint8_t profileIndex, MenuControlProfile* outProfile, std::string* outError)
+{
+    if (outProfile == nullptr)
+    {
+        return false;
+    }
+
+    const std::string path = BuildIgcrOverrideStorePath();
+    if (path.empty())
+    {
+        if (outError != nullptr)
+        {
+            *outError = "unable to resolve IGCR override store path";
+        }
+        return false;
+    }
+
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input.is_open())
+    {
+        return false;
+    }
+
+    const std::streamoff endPos = input.tellg();
+    if (endPos <= 0)
+    {
+        if (outError != nullptr)
+        {
+            *outError = "IGCR override store is empty";
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(endPos), 0u);
+    input.seekg(0, std::ios::beg);
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!input.good())
+    {
+        if (outError != nullptr)
+        {
+            *outError = "failed to read IGCR override store";
+        }
+        return false;
+    }
+
+    if (bytes.size() != kIgcrExpectedFileBytes)
+    {
+        if (outError != nullptr)
+        {
+            char buffer[128] = {};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "unexpected IGCR override store size %zu (expected %zu)",
+                bytes.size(),
+                kIgcrExpectedFileBytes);
+            *outError = buffer;
+        }
+        return false;
+    }
+
+    size_t cursor = 0;
+    for (uint8_t expected : kIgcrOverrideMagic)
+    {
+        if (bytes[cursor++] != expected)
+        {
+            if (outError != nullptr)
+            {
+                *outError = "IGCR override store magic mismatch";
+            }
+            return false;
+        }
+    }
+
+    const uint8_t version = bytes[cursor++];
+    const uint8_t count = bytes[cursor++];
+    if (version != 1u || count != static_cast<uint8_t>(kIgcrProfileCount))
+    {
+        if (outError != nullptr)
+        {
+            *outError = "IGCR override store version/count mismatch";
+        }
+        return false;
+    }
+
+    const size_t slotIndex = static_cast<size_t>(ClampMenuControlProfileIndex(profileIndex));
+    cursor = kIgcrHeaderBytes + (slotIndex * kIgcrSlotBytes);
+
+    if (bytes[cursor++] == 0u)
+    {
+        return false;
+    }
+
+    MenuControlProfile profile = {};
+    profile.profileIndex = static_cast<uint8_t>(slotIndex);
+    profile.povMasks[0] = static_cast<uint8_t>(bytes[cursor++] & kMenuDirectionalRuntimeMask);
+    profile.povMasks[1] = static_cast<uint8_t>(bytes[cursor++] & kMenuDirectionalRuntimeMask);
+    ++cursor;
+
+    for (int player = 0; player < 2; ++player)
+    {
+        for (int action = 0; action < 8; ++action)
+        {
+            MenuControlBinding binding = {};
+            binding.device = bytes[cursor++];
+            binding.code = bytes[cursor++];
+            if (binding.device > 2u ||
+                (!IsMenuNativePadBinding(binding) && binding.device != 0u &&
+                    binding.code != 0u && !IsMenuKnownExtendedPadCode(binding.code)))
+            {
+                binding = {};
+            }
+
+            profile.players[static_cast<size_t>(player)][static_cast<size_t>(action)] = binding;
+            profile.hasRuntimeOnlyPadBindings = profile.hasRuntimeOnlyPadBindings || IsMenuRuntimeOnlyPadBinding(binding);
+        }
+    }
+
+    profile.hasPovDirectionalOverrides =
+        (profile.povMasks[0] & kMenuDirectionalRuntimeMask) != 0u ||
+        (profile.povMasks[1] & kMenuDirectionalRuntimeMask) != 0u;
+    *outProfile = profile;
+    return true;
+}
+
+bool WriteMenuControlProfileLiveMappings(uintptr_t inputManager, const MenuControlProfile& profile)
+{
+    if (inputManager == 0)
+    {
+        return false;
+    }
+
+    __try
+    {
+        auto* const mappingWords = reinterpret_cast<volatile uint16_t*>(inputManager + kInputManagerMappingOffsetBytes);
+        for (int player = 0; player < 2; ++player)
+        {
+            for (int action = 0; action < 8; ++action)
+            {
+                const int runtimeIndex = kMenuActionToRuntimeWordIndex[static_cast<size_t>(action)];
+                if (runtimeIndex < 0 || runtimeIndex >= 8)
+                {
+                    continue;
+                }
+                mappingWords[(player * 8) + runtimeIndex] =
+                    EncodeMenuBindingWord(profile.players[static_cast<size_t>(player)][static_cast<size_t>(action)]);
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool ReadMenuControlProfileIndex(uint8_t* outProfile)
+{
+    if (outProfile == nullptr)
+    {
+        return false;
+    }
+
+    auto const readConfigByte = reinterpret_cast<ReadConfigByteFn>(RuntimeAddress(kVaReadConfigByte));
+    if (readConfigByte == nullptr)
+    {
+        return false;
+    }
+
+    __try
+    {
+        *outProfile = ClampMenuControlProfileIndex(readConfigByte(kSelectedControlProfileConfigByte));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool IsMenuPadBindingActiveFromJoyState(const uint8_t* inputManagerBytes, const MenuControlBinding& binding)
+{
+    if (inputManagerBytes == nullptr || binding.device < 1u || binding.device > 2u || binding.code == 0u)
+    {
+        return false;
+    }
+
+    const uintptr_t deviceOffset = (binding.device == 1u) ? kInputManagerPad1DeviceOffset : kInputManagerPad2DeviceOffset;
+    if (ReadMenuInputManagerPointerField(inputManagerBytes, deviceOffset) == 0u)
+    {
+        return false;
+    }
+
+    const uintptr_t padStateOffset = (binding.device == 1u) ? kPad1StateOffset : kPad2StateOffset;
+    auto readAxis = [&](uintptr_t axisOffset, int32_t* outValue) -> bool
+    {
+        if (outValue == nullptr)
+        {
+            return false;
+        }
+
+        __try
+        {
+            *outValue = *reinterpret_cast<volatile const int32_t*>(inputManagerBytes + padStateOffset + axisOffset);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    };
+
+    const int buttonIndex = MenuExtendedPadButtonIndexFromCode(binding.code);
+    if (buttonIndex >= 0)
+    {
+        __try
+        {
+            const uint8_t value = *reinterpret_cast<volatile const uint8_t*>(
+                inputManagerBytes + padStateOffset + kJoyStateButton0Offset + static_cast<uintptr_t>(buttonIndex));
+            return (value & 0x80u) != 0u;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    int32_t axisValue = 0;
+    switch (binding.code)
+    {
+    case kMenuRightStickUpCode:
+        return readAxis(kJoyStateRyOffset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuRightStickDownCode:
+        return readAxis(kJoyStateRyOffset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    case kMenuRightStickLeftCode:
+        return readAxis(kJoyStateRxOffset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuRightStickRightCode:
+        return readAxis(kJoyStateRxOffset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    case kMenuZAxisNegativeCode:
+        return readAxis(kJoyStateZOffset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuZAxisPositiveCode:
+        return readAxis(kJoyStateZOffset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    case kMenuRzAxisNegativeCode:
+        return readAxis(kJoyStateRzOffset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuRzAxisPositiveCode:
+        return readAxis(kJoyStateRzOffset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    case kMenuSlider0NegativeCode:
+        return readAxis(kJoyStateSlider0Offset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuSlider0PositiveCode:
+        return readAxis(kJoyStateSlider0Offset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    case kMenuSlider1NegativeCode:
+        return readAxis(kJoyStateSlider1Offset, &axisValue) && axisValue < -kMenuPadAxisThreshold;
+    case kMenuSlider1PositiveCode:
+        return readAxis(kJoyStateSlider1Offset, &axisValue) && axisValue > kMenuPadAxisThreshold;
+    default:
+        return false;
+    }
+}
+
+bool GetMenuActionStateFromBytes(const uint8_t* inputBytes, int player, int action)
+{
+    if (inputBytes == nullptr || player < 0 || player > 1)
+    {
+        return false;
+    }
+
+    const int playerOffset = player;
+    switch (action)
+    {
+    case 0:
+        return static_cast<int8_t>(inputBytes[14 + playerOffset]) < 0;
+    case 1:
+        return static_cast<int8_t>(inputBytes[14 + playerOffset]) > 0;
+    case 2:
+        return static_cast<int8_t>(inputBytes[12 + playerOffset]) < 0;
+    case 3:
+        return static_cast<int8_t>(inputBytes[12 + playerOffset]) > 0;
+    case 4:
+        return inputBytes[16 + playerOffset] != 0;
+    case 5:
+        return inputBytes[18 + playerOffset] != 0;
+    case 6:
+        return inputBytes[20 + playerOffset] != 0;
+    case 7:
+        return inputBytes[22 + playerOffset] != 0;
+    default:
+        return false;
+    }
+}
+
+void WriteMenuActionsToBytes(uint8_t* inputBytes, int player, const std::array<bool, 8>& actions)
+{
+    if (inputBytes == nullptr || player < 0 || player > 1)
+    {
+        return;
+    }
+
+    const int playerOffset = player;
+    int8_t horizontal = 0;
+    if (actions[3] && !actions[2])
+    {
+        horizontal = 1;
+    }
+    else if (actions[2] && !actions[3])
+    {
+        horizontal = -1;
+    }
+
+    int8_t vertical = 0;
+    if (actions[1] && !actions[0])
+    {
+        vertical = 1;
+    }
+    else if (actions[0] && !actions[1])
+    {
+        vertical = -1;
+    }
+
+    inputBytes[12 + playerOffset] = static_cast<uint8_t>(horizontal);
+    inputBytes[14 + playerOffset] = static_cast<uint8_t>(vertical);
+    inputBytes[16 + playerOffset] = actions[4] ? 1u : 0u;
+    inputBytes[18 + playerOffset] = actions[5] ? 1u : 0u;
+    inputBytes[20 + playerOffset] = actions[6] ? 1u : 0u;
+    inputBytes[22 + playerOffset] = actions[7] ? 1u : 0u;
+}
+
+void ApplyIgcrMenuControlCompatibility(int gameSystem, uint8_t* inputBytes)
+{
+    if (!g_menuControlRuntimeCompatActive || inputBytes == nullptr)
+    {
+        return;
+    }
+
+    uint8_t currentProfile = 0;
+    if (ReadMenuControlProfileIndex(&currentProfile) && currentProfile != g_menuControlProfile.profileIndex)
+    {
+        return;
+    }
+
+    const uintptr_t inputManager = TryResolveMenuInputManager(gameSystem);
+    if (inputManager == 0)
+    {
+        return;
+    }
+
+    const auto* const inputManagerBytes = reinterpret_cast<const uint8_t*>(inputManager);
+    bool anyChanged = false;
+    for (int player = 0; player < 2; ++player)
+    {
+        std::array<bool, 8> actions = {};
+        for (int action = 0; action < 8; ++action)
+        {
+            actions[static_cast<size_t>(action)] = GetMenuActionStateFromBytes(inputBytes, player, action);
+        }
+
+        const uint8_t playerPovMask = g_menuControlProfile.povMasks[static_cast<size_t>(player)];
+        const bool padPresent = ReadMenuInputManagerPointerField(
+            inputManagerBytes,
+            (player == 0) ? kInputManagerPad1DeviceOffset : kInputManagerPad2DeviceOffset) != 0u;
+        const uint8_t livePovMask = ReadMenuPadPovMask(
+            inputManagerBytes,
+            (player == 0) ? kPad1StateOffset : kPad2StateOffset,
+            padPresent);
+
+        std::array<bool, 8> rewritten = actions;
+        for (int action = 0; action < 8; ++action)
+        {
+            const MenuControlBinding binding =
+                g_menuControlProfile.players[static_cast<size_t>(player)][static_cast<size_t>(action)];
+            if (IsMenuRuntimeOnlyPadBinding(binding))
+            {
+                rewritten[static_cast<size_t>(action)] =
+                    IsMenuPadBindingActiveFromJoyState(inputManagerBytes, binding);
+                continue;
+            }
+
+            if (!IsMenuDirectionalAction(action) || !IsMenuNativePadAxisCode(binding.code))
+            {
+                continue;
+            }
+
+            const uint8_t directionBit = MenuDirectionalRuntimeBit(action);
+            if ((playerPovMask & directionBit) == 0u)
+            {
+                continue;
+            }
+
+            const uint8_t pollMask = MenuAxisCodeToPollMaskBit(binding.code);
+            rewritten[static_cast<size_t>(action)] = (livePovMask & pollMask) != 0u;
+        }
+
+        if (rewritten != actions)
+        {
+            WriteMenuActionsToBytes(inputBytes, player, rewritten);
+            anyChanged = true;
+        }
+    }
+
+    if (!anyChanged)
+    {
+        return;
+    }
+
+    InputSnapshot compatSnapshot = {
+        static_cast<int8_t>(inputBytes[12]),
+        static_cast<int8_t>(inputBytes[14]),
+        inputBytes[16],
+        inputBytes[18],
+        static_cast<int8_t>(inputBytes[13]),
+        static_cast<int8_t>(inputBytes[15]),
+        inputBytes[17],
+        inputBytes[19],
+    };
+    if (!g_hasLoggedCompatInputSnapshot ||
+        std::memcmp(&compatSnapshot, &g_lastCompatInputSnapshot, sizeof(InputSnapshot)) != 0)
+    {
+        mod::Log(
+            "MenuControls: IGCR compatibility rewrote menu input profile=%u P1(h=%d v=%d a=%u b=%u) P2(h=%d v=%d a=%u b=%u)",
+            static_cast<unsigned>(g_menuControlProfile.profileIndex),
+            static_cast<int>(compatSnapshot.p1Horizontal),
+            static_cast<int>(compatSnapshot.p1Vertical),
+            static_cast<unsigned>(compatSnapshot.p1Confirm),
+            static_cast<unsigned>(compatSnapshot.p1Cancel),
+            static_cast<int>(compatSnapshot.p2Horizontal),
+            static_cast<int>(compatSnapshot.p2Vertical),
+            static_cast<unsigned>(compatSnapshot.p2Confirm),
+            static_cast<unsigned>(compatSnapshot.p2Cancel));
+        g_lastCompatInputSnapshot = compatSnapshot;
+        g_hasLoggedCompatInputSnapshot = true;
+    }
+}
+
+bool ReloadNativeMenuControlBindings(uint32_t screenContext)
+{
+    const int gameSystem = GetGameSystem(screenContext);
+    if (gameSystem == 0)
+    {
+        mod::Log("MenuControls: skipped live control refresh (gameSystem unavailable)");
+        return false;
+    }
+
+    auto const readConfigByte =
+        reinterpret_cast<ReadConfigByteFn>(RuntimeAddress(kVaReadConfigByte));
+    auto const loadControlBindings =
+        reinterpret_cast<LoadControlBindingsFn>(RuntimeAddress(kVaLoadControlBindings));
+    auto const loadControlPreset =
+        reinterpret_cast<LoadControlPresetFn>(RuntimeAddress(kVaLoadControlPreset));
+    if (readConfigByte == nullptr || loadControlBindings == nullptr || loadControlPreset == nullptr)
+    {
+        mod::Log(
+            "MenuControls: skipped live control refresh (functions unavailable read=0x%08lX load=0x%08lX preset=0x%08lX)",
+            static_cast<unsigned long>(reinterpret_cast<uintptr_t>(readConfigByte)),
+            static_cast<unsigned long>(reinterpret_cast<uintptr_t>(loadControlBindings)),
+            static_cast<unsigned long>(reinterpret_cast<uintptr_t>(loadControlPreset)));
+        return false;
+    }
+
+    const uintptr_t inputManager = TryResolveMenuInputManager(gameSystem);
+
+    if (inputManager == 0)
+    {
+        mod::Log(
+            "MenuControls: skipped live control refresh (input manager missing gameSystem=0x%08lX)",
+            static_cast<unsigned long>(gameSystem));
+        return false;
+    }
+
+    uint8_t profile = 0;
+    if (!ReadMenuControlProfileIndex(&profile))
+    {
+        mod::Log("MenuControls: exception reading selected control profile");
+        return false;
+    }
+
+    if (profile > 5u)
+    {
+        mod::Log(
+            "MenuControls: selected control profile out of range (%u), falling back to custom profile",
+            static_cast<unsigned>(profile));
+        profile = 0;
+    }
+
+    BOOL ok = FALSE;
+    const char* reloadPath = (profile == 0u) ? "loadControlBindings" : "loadControlPreset";
+    __try
+    {
+        ok = (profile == 0u)
+            ? loadControlBindings(reinterpret_cast<uint16_t*>(inputManager))
+            : loadControlPreset(reinterpret_cast<uint16_t*>(inputManager), static_cast<int>(profile));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log(
+            "MenuControls: exception during live control refresh path=%s profile=%u inputManager=0x%08lX",
+            reloadPath,
+            static_cast<unsigned>(profile),
+            static_cast<unsigned long>(inputManager));
+        return false;
+    }
+
+    mod::Log(
+        "MenuControls: live control refresh path=%s profile=%u inputManager=0x%08lX ok=%d",
+        reloadPath,
+        static_cast<unsigned>(profile),
+        static_cast<unsigned long>(inputManager),
+        ok ? 1 : 0);
+    return ok == TRUE;
+}
+
+bool SyncMenuControlBindings(uint32_t screenContext)
+{
+    g_menuControlProfile = {};
+    g_menuControlProfileLoaded = false;
+    g_menuControlRuntimeCompatActive = false;
+    g_hasLoggedCompatInputSnapshot = false;
+
+    const int gameSystem = GetGameSystem(screenContext);
+    if (gameSystem == 0)
+    {
+        mod::Log("MenuControls: sync skipped (gameSystem unavailable)");
+        return false;
+    }
+
+    const uintptr_t inputManager = TryResolveMenuInputManager(gameSystem);
+    if (inputManager == 0)
+    {
+        mod::Log(
+            "MenuControls: sync skipped (input manager unavailable gameSystem=0x%08lX)",
+            static_cast<unsigned long>(gameSystem));
+        return false;
+    }
+
+    uint8_t profileIndex = 0;
+    if (!ReadMenuControlProfileIndex(&profileIndex))
+    {
+        mod::Log("MenuControls: sync failed (selected control profile unavailable)");
+        return ReloadNativeMenuControlBindings(screenContext);
+    }
+
+    MenuControlProfile effectiveProfile = {};
+    std::string overrideError;
+    if (!LoadIgcrOverrideProfile(profileIndex, &effectiveProfile, &overrideError))
+    {
+        if (!overrideError.empty())
+        {
+            mod::Log(
+                "MenuControls: IGCR override load failed profile=%u reason=%s",
+                static_cast<unsigned>(profileIndex),
+                overrideError.c_str());
+        }
+        const bool ok = ReloadNativeMenuControlBindings(screenContext);
+        mod::Log(
+            "MenuControls: sync fallback native reload profile=%u ok=%d",
+            static_cast<unsigned>(profileIndex),
+            ok ? 1 : 0);
+        return ok;
+    }
+
+    const bool writeOk = WriteMenuControlProfileLiveMappings(inputManager, effectiveProfile);
+    if (!writeOk)
+    {
+        mod::Log(
+            "MenuControls: IGCR live mapping apply failed profile=%u inputManager=0x%08lX; falling back to native reload",
+            static_cast<unsigned>(effectiveProfile.profileIndex),
+            static_cast<unsigned long>(inputManager));
+        const bool nativeOk = ReloadNativeMenuControlBindings(screenContext);
+        g_menuControlProfile = effectiveProfile;
+        g_menuControlProfileLoaded = true;
+        g_menuControlRuntimeCompatActive =
+            effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides;
+        return nativeOk;
+    }
+
+    g_menuControlProfile = effectiveProfile;
+    g_menuControlProfileLoaded = true;
+    g_menuControlRuntimeCompatActive =
+        effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides;
+    mod::Log(
+        "MenuControls: IGCR profile sync applied profile=%u inputManager=0x%08lX runtimeOnly=%d povMaskP1=0x%02X povMaskP2=0x%02X extAxis=%d compat=%d",
+        static_cast<unsigned>(effectiveProfile.profileIndex),
+        static_cast<unsigned long>(inputManager),
+        effectiveProfile.hasRuntimeOnlyPadBindings ? 1 : 0,
+        static_cast<unsigned>(effectiveProfile.povMasks[0]),
+        static_cast<unsigned>(effectiveProfile.povMasks[1]),
+        ProfileUsesExtendedPadAxisBindings(effectiveProfile) ? 1 : 0,
+        g_menuControlRuntimeCompatActive ? 1 : 0);
+    return true;
+}
+
+void ResetMenuControlCompatibilityState()
+{
+    g_menuControlProfile = {};
+    g_menuControlProfileLoaded = false;
+    g_menuControlRuntimeCompatActive = false;
+    g_hasLoggedCompatInputSnapshot = false;
+}
 
 void ReenterNetplayMenuAfterSessionAbort(uint32_t screenContext, const char* reason)
 {
@@ -1866,6 +2803,8 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 
     LoadNetplayMenuSettingsFromIni();
     ResetTitleMenuState(screenContext, 0);
+    ResetMenuControlCompatibilityState();
+    (void)SyncMenuControlBindings(screenContext);
 
     // If a lobby session is still alive (e.g. returning from a lobby match),
     // re-enter the Lobby menu directly instead of Main so the user stays in
@@ -2819,8 +3758,11 @@ char UpdateNetplayMenu(uint32_t screenContext)
     processInput(reinterpret_cast<int*>(gameSystem));
     netplay::bridge::Tick();
     auto* const rawInputBytes = reinterpret_cast<uint8_t*>(gameSystem);
+    std::array<uint8_t, kFilteredMenuInputBytes> menuInputBytes = {};
+    std::memcpy(menuInputBytes.data(), rawInputBytes, kFilteredMenuInputBytes);
+    ApplyIgcrMenuControlCompatibility(gameSystem, menuInputBytes.data());
     const bool windowFocused = IsScreenWindowFocused(screenContext);
-    const uint8_t* const inputBytes = FilterMenuInputsForWindowFocus(rawInputBytes, windowFocused);
+    const uint8_t* const inputBytes = FilterMenuInputsForWindowFocus(menuInputBytes.data(), windowFocused);
     InputSnapshot currentSnapshot = {
         static_cast<int8_t>(inputBytes[12]),
         static_cast<int8_t>(inputBytes[14]),
