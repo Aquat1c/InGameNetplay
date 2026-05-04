@@ -11,6 +11,12 @@
 
 #include "logger.h"
 
+#ifndef DIRECTINPUT_VERSION
+#define DIRECTINPUT_VERSION 0x0800
+#endif
+
+#include <dinput.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -130,6 +136,12 @@ bool g_menuControlProfileLoaded = false;
 bool g_menuControlRuntimeCompatActive = false;
 InputSnapshot g_lastCompatInputSnapshot = {};
 bool g_hasLoggedCompatInputSnapshot = false;
+bool g_menuControlSyncAttempted = false;
+uint8_t g_lastMenuControlSyncProfileIndex = 0xFFu;
+std::array<uintptr_t, 2> g_menuLiveAxisRangeNormalizedDevicePtrs = {};
+FILETIME g_lastIgcrOverrideWriteTime = {};
+bool g_hasLastIgcrOverrideWriteTime = false;
+DWORD g_nextMenuControlRefreshTick = 0;
 
 constexpr uint8_t kMenuPollMaskRight = 1u << 0u;
 constexpr uint8_t kMenuPollMaskLeft = 1u << 1u;
@@ -333,6 +345,66 @@ uintptr_t ReadMenuInputManagerPointerField(const uint8_t* inputManagerBytes, uin
     }
 }
 
+BOOL CALLBACK NormalizeMenuLivePadAxisRangeCallback(const DIDEVICEOBJECTINSTANCEA* objectInstance, VOID* context)
+{
+    if (objectInstance == nullptr || context == nullptr)
+    {
+        return DIENUM_CONTINUE;
+    }
+
+    auto* const device = static_cast<IDirectInputDevice8A*>(context);
+    DIPROPRANGE range = {};
+    range.lMin = -1000;
+    range.lMax = 1000;
+    range.diph.dwSize = sizeof(DIPROPRANGE);
+    range.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+    range.diph.dwHow = DIPH_BYID;
+    range.diph.dwObj = objectInstance->dwType;
+    device->SetProperty(DIPROP_RANGE, &range.diph);
+    return DIENUM_CONTINUE;
+}
+
+void MaybeNormalizeMenuLivePadAxisRanges(uintptr_t inputManager)
+{
+    if (inputManager == 0)
+    {
+        return;
+    }
+
+    const auto* const inputManagerBytes = reinterpret_cast<const uint8_t*>(inputManager);
+    const std::array<uintptr_t, 2> deviceOffsets = {
+        kInputManagerPad1DeviceOffset,
+        kInputManagerPad2DeviceOffset,
+    };
+
+    for (size_t padIndex = 0; padIndex < deviceOffsets.size(); ++padIndex)
+    {
+        const uintptr_t devicePtr = ReadMenuInputManagerPointerField(inputManagerBytes, deviceOffsets[padIndex]);
+        if (devicePtr == 0 || g_menuLiveAxisRangeNormalizedDevicePtrs[padIndex] == devicePtr)
+        {
+            continue;
+        }
+
+        auto* const device = reinterpret_cast<IDirectInputDevice8A*>(devicePtr);
+        const HRESULT hr = device->EnumObjects(&NormalizeMenuLivePadAxisRangeCallback, device, DIDFT_AXIS);
+        if (FAILED(hr))
+        {
+            mod::Log(
+                "MenuControls: live pad axis-range normalization warning PAD%u device=0x%08lX hr=0x%08lX",
+                static_cast<unsigned>(padIndex + 1u),
+                static_cast<unsigned long>(devicePtr),
+                static_cast<unsigned long>(hr));
+            continue;
+        }
+
+        g_menuLiveAxisRangeNormalizedDevicePtrs[padIndex] = devicePtr;
+        mod::Log(
+            "MenuControls: live pad axis-range normalization applied PAD%u device=0x%08lX",
+            static_cast<unsigned>(padIndex + 1u),
+            static_cast<unsigned long>(devicePtr));
+    }
+}
+
 uint8_t MenuPovMaskFromRaw(DWORD raw)
 {
     if (LOWORD(raw) == 0xFFFFu)
@@ -444,6 +516,43 @@ std::string BuildIgcrOverrideStorePath()
     std::string path(exePath);
     path += "\\mods\\InGameControlsRebind\\IGCRProfileOverrides.bin";
     return path;
+}
+
+bool GetIgcrOverrideStoreWriteTime(FILETIME* outWriteTime)
+{
+    if (outWriteTime == nullptr)
+    {
+        return false;
+    }
+
+    const std::string path = BuildIgcrOverrideStorePath();
+    if (path.empty())
+    {
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes) == FALSE)
+    {
+        return false;
+    }
+
+    *outWriteTime = attributes.ftLastWriteTime;
+    return true;
+}
+
+void UpdateIgcrOverrideWriteTimeCache()
+{
+    FILETIME writeTime = {};
+    if (GetIgcrOverrideStoreWriteTime(&writeTime))
+    {
+        g_lastIgcrOverrideWriteTime = writeTime;
+        g_hasLastIgcrOverrideWriteTime = true;
+        return;
+    }
+
+    g_lastIgcrOverrideWriteTime = {};
+    g_hasLastIgcrOverrideWriteTime = false;
 }
 
 bool LoadIgcrOverrideProfile(uint8_t profileIndex, MenuControlProfile* outProfile, std::string* outError)
@@ -791,6 +900,11 @@ void ApplyIgcrMenuControlCompatibility(int gameSystem, uint8_t* inputBytes)
         return;
     }
 
+    if (ProfileUsesExtendedPadAxisBindings(g_menuControlProfile))
+    {
+        MaybeNormalizeMenuLivePadAxisRanges(inputManager);
+    }
+
     const auto* const inputManagerBytes = reinterpret_cast<const uint8_t*>(inputManager);
     bool anyChanged = false;
     for (int player = 0; player < 2; ++player)
@@ -961,6 +1075,8 @@ bool SyncMenuControlBindings(uint32_t screenContext)
     g_menuControlProfileLoaded = false;
     g_menuControlRuntimeCompatActive = false;
     g_hasLoggedCompatInputSnapshot = false;
+    g_menuControlSyncAttempted = true;
+    UpdateIgcrOverrideWriteTimeCache();
 
     const int gameSystem = GetGameSystem(screenContext);
     if (gameSystem == 0)
@@ -984,6 +1100,7 @@ bool SyncMenuControlBindings(uint32_t screenContext)
         mod::Log("MenuControls: sync failed (selected control profile unavailable)");
         return ReloadNativeMenuControlBindings(screenContext);
     }
+    g_lastMenuControlSyncProfileIndex = profileIndex;
 
     MenuControlProfile effectiveProfile = {};
     std::string overrideError;
@@ -1005,6 +1122,10 @@ bool SyncMenuControlBindings(uint32_t screenContext)
     }
 
     const bool writeOk = WriteMenuControlProfileLiveMappings(inputManager, effectiveProfile);
+    if (ProfileUsesExtendedPadAxisBindings(effectiveProfile))
+    {
+        MaybeNormalizeMenuLivePadAxisRanges(inputManager);
+    }
     if (!writeOk)
     {
         mod::Log(
@@ -1035,12 +1156,54 @@ bool SyncMenuControlBindings(uint32_t screenContext)
     return true;
 }
 
+void MaybeRefreshMenuControlBindings(uint32_t screenContext)
+{
+    const DWORD now = GetTickCount();
+    if (now < g_nextMenuControlRefreshTick)
+    {
+        return;
+    }
+    g_nextMenuControlRefreshTick = now + 500u;
+
+    bool needsSync = !g_menuControlSyncAttempted;
+
+    uint8_t profileIndex = 0;
+    if (ReadMenuControlProfileIndex(&profileIndex))
+    {
+        if (!g_menuControlSyncAttempted || profileIndex != g_lastMenuControlSyncProfileIndex)
+        {
+            needsSync = true;
+        }
+    }
+
+    FILETIME currentWriteTime = {};
+    const bool hasCurrentWriteTime = GetIgcrOverrideStoreWriteTime(&currentWriteTime);
+    if (hasCurrentWriteTime != g_hasLastIgcrOverrideWriteTime ||
+        (hasCurrentWriteTime && CompareFileTime(&currentWriteTime, &g_lastIgcrOverrideWriteTime) != 0))
+    {
+        needsSync = true;
+    }
+
+    if (!needsSync)
+    {
+        return;
+    }
+
+    (void)SyncMenuControlBindings(screenContext);
+}
+
 void ResetMenuControlCompatibilityState()
 {
     g_menuControlProfile = {};
     g_menuControlProfileLoaded = false;
     g_menuControlRuntimeCompatActive = false;
     g_hasLoggedCompatInputSnapshot = false;
+    g_menuControlSyncAttempted = false;
+    g_lastMenuControlSyncProfileIndex = 0xFFu;
+    g_menuLiveAxisRangeNormalizedDevicePtrs = {};
+    g_lastIgcrOverrideWriteTime = {};
+    g_hasLastIgcrOverrideWriteTime = false;
+    g_nextMenuControlRefreshTick = 0;
 }
 
 void ReenterNetplayMenuAfterSessionAbort(uint32_t screenContext, const char* reason)
@@ -3760,6 +3923,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     auto* const rawInputBytes = reinterpret_cast<uint8_t*>(gameSystem);
     std::array<uint8_t, kFilteredMenuInputBytes> menuInputBytes = {};
     std::memcpy(menuInputBytes.data(), rawInputBytes, kFilteredMenuInputBytes);
+    MaybeRefreshMenuControlBindings(screenContext);
     ApplyIgcrMenuControlCompatibility(gameSystem, menuInputBytes.data());
     const bool windowFocused = IsScreenWindowFocused(screenContext);
     const uint8_t* const inputBytes = FilterMenuInputsForWindowFocus(menuInputBytes.data(), windowFocused);
