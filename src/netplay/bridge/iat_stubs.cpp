@@ -399,15 +399,31 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 
         if (ConsumeOnlineMatchEscGracefulQuit())
         {
-            // Match-local ESC already queued a graceful Quit packet from the
-            // live battle screen. Give the helper a moment to flush it to the
-            // peer before we tear the process down.
+            // Match-local ESC was armed on the live battle screen. Ask the
+            // injected helper to run its native "send MessageQuit to every
+            // peer" path before we tear the helper process down from the host.
             mod::Log(
-                "NeutralizeExitProcess: online match ESC graceful quit already primed "
-                "caller=%s+0x%lX — sleeping 100ms before cleanup",
+                "NeutralizeExitProcess: online match ESC broadcast request "
+                "role=%d screen=%d helperPid=%lu caller=%s+0x%lX",
+                role,
+                currentScreenIndex,
+                static_cast<unsigned long>(g_revivalProcessId),
                 callerModule,
                 static_cast<unsigned long>(callerRva));
-            Sleep(100u);
+            const bool peerQuitSent =
+                RequestInjectedPeerQuitBroadcast("online_match_esc_late_fallback", 300u);
+            mod::Log(
+                "NeutralizeExitProcess: online match ESC peer-quit broadcast=%d "
+                "caller=%s+0x%lX",
+                peerQuitSent ? 1 : 0,
+                callerModule,
+                static_cast<unsigned long>(callerRva));
+            if (!peerQuitSent)
+            {
+                mod::Log(
+                    "NeutralizeExitProcess: online match ESC broadcast failed; "
+                    "continuing with local cleanup and helper teardown");
+            }
         }
 
         if (role == kLocalRoleTournament)
@@ -2080,6 +2096,7 @@ HANDLE StubCreateFileA(
         const std::string redirectPath = GetNativeShadowLogEfzPathA();
         if (!redirectPath.empty())
         {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
             mod::Log(
                 "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
                 lpFileName,
@@ -2087,7 +2104,7 @@ HANDLE StubCreateFileA(
             return CreateFileA(
                 redirectPath.c_str(),
                 dwDesiredAccess,
-                dwShareMode,
+                redirectShareMode,
                 lpSecurityAttributes,
                 dwCreationDisposition,
                 dwFlagsAndAttributes,
@@ -2119,6 +2136,7 @@ HANDLE StubCreateFileW(
         const std::wstring redirectPath = GetNativeShadowLogEfzPathW();
         if (!redirectPath.empty())
         {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
             char originalUtf8[MAX_PATH * 2] = {};
             char redirectUtf8[MAX_PATH * 2] = {};
             WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
@@ -2130,7 +2148,7 @@ HANDLE StubCreateFileW(
             return CreateFileW(
                 redirectPath.c_str(),
                 dwDesiredAccess,
-                dwShareMode,
+                redirectShareMode,
                 lpSecurityAttributes,
                 dwCreationDisposition,
                 dwFlagsAndAttributes,
@@ -2382,4 +2400,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeThread(HANDLE hT
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_ResumeThread(HANDLE hThread)
 {
     return netplay::bridge::takeover::StubResumeThread(hThread);
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_RequestPeerQuitBroadcast(LPVOID)
+{
+    return netplay::bridge::takeover::RunInjectedPeerQuitBroadcast();
 }

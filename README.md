@@ -119,6 +119,10 @@ Options:
   - `HideEmptySetsInBattleLog`
 - `About` modal with version/build information
 
+Netplay menu theming:
+- The menu background theme is currently read from `EfzRevival.ini` under `[NetplayMenu]` with `Theme=scroll` or `Theme=classic`.
+- The `scroll` theme uses a wrapped horizontal pan and expects `assets\netplay_bg.dat` to decode as `320x240`; unsupported background sizes fall back to the classic static draw.
+
 Logging and diagnostics:
 - Logger banner includes version and build timestamp
 - Optional console and optional file logging

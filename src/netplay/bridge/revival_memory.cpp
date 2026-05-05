@@ -280,6 +280,8 @@ bool ReadModuleImageRange(HMODULE module, uintptr_t* outBase, uintptr_t* outEnd)
 
 int ReadRoleFlagFromRevival()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -347,6 +349,8 @@ bool IsLikelySessionPointer(uintptr_t sessionPtr, uintptr_t revivalImageBase, ui
 
 uintptr_t ReadSessionPointerFromRevival()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -381,6 +385,8 @@ uintptr_t ReadSessionPointerFromRevival()
 
 uintptr_t ReadSessionPointerFromRevivalLoose()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -3267,7 +3273,15 @@ static bool    g_perFrameMismatchLogged     = false;
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
+static volatile LONG g_localBattleEscQuitRingIgnoreArmed = 0;
 static volatile LONG* g_quitRingHeader = nullptr;
+static volatile LONG g_scheduledGracefulQuitTeardownActive = 0;
+static DWORD g_localBattleEscQuitRingIgnoreStartMs = 0;
+static DWORD g_scheduledGracefulQuitTeardownStartMs = 0;
+static LONG g_scheduledGracefulQuitHead = 0;
+static LONG g_scheduledGracefulQuitTail = 0;
+static DWORD g_scheduledGracefulQuitHelperPid = 0;
+static char g_scheduledGracefulQuitPhase[16] = {};
 
 // Spectator tick holdoff: when true, the per-frame tick hook will not
 // call RunPerFrameTickDispatch while the spectator session is active on
@@ -3290,6 +3304,8 @@ static bool g_spectateHoldoffWasActive = false;
 // watchdog forces a full cleanup and return to the netplay menu.
 static unsigned int g_watchdogDeadFrameCount = 0;
 static constexpr unsigned int kWatchdogGraceFrames = 30; // ~0.5s at 60fps
+static constexpr DWORD kLocalBattleEscQuitRingIgnoreWindowMs = 500u;
+static constexpr DWORD kScheduledGracefulQuitTeardownDelayMs = 500u;
 
 // __thiscall trampoline: ECX = this, no other args.
 using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
@@ -3300,6 +3316,15 @@ static uint32_t g_frameTick = 0;           // monotonic per-frame counter
 static bool EnsureQuitRingHeader();
 static void ReleaseQuitRingHeader();
 static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefore);
+static void ResetLocalBattleEscQuitRingIgnore();
+static void ArmLocalBattleEscQuitRingIgnore();
+static bool ConsumeLocalBattleEscQuitRingIgnore(
+    const char* phaseTag,
+    LONG quitHeadBefore,
+    LONG quitTailBefore);
+static void ResetScheduledGracefulQuitTeardown();
+static void ScheduleGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore);
+static char FinalizeGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore, const char* originTag);
 static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore);
 
 // --- Double-speed diagnostics -------------------------------------------
@@ -3776,14 +3801,20 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     {
         if (ConsumeGracefulQuitRingSignal(&preTickQuitHead, &preTickQuitTail))
         {
-            mod::Log(
-                "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
-                "quitHead=%ld quitTail=%ld — skipping DLL tick",
-                g_frameTick,
-                static_cast<long>(preTickQuitHead),
-                static_cast<long>(preTickQuitTail));
-            preTickDisconnect = true;
-            preTickGracefulQuit = true;
+            if (!ConsumeLocalBattleEscQuitRingIgnore(
+                    "PRE-TICK",
+                    preTickQuitHead,
+                    preTickQuitTail))
+            {
+                mod::Log(
+                    "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
+                    "quitHead=%ld quitTail=%ld — skipping DLL tick",
+                    g_frameTick,
+                    static_cast<long>(preTickQuitHead),
+                    static_cast<long>(preTickQuitTail));
+                preTickDisconnect = true;
+                preTickGracefulQuit = true;
+            }
         }
 
         if (!preTickDisconnect && g_hostBlock != nullptr)
@@ -3803,11 +3834,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
-    // ---- Online match ESC graceful-quit priming --------------------------
-    // Pressing Esc during an active online battle should queue Revival's own
-    // Quit packet before the later ExitProcess interception tears the helper
-    // down. Restrict this to the battle screen so normal post-match cleanup
-    // remains untouched.
+    // ---- Online match ESC battle-return tracking -------------------------
+    // Native EFZ/Revival battle ESC returns to charselect rather than leaving
+    // netplay entirely. Keep a short marker so if the helper publishes a Quit
+    // ring entry for that local ESC, we consume it without promoting the
+    // session into the title/netplay-menu teardown path.
     {
         static bool s_onlineMatchEscWasDown = false;
         const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -3828,19 +3859,19 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (escRisingEdge)
         {
-            const bool quitQueued =
-                SignalGracefulQuitRing("online_match_esc_key", 0);
+            ArmLocalBattleEscQuitRingIgnore();
             mod::Log(
                 "TICK_HOOK: online match ESC detected frameTick=%u screen=%u "
-                "session=0x%08lX quitQueued=%d",
+                "session=0x%08lX role=%d netRole=%d helperPid=%lu "
+                "dllExitPatched=%d ignoreQuitRingWindowMs=%lu",
                 g_frameTick,
                 static_cast<unsigned>(escScreen),
                 static_cast<unsigned long>(currentSession),
-                quitQueued ? 1 : 0);
-            if (quitQueued)
-            {
-                ArmOnlineMatchEscGracefulQuit();
-            }
+                g_localRoleFlag,
+                g_netplayRole,
+                static_cast<unsigned long>(g_revivalProcessId),
+                g_dllExitProcessPatchesSaved ? 1 : 0,
+                static_cast<unsigned long>(kLocalBattleEscQuitRingIgnoreWindowMs));
         }
     }
 
@@ -4715,6 +4746,34 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         return RecoverFromQuitRingSignal("PRE-TICK", preTickQuitHead, preTickQuitTail);
     }
 
+    if (InterlockedCompareExchange(&g_scheduledGracefulQuitTeardownActive, 0, 0) != 0)
+    {
+        const DWORD elapsedMs = GetTickCount() - g_scheduledGracefulQuitTeardownStartMs;
+        const bool helperAlive = g_revivalProcess != nullptr && IsPeerProcessAlive();
+        if (helperAlive && elapsedMs < kScheduledGracefulQuitTeardownDelayMs)
+        {
+            return 0;
+        }
+
+        char phaseTag[sizeof(g_scheduledGracefulQuitPhase)] = {};
+        std::memcpy(phaseTag, g_scheduledGracefulQuitPhase, sizeof(phaseTag));
+        const LONG quitHeadBefore = g_scheduledGracefulQuitHead;
+        const LONG quitTailBefore = g_scheduledGracefulQuitTail;
+        const DWORD scheduledPid = g_scheduledGracefulQuitHelperPid;
+        ResetScheduledGracefulQuitTeardown();
+        mod::Log(
+            "TICK_HOOK: graceful-quit scheduled teardown ready elapsedMs=%lu helperAlive=%d scheduledPid=%lu phase=%s",
+            static_cast<unsigned long>(elapsedMs),
+            helperAlive ? 1 : 0,
+            static_cast<unsigned long>(scheduledPid),
+            phaseTag[0] != '\0' ? phaseTag : "POST-TICK");
+        return FinalizeGracefulQuitTeardown(
+            phaseTag[0] != '\0' ? phaseTag : "POST-TICK",
+            quitHeadBefore,
+            quitTailBefore,
+            helperAlive ? "delay_elapsed" : "helper_exited");
+    }
+
     // ---- Proactive graceful session-end detection -------------------------
     // Also catch Quit-ring signals that were published during the current
     // DLL tick, not just between frames.
@@ -4725,7 +4784,13 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         LONG quitTailAfter = 0;
         if (ConsumeGracefulQuitRingSignal(&quitHeadAfter, &quitTailAfter))
         {
-            return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
+            if (!ConsumeLocalBattleEscQuitRingIgnore(
+                    "POST-TICK",
+                    quitHeadAfter,
+                    quitTailAfter))
+            {
+                return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
+            }
         }
     }
 
@@ -5173,6 +5238,75 @@ void ResetOnlineMatchEscGracefulQuit()
     InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0);
 }
 
+static void ResetLocalBattleEscQuitRingIgnore()
+{
+    InterlockedExchange(&g_localBattleEscQuitRingIgnoreArmed, 0);
+    g_localBattleEscQuitRingIgnoreStartMs = 0;
+}
+
+static void ArmLocalBattleEscQuitRingIgnore()
+{
+    g_localBattleEscQuitRingIgnoreStartMs = GetTickCount();
+    InterlockedExchange(&g_localBattleEscQuitRingIgnoreArmed, 1);
+}
+
+static bool ConsumeLocalBattleEscQuitRingIgnore(
+    const char* phaseTag,
+    LONG quitHeadBefore,
+    LONG quitTailBefore)
+{
+    if (InterlockedCompareExchange(&g_localBattleEscQuitRingIgnoreArmed, 0, 0) == 0)
+    {
+        return false;
+    }
+
+    const DWORD elapsedMs = GetTickCount() - g_localBattleEscQuitRingIgnoreStartMs;
+    if (elapsedMs > kLocalBattleEscQuitRingIgnoreWindowMs)
+    {
+        ResetLocalBattleEscQuitRingIgnore();
+        return false;
+    }
+
+    ResetLocalBattleEscQuitRingIgnore();
+    mod::Log(
+        "TICK_HOOK: local battle ESC consumed Quit ring without session teardown "
+        "phase=%s frameTick=%u quitHead=%ld quitTail=%ld elapsedMs=%lu",
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        g_frameTick,
+        static_cast<long>(quitHeadBefore),
+        static_cast<long>(quitTailBefore),
+        static_cast<unsigned long>(elapsedMs));
+    return true;
+}
+
+static void ResetScheduledGracefulQuitTeardown()
+{
+    InterlockedExchange(&g_scheduledGracefulQuitTeardownActive, 0);
+    g_scheduledGracefulQuitTeardownStartMs = 0;
+    g_scheduledGracefulQuitHead = 0;
+    g_scheduledGracefulQuitTail = 0;
+    g_scheduledGracefulQuitHelperPid = 0;
+    std::memset(g_scheduledGracefulQuitPhase, 0, sizeof(g_scheduledGracefulQuitPhase));
+}
+
+static void ScheduleGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore)
+{
+    g_scheduledGracefulQuitTeardownStartMs = GetTickCount();
+    g_scheduledGracefulQuitHead = quitHeadBefore;
+    g_scheduledGracefulQuitTail = quitTailBefore;
+    g_scheduledGracefulQuitHelperPid = g_revivalProcessId;
+    std::memset(g_scheduledGracefulQuitPhase, 0, sizeof(g_scheduledGracefulQuitPhase));
+    if (phaseTag != nullptr)
+    {
+        strncpy_s(
+            g_scheduledGracefulQuitPhase,
+            sizeof(g_scheduledGracefulQuitPhase),
+            phaseTag,
+            _TRUNCATE);
+    }
+    InterlockedExchange(&g_scheduledGracefulQuitTeardownActive, 1);
+}
+
 static bool EnsureQuitRingHeader()
 {
     if (g_quitRingHeader != nullptr)
@@ -5250,23 +5384,23 @@ static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefo
     return true;
 }
 
-static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore)
+static char FinalizeGracefulQuitTeardown(
+    const char* phaseTag,
+    LONG quitHeadBefore,
+    LONG quitTailBefore,
+    const char* originTag)
 {
     const int deadRole = g_localRoleFlag;
     const DWORD deadPid = g_revivalProcessId;
-    LogSessionDiagnosticState("TickHook_gracefulQuit_entry");
+    LogSessionDiagnosticState("TickHook_gracefulQuit_finalize");
     mod::Log(
-        "TICK_HOOK: *** %s GRACEFUL SESSION END *** frameTick=%u "
-        "role=%d pid=%lu quitHead=%ld quitTail=%ld — synthesizing exit interception",
+        "TICK_HOOK: graceful-quit teardown begin origin=%s phase=%s role=%d pid=%lu quitHead=%ld quitTail=%ld",
+        originTag != nullptr ? originTag : "immediate",
         phaseTag != nullptr ? phaseTag : "POST-TICK",
-        g_frameTick,
         deadRole,
         static_cast<unsigned long>(deadPid),
         static_cast<long>(quitHeadBefore),
         static_cast<long>(quitTailBefore));
-
-    InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
-    InterlockedExchange(&g_revivalExitIntercepted, 1);
 
     NeutralizeRevivalSessionVtable();
 
@@ -5315,7 +5449,74 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
         "next title-screen frame will consume exit interception",
         deadRole);
     LogSessionDiagnosticState("TickHook_gracefulQuit_exit");
+
     return 0;
+}
+
+static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore)
+{
+    const int deadRole = g_localRoleFlag;
+    const DWORD deadPid = g_revivalProcessId;
+    LogSessionDiagnosticState("TickHook_gracefulQuit_entry");
+    mod::Log(
+        "TICK_HOOK: *** %s GRACEFUL SESSION END *** frameTick=%u "
+        "role=%d pid=%lu quitHead=%ld quitTail=%ld — synthesizing exit interception",
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        g_frameTick,
+        deadRole,
+        static_cast<unsigned long>(deadPid),
+        static_cast<long>(quitHeadBefore),
+        static_cast<long>(quitTailBefore));
+
+    InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
+    InterlockedExchange(&g_revivalExitIntercepted, 1);
+
+    if (deadRole == kLocalRoleOnline)
+    {
+        // Revival can publish the Quit-ring signal before our later
+        // ExitProcess interception path sees the local ESC. If we convert the
+        // session back to local play and tear the helper down first, the peer
+        // never receives the native MessageQuit packet and has to wait for the
+        // network timeout instead. Request that packet here, then defer the
+        // actual local teardown to a later frame so the helper gets a grace
+        // window to finish its native quit path before we destroy it.
+        const bool peerQuitSent =
+            RequestInjectedPeerQuitBroadcast("quit_ring_pre_teardown", 300u);
+        NeutralizeRevivalSessionVtable();
+        if (g_revivalProcess != nullptr)
+        {
+            ScheduleGracefulQuitTeardown(phaseTag, quitHeadBefore, quitTailBefore);
+            mod::Log(
+                "TICK_HOOK: graceful-quit teardown scheduled delayMs=%lu "
+                "phase=%s role=%d pid=%lu peerQuitSent=%d",
+                static_cast<unsigned long>(kScheduledGracefulQuitTeardownDelayMs),
+                phaseTag != nullptr ? phaseTag : "POST-TICK",
+                deadRole,
+                static_cast<unsigned long>(deadPid),
+                peerQuitSent ? 1 : 0);
+            mod::Log(
+                "TICK_HOOK: graceful-quit pre-teardown peer-quit broadcast=%d "
+                "phase=%s role=%d pid=%lu",
+                peerQuitSent ? 1 : 0,
+                phaseTag != nullptr ? phaseTag : "POST-TICK",
+                deadRole,
+                static_cast<unsigned long>(deadPid));
+            return 0;
+        }
+        mod::Log(
+            "TICK_HOOK: graceful-quit pre-teardown peer-quit broadcast=%d "
+            "phase=%s role=%d pid=%lu",
+            peerQuitSent ? 1 : 0,
+            phaseTag != nullptr ? phaseTag : "POST-TICK",
+            deadRole,
+            static_cast<unsigned long>(deadPid));
+    }
+
+    return FinalizeGracefulQuitTeardown(
+        phaseTag,
+        quitHeadBefore,
+        quitTailBefore,
+        "immediate");
 }
 
 // Reset the per-frame validator state.  Called when a session ends so the
@@ -5336,6 +5537,8 @@ void ResetGameModeValidation()
     g_retAddrSlotCount = 0;
     std::memset(g_retAddrSlots, 0, sizeof(g_retAddrSlots));
     ResetOnlineMatchEscGracefulQuit();
+    ResetLocalBattleEscQuitRingIgnore();
+    ResetScheduledGracefulQuitTeardown();
     ReleaseQuitRingHeader();
 
     // Increment session number and reset cross-session change-detection state.

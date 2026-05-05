@@ -167,8 +167,16 @@ public:
     void SendChallenge(int targetPlayerId, const std::string& targetName, const std::string& ipPort);
 
     // Queue a pre_accept for an incoming challenge from |challengerPlayerId|.
+    // |challengerName| is tracked so the poll thread can detect if the
+    // challenger disappears from the lobby while we're still connecting.
     // The actual accept is deferred until NotifyMatchConnected() is called.
-    void AcceptChallenge(int challengerPlayerId);
+    void AcceptChallenge(int challengerPlayerId, const std::string& challengerName);
+
+    // Returns true once when the challenger we were accepting disappears
+    // from the lobby before the P2P connection is established (or the
+    // server rejects our pre_accept/accept because the challenger is gone).
+    // The title/menu layer consumes this to abort the local joining overlay.
+    bool ConsumeAbandonedIncomingChallenge();
 
     // Notify that a P2P connection was successfully established after
     // accepting a challenge.  Sends the deferred 'accept' call to the
@@ -184,9 +192,16 @@ public:
     // connection dropped).  Pending challenges that never reached the
     // connected-match state send 'end' immediately so the opponent's
     // client clears the challenge right away.  Connected host matches
-    // still defer 'end' until RequestRefresh() so the playing pair is
-    // preserved until the host returns to the lobby.
+    // defer 'end' until FlushDeferredEndOnReturn() is called (on lobby
+    // re-entry) so the playing pair stays visible during teardown.
     void NotifyEndMatch();
+
+    // Called when the netplay menu is re-entered after a match.  Sends
+    // the deferred host End immediately (if queued) and clears the
+    // returning-from-match latch so the lobby unwedges as soon as we
+    // exit the match back to the menu — regardless of whether
+    // RequestRefresh() fires on this tick.
+    void FlushDeferredEndOnReturn();
 
     // Notify that a spectate session has ended. When |preserveUntilRefresh|
     // is true, the room remains locally busy until RequestRefresh() runs on
@@ -275,6 +290,7 @@ private:
 
     // Target player ID from the last pre_accept, used for the deferred accept.
     int m_pendingAcceptTargetId = 0;
+    std::string m_pendingAcceptChallengerName;
     int m_pendingChallengeTargetId = 0;
     std::string m_pendingChallengeTargetName;
 
@@ -297,6 +313,7 @@ private:
     std::atomic<bool> m_returningFromMatch{false};
     std::atomic<bool> m_challengePending{false};
     std::atomic<bool> m_abandonedOutgoingChallenge{false};
+    std::atomic<bool> m_abandonedIncomingChallenge{false};
     std::atomic<bool> m_matchConnected{false};
     std::atomic<bool> m_endDeferred{false};
     std::atomic<bool> m_endPending{false};

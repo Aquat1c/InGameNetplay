@@ -64,6 +64,7 @@ struct SharedBlock
     uint32_t version = 0;
     uint32_t hostPid = 0;
     uint32_t hostRevivalBase = 0;
+    uint32_t hostRevivalTimestamp = 0;
     volatile LONG initSerial = 0;
     int initParams[2] = {0, 0};
     volatile LONG consoleSerial = 0;
@@ -95,6 +96,8 @@ struct SharedBlock
     volatile LONG dbgCreateRemoteThreadHits = 0;
     volatile LONG consoleErrorSerial = 0;
     char consoleErrorText[128] = {};
+    volatile LONG peerQuitDiagnosticSerial = 0;
+    char peerQuitDiagnosticText[8192] = {};
 };
 #pragma pack(pop)
 
@@ -154,6 +157,7 @@ extern const RevivalAddressProfile* g_activeRevival;
 
 // Runtime version detection — reads PE TimeDateStamp, sets g_activeRevival.
 void DetectRevivalVersion();
+void EnsureActiveRevivalProfile();
 
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
@@ -398,13 +402,22 @@ bool IsInsideFrameTick();
 // current frame tick completes instead of immediately.
 void RequestDeferredCancelCleanup();
 
-// Arm/consume the one-shot "online match ESC already queued a graceful quit"
-// marker. The per-frame tick sets it when it detects a local Esc edge on the
-// live battle screen, and ExitProcess interception consumes it to wait briefly
-// before tearing the helper down.
+// Arm/consume the one-shot "online match ESC should trigger a native peer
+// quit broadcast" marker. The per-frame tick sets it when it detects a local
+// Esc edge on the live battle screen, and ExitProcess interception consumes it
+// to ask the injected helper to send MessageQuit before teardown.
 void ArmOnlineMatchEscGracefulQuit();
 bool ConsumeOnlineMatchEscGracefulQuit();
 void ResetOnlineMatchEscGracefulQuit();
+
+// Ask the injected EfzRevival.exe helper to broadcast its native MessageQuit
+// packet to connected peers before the host tears the helper down locally.
+// This is used for the "press ESC but don't actually exit EFZ.exe" path.
+bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs);
+
+// Helper-process entry point invoked inside EfzRevival.exe. Resolves the live
+// peer manager object and calls the native "send quit to every peer" routine.
+DWORD RunInjectedPeerQuitBroadcast();
 
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
@@ -434,11 +447,16 @@ void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
+void ClearPeerQuitDiagnostic();
+void AppendPeerQuitDiagnostic(const char* text);
+void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize);
 HMODULE SelfModule();
 std::string ModulePath(HMODULE module);
+void CleanupNativeHostShadowLogDirectory(const char* reason);
 bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag);
 bool CaptureRevivalNativeLogsEnabled();
 std::string GameDirectory();
+std::wstring GameDirectoryWide();
 bool TryWriteClipboardAscii(const char* text);
 void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error);
 void CloseProcessHandle(NetbridgeStatus* status);
@@ -463,7 +481,6 @@ bool PatchRevivalErrorCodeNullGuard();
 void PublishHostRevivalBase();
 uintptr_t ResolveInjectedExpectedRevivalBase();
 bool WriteIni(
-    const std::string& gameDir,
     int role,
     uint16_t port,
     const char* address,

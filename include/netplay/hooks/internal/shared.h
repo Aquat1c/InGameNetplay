@@ -24,11 +24,18 @@ enum class NetplayNicknameSource : uint8_t
     UserProvided,
 };
 
+enum class NetplayMenuTheme : uint8_t
+{
+    Scroll = 0,
+    Classic,
+};
+
 struct NetplayMenuState
 {
     bool active = false;
     bool bgmActive = false;
     bool useConfigStyleRender = false;
+    NetplayMenuTheme theme = NetplayMenuTheme::Scroll;
     netplay::menu::NetplayMenuId menuId = netplay::menu::NetplayMenuId::Main;
     int mainSelection = 0;
     int optionCount = netplay::constants::kNetplayDefaultOptionCount;
@@ -41,6 +48,11 @@ struct NetplayMenuState
     uint8_t paletteStart = 193;
     uint8_t paletteCount = 48;
     netplay::constants::NetplayRenderLayout renderLayout = {};
+    bool backgroundSupportsScroll = false;
+    int backgroundWidth = 320;
+    int backgroundHeight = 240;
+    double backgroundScrollOffset = 0.0;
+    DWORD backgroundScrollTick = 0;
     // Lobby browser: index of the first idle player shown in the visible window.
     // Incremented/decremented at the scroll boundary rows to pan through a list
     // longer than kLobbyMaxDisplayPlayers.
