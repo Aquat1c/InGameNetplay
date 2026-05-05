@@ -54,6 +54,32 @@ namespace netplay::bridge::takeover
 std::mutex g_mutex;
 const RevivalAddressProfile* g_activeRevival = &kRevival_1_02e;
 
+namespace
+{
+enum class RevivalProfileSource : uint8_t
+{
+    Default = 0,
+    DllTimestamp,
+    PublishedHostTimestamp,
+};
+
+RevivalProfileSource g_activeRevivalSource = RevivalProfileSource::Default;
+
+const char* RevivalProfileSourceToString(RevivalProfileSource source)
+{
+    switch (source)
+    {
+    case RevivalProfileSource::DllTimestamp:
+        return "dll_timestamp";
+    case RevivalProfileSource::PublishedHostTimestamp:
+        return "published_host_timestamp";
+    case RevivalProfileSource::Default:
+    default:
+        return "default";
+    }
+}
+} // namespace
+
 HMODULE g_localRevivalModule = nullptr;
 RevivalInitFn g_localInitFn = nullptr;
 HANDLE g_revivalProcess = nullptr;
@@ -276,6 +302,77 @@ static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t times
     return nullptr;
 }
 
+static bool TryReadModulePeTimestamp(HMODULE module, uint32_t* outTimestamp)
+{
+    if (outTimestamp != nullptr)
+    {
+        *outTimestamp = 0;
+    }
+    if (module == nullptr)
+    {
+        return false;
+    }
+
+    const auto* base = reinterpret_cast<const uint8_t*>(module);
+    const auto dosE_lfanew = *reinterpret_cast<const int32_t*>(base + 0x3C);
+    if (dosE_lfanew < 0 || dosE_lfanew > 0x1000)
+    {
+        return false;
+    }
+
+    const auto* peSignature = reinterpret_cast<const uint32_t*>(base + dosE_lfanew);
+    if (*peSignature != 0x00004550u)
+    {
+        return false;
+    }
+
+    if (outTimestamp != nullptr)
+    {
+        *outTimestamp = *reinterpret_cast<const uint32_t*>(base + dosE_lfanew + 8);
+    }
+    return true;
+}
+
+static void SetActiveRevivalProfile(
+    const RevivalAddressProfile* profile,
+    RevivalProfileSource source)
+{
+    g_activeRevival = (profile != nullptr) ? profile : &kRevival_1_02e;
+    g_activeRevivalSource = source;
+}
+
+void EnsureActiveRevivalProfile()
+{
+    const HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    const bool hasPublishedTimestamp =
+        g_injectedBlock != nullptr && g_injectedBlock->hostRevivalTimestamp != 0;
+
+    switch (g_activeRevivalSource)
+    {
+    case RevivalProfileSource::DllTimestamp:
+        if (revival != nullptr)
+        {
+            return;
+        }
+        break;
+    case RevivalProfileSource::PublishedHostTimestamp:
+        if (revival == nullptr && hasPublishedTimestamp)
+        {
+            return;
+        }
+        break;
+    case RevivalProfileSource::Default:
+    default:
+        if (revival == nullptr && !hasPublishedTimestamp)
+        {
+            return;
+        }
+        break;
+    }
+
+    DetectRevivalVersion();
+}
+
 /// Detect the loaded Revival DLL version by reading its PE TimeDateStamp
 /// and matching against known profiles.  Sets g_activeRevival to the
 /// matching profile (or leaves it at the default 1.02e if detection fails).
@@ -283,31 +380,30 @@ static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t times
 void DetectRevivalVersion()
 {
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    const uint32_t publishedTimestamp =
+        (g_injectedBlock != nullptr) ? g_injectedBlock->hostRevivalTimestamp : 0;
+
     if (revival != nullptr)
     {
-        // Read PE TimeDateStamp from the loaded image header.
-        const auto* base = reinterpret_cast<const uint8_t*>(revival);
-        const auto dosE_lfanew = *reinterpret_cast<const int32_t*>(base + 0x3C);
-        if (dosE_lfanew < 0 || dosE_lfanew > 0x1000)
+        uint32_t timestamp = 0;
+        if (!TryReadModulePeTimestamp(revival, &timestamp))
         {
-            mod::Log("DetectRevivalVersion: invalid e_lfanew=0x%X — keeping default",
-                     static_cast<unsigned>(dosE_lfanew));
+            SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
+            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header — keeping default");
             return;
         }
 
-        const auto* peSignature = reinterpret_cast<const uint32_t*>(base + dosE_lfanew);
-        if (*peSignature != 0x00004550u)  // "PE\0\0"
+        if (publishedTimestamp != 0 && publishedTimestamp != timestamp)
         {
-            mod::Log("DetectRevivalVersion: bad PE signature 0x%08X — keeping default",
-                     static_cast<unsigned>(*peSignature));
-            return;
+            mod::Log(
+                "DetectRevivalVersion: local/published timestamp mismatch local=0x%08X published=0x%08X",
+                static_cast<unsigned>(timestamp),
+                static_cast<unsigned>(publishedTimestamp));
         }
 
-        // COFF header TimeDateStamp is at PE+8.
-        const uint32_t timestamp = *reinterpret_cast<const uint32_t*>(base + dosE_lfanew + 8);
         if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(timestamp))
         {
-            g_activeRevival = profile;
+            SetActiveRevivalProfile(profile, RevivalProfileSource::DllTimestamp);
             mod::Log("DetectRevivalVersion: matched timestamp 0x%08X → %s",
                      static_cast<unsigned>(timestamp),
                      g_activeRevival->versionTag);
@@ -318,13 +414,11 @@ void DetectRevivalVersion()
                  static_cast<unsigned>(timestamp));
     }
 
-    const uint32_t publishedTimestamp =
-        (g_injectedBlock != nullptr) ? g_injectedBlock->hostRevivalTimestamp : 0;
     if (publishedTimestamp != 0)
     {
         if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(publishedTimestamp))
         {
-            g_activeRevival = profile;
+            SetActiveRevivalProfile(profile, RevivalProfileSource::PublishedHostTimestamp);
             mod::Log(
                 "DetectRevivalVersion: adopted published host timestamp 0x%08X → %s",
                 static_cast<unsigned>(publishedTimestamp),
@@ -332,6 +426,7 @@ void DetectRevivalVersion()
             return;
         }
 
+        SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
         mod::Log(
             "DetectRevivalVersion: published host timestamp 0x%08X unknown — keeping default %s. Addresses may be wrong!",
             static_cast<unsigned>(publishedTimestamp),
@@ -339,6 +434,7 @@ void DetectRevivalVersion()
         return;
     }
 
+    SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
     if (revival == nullptr)
     {
         mod::Log(
@@ -353,6 +449,8 @@ void DetectRevivalVersion()
 
 static uintptr_t ResolveHelperSendQuitAllRva()
 {
+    EnsureActiveRevivalProfile();
+
     // Native helper routine that broadcasts EfzPackets::MessageQuit to every
     // connected peer. RVAs were confirmed from the 1.02e/h/i decompilations
     // and resolved for 1.02f/g by matching the helper EXE disassembly.
@@ -492,6 +590,8 @@ struct InjectedPeerManagerLayout
 
 static InjectedPeerManagerLayout ResolveInjectedPeerManagerLayout()
 {
+    EnsureActiveRevivalProfile();
+
     InjectedPeerManagerLayout layout = {};
     if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
     {

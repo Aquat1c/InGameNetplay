@@ -280,6 +280,8 @@ bool ReadModuleImageRange(HMODULE module, uintptr_t* outBase, uintptr_t* outEnd)
 
 int ReadRoleFlagFromRevival()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -347,6 +349,8 @@ bool IsLikelySessionPointer(uintptr_t sessionPtr, uintptr_t revivalImageBase, ui
 
 uintptr_t ReadSessionPointerFromRevival()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -381,6 +385,8 @@ uintptr_t ReadSessionPointerFromRevival()
 
 uintptr_t ReadSessionPointerFromRevivalLoose()
 {
+    EnsureActiveRevivalProfile();
+
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -3267,8 +3273,10 @@ static bool    g_perFrameMismatchLogged     = false;
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
+static volatile LONG g_localBattleEscQuitRingIgnoreArmed = 0;
 static volatile LONG* g_quitRingHeader = nullptr;
 static volatile LONG g_scheduledGracefulQuitTeardownActive = 0;
+static DWORD g_localBattleEscQuitRingIgnoreStartMs = 0;
 static DWORD g_scheduledGracefulQuitTeardownStartMs = 0;
 static LONG g_scheduledGracefulQuitHead = 0;
 static LONG g_scheduledGracefulQuitTail = 0;
@@ -3296,6 +3304,7 @@ static bool g_spectateHoldoffWasActive = false;
 // watchdog forces a full cleanup and return to the netplay menu.
 static unsigned int g_watchdogDeadFrameCount = 0;
 static constexpr unsigned int kWatchdogGraceFrames = 30; // ~0.5s at 60fps
+static constexpr DWORD kLocalBattleEscQuitRingIgnoreWindowMs = 500u;
 static constexpr DWORD kScheduledGracefulQuitTeardownDelayMs = 500u;
 
 // __thiscall trampoline: ECX = this, no other args.
@@ -3307,6 +3316,12 @@ static uint32_t g_frameTick = 0;           // monotonic per-frame counter
 static bool EnsureQuitRingHeader();
 static void ReleaseQuitRingHeader();
 static bool ConsumeGracefulQuitRingSignal(LONG* outHeadBefore, LONG* outTailBefore);
+static void ResetLocalBattleEscQuitRingIgnore();
+static void ArmLocalBattleEscQuitRingIgnore();
+static bool ConsumeLocalBattleEscQuitRingIgnore(
+    const char* phaseTag,
+    LONG quitHeadBefore,
+    LONG quitTailBefore);
 static void ResetScheduledGracefulQuitTeardown();
 static void ScheduleGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore);
 static char FinalizeGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefore, LONG quitTailBefore, const char* originTag);
@@ -3786,14 +3801,20 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     {
         if (ConsumeGracefulQuitRingSignal(&preTickQuitHead, &preTickQuitTail))
         {
-            mod::Log(
-                "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
-                "quitHead=%ld quitTail=%ld — skipping DLL tick",
-                g_frameTick,
-                static_cast<long>(preTickQuitHead),
-                static_cast<long>(preTickQuitTail));
-            preTickDisconnect = true;
-            preTickGracefulQuit = true;
+            if (!ConsumeLocalBattleEscQuitRingIgnore(
+                    "PRE-TICK",
+                    preTickQuitHead,
+                    preTickQuitTail))
+            {
+                mod::Log(
+                    "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
+                    "quitHead=%ld quitTail=%ld — skipping DLL tick",
+                    g_frameTick,
+                    static_cast<long>(preTickQuitHead),
+                    static_cast<long>(preTickQuitTail));
+                preTickDisconnect = true;
+                preTickGracefulQuit = true;
+            }
         }
 
         if (!preTickDisconnect && g_hostBlock != nullptr)
@@ -3813,13 +3834,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
-    // ---- Online match ESC graceful-quit priming --------------------------
-    // Pressing Esc during an active online battle eventually triggers
-    // ExitProcess inside EFZ.exe. We intercept that later, keep EFZ.exe alive,
-    // and ask the injected EfzRevival.exe helper to broadcast its native
-    // MessageQuit packet before we tear the helper down locally. Restrict
-    // this to the battle screen so normal post-match cleanup remains
-    // untouched.
+    // ---- Online match ESC battle-return tracking -------------------------
+    // Native EFZ/Revival battle ESC returns to charselect rather than leaving
+    // netplay entirely. Keep a short marker so if the helper publishes a Quit
+    // ring entry for that local ESC, we consume it without promoting the
+    // session into the title/netplay-menu teardown path.
     {
         static bool s_onlineMatchEscWasDown = false;
         const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -3840,39 +3859,19 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (escRisingEdge)
         {
+            ArmLocalBattleEscQuitRingIgnore();
             mod::Log(
                 "TICK_HOOK: online match ESC detected frameTick=%u screen=%u "
                 "session=0x%08lX role=%d netRole=%d helperPid=%lu "
-                "dllExitPatched=%d liveEdgeAttempt=1",
+                "dllExitPatched=%d ignoreQuitRingWindowMs=%lu",
                 g_frameTick,
                 static_cast<unsigned>(escScreen),
                 static_cast<unsigned long>(currentSession),
                 g_localRoleFlag,
                 g_netplayRole,
                 static_cast<unsigned long>(g_revivalProcessId),
-                g_dllExitProcessPatchesSaved ? 1 : 0);
-
-            const bool peerQuitSent =
-                RequestInjectedPeerQuitBroadcast("online_match_esc_live_edge", 300u);
-            if (peerQuitSent)
-            {
-                ResetOnlineMatchEscGracefulQuit();
-            }
-            else
-            {
-                ArmOnlineMatchEscGracefulQuit();
-            }
-
-            mod::Log(
-                "TICK_HOOK: online match ESC live-edge peer-quit broadcast=%d "
-                "frameTick=%u screen=%u session=0x%08lX helperPid=%lu "
-                "lateRetryArmed=%d",
-                peerQuitSent ? 1 : 0,
-                g_frameTick,
-                static_cast<unsigned>(escScreen),
-                static_cast<unsigned long>(currentSession),
-                static_cast<unsigned long>(g_revivalProcessId),
-                peerQuitSent ? 0 : 1);
+                g_dllExitProcessPatchesSaved ? 1 : 0,
+                static_cast<unsigned long>(kLocalBattleEscQuitRingIgnoreWindowMs));
         }
     }
 
@@ -4785,7 +4784,13 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         LONG quitTailAfter = 0;
         if (ConsumeGracefulQuitRingSignal(&quitHeadAfter, &quitTailAfter))
         {
-            return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
+            if (!ConsumeLocalBattleEscQuitRingIgnore(
+                    "POST-TICK",
+                    quitHeadAfter,
+                    quitTailAfter))
+            {
+                return RecoverFromQuitRingSignal("POST-TICK", quitHeadAfter, quitTailAfter);
+            }
         }
     }
 
@@ -5233,6 +5238,47 @@ void ResetOnlineMatchEscGracefulQuit()
     InterlockedExchange(&g_onlineMatchEscGracefulQuitArmed, 0);
 }
 
+static void ResetLocalBattleEscQuitRingIgnore()
+{
+    InterlockedExchange(&g_localBattleEscQuitRingIgnoreArmed, 0);
+    g_localBattleEscQuitRingIgnoreStartMs = 0;
+}
+
+static void ArmLocalBattleEscQuitRingIgnore()
+{
+    g_localBattleEscQuitRingIgnoreStartMs = GetTickCount();
+    InterlockedExchange(&g_localBattleEscQuitRingIgnoreArmed, 1);
+}
+
+static bool ConsumeLocalBattleEscQuitRingIgnore(
+    const char* phaseTag,
+    LONG quitHeadBefore,
+    LONG quitTailBefore)
+{
+    if (InterlockedCompareExchange(&g_localBattleEscQuitRingIgnoreArmed, 0, 0) == 0)
+    {
+        return false;
+    }
+
+    const DWORD elapsedMs = GetTickCount() - g_localBattleEscQuitRingIgnoreStartMs;
+    if (elapsedMs > kLocalBattleEscQuitRingIgnoreWindowMs)
+    {
+        ResetLocalBattleEscQuitRingIgnore();
+        return false;
+    }
+
+    ResetLocalBattleEscQuitRingIgnore();
+    mod::Log(
+        "TICK_HOOK: local battle ESC consumed Quit ring without session teardown "
+        "phase=%s frameTick=%u quitHead=%ld quitTail=%ld elapsedMs=%lu",
+        phaseTag != nullptr ? phaseTag : "POST-TICK",
+        g_frameTick,
+        static_cast<long>(quitHeadBefore),
+        static_cast<long>(quitTailBefore),
+        static_cast<unsigned long>(elapsedMs));
+    return true;
+}
+
 static void ResetScheduledGracefulQuitTeardown()
 {
     InterlockedExchange(&g_scheduledGracefulQuitTeardownActive, 0);
@@ -5491,6 +5537,7 @@ void ResetGameModeValidation()
     g_retAddrSlotCount = 0;
     std::memset(g_retAddrSlots, 0, sizeof(g_retAddrSlots));
     ResetOnlineMatchEscGracefulQuit();
+    ResetLocalBattleEscQuitRingIgnore();
     ResetScheduledGracefulQuitTeardown();
     ReleaseQuitRingHeader();
 

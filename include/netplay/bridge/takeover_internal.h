@@ -157,6 +157,7 @@ extern const RevivalAddressProfile* g_activeRevival;
 
 // Runtime version detection — reads PE TimeDateStamp, sets g_activeRevival.
 void DetectRevivalVersion();
+void EnsureActiveRevivalProfile();
 
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
