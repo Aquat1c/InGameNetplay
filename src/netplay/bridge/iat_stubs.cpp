@@ -411,7 +411,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
                 callerModule,
                 static_cast<unsigned long>(callerRva));
             const bool peerQuitSent =
-                RequestInjectedPeerQuitBroadcast("online_match_esc", 300u);
+                RequestInjectedPeerQuitBroadcast("online_match_esc_late_fallback", 300u);
             mod::Log(
                 "NeutralizeExitProcess: online match ESC peer-quit broadcast=%d "
                 "caller=%s+0x%lX",
@@ -2096,6 +2096,7 @@ HANDLE StubCreateFileA(
         const std::string redirectPath = GetNativeShadowLogEfzPathA();
         if (!redirectPath.empty())
         {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
             mod::Log(
                 "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
                 lpFileName,
@@ -2103,7 +2104,7 @@ HANDLE StubCreateFileA(
             return CreateFileA(
                 redirectPath.c_str(),
                 dwDesiredAccess,
-                dwShareMode,
+                redirectShareMode,
                 lpSecurityAttributes,
                 dwCreationDisposition,
                 dwFlagsAndAttributes,
@@ -2135,6 +2136,7 @@ HANDLE StubCreateFileW(
         const std::wstring redirectPath = GetNativeShadowLogEfzPathW();
         if (!redirectPath.empty())
         {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
             char originalUtf8[MAX_PATH * 2] = {};
             char redirectUtf8[MAX_PATH * 2] = {};
             WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
@@ -2146,7 +2148,7 @@ HANDLE StubCreateFileW(
             return CreateFileW(
                 redirectPath.c_str(),
                 dwDesiredAccess,
-                dwShareMode,
+                redirectShareMode,
                 lpSecurityAttributes,
                 dwCreationDisposition,
                 dwFlagsAndAttributes,

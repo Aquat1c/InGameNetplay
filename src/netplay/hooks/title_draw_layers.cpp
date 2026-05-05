@@ -16,6 +16,117 @@ using NetplayMenuId = netplay::menu::NetplayMenuId;
 using netplay::menu::GetMenuEntries;
 using netplay::menu::RowToIndex;
 
+namespace
+{
+constexpr int kNetplayBackgroundWidth = 320;
+constexpr int kNetplayBackgroundHeight = 240;
+constexpr double kNetplayBackgroundScrollPixelsPerSecond = 12.5;
+
+bool UseScrollingNetplayBackground()
+{
+    return g_netplayMenuState.theme == NetplayMenuTheme::Scroll
+        && g_netplayMenuState.backgroundSupportsScroll;
+}
+
+void ResetNetplayBackgroundAnimation()
+{
+    g_netplayMenuState.backgroundScrollOffset = 0.0;
+    g_netplayMenuState.backgroundScrollTick = 0;
+}
+
+void AdvanceNetplayBackgroundAnimation()
+{
+    if (!UseScrollingNetplayBackground())
+    {
+        ResetNetplayBackgroundAnimation();
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (g_netplayMenuState.backgroundScrollTick == 0)
+    {
+        g_netplayMenuState.backgroundScrollTick = now;
+        return;
+    }
+
+    DWORD elapsedMs = now - g_netplayMenuState.backgroundScrollTick;
+    if (elapsedMs > 250)
+    {
+        elapsedMs = 250;
+    }
+    g_netplayMenuState.backgroundScrollTick = now;
+
+    g_netplayMenuState.backgroundScrollOffset +=
+        (static_cast<double>(elapsedMs) * kNetplayBackgroundScrollPixelsPerSecond) / 1000.0;
+    while (g_netplayMenuState.backgroundScrollOffset >= kNetplayBackgroundWidth)
+    {
+        g_netplayMenuState.backgroundScrollOffset -= kNetplayBackgroundWidth;
+    }
+}
+
+void DrawNetplayBackgroundSurface(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
+
+    if (!UseScrollingNetplayBackground())
+    {
+        (void)blit(
+            graphicsContext,
+            0,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            0,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+        return;
+    }
+
+    AdvanceNetplayBackgroundAnimation();
+    const int scrollX = static_cast<int>(g_netplayMenuState.backgroundScrollOffset);
+    const int firstSliceWidth = kNetplayBackgroundWidth - scrollX;
+    if (firstSliceWidth > 0)
+    {
+        (void)blit(
+            graphicsContext,
+            0,
+            0,
+            firstSliceWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            scrollX,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+    }
+
+    if (scrollX > 0)
+    {
+        (void)blit(
+            graphicsContext,
+            firstSliceWidth,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            0,
+            0,
+            scrollX,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+    }
+}
+} // namespace
+
 void DrawSpriteText(
     uint32_t screenContext,
     int startX,
@@ -274,11 +385,7 @@ bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc)
 
 void DrawAnimatedCompactMenuLayer(uint32_t screenContext)
 {
-    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
-    auto* const graphicsContext = GetGraphicsContext(screenContext);
-    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
-
-    (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
+    DrawNetplayBackgroundSurface(screenContext);
     DrawCompactMenuTitle(screenContext);
     const int logicalSelection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
     DrawCompactMenuRows(screenContext, g_netplayMenuState.menuId, logicalSelection, 0);
@@ -286,11 +393,7 @@ void DrawAnimatedCompactMenuLayer(uint32_t screenContext)
 
 void DrawNetplayBackgroundOnly(uint32_t screenContext)
 {
-    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
-    auto* const graphicsContext = GetGraphicsContext(screenContext);
-    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
-
-    (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
+    DrawNetplayBackgroundSurface(screenContext);
 }
 
 void DrawNetplayBaseLayer(uint32_t screenContext)
@@ -298,11 +401,10 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
     auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
 
     auto* const graphicsContext = GetGraphicsContext(screenContext);
-    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
     const int objectsSurface = *reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface);
     const char transparentColor = static_cast<char>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor));
 
-    (void)blit(graphicsContext, 0, 0, 320, 240, backgroundSurface, 0, 0, 320, 240, 0, 0);
+    DrawNetplayBackgroundSurface(screenContext);
     (void)blit(graphicsContext, 0, 0, 320, 240, objectsSurface, 0, 0, 320, 240, transparentColor, 0);
 
     {

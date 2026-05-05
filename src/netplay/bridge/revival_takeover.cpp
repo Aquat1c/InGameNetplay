@@ -9,6 +9,7 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -139,6 +140,10 @@ bool g_nativeWorkflowMatchLoopSeen = false;
 bool g_nativeWorkflowTournamentSeen = false;
 bool g_nativeWorkflowPeerDiedSeen = false;
 bool g_nativeWorkflowHolePunchDiedSeen = false;
+static uintptr_t g_injectedPeerManagerCachePtr = 0;
+static DWORD g_injectedPeerManagerCacheHostPid = 0;
+static bool g_injectedPeerManagerCacheStrictHostMatch = false;
+static DWORD g_injectedPeerQuitLastDetail = 0;
 bool g_holePunchServerConfigLoaded = false;
 std::string g_configuredHolePunchServer;
 
@@ -259,6 +264,18 @@ void EnsureHostLogEfzIatPatched(bool verboseLogs)
 // Version detection
 // ---------------------------------------------------------------------------
 
+static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t timestamp)
+{
+    for (size_t i = 0; i < kRevivalProfileCount; ++i)
+    {
+        if (kAllRevivalProfiles[i]->peTimestamp == timestamp)
+        {
+            return kAllRevivalProfiles[i];
+        }
+    }
+    return nullptr;
+}
+
 /// Detect the loaded Revival DLL version by reading its PE TimeDateStamp
 /// and matching against known profiles.  Sets g_activeRevival to the
 /// matching profile (or leaves it at the default 1.02e if detection fails).
@@ -266,51 +283,71 @@ void EnsureHostLogEfzIatPatched(bool verboseLogs)
 void DetectRevivalVersion()
 {
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
-    if (revival == nullptr)
+    if (revival != nullptr)
     {
-        mod::Log("DetectRevivalVersion: EfzRevival.dll not loaded — keeping "
-                 "default profile %s", g_activeRevival->versionTag);
-        return;
-    }
-
-    // Read PE TimeDateStamp from the loaded image header.
-    const auto* base = reinterpret_cast<const uint8_t*>(revival);
-    const auto dosE_lfanew = *reinterpret_cast<const int32_t*>(base + 0x3C);
-    if (dosE_lfanew < 0 || dosE_lfanew > 0x1000)
-    {
-        mod::Log("DetectRevivalVersion: invalid e_lfanew=0x%X — keeping default",
-                 static_cast<unsigned>(dosE_lfanew));
-        return;
-    }
-
-    const auto* peSignature = reinterpret_cast<const uint32_t*>(base + dosE_lfanew);
-    if (*peSignature != 0x00004550u)  // "PE\0\0"
-    {
-        mod::Log("DetectRevivalVersion: bad PE signature 0x%08X — keeping default",
-                 static_cast<unsigned>(*peSignature));
-        return;
-    }
-
-    // COFF header TimeDateStamp is at PE+8.
-    const uint32_t timestamp = *reinterpret_cast<const uint32_t*>(base + dosE_lfanew + 8);
-
-    // Search known profiles.
-    for (size_t i = 0; i < kRevivalProfileCount; ++i)
-    {
-        if (kAllRevivalProfiles[i]->peTimestamp == timestamp)
+        // Read PE TimeDateStamp from the loaded image header.
+        const auto* base = reinterpret_cast<const uint8_t*>(revival);
+        const auto dosE_lfanew = *reinterpret_cast<const int32_t*>(base + 0x3C);
+        if (dosE_lfanew < 0 || dosE_lfanew > 0x1000)
         {
-            g_activeRevival = kAllRevivalProfiles[i];
+            mod::Log("DetectRevivalVersion: invalid e_lfanew=0x%X — keeping default",
+                     static_cast<unsigned>(dosE_lfanew));
+            return;
+        }
+
+        const auto* peSignature = reinterpret_cast<const uint32_t*>(base + dosE_lfanew);
+        if (*peSignature != 0x00004550u)  // "PE\0\0"
+        {
+            mod::Log("DetectRevivalVersion: bad PE signature 0x%08X — keeping default",
+                     static_cast<unsigned>(*peSignature));
+            return;
+        }
+
+        // COFF header TimeDateStamp is at PE+8.
+        const uint32_t timestamp = *reinterpret_cast<const uint32_t*>(base + dosE_lfanew + 8);
+        if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(timestamp))
+        {
+            g_activeRevival = profile;
             mod::Log("DetectRevivalVersion: matched timestamp 0x%08X → %s",
                      static_cast<unsigned>(timestamp),
                      g_activeRevival->versionTag);
             return;
         }
+
+        mod::Log("DetectRevivalVersion: UNKNOWN timestamp 0x%08X from EfzRevival.dll — trying published host profile",
+                 static_cast<unsigned>(timestamp));
     }
 
-    // Unknown timestamp — keep default and warn.
-    mod::Log("DetectRevivalVersion: UNKNOWN timestamp 0x%08X — keeping default %s. "
-             "Addresses may be wrong!",
-             static_cast<unsigned>(timestamp),
+    const uint32_t publishedTimestamp =
+        (g_injectedBlock != nullptr) ? g_injectedBlock->hostRevivalTimestamp : 0;
+    if (publishedTimestamp != 0)
+    {
+        if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(publishedTimestamp))
+        {
+            g_activeRevival = profile;
+            mod::Log(
+                "DetectRevivalVersion: adopted published host timestamp 0x%08X → %s",
+                static_cast<unsigned>(publishedTimestamp),
+                g_activeRevival->versionTag);
+            return;
+        }
+
+        mod::Log(
+            "DetectRevivalVersion: published host timestamp 0x%08X unknown — keeping default %s. Addresses may be wrong!",
+            static_cast<unsigned>(publishedTimestamp),
+            g_activeRevival->versionTag);
+        return;
+    }
+
+    if (revival == nullptr)
+    {
+        mod::Log(
+            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile — keeping default %s",
+            g_activeRevival->versionTag);
+        return;
+    }
+
+    mod::Log("DetectRevivalVersion: keeping default %s. Addresses may be wrong!",
              g_activeRevival->versionTag);
 }
 
@@ -399,16 +436,1055 @@ static bool TryGetProcessIdFromHandleCompat(HANDLE processHandle, DWORD* outPid)
     return true;
 }
 
-static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStrictHostMatch)
+struct InjectedPeerManagerValidation
+{
+    bool valid = false;
+    bool strictCheckUsed = false;
+    bool structureCheckUsed = false;
+    bool peerContainerSnapshotRead = false;
+    bool peerBackingSnapshotRead = false;
+    bool quitRingSnapshotRead = false;
+    DWORD selfPid = 0;
+    DWORD childPid = 0;
+    DWORD handlePid = 0;
+    DWORD exitCode = 0;
+    DWORD quitCapacity = 0;
+    DWORD handleFlags = 0;
+    LONG quitHead = 0;
+    LONG quitTail = 0;
+    SIZE_T objectRegionSize = 0;
+    uintptr_t objectBase = 0;
+    uintptr_t peerContainerBase = 0;
+    uintptr_t peerBackingBase = 0;
+    uintptr_t quitRingBase = 0;
+    size_t layoutObjectSize = 0;
+    size_t layoutPeerContainerOffset = 0;
+    size_t layoutPeerBackingOffset = 0;
+    size_t layoutQuitRingOffset = 0;
+    HANDLE hostProcessHandle = nullptr;
+    DWORD peerContainerWords[8] = {};
+    DWORD peerBackingWords[8] = {};
+    DWORD quitRingWords[8] = {};
+    const char* reason = "not_checked";
+};
+
+constexpr size_t kInjectedPeerManagerSelfPidOffset = 328u;
+constexpr size_t kInjectedPeerManagerHostHandleOffset = 360u;
+constexpr size_t kInjectedPeerManagerChildPidOffset = 368u;
+constexpr size_t kInjectedPeerManagerPeerContainerOffset = 488u;
+// Native decomp shows the live session object stores the peer-manager pointer
+// at +1176 for e/h/i families; the same session object also carries the
+// versioned currentFrame field that our session-pointer code already tracks.
+constexpr size_t kInjectedPeerManagerSessionFieldOffset = 1176u;
+constexpr size_t kInjectedPeerManagerQuitRingCapacityOffset = 36u;
+constexpr DWORD kInjectedPeerManagerQuitRingExpectedCapacity = 1u;
+constexpr size_t kInjectedPeerManagerMinScanSpan =
+    kInjectedPeerManagerHostHandleOffset + sizeof(HANDLE);
+constexpr size_t kInjectedPeerManagerDumpWordCount = 8u;
+
+struct InjectedPeerManagerLayout
+{
+    size_t objectSize = 0;
+    size_t peerContainerOffset = 0;
+    size_t peerBackingOffset = 0;
+    size_t quitRingOffset = 0;
+};
+
+static InjectedPeerManagerLayout ResolveInjectedPeerManagerLayout()
+{
+    InjectedPeerManagerLayout layout = {};
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return layout;
+    }
+
+    const char* const tag = g_activeRevival->versionTag;
+    if (std::strcmp(tag, "1.02i") == 0)
+    {
+        layout.objectSize = 0x1318u;
+        layout.peerContainerOffset = kInjectedPeerManagerPeerContainerOffset;
+        layout.peerBackingOffset = 684u;
+        layout.quitRingOffset = 4624u;
+        return layout;
+    }
+
+    if (std::strcmp(tag, "1.02e") == 0
+        || std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02g") == 0
+        || std::strcmp(tag, "1.02h") == 0)
+    {
+        layout.objectSize = 0x760u;
+        layout.peerContainerOffset = kInjectedPeerManagerPeerContainerOffset;
+        layout.peerBackingOffset = 680u;
+        layout.quitRingOffset = 1624u;
+    }
+
+    return layout;
+}
+
+static DWORD EncodeInjectedPeerManagerReason(const char* reason)
+{
+    if (reason == nullptr)
+    {
+        return 0;
+    }
+    if (std::strcmp(reason, "identity_unreadable") == 0)
+    {
+        return 1;
+    }
+    if (std::strcmp(reason, "self_pid_mismatch") == 0)
+    {
+        return 2;
+    }
+    if (std::strcmp(reason, "invalid_host_handle") == 0)
+    {
+        return 3;
+    }
+    if (std::strcmp(reason, "host_handle_query_failed") == 0)
+    {
+        return 4;
+    }
+    if (std::strcmp(reason, "host_pid_mismatch") == 0)
+    {
+        return 5;
+    }
+    if (std::strcmp(reason, "host_process_dead") == 0)
+    {
+        return 6;
+    }
+    if (std::strcmp(reason, "layout_inconsistent") == 0)
+    {
+        return 7;
+    }
+    if (std::strcmp(reason, "object_query_failed") == 0)
+    {
+        return 8;
+    }
+    if (std::strcmp(reason, "object_region_invalid") == 0)
+    {
+        return 9;
+    }
+    if (std::strcmp(reason, "object_base_invalid") == 0)
+    {
+        return 10;
+    }
+    if (std::strcmp(reason, "object_out_of_range") == 0)
+    {
+        return 11;
+    }
+    if (std::strcmp(reason, "structure_unreadable") == 0)
+    {
+        return 12;
+    }
+    if (std::strcmp(reason, "quit_ring_base_null") == 0)
+    {
+        return 13;
+    }
+    if (std::strcmp(reason, "quit_ring_capacity_invalid") == 0)
+    {
+        return 14;
+    }
+    if (std::strcmp(reason, "quit_ring_region_invalid") == 0)
+    {
+        return 15;
+    }
+    if (std::strcmp(reason, "quit_ring_range_invalid") == 0)
+    {
+        return 16;
+    }
+    if (std::strcmp(reason, "quit_ring_state_invalid") == 0)
+    {
+        return 17;
+    }
+    return 255;
+}
+
+static const char* DecodeInjectedPeerManagerReason(DWORD detail)
+{
+    switch (detail)
+    {
+    case 1:
+        return "identity_unreadable";
+    case 2:
+        return "self_pid_mismatch";
+    case 3:
+        return "invalid_host_handle";
+    case 4:
+        return "host_handle_query_failed";
+    case 5:
+        return "host_pid_mismatch";
+    case 6:
+        return "host_process_dead";
+    case 7:
+        return "layout_inconsistent";
+    case 8:
+        return "object_query_failed";
+    case 9:
+        return "object_region_invalid";
+    case 10:
+        return "object_base_invalid";
+    case 11:
+        return "object_out_of_range";
+    case 12:
+        return "structure_unreadable";
+    case 13:
+        return "quit_ring_base_null";
+    case 14:
+        return "quit_ring_capacity_invalid";
+    case 15:
+        return "quit_ring_region_invalid";
+    case 16:
+        return "quit_ring_range_invalid";
+    case 17:
+        return "quit_ring_state_invalid";
+    case 255:
+        return "other_validation_reason";
+    default:
+        return "unknown_detail";
+    }
+}
+
+static DWORD EncodeInjectedExceptionDetail(DWORD exceptionCode)
+{
+    switch (exceptionCode)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:
+        return 1;
+    case EXCEPTION_IN_PAGE_ERROR:
+        return 2;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return 3;
+    case EXCEPTION_STACK_OVERFLOW:
+        return 4;
+    case EXCEPTION_GUARD_PAGE:
+        return 5;
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+        return 6;
+    default:
+        return 255;
+    }
+}
+
+static const char* DecodeInjectedExceptionDetail(DWORD detail)
+{
+    switch (detail)
+    {
+    case 1:
+        return "access_violation";
+    case 2:
+        return "in_page_error";
+    case 3:
+        return "illegal_instruction";
+    case 4:
+        return "stack_overflow";
+    case 5:
+        return "guard_page";
+    case 6:
+        return "datatype_misalignment";
+    case 255:
+        return "other_exception";
+    default:
+        return "unknown_exception";
+    }
+}
+
+static void LogInjectedPeerQuitDiagnosticLine(const char* fmt, ...)
+{
+    char buffer[1024] = {};
+    va_list args;
+    va_start(args, fmt);
+    const int written = std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    if (written <= 0)
+    {
+        return;
+    }
+
+    mod::Log("%s", buffer);
+    AppendPeerQuitDiagnostic(buffer);
+}
+
+static void FlushInjectedPeerQuitDiagnosticToHostLog(const char* reason, DWORD helperPid)
+{
+    LONG diagnosticSerial = 0;
+    char diagnosticText[8192] = {};
+    ReadPeerQuitDiagnostic(&diagnosticSerial, diagnosticText, sizeof(diagnosticText));
+    if (diagnosticText[0] == '\0')
+    {
+        mod::Log(
+            "Takeover: peer-quit helper dump empty reason='%s' serial=%ld helperPid=%lu",
+            reason != nullptr ? reason : "",
+            static_cast<long>(diagnosticSerial),
+            static_cast<unsigned long>(helperPid));
+        return;
+    }
+
+    const char* cursor = diagnosticText;
+    while (*cursor != '\0')
+    {
+        while (*cursor == '\r' || *cursor == '\n')
+        {
+            ++cursor;
+        }
+        if (*cursor == '\0')
+        {
+            break;
+        }
+
+        const char* lineEnd = cursor;
+        while (*lineEnd != '\0' && *lineEnd != '\r' && *lineEnd != '\n')
+        {
+            ++lineEnd;
+        }
+
+        char line[1024] = {};
+        const size_t lineLen = static_cast<size_t>(lineEnd - cursor);
+        const size_t copyLen = (std::min)(lineLen, sizeof(line) - 1u);
+        std::memcpy(line, cursor, copyLen);
+        line[copyLen] = '\0';
+        mod::Log(
+            "Takeover: peer-quit helper dump reason='%s' serial=%ld helperPid=%lu | %s",
+            reason != nullptr ? reason : "",
+            static_cast<long>(diagnosticSerial),
+            static_cast<unsigned long>(helperPid),
+            line);
+        cursor = lineEnd;
+    }
+}
+
+static bool TryReadInjectedPeerManagerIdentity(
+    uintptr_t candidatePtr,
+    DWORD* outSelfPid,
+    HANDLE* outHostProcessHandle)
+{
+    if (outSelfPid != nullptr)
+    {
+        *outSelfPid = 0;
+    }
+    if (outHostProcessHandle != nullptr)
+    {
+        *outHostProcessHandle = nullptr;
+    }
+    if (candidatePtr == 0)
+    {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(candidatePtr), &mbi, sizeof(mbi))
+        != sizeof(mbi))
+    {
+        return false;
+    }
+    if (!IsWritableUserRegion(mbi)
+        || static_cast<uintptr_t>(mbi.RegionSize) < kInjectedPeerManagerMinScanSpan)
+    {
+        return false;
+    }
+
+    const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    if (candidatePtr < regionBase)
+    {
+        return false;
+    }
+
+    const uintptr_t maxOffset =
+        static_cast<uintptr_t>(mbi.RegionSize) - kInjectedPeerManagerMinScanSpan;
+    const uintptr_t candidateOffset = candidatePtr - regionBase;
+    if (candidateOffset > maxOffset)
+    {
+        return false;
+    }
+
+    __try
+    {
+        if (outSelfPid != nullptr)
+        {
+            *outSelfPid = *reinterpret_cast<const DWORD*>(
+                candidatePtr + kInjectedPeerManagerSelfPidOffset);
+        }
+        if (outHostProcessHandle != nullptr)
+        {
+            *outHostProcessHandle = *reinterpret_cast<HANDLE const*>(
+                candidatePtr + kInjectedPeerManagerHostHandleOffset);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool TryReadInjectedWordSnapshot(
+    uintptr_t address,
+    DWORD* outWords,
+    size_t wordCount)
+{
+    if (outWords == nullptr || wordCount == 0 || address == 0)
+    {
+        return false;
+    }
+
+    std::fill(outWords, outWords + wordCount, 0u);
+    __try
+    {
+        for (size_t index = 0; index < wordCount; ++index)
+        {
+            outWords[index] = *reinterpret_cast<const DWORD*>(
+                address + index * sizeof(DWORD));
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static void LogInjectedWordSnapshot(
+    const char* context,
+    const char* label,
+    uintptr_t address,
+    const DWORD* words,
+    size_t wordCount,
+    bool readOk)
+{
+    if (address == 0 || words == nullptr || wordCount == 0)
+    {
+        return;
+    }
+
+    char buffer[512] = {};
+    int written = std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "Takeover: %s %s addr=0x%08lX read=%d words=",
+        context != nullptr ? context : "injected peer-manager dump",
+        label != nullptr ? label : "snapshot",
+        static_cast<unsigned long>(address),
+        readOk ? 1 : 0);
+    if (written < 0)
+    {
+        return;
+    }
+
+    size_t used = static_cast<size_t>(written);
+    for (size_t index = 0; index < wordCount && used < sizeof(buffer); ++index)
+    {
+        written = std::snprintf(
+            buffer + used,
+            sizeof(buffer) - used,
+            "%s%08lX",
+            index == 0 ? "" : " ",
+            static_cast<unsigned long>(words[index]));
+        if (written < 0)
+        {
+            return;
+        }
+        const size_t delta = static_cast<size_t>(written);
+        if (delta >= sizeof(buffer) - used)
+        {
+            used = sizeof(buffer) - 1u;
+            break;
+        }
+        used += delta;
+    }
+
+    LogInjectedPeerQuitDiagnosticLine("%s", buffer);
+}
+
+static void LogInjectedPeerManagerLayout(const char* context)
+{
+    const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: %s version=%s objectSize=0x%08lX peerContainerOff=0x%08lX peerBackingOff=0x%08lX quitRingOff=0x%08lX",
+        context != nullptr ? context : "injected peer-manager layout",
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown",
+        static_cast<unsigned long>(layout.objectSize),
+        static_cast<unsigned long>(layout.peerContainerOffset),
+        static_cast<unsigned long>(layout.peerBackingOffset),
+        static_cast<unsigned long>(layout.quitRingOffset));
+}
+
+static bool ValidateInjectedPeerManagerStructure(
+    uintptr_t candidatePtr,
+    DWORD hostPid,
+    InjectedPeerManagerValidation* result)
+{
+    if (result == nullptr)
+    {
+        return false;
+    }
+
+    (void)hostPid;
+
+    const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
+    result->layoutObjectSize = layout.objectSize;
+    result->layoutPeerContainerOffset = layout.peerContainerOffset;
+    result->layoutPeerBackingOffset = layout.peerBackingOffset;
+    result->layoutQuitRingOffset = layout.quitRingOffset;
+    result->peerContainerBase = candidatePtr + layout.peerContainerOffset;
+    result->peerBackingBase = candidatePtr + layout.peerBackingOffset;
+    if (layout.objectSize == 0)
+    {
+        return true;
+    }
+
+    result->structureCheckUsed = true;
+
+    const size_t peerContainerEnd =
+        layout.peerContainerOffset + kInjectedPeerManagerDumpWordCount * sizeof(DWORD);
+    const size_t peerBackingEnd = layout.peerBackingOffset + 28u * 4u;
+    const size_t quitRingEnd =
+        layout.quitRingOffset + kInjectedPeerManagerQuitRingCapacityOffset + sizeof(DWORD);
+    if (peerContainerEnd > layout.objectSize
+        || peerBackingEnd > layout.objectSize
+        || quitRingEnd > layout.objectSize)
+    {
+        result->reason = "layout_inconsistent";
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION objectMbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(candidatePtr), &objectMbi, sizeof(objectMbi))
+        != sizeof(objectMbi))
+    {
+        result->reason = "object_query_failed";
+        return false;
+    }
+    if (!IsWritableUserRegion(objectMbi)
+        || static_cast<uintptr_t>(objectMbi.RegionSize) < layout.objectSize)
+    {
+        result->reason = "object_region_invalid";
+        return false;
+    }
+
+    const uintptr_t objectBase = reinterpret_cast<uintptr_t>(objectMbi.BaseAddress);
+    result->objectBase = objectBase;
+    result->objectRegionSize = objectMbi.RegionSize;
+    if (candidatePtr < objectBase)
+    {
+        result->reason = "object_base_invalid";
+        return false;
+    }
+
+    const uintptr_t objectOffset = candidatePtr - objectBase;
+    const uintptr_t maxObjectOffset =
+        static_cast<uintptr_t>(objectMbi.RegionSize) - layout.objectSize;
+    if (objectOffset > maxObjectOffset)
+    {
+        result->reason = "object_out_of_range";
+        return false;
+    }
+
+    uintptr_t quitRingBase = 0;
+    __try
+    {
+        result->childPid = *reinterpret_cast<const DWORD*>(
+            candidatePtr + kInjectedPeerManagerChildPidOffset);
+        quitRingBase = *reinterpret_cast<const uintptr_t*>(
+            candidatePtr + layout.quitRingOffset);
+        result->quitCapacity = *reinterpret_cast<const DWORD*>(
+            candidatePtr + layout.quitRingOffset + kInjectedPeerManagerQuitRingCapacityOffset);
+        if (quitRingBase != 0)
+        {
+            result->quitHead = *reinterpret_cast<const LONG*>(quitRingBase);
+            result->quitTail = *reinterpret_cast<const LONG*>(quitRingBase + sizeof(LONG));
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        result->reason = "structure_unreadable";
+        return false;
+    }
+
+    result->quitRingBase = quitRingBase;
+    result->peerContainerSnapshotRead = TryReadInjectedWordSnapshot(
+        result->peerContainerBase,
+        result->peerContainerWords,
+        kInjectedPeerManagerDumpWordCount);
+    result->peerBackingSnapshotRead = TryReadInjectedWordSnapshot(
+        result->peerBackingBase,
+        result->peerBackingWords,
+        kInjectedPeerManagerDumpWordCount);
+    if (quitRingBase != 0)
+    {
+        result->quitRingSnapshotRead = TryReadInjectedWordSnapshot(
+            quitRingBase,
+            result->quitRingWords,
+            kInjectedPeerManagerDumpWordCount);
+    }
+
+    // Native manager construction initializes the Quit shared-memory ring
+    // immediately with capacity 1. sendQuitAll checks and dereferences that
+    // ring before enqueueing, so a null ring base here means this candidate is
+    // not the live peer manager object we want.
+    if (quitRingBase == 0)
+    {
+        result->reason = "quit_ring_base_null";
+        return false;
+    }
+    if (result->quitCapacity != kInjectedPeerManagerQuitRingExpectedCapacity)
+    {
+        result->reason = "quit_ring_capacity_invalid";
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION ringMbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(quitRingBase), &ringMbi, sizeof(ringMbi))
+            != sizeof(ringMbi)
+        || !IsWritableUserRegion(ringMbi))
+    {
+        result->reason = "quit_ring_region_invalid";
+        return false;
+    }
+
+    const uintptr_t ringRegionBase = reinterpret_cast<uintptr_t>(ringMbi.BaseAddress);
+    if (quitRingBase < ringRegionBase)
+    {
+        result->reason = "quit_ring_range_invalid";
+        return false;
+    }
+
+    const uintptr_t ringOffset = quitRingBase - ringRegionBase;
+    const uintptr_t ringRequiredSpan =
+        8u + static_cast<uintptr_t>(result->quitCapacity);
+    if (static_cast<uintptr_t>(ringMbi.RegionSize) < ringRequiredSpan
+        || ringOffset > static_cast<uintptr_t>(ringMbi.RegionSize) - ringRequiredSpan)
+    {
+        result->reason = "quit_ring_range_invalid";
+        return false;
+    }
+
+    if (result->quitTail < result->quitHead)
+    {
+        result->reason = "quit_ring_state_invalid";
+        return false;
+    }
+
+    const DWORD pendingCount = static_cast<DWORD>(result->quitTail - result->quitHead);
+    if (pendingCount > result->quitCapacity)
+    {
+        result->reason = "quit_ring_state_invalid";
+        return false;
+    }
+
+    return true;
+}
+
+static InjectedPeerManagerValidation ValidateInjectedPeerManagerPointer(
+    uintptr_t candidatePtr,
+    DWORD hostPid)
+{
+    InjectedPeerManagerValidation result = {};
+    result.reason = "identity_unreadable";
+
+    if (!TryReadInjectedPeerManagerIdentity(
+            candidatePtr,
+            &result.selfPid,
+            &result.hostProcessHandle))
+    {
+        return result;
+    }
+
+    const DWORD selfPid = GetCurrentProcessId();
+    if (result.selfPid != selfPid)
+    {
+        result.reason = "self_pid_mismatch";
+        return result;
+    }
+
+    if (result.hostProcessHandle == nullptr
+        || result.hostProcessHandle == INVALID_HANDLE_VALUE)
+    {
+        result.reason = "invalid_host_handle";
+        return result;
+    }
+
+    if (!GetHandleInformation(result.hostProcessHandle, &result.handleFlags)
+        || !GetExitCodeProcess(result.hostProcessHandle, &result.exitCode))
+    {
+        result.reason = "host_handle_query_failed";
+        return result;
+    }
+
+    if (hostPid != 0
+        && TryGetProcessIdFromHandleCompat(
+            result.hostProcessHandle,
+            &result.handlePid))
+    {
+        result.strictCheckUsed = true;
+        if (result.handlePid != hostPid)
+        {
+            result.reason = "host_pid_mismatch";
+            return result;
+        }
+
+        if (!ValidateInjectedPeerManagerStructure(candidatePtr, hostPid, &result))
+        {
+            return result;
+        }
+
+        result.valid = true;
+        result.reason = "strict_match";
+        return result;
+    }
+
+    if (result.exitCode != STILL_ACTIVE)
+    {
+        result.reason = "host_process_dead";
+        return result;
+    }
+
+    if (!ValidateInjectedPeerManagerStructure(candidatePtr, hostPid, &result))
+    {
+        return result;
+    }
+
+    result.valid = true;
+    result.reason = "fallback_alive";
+    return result;
+}
+
+static void LogInjectedPeerManagerValidation(
+    const char* context,
+    uintptr_t candidatePtr,
+    DWORD hostPid,
+    const InjectedPeerManagerValidation& validation)
+{
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: %s ptr=0x%08lX hostPid=%lu valid=%d reason=%s selfPid=%lu childPid=%lu hostHandle=%p handlePid=%lu exit=%lu strict=%d structure=%d objectBase=0x%08lX objectSpan=0x%08lX layoutObj=0x%08lX peerContainer=0x%08lX peerBacking=0x%08lX quitRing=0x%08lX quitHead=%ld quitTail=%ld quitCap=%lu flags=0x%08lX",
+        context != nullptr ? context : "injected peer-manager validate",
+        static_cast<unsigned long>(candidatePtr),
+        static_cast<unsigned long>(hostPid),
+        validation.valid ? 1 : 0,
+        validation.reason != nullptr ? validation.reason : "unknown",
+        static_cast<unsigned long>(validation.selfPid),
+        static_cast<unsigned long>(validation.childPid),
+        validation.hostProcessHandle,
+        static_cast<unsigned long>(validation.handlePid),
+        static_cast<unsigned long>(validation.exitCode),
+        validation.strictCheckUsed ? 1 : 0,
+        validation.structureCheckUsed ? 1 : 0,
+        static_cast<unsigned long>(validation.objectBase),
+        static_cast<unsigned long>(validation.objectRegionSize),
+        static_cast<unsigned long>(validation.layoutObjectSize),
+        static_cast<unsigned long>(validation.peerContainerBase),
+        static_cast<unsigned long>(validation.peerBackingBase),
+        static_cast<unsigned long>(validation.quitRingBase),
+        static_cast<long>(validation.quitHead),
+        static_cast<long>(validation.quitTail),
+        static_cast<unsigned long>(validation.quitCapacity),
+        static_cast<unsigned long>(validation.handleFlags));
+
+    if (validation.structureCheckUsed)
+    {
+        LogInjectedPeerQuitDiagnosticLine(
+            "Takeover: %s layout version=%s peerContainerOff=0x%08lX peerBackingOff=0x%08lX quitRingOff=0x%08lX",
+            context != nullptr ? context : "injected peer-manager validate",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown",
+            static_cast<unsigned long>(validation.layoutPeerContainerOffset),
+            static_cast<unsigned long>(validation.layoutPeerBackingOffset),
+            static_cast<unsigned long>(validation.layoutQuitRingOffset));
+        LogInjectedWordSnapshot(
+            context,
+            "peerContainer",
+            validation.peerContainerBase,
+            validation.peerContainerWords,
+            kInjectedPeerManagerDumpWordCount,
+            validation.peerContainerSnapshotRead);
+        LogInjectedWordSnapshot(
+            context,
+            "peerBacking",
+            validation.peerBackingBase,
+            validation.peerBackingWords,
+            kInjectedPeerManagerDumpWordCount,
+            validation.peerBackingSnapshotRead);
+        LogInjectedWordSnapshot(
+            context,
+            "quitRing",
+            validation.quitRingBase,
+            validation.quitRingWords,
+            kInjectedPeerManagerDumpWordCount,
+            validation.quitRingSnapshotRead);
+    }
+}
+
+static void CacheInjectedPeerManagerPointer(
+    uintptr_t candidatePtr,
+    DWORD hostPid,
+    bool strictHostMatch)
+{
+    const bool changed =
+        g_injectedPeerManagerCachePtr != candidatePtr
+        || g_injectedPeerManagerCacheHostPid != hostPid
+        || g_injectedPeerManagerCacheStrictHostMatch != strictHostMatch;
+
+    g_injectedPeerManagerCachePtr = candidatePtr;
+    g_injectedPeerManagerCacheHostPid = hostPid;
+    g_injectedPeerManagerCacheStrictHostMatch = strictHostMatch;
+
+    if (changed)
+    {
+        mod::Log(
+            "Takeover: injected peer-manager cache store ptr=0x%08lX hostPid=%lu strictHostMatch=%d",
+            static_cast<unsigned long>(candidatePtr),
+            static_cast<unsigned long>(hostPid),
+            strictHostMatch ? 1 : 0);
+    }
+}
+
+static void InvalidateInjectedPeerManagerCache(const char* reason)
+{
+    if (g_injectedPeerManagerCachePtr != 0)
+    {
+        mod::Log(
+            "Takeover: injected peer-manager cache clear ptr=0x%08lX hostPid=%lu strictHostMatch=%d reason=%s",
+            static_cast<unsigned long>(g_injectedPeerManagerCachePtr),
+            static_cast<unsigned long>(g_injectedPeerManagerCacheHostPid),
+            g_injectedPeerManagerCacheStrictHostMatch ? 1 : 0,
+            reason != nullptr ? reason : "unknown");
+    }
+
+    g_injectedPeerManagerCachePtr = 0;
+    g_injectedPeerManagerCacheHostPid = 0;
+    g_injectedPeerManagerCacheStrictHostMatch = false;
+}
+
+static uintptr_t TryGetCachedInjectedPeerManagerPointer(
+    DWORD hostPid,
+    bool* outUsedStrictHostMatch)
+{
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = false;
+    }
+    if (g_injectedPeerManagerCachePtr == 0)
+    {
+        return 0;
+    }
+
+    const InjectedPeerManagerValidation validation =
+        ValidateInjectedPeerManagerPointer(g_injectedPeerManagerCachePtr, hostPid);
+    LogInjectedPeerManagerValidation(
+        "injected peer-manager cache validate",
+        g_injectedPeerManagerCachePtr,
+        hostPid,
+        validation);
+    if (!validation.valid)
+    {
+        g_injectedPeerQuitLastDetail = EncodeInjectedPeerManagerReason(validation.reason);
+        InvalidateInjectedPeerManagerCache(validation.reason);
+        return 0;
+    }
+
+    g_injectedPeerQuitLastDetail = 0;
+
+    const bool strictHostMatch =
+        validation.strictCheckUsed || g_injectedPeerManagerCacheStrictHostMatch;
+    CacheInjectedPeerManagerPointer(
+        g_injectedPeerManagerCachePtr,
+        hostPid,
+        strictHostMatch);
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = strictHostMatch;
+    }
+
+    mod::Log(
+        "Takeover: injected peer-manager cache hit ptr=0x%08lX hostPid=%lu strictHostMatch=%d",
+        static_cast<unsigned long>(g_injectedPeerManagerCachePtr),
+        static_cast<unsigned long>(hostPid),
+        strictHostMatch ? 1 : 0);
+    return g_injectedPeerManagerCachePtr;
+}
+
+static uintptr_t TryResolveInjectedPeerManagerFromSessionPointer(
+    uintptr_t sessionPtr,
+    const char* source,
+    DWORD hostPid,
+    bool* outUsedStrictHostMatch)
+{
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = false;
+    }
+    if (sessionPtr == 0)
+    {
+        return 0;
+    }
+
+    uintptr_t managerPtr = 0;
+    if (!SafeReadPtr(
+            reinterpret_cast<const void*>(
+                sessionPtr + kInjectedPeerManagerSessionFieldOffset),
+            &managerPtr))
+    {
+        LogInjectedPeerQuitDiagnosticLine(
+            "Takeover: injected peer-manager session source=%s session=0x%08lX managerField=unreadable fieldOff=0x%08lX",
+            source != nullptr ? source : "unknown",
+            static_cast<unsigned long>(sessionPtr),
+            static_cast<unsigned long>(kInjectedPeerManagerSessionFieldOffset));
+        return 0;
+    }
+
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: injected peer-manager session source=%s session=0x%08lX manager=0x%08lX fieldOff=0x%08lX",
+        source != nullptr ? source : "unknown",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(managerPtr),
+        static_cast<unsigned long>(kInjectedPeerManagerSessionFieldOffset));
+    if (managerPtr == 0)
+    {
+        return 0;
+    }
+
+    char context[96] = {};
+    std::snprintf(
+        context,
+        sizeof(context),
+        "injected peer-manager session %s",
+        source != nullptr ? source : "unknown");
+    const InjectedPeerManagerValidation validation =
+        ValidateInjectedPeerManagerPointer(managerPtr, hostPid);
+    LogInjectedPeerManagerValidation(context, managerPtr, hostPid, validation);
+    if (!validation.valid)
+    {
+        g_injectedPeerQuitLastDetail =
+            EncodeInjectedPeerManagerReason(validation.reason);
+        return 0;
+    }
+
+    const bool strictHostMatch = validation.strictCheckUsed;
+    CacheInjectedPeerManagerPointer(managerPtr, hostPid, strictHostMatch);
+    g_injectedPeerQuitLastDetail = 0;
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = strictHostMatch;
+    }
+
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: injected peer-manager resolved source=%s session=0x%08lX ptr=0x%08lX hostPid=%lu strictHostMatch=%d",
+        source != nullptr ? source : "unknown",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(managerPtr),
+        static_cast<unsigned long>(hostPid),
+        strictHostMatch ? 1 : 0);
+    return managerPtr;
+}
+
+static uintptr_t TryResolveInjectedPeerManagerFromSession(
+    DWORD hostPid,
+    bool* outUsedStrictHostMatch)
 {
     if (outUsedStrictHostMatch != nullptr)
     {
         *outUsedStrictHostMatch = false;
     }
 
-    constexpr size_t kManagerSelfPidOffset = 328u;
-    constexpr size_t kManagerHostHandleOffset = 360u;
-    constexpr size_t kManagerMinScanSpan = kManagerHostHandleOffset + sizeof(HANDLE);
+    const uintptr_t cachedSessionPtrBeforeRead = g_lastValidatedSessionPtr;
+    HMODULE sessionModule = GetModuleHandleA("EfzRevival.dll");
+    auto trySession = [&](uintptr_t sessionPtr, const char* source) -> uintptr_t {
+        bool strictHostMatch = false;
+        const uintptr_t managerPtr = TryResolveInjectedPeerManagerFromSessionPointer(
+            sessionPtr,
+            source,
+            hostPid,
+            &strictHostMatch);
+        if (managerPtr != 0 && outUsedStrictHostMatch != nullptr)
+        {
+            *outUsedStrictHostMatch = strictHostMatch;
+        }
+        return managerPtr;
+    };
+
+    if (cachedSessionPtrBeforeRead != 0)
+    {
+        const uintptr_t managerPtr =
+            trySession(cachedSessionPtrBeforeRead, "cached_preexisting");
+        if (managerPtr != 0)
+        {
+            return managerPtr;
+        }
+    }
+
+    const uintptr_t strictSessionPtr = ReadSessionPointerFromRevival();
+    if (cachedSessionPtrBeforeRead == 0 && strictSessionPtr == 0 && sessionModule == nullptr)
+    {
+        LogInjectedPeerQuitDiagnosticLine(
+            "Takeover: injected peer-manager session lookup skipped (EfzRevival.dll not loaded in helper)");
+    }
+    if (strictSessionPtr != 0)
+    {
+        const uintptr_t managerPtr = trySession(strictSessionPtr, "strict");
+        if (managerPtr != 0)
+        {
+            return managerPtr;
+        }
+    }
+
+    if (sessionModule != nullptr && g_activeRevival != nullptr)
+    {
+        const uintptr_t dllBase = reinterpret_cast<uintptr_t>(sessionModule);
+        for (size_t index = 0; index < g_activeRevival->sessionPtrOffsetCount; ++index)
+        {
+            const uintptr_t offset = g_activeRevival->sessionPtrOffsets[index];
+            if (offset == 0)
+            {
+                continue;
+            }
+
+            uintptr_t rawSessionPtr = 0;
+            if (!SafeReadPtr(reinterpret_cast<const void*>(dllBase + offset), &rawSessionPtr)
+                || rawSessionPtr == 0
+                || rawSessionPtr == strictSessionPtr
+                || rawSessionPtr == cachedSessionPtrBeforeRead)
+            {
+                continue;
+            }
+
+            char source[48] = {};
+            std::snprintf(
+                source,
+                sizeof(source),
+                "raw_global[%lu]",
+                static_cast<unsigned long>(index));
+            const uintptr_t managerPtr = trySession(rawSessionPtr, source);
+            if (managerPtr != 0)
+            {
+                return managerPtr;
+            }
+        }
+    }
+
+    const uintptr_t looseSessionPtr = ReadSessionPointerFromRevivalLoose();
+    if (looseSessionPtr != 0
+        && looseSessionPtr != strictSessionPtr
+        && looseSessionPtr != cachedSessionPtrBeforeRead)
+    {
+        const uintptr_t managerPtr = trySession(looseSessionPtr, "loose");
+        if (managerPtr != 0)
+        {
+            return managerPtr;
+        }
+    }
+
+    return 0;
+}
+
+static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStrictHostMatch)
+{
+    if (outUsedStrictHostMatch != nullptr)
+    {
+        *outUsedStrictHostMatch = false;
+    }
 
     const DWORD selfPid = GetCurrentProcessId();
     const bool hostPidKnown = hostPid != 0;
@@ -422,9 +1498,32 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
     SIZE_T strictPidMismatches = 0;
     SIZE_T fallbackAliveMatches = 0;
     SIZE_T fallbackDeadRejects = 0;
+    DWORD lastValidationDetail = 0;
     std::vector<uintptr_t> candidates;
 
-    mod::Log(
+    const uintptr_t cachedPtr =
+        TryGetCachedInjectedPeerManagerPointer(hostPid, &usedStrictHostMatch);
+    if (cachedPtr != 0)
+    {
+        if (outUsedStrictHostMatch != nullptr)
+        {
+            *outUsedStrictHostMatch = usedStrictHostMatch;
+        }
+        return cachedPtr;
+    }
+
+    const uintptr_t sessionManagerPtr =
+        TryResolveInjectedPeerManagerFromSession(hostPid, &usedStrictHostMatch);
+    if (sessionManagerPtr != 0)
+    {
+        if (outUsedStrictHostMatch != nullptr)
+        {
+            *outUsedStrictHostMatch = usedStrictHostMatch;
+        }
+        return sessionManagerPtr;
+    }
+
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-manager scan start selfPid=%lu hostPid=%lu hostPidKnown=%d version=%s",
         static_cast<unsigned long>(selfPid),
         static_cast<unsigned long>(hostPid),
@@ -432,6 +1531,7 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
         (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
             ? g_activeRevival->versionTag
             : "unknown");
+    LogInjectedPeerManagerLayout("injected peer-manager scan layout");
 
     SYSTEM_INFO sysInfo = {};
     GetSystemInfo(&sysInfo);
@@ -446,7 +1546,7 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
             reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi));
         if (queried != sizeof(mbi))
         {
-            mod::Log(
+            LogInjectedPeerQuitDiagnosticLine(
                 "Takeover: injected peer-manager scan stopped cursor=0x%08lX queried=%lu err=%lu",
                 static_cast<unsigned long>(cursor),
                 static_cast<unsigned long>(queried),
@@ -454,22 +1554,24 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
             break;
         }
 
-        if (IsWritableUserRegion(mbi) && mbi.RegionSize >= kManagerMinScanSpan)
+        if (IsWritableUserRegion(mbi)
+            && mbi.RegionSize >= kInjectedPeerManagerMinScanSpan)
         {
             ++writableRegionCount;
             const auto* regionBase = static_cast<const uint8_t*>(mbi.BaseAddress);
-            const SIZE_T limit = mbi.RegionSize - kManagerMinScanSpan;
+            const SIZE_T limit = mbi.RegionSize - kInjectedPeerManagerMinScanSpan;
             for (SIZE_T off = 0; off <= limit; off += sizeof(uint32_t))
             {
                 const auto* candidate = regionBase + off;
-                if (*reinterpret_cast<const DWORD*>(candidate + kManagerSelfPidOffset) != selfPid)
+                if (*reinterpret_cast<const DWORD*>(candidate + kInjectedPeerManagerSelfPidOffset)
+                    != selfPid)
                 {
                     continue;
                 }
                 ++selfPidHits;
 
                 const HANDLE hostProcessHandle =
-                    *reinterpret_cast<HANDLE const*>(candidate + kManagerHostHandleOffset);
+                    *reinterpret_cast<HANDLE const*>(candidate + kInjectedPeerManagerHostHandleOffset);
                 if (hostProcessHandle == nullptr || hostProcessHandle == INVALID_HANDLE_VALUE)
                 {
                     ++invalidHandleRejects;
@@ -520,16 +1622,26 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
                     continue;
                 }
 
-                candidates.push_back(reinterpret_cast<uintptr_t>(candidate));
-                mod::Log(
-                    "Takeover: injected peer-manager candidate ptr=0x%08lX hostHandle=0x%p "
-                    "handlePid=%lu exit=%lu strict=%d flags=0x%08lX",
-                    static_cast<unsigned long>(reinterpret_cast<uintptr_t>(candidate)),
-                    hostProcessHandle,
-                    static_cast<unsigned long>(handlePid),
-                    static_cast<unsigned long>(exitCode),
-                    strictCheckUsed ? 1 : 0,
-                    static_cast<unsigned long>(handleFlags));
+                const uintptr_t candidatePtr =
+                    reinterpret_cast<uintptr_t>(candidate);
+                const InjectedPeerManagerValidation validation =
+                    ValidateInjectedPeerManagerPointer(candidatePtr, hostPid);
+                LogInjectedPeerManagerValidation(
+                    validation.valid
+                        ? "injected peer-manager scan accept"
+                        : "injected peer-manager scan reject",
+                    candidatePtr,
+                    hostPid,
+                    validation);
+                if (!validation.valid)
+                {
+                    lastValidationDetail = EncodeInjectedPeerManagerReason(validation.reason);
+                    continue;
+                }
+
+                lastValidationDetail = 0;
+                usedStrictHostMatch = usedStrictHostMatch || validation.strictCheckUsed;
+                candidates.push_back(candidatePtr);
                 if (candidates.size() > 8u)
                 {
                     break;
@@ -551,7 +1663,9 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
         *outUsedStrictHostMatch = usedStrictHostMatch;
     }
 
-    mod::Log(
+    g_injectedPeerQuitLastDetail = lastValidationDetail;
+
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-manager scan summary regions=%lu writable=%lu "
         "selfPidHits=%lu invalidHandle=%lu handleQueryFail=%lu strictMatch=%lu "
         "strictMismatch=%lu fallbackAlive=%lu fallbackDead=%lu candidates=%u",
@@ -568,7 +1682,7 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
 
     if (candidates.size() != 1u)
     {
-        mod::Log(
+        LogInjectedPeerQuitDiagnosticLine(
             "Takeover: injected peer-manager scan ambiguous hostPid=%lu strictHostMatch=%d candidates=%u",
             static_cast<unsigned long>(hostPid),
             usedStrictHostMatch ? 1 : 0,
@@ -576,7 +1690,12 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
         return 0;
     }
 
-    mod::Log(
+    CacheInjectedPeerManagerPointer(
+        candidates.front(),
+        hostPid,
+        usedStrictHostMatch);
+
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-manager resolved ptr=0x%08lX hostPid=%lu strictHostMatch=%d",
         static_cast<unsigned long>(candidates.front()),
         static_cast<unsigned long>(hostPid),
@@ -584,12 +1703,79 @@ static uintptr_t FindInjectedPeerManagerPointer(DWORD hostPid, bool* outUsedStri
     return candidates.front();
 }
 
+enum InjectedPeerQuitBroadcastResult : DWORD
+{
+    kInjectedPeerQuitBroadcastResultSuccess = 1,
+    kInjectedPeerQuitBroadcastResultNotRevival = 2,
+    kInjectedPeerQuitBroadcastResultUnsupportedVersion = 3,
+    kInjectedPeerQuitBroadcastResultManagerUnresolved = 4,
+    kInjectedPeerQuitBroadcastResultHelperBaseUnresolved = 5,
+    kInjectedPeerQuitBroadcastResultNativeCallCrashed = 6,
+};
+
+constexpr DWORD kInjectedPeerQuitBroadcastResultMask = 0xFFu;
+constexpr unsigned kInjectedPeerQuitBroadcastDetailShift = 8u;
+
+static DWORD EncodeInjectedPeerQuitBroadcastExitCode(
+    InjectedPeerQuitBroadcastResult result,
+    DWORD detail)
+{
+    return (detail << kInjectedPeerQuitBroadcastDetailShift)
+        | (static_cast<DWORD>(result) & kInjectedPeerQuitBroadcastResultMask);
+}
+
+static DWORD DecodeInjectedPeerQuitBroadcastResultCode(DWORD exitCode)
+{
+    return exitCode & kInjectedPeerQuitBroadcastResultMask;
+}
+
+static DWORD DecodeInjectedPeerQuitBroadcastDetailCode(DWORD exitCode)
+{
+    return exitCode >> kInjectedPeerQuitBroadcastDetailShift;
+}
+
+static const char* InjectedPeerQuitBroadcastResultToString(DWORD result)
+{
+    switch (result)
+    {
+    case kInjectedPeerQuitBroadcastResultSuccess:
+        return "success";
+    case kInjectedPeerQuitBroadcastResultNotRevival:
+        return "not_revival";
+    case kInjectedPeerQuitBroadcastResultUnsupportedVersion:
+        return "unsupported_version";
+    case kInjectedPeerQuitBroadcastResultManagerUnresolved:
+        return "manager_unresolved";
+    case kInjectedPeerQuitBroadcastResultHelperBaseUnresolved:
+        return "helper_base_unresolved";
+    case kInjectedPeerQuitBroadcastResultNativeCallCrashed:
+        return "native_call_crashed";
+    default:
+        return "unknown";
+    }
+}
+
+static DWORD FinishInjectedPeerQuitBroadcast(InjectedPeerQuitBroadcastResult result)
+{
+    const DWORD detail = g_injectedPeerQuitLastDetail;
+    const DWORD exitCode = EncodeInjectedPeerQuitBroadcastExitCode(result, detail);
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: injected peer-quit broadcast returning code=%lu result=%s detail=%lu",
+        static_cast<unsigned long>(exitCode),
+        InjectedPeerQuitBroadcastResultToString(static_cast<DWORD>(result)),
+        static_cast<unsigned long>(detail));
+    mod::FlushLoggerSync();
+    return exitCode;
+}
+
 DWORD RunInjectedPeerQuitBroadcast()
 {
+    g_injectedPeerQuitLastDetail = 0;
+    ClearPeerQuitDiagnostic();
     if (!IsCurrentProcessRevival())
     {
-        mod::Log("Takeover: injected peer-quit broadcast skipped (not in EfzRevival.exe)");
-        return 0;
+        LogInjectedPeerQuitDiagnosticLine("Takeover: injected peer-quit broadcast skipped (not in EfzRevival.exe)");
+        return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultNotRevival);
     }
 
     if (!HasInjectedContext())
@@ -602,22 +1788,30 @@ DWORD RunInjectedPeerQuitBroadcast()
     const DWORD hostPid =
         (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
     const uintptr_t sendQuitAllRva = ResolveHelperSendQuitAllRva();
-    mod::Log(
-        "Takeover: injected peer-quit broadcast begin ready=%d hostPid=%lu version=%s sendQuitAllRva=0x%08lX",
+    const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
+    LogInjectedPeerQuitDiagnosticLine(
+        "Takeover: injected peer-quit broadcast begin ready=%d hostPid=%lu version=%s sendQuitAllRva=0x%08lX layoutObj=0x%08lX peerContainerOff=0x%08lX peerBackingOff=0x%08lX quitRingOff=0x%08lX cachedManager=0x%08lX cachedHostPid=%lu cachedStrict=%d",
         HasInjectedContext() ? 1 : 0,
         static_cast<unsigned long>(hostPid),
         (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
             ? g_activeRevival->versionTag
             : "unknown",
-        static_cast<unsigned long>(sendQuitAllRva));
+        static_cast<unsigned long>(sendQuitAllRva),
+        static_cast<unsigned long>(layout.objectSize),
+        static_cast<unsigned long>(layout.peerContainerOffset),
+        static_cast<unsigned long>(layout.peerBackingOffset),
+        static_cast<unsigned long>(layout.quitRingOffset),
+        static_cast<unsigned long>(g_injectedPeerManagerCachePtr),
+        static_cast<unsigned long>(g_injectedPeerManagerCacheHostPid),
+        g_injectedPeerManagerCacheStrictHostMatch ? 1 : 0);
     if (sendQuitAllRva == 0)
     {
-        mod::Log(
+        LogInjectedPeerQuitDiagnosticLine(
             "Takeover: injected peer-quit broadcast skipped (unsupported helper version=%s)",
             (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
                 ? g_activeRevival->versionTag
                 : "unknown");
-        return 0;
+        return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultUnsupportedVersion);
     }
 
     bool usedStrictHostMatch = false;
@@ -625,39 +1819,53 @@ DWORD RunInjectedPeerQuitBroadcast()
         FindInjectedPeerManagerPointer(hostPid, &usedStrictHostMatch);
     if (managerPtr == 0)
     {
-        return 0;
+        if (g_injectedPeerQuitLastDetail == 0)
+        {
+            g_injectedPeerQuitLastDetail = 255;
+        }
+        LogInjectedPeerQuitDiagnosticLine(
+            "Takeover: injected peer-quit broadcast failed (manager unresolved) hostPid=%lu cachedManager=0x%08lX cachedHostPid=%lu cachedStrict=%d",
+            static_cast<unsigned long>(hostPid),
+            static_cast<unsigned long>(g_injectedPeerManagerCachePtr),
+            static_cast<unsigned long>(g_injectedPeerManagerCacheHostPid),
+            g_injectedPeerManagerCacheStrictHostMatch ? 1 : 0);
+        return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultManagerUnresolved);
     }
 
     const uintptr_t helperBase =
         reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     if (helperBase == 0)
     {
-        mod::Log("Takeover: injected peer-quit broadcast failed (helper base unresolved)");
-        return 0;
+        LogInjectedPeerQuitDiagnosticLine("Takeover: injected peer-quit broadcast failed (helper base unresolved)");
+        return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultHelperBaseUnresolved);
     }
 
     typedef void (__thiscall *SendQuitAllFn)(void*);
     const auto sendQuitAll =
         reinterpret_cast<SendQuitAllFn>(helperBase + sendQuitAllRva);
-    mod::Log(
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-quit broadcast invoking helperBase=0x%08lX manager=0x%08lX target=0x%08lX",
         static_cast<unsigned long>(helperBase),
         static_cast<unsigned long>(managerPtr),
         static_cast<unsigned long>(helperBase + sendQuitAllRva));
 
+    DWORD exceptionCode = 0;
     __try
     {
         sendQuitAll(reinterpret_cast<void*>(managerPtr));
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
     {
-        mod::Log(
-            "Takeover: injected peer-quit broadcast crashed manager=0x%08lX rva=0x%08lX",
+        g_injectedPeerQuitLastDetail = EncodeInjectedExceptionDetail(exceptionCode);
+        LogInjectedPeerQuitDiagnosticLine(
+            "Takeover: injected peer-quit broadcast crashed manager=0x%08lX rva=0x%08lX exception=0x%08lX detail=%s",
             static_cast<unsigned long>(managerPtr),
-            static_cast<unsigned long>(sendQuitAllRva));
-        return 0;
+            static_cast<unsigned long>(sendQuitAllRva),
+            static_cast<unsigned long>(exceptionCode),
+            DecodeInjectedExceptionDetail(g_injectedPeerQuitLastDetail));
+        return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultNativeCallCrashed);
     }
-    mod::Log(
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-quit broadcast native call returned manager=0x%08lX",
         static_cast<unsigned long>(managerPtr));
 
@@ -665,13 +1873,13 @@ DWORD RunInjectedPeerQuitBroadcast()
     // their own shutdown logic. Give the packet a small head start before the
     // host tears the helper down from the outside.
     Sleep(100u);
-    mod::Log(
+    LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-quit broadcast sent manager=0x%08lX rva=0x%08lX hostPid=%lu strictHostMatch=%d",
         static_cast<unsigned long>(managerPtr),
         static_cast<unsigned long>(sendQuitAllRva),
         static_cast<unsigned long>(hostPid),
         usedStrictHostMatch ? 1 : 0);
-    return 1;
+    return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultSuccess);
 }
 
 static uintptr_t ResolveRemoteSelfExportAddress(
@@ -772,14 +1980,42 @@ static bool RequestInjectedPeerQuitBroadcastImpl(
         static_cast<unsigned long>(threadId),
         reason != nullptr ? reason : "");
 
+    ClearPeerQuitDiagnostic();
     const DWORD waitResult = WaitForSingleObject(remoteThread, waitMs);
     DWORD exitCode = 0;
+    const char* exitMeaning = "not_waited";
     if (waitResult == WAIT_OBJECT_0)
     {
         (void)GetExitCodeThread(remoteThread, &exitCode);
+        const DWORD exitResult = DecodeInjectedPeerQuitBroadcastResultCode(exitCode);
+        const DWORD exitDetail = DecodeInjectedPeerQuitBroadcastDetailCode(exitCode);
+        exitMeaning = InjectedPeerQuitBroadcastResultToString(exitResult);
+        if (exitResult != kInjectedPeerQuitBroadcastResultSuccess)
+        {
+            const char* detailMeaning = "";
+            if (exitResult == kInjectedPeerQuitBroadcastResultManagerUnresolved)
+            {
+                detailMeaning = DecodeInjectedPeerManagerReason(exitDetail);
+            }
+            else if (exitResult == kInjectedPeerQuitBroadcastResultNativeCallCrashed)
+            {
+                detailMeaning = DecodeInjectedExceptionDetail(exitDetail);
+            }
+            mod::Log(
+                "Takeover: peer-quit broadcast helper returned failure reason='%s' exit=%lu (%s) detail=%lu (%s) helperPid=%lu tid=%lu",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(exitResult),
+                exitMeaning,
+                static_cast<unsigned long>(exitDetail),
+                detailMeaning,
+                static_cast<unsigned long>(helperPid),
+                static_cast<unsigned long>(threadId));
+        }
+        exitCode = exitResult;
     }
     else if (waitResult == WAIT_TIMEOUT)
     {
+        exitMeaning = "timeout";
         mod::Log(
             "Takeover: peer-quit broadcast wait timed out reason='%s' waitMs=%lu tid=%lu",
             reason != nullptr ? reason : "",
@@ -788,6 +2024,7 @@ static bool RequestInjectedPeerQuitBroadcastImpl(
     }
     else
     {
+        exitMeaning = "wait_failed";
         mod::Log(
             "Takeover: peer-quit broadcast wait failed reason='%s' wait=%lu err=%lu tid=%lu",
             reason != nullptr ? reason : "",
@@ -796,40 +2033,60 @@ static bool RequestInjectedPeerQuitBroadcastImpl(
             static_cast<unsigned long>(threadId));
     }
 
+            FlushInjectedPeerQuitDiagnosticToHostLog(reason, helperPid);
     CloseHandle(remoteThread);
     CloseHandle(helperProcess);
 
     mod::Log(
-        "Takeover: peer-quit broadcast reason='%s' wait=%lu exit=%lu tid=%lu start=0x%08lX",
+        "Takeover: peer-quit broadcast reason='%s' wait=%lu exit=%lu exitMeaning=%s tid=%lu start=0x%08lX helperPid=%lu",
         reason != nullptr ? reason : "",
         static_cast<unsigned long>(waitResult),
         static_cast<unsigned long>(exitCode),
+        exitMeaning,
         static_cast<unsigned long>(threadId),
-        static_cast<unsigned long>(remoteStart));
-    return waitResult == WAIT_OBJECT_0 && exitCode == 1;
+        static_cast<unsigned long>(remoteStart),
+        static_cast<unsigned long>(helperPid));
+    return waitResult == WAIT_OBJECT_0 && exitCode == kInjectedPeerQuitBroadcastResultSuccess;
 }
 
 bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
 {
     HANDLE helperProcess = nullptr;
+    HANDLE sourceHelperProcess = nullptr;
     uintptr_t remoteSelfBase = 0;
     DWORD helperPid = 0;
+    DWORD duplicateErr = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         remoteSelfBase = g_remoteInjectedSelfBase;
         helperPid = g_revivalProcessId;
+        sourceHelperProcess = g_revivalProcess;
         if (g_revivalProcess != nullptr)
         {
-            (void)DuplicateHandle(
-                GetCurrentProcess(),
-                g_revivalProcess,
-                GetCurrentProcess(),
-                &helperProcess,
-                0,
-                FALSE,
-                DUPLICATE_SAME_ACCESS);
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    g_revivalProcess,
+                    GetCurrentProcess(),
+                    &helperProcess,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS))
+            {
+                duplicateErr = GetLastError();
+            }
         }
     }
+
+    mod::Log(
+        "Takeover: peer-quit broadcast prepare reason='%s' sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu localRole=%d netRole=%d",
+        reason != nullptr ? reason : "",
+        sourceHelperProcess,
+        helperProcess,
+        static_cast<unsigned long>(helperPid),
+        static_cast<unsigned long>(remoteSelfBase),
+        static_cast<unsigned long>(duplicateErr),
+        g_localRoleFlag,
+        g_netplayRole);
 
     return RequestInjectedPeerQuitBroadcastImpl(
         helperProcess,
@@ -894,6 +2151,7 @@ static void CloseChildJobObject()
 void InitializeHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    CleanupNativeHostShadowLogDirectory("startup");
     PrimeManagedLogEfzHistory();
     (void)EnsureHostIpc();
     if (!EnsureLocalRevivalLoaded())
@@ -920,6 +2178,7 @@ void ShutdownHost()
     CloseProcessHandle(nullptr);
     CloseChildJobObject();
     CloseHostIpc();
+    CleanupNativeHostShadowLogDirectory("host_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
     g_delayPromptMetrics = {};
@@ -950,6 +2209,7 @@ void EmergencyShutdownHost()
     CloseProcessHandle(nullptr);
     CloseChildJobObject();
     CloseHostIpc();
+    CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
     g_delayPromptMetrics = {};
@@ -1122,11 +2382,13 @@ bool StartSession(
         const uint32_t savedVersion = g_hostBlock->version;
         const uint32_t savedPid = g_hostBlock->hostPid;
         const uint32_t savedBase = g_hostBlock->hostRevivalBase;
+        const uint32_t savedTimestamp = g_hostBlock->hostRevivalTimestamp;
         memset(g_hostBlock, 0, sizeof(SharedBlock));
         g_hostBlock->magic = savedMagic;
         g_hostBlock->version = savedVersion;
         g_hostBlock->hostPid = savedPid;
         g_hostBlock->hostRevivalBase = savedBase;
+        g_hostBlock->hostRevivalTimestamp = savedTimestamp;
         // Restore default values for delay prompt fields.
         g_hostBlock->delayInputValue = -1;
         g_hostBlock->delayAveragePingMs = -1;
@@ -1178,7 +2440,8 @@ bool StartSession(
     }
 
     const std::string gameDir = GameDirectory();
-    if (!WriteIni(gameDir, static_cast<int>(role), port, address, nickname, writeNicknameToIni))
+    const std::wstring gameDirWide = GameDirectoryWide();
+    if (!WriteIni(static_cast<int>(role), port, address, nickname, writeNicknameToIni))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
         return false;
@@ -1193,6 +2456,13 @@ bool StartSession(
         exePath += "\\";
     }
     exePath += "EfzRevival.exe";
+
+    std::wstring exePathWide = gameDirWide;
+    if (!exePathWide.empty())
+    {
+        exePathWide += L"\\";
+    }
+    exePathWide += L"EfzRevival.exe";
 
     // ---- Wine/Proton path --------------------------------------------------
     // Both Wine and native paths use CREATE_SUSPENDED so that the child's
@@ -1314,16 +2584,18 @@ bool StartSession(
     else
     {
         // ---- Native Windows path -------------------------------------------
-        BOOL created = CreateProcessA(
-            exePath.c_str(),
+        STARTUPINFOW siWide = {};
+        siWide.cb = sizeof(siWide);
+        BOOL created = CreateProcessW(
+            exePathWide.c_str(),
             nullptr,
             nullptr,
             nullptr,
             FALSE,
             CREATE_SUSPENDED | CREATE_NO_WINDOW,
             nullptr,
-            gameDir.empty() ? nullptr : gameDir.c_str(),
-            &si,
+            gameDirWide.empty() ? nullptr : gameDirWide.c_str(),
+            &siWide,
             &pi);
 
         if (!created)
@@ -2598,17 +3870,30 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     if (gameplayEscPeerQuitPending)
     {
         HANDLE helperProcess = nullptr;
+        HANDLE sourceHelperProcess = g_revivalProcess;
+        DWORD duplicateErr = 0;
         if (g_revivalProcess != nullptr)
         {
-            (void)DuplicateHandle(
-                GetCurrentProcess(),
-                g_revivalProcess,
-                GetCurrentProcess(),
-                &helperProcess,
-                0,
-                FALSE,
-                DUPLICATE_SAME_ACCESS);
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    g_revivalProcess,
+                    GetCurrentProcess(),
+                    &helperProcess,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS))
+            {
+                duplicateErr = GetLastError();
+            }
         }
+
+        mod::Log(
+            "Takeover: cancel session gameplay-ESC peer-quit prepare sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
+            sourceHelperProcess,
+            helperProcess,
+            static_cast<unsigned long>(g_revivalProcessId),
+            static_cast<unsigned long>(g_remoteInjectedSelfBase),
+            static_cast<unsigned long>(duplicateErr));
 
         const bool peerQuitSent = RequestInjectedPeerQuitBroadcastImpl(
             helperProcess,

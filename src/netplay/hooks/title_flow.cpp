@@ -2990,6 +2990,8 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_netplayMenuState.bgmActive = true;
     g_netplayMenuState.menuId = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     g_netplayMenuState.mainSelection = 0;
+    g_netplayMenuState.backgroundScrollOffset = 0.0;
+    g_netplayMenuState.backgroundScrollTick = 0;
     g_charSelectResetPending = true;
     ResetMenuSlideTransition();
     ResetInlineEditState();
@@ -3043,11 +3045,13 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 
     RunTransitionFadeIn(screenContext);
     mod::Log(
-        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d optionCount=%d backIndex=%d skipFadeOut=%d deferredLobbyRefresh=%d",
+        "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d theme=%d bgScrollSupported=%d optionCount=%d backIndex=%d skipFadeOut=%d deferredLobbyRefresh=%d",
         MenuIdToString(g_netplayMenuState.menuId),
         static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
         kNetplayBgmTrack,
         g_netplayMenuState.useConfigStyleRender,
+        static_cast<int>(g_netplayMenuState.theme),
+        g_netplayMenuState.backgroundSupportsScroll ? 1 : 0,
         g_netplayMenuState.optionCount,
         g_netplayMenuState.backIndex,
         skipFadeOut ? 1 : 0,
@@ -3095,6 +3099,11 @@ void LeaveNetplayMenu(uint32_t screenContext)
     g_netplayMenuState.optionCount = kNetplayDefaultOptionCount;
     g_netplayMenuState.backIndex = kNetplayDefaultBackIndex;
     g_netplayMenuState.renderLayout = {};
+    g_netplayMenuState.backgroundSupportsScroll = false;
+    g_netplayMenuState.backgroundWidth = 320;
+    g_netplayMenuState.backgroundHeight = 240;
+    g_netplayMenuState.backgroundScrollOffset = 0.0;
+    g_netplayMenuState.backgroundScrollTick = 0;
     g_netplayMenuState.lobbyScrollOffset = 0;
     ResetMenuSlideTransition();
     ResetInlineEditState();

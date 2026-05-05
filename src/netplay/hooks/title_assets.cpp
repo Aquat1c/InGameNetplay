@@ -27,6 +27,48 @@ using netplay::validation::ParsePort;
 
 namespace
 {
+const char* NetplayMenuThemeToString(NetplayMenuTheme theme)
+{
+    switch (theme)
+    {
+    case NetplayMenuTheme::Scroll:
+        return "scroll";
+    case NetplayMenuTheme::Classic:
+        return "classic";
+    default:
+        return "unknown";
+    }
+}
+
+bool TryParseNetplayMenuTheme(const std::string& text, NetplayMenuTheme* outTheme)
+{
+    if (outTheme == nullptr)
+    {
+        return false;
+    }
+
+    std::string lower;
+    lower.reserve(text.size());
+    for (char ch : text)
+    {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+
+    if (lower == "scroll" || lower == "config_scroll")
+    {
+        *outTheme = NetplayMenuTheme::Scroll;
+        return true;
+    }
+
+    if (lower == "classic" || lower == "static")
+    {
+        *outTheme = NetplayMenuTheme::Classic;
+        return true;
+    }
+
+    return false;
+}
+
 std::string TrimAscii(std::string value)
 {
     size_t begin = 0;
@@ -44,24 +86,121 @@ std::string TrimAscii(std::string value)
     return value.substr(begin, end - begin);
 }
 
-std::string ResolveRevivalIniPath()
+std::string WideToUtf8(const std::wstring& wide)
 {
-    char exePath[MAX_PATH] = {};
-    if (GetModuleFileNameA(nullptr, exePath, static_cast<DWORD>(std::size(exePath))) == 0)
+    if (wide.empty())
     {
-        return "EfzRevival.ini";
+        return std::string();
     }
 
-    std::string iniPath = exePath;
-    const size_t sep = iniPath.find_last_of("\\/");
-    if (sep == std::string::npos)
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        wide.data(),
+        static_cast<int>(wide.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (bytes <= 0)
     {
-        return "EfzRevival.ini";
+        return std::string();
+    }
+
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            wide.data(),
+            static_cast<int>(wide.size()),
+            utf8.data(),
+            bytes,
+            nullptr,
+            nullptr)
+        <= 0)
+    {
+        return std::string();
+    }
+
+    return utf8;
+}
+
+std::wstring Utf8ToWide(const std::string& utf8)
+{
+    if (utf8.empty())
+    {
+        return std::wstring();
+    }
+
+    const int chars = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        utf8.data(),
+        static_cast<int>(utf8.size()),
+        nullptr,
+        0);
+    if (chars <= 0)
+    {
+        return std::wstring();
+    }
+
+    std::wstring wide(static_cast<size_t>(chars), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            utf8.data(),
+            static_cast<int>(utf8.size()),
+            wide.data(),
+            chars)
+        <= 0)
+    {
+        return std::wstring();
+    }
+
+    return wide;
+}
+
+std::wstring ResolveRevivalIniPathWide()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exePath, static_cast<DWORD>(std::size(exePath))) == 0)
+    {
+        return L"EfzRevival.ini";
+    }
+
+    std::wstring iniPath = exePath;
+    const size_t sep = iniPath.find_last_of(L"\\/");
+    if (sep == std::wstring::npos)
+    {
+        return L"EfzRevival.ini";
     }
 
     iniPath.resize(sep + 1);
-    iniPath += "EfzRevival.ini";
+    iniPath += L"EfzRevival.ini";
     return iniPath;
+}
+
+std::string ResolveRevivalIniPath()
+{
+    const std::wstring widePath = ResolveRevivalIniPathWide();
+    const std::string utf8Path = WideToUtf8(widePath);
+    return utf8Path.empty() ? "EfzRevival.ini" : utf8Path;
+}
+
+std::string ReadIniValueUtf8(
+    const std::wstring& iniPath,
+    const wchar_t* section,
+    const wchar_t* key)
+{
+    std::array<wchar_t, 512> buffer = {};
+    (void)GetPrivateProfileStringW(
+        section,
+        key,
+        L"",
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()),
+        iniPath.c_str());
+    return TrimAscii(WideToUtf8(std::wstring(buffer.data())));
 }
 
 bool IsValidStoredJoinAddress(const std::string& address)
@@ -230,41 +369,41 @@ bool LoadTitleAssets(uint32_t screenContext)
 
 void LoadNetplayMenuSettingsFromIni()
 {
-    const std::string iniPath = ResolveRevivalIniPath();
-    if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    const std::wstring wideIniPath = ResolveRevivalIniPathWide();
+    const std::string iniPath = WideToUtf8(wideIniPath).empty() ? "EfzRevival.ini" : WideToUtf8(wideIniPath);
+    if (GetFileAttributesW(wideIniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         mod::Log("LoadNetplayMenuSettingsFromIni: ini not found path='%s' (using in-memory defaults)", iniPath.c_str());
         return;
     }
 
-    // Use GetPrivateProfileStringW so Windows gives us the real wide
-    // characters rather than converting through CP_ACP (which destroys
-    // CJK/Cyrillic characters on non-matching system locales).
-    std::string nickname;
+    const std::string themeText = ReadIniValueUtf8(wideIniPath, L"NetplayMenu", L"Theme");
+    if (!themeText.empty())
     {
-        const std::wstring wideIniPath(iniPath.begin(), iniPath.end());
-        wchar_t wideNickname[128] = {};
-        (void)GetPrivateProfileStringW(L"Network", L"Name", L"", wideNickname, static_cast<DWORD>(std::size(wideNickname)), wideIniPath.c_str());
-        // Trim whitespace from the wide string.
-        int len = static_cast<int>(wcslen(wideNickname));
-        while (len > 0 && (wideNickname[len - 1] == L' ' || wideNickname[len - 1] == L'\t' ||
-                           wideNickname[len - 1] == L'\r' || wideNickname[len - 1] == L'\n'))
-            --len;
-        int start = 0;
-        while (start < len && (wideNickname[start] == L' ' || wideNickname[start] == L'\t' ||
-                               wideNickname[start] == L'\r' || wideNickname[start] == L'\n'))
-            ++start;
-        // Convert wide -> UTF-8.
-        if (start < len)
+        NetplayMenuTheme parsedTheme = g_netplayMenuState.theme;
+        if (TryParseNetplayMenuTheme(themeText, &parsedTheme))
         {
-            const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nullptr, 0, nullptr, nullptr);
-            if (utf8Len > 0)
-            {
-                nickname.resize(static_cast<std::size_t>(utf8Len));
-                WideCharToMultiByte(CP_UTF8, 0, wideNickname + start, len - start, nickname.data(), utf8Len, nullptr, nullptr);
-            }
+            g_netplayMenuState.theme = parsedTheme;
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: loaded NetplayMenu.Theme='%s'",
+                NetplayMenuThemeToString(g_netplayMenuState.theme));
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid NetplayMenu.Theme='%s' (keeping '%s')",
+                themeText.c_str(),
+                NetplayMenuThemeToString(g_netplayMenuState.theme));
         }
     }
+    else
+    {
+        mod::Log(
+            "LoadNetplayMenuSettingsFromIni: NetplayMenu.Theme missing/empty (keeping '%s')",
+            NetplayMenuThemeToString(g_netplayMenuState.theme));
+    }
+
+    const std::string nickname = ReadIniValueUtf8(wideIniPath, L"Network", L"Name");
     if (!nickname.empty())
     {
         if (IsValidNickname(nickname))
@@ -293,9 +432,7 @@ void LoadNetplayMenuSettingsFromIni()
             NetplayNicknameSourceToString(g_netplayMenuState.nicknameSource));
     }
 
-    char addressBuffer[160] = {};
-    (void)GetPrivateProfileStringA("Network", "Address", "", addressBuffer, static_cast<DWORD>(std::size(addressBuffer)), iniPath.c_str());
-    const std::string joinAddress = TrimAscii(addressBuffer);
+    const std::string joinAddress = ReadIniValueUtf8(wideIniPath, L"Network", L"Address");
     if (!joinAddress.empty())
     {
         if (IsValidStoredJoinAddress(joinAddress))
@@ -318,9 +455,7 @@ void LoadNetplayMenuSettingsFromIni()
             g_netplayMenuState.joinAddress.c_str());
     }
 
-    char portBuffer[32] = {};
-    (void)GetPrivateProfileStringA("Network", "Port", "", portBuffer, static_cast<DWORD>(std::size(portBuffer)), iniPath.c_str());
-    const std::string portText = TrimAscii(portBuffer);
+    const std::string portText = ReadIniValueUtf8(wideIniPath, L"Network", L"Port");
     if (!portText.empty())
     {
         uint16_t parsedPort = 0;
@@ -350,7 +485,8 @@ void LoadNetplayMenuSettingsFromIni()
 
 void SaveNetplayJoinAddressToIni()
 {
-    const std::string iniPath = ResolveRevivalIniPath();
+    const std::wstring wideIniPath = ResolveRevivalIniPathWide();
+    const std::string iniPath = WideToUtf8(wideIniPath).empty() ? "EfzRevival.ini" : WideToUtf8(wideIniPath);
     const std::string joinAddress = TrimAscii(g_netplayMenuState.joinAddress);
     if (joinAddress.empty())
     {
@@ -367,7 +503,13 @@ void SaveNetplayJoinAddressToIni()
         return;
     }
 
-    if (WritePrivateProfileStringA("Network", "Address", joinAddress.c_str(), iniPath.c_str()) == FALSE)
+    const std::wstring wideJoinAddress = Utf8ToWide(joinAddress);
+    if (WritePrivateProfileStringW(
+            L"Network",
+            L"Address",
+            wideJoinAddress.c_str(),
+            wideIniPath.c_str())
+        == FALSE)
     {
         mod::Log(
             "SaveNetplayJoinAddressToIni: failed Network.Address='%s' path='%s' err=%lu",
@@ -413,8 +555,26 @@ bool LoadNetplayAssets(uint32_t screenContext)
     g_netplayMenuState.paletteStart = static_cast<uint8_t>(objectProfile.paletteDestStart);
     g_netplayMenuState.paletteCount = static_cast<uint8_t>(objectProfile.paletteCount);
     g_netplayMenuState.renderLayout = objectProfile.renderLayout;
+    g_netplayMenuState.backgroundSupportsScroll = false;
+    g_netplayMenuState.backgroundWidth = 320;
+    g_netplayMenuState.backgroundHeight = 240;
     bool hasDerivedTransparentIndex = false;
     uint8_t derivedTransparentIndex = 0;
+
+    ParsedDatImage backgroundImage = {};
+    if (ParseEfzDatImage(bgPath, &backgroundImage))
+    {
+        g_netplayMenuState.backgroundWidth = backgroundImage.width;
+        g_netplayMenuState.backgroundHeight = backgroundImage.height;
+        g_netplayMenuState.backgroundSupportsScroll =
+            backgroundImage.width == 320 && backgroundImage.height == 240;
+    }
+    else
+    {
+        mod::Log(
+            "LoadNetplayAssets: failed to parse netplay background '%s' for theme validation",
+            bgPath.c_str());
+    }
 
     if (objectProfile.deriveLayoutFromDat)
     {
@@ -511,13 +671,16 @@ bool LoadNetplayAssets(uint32_t screenContext)
         objPaletteOk,
         static_cast<unsigned>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor)));
     mod::Log(
-        "LoadNetplayAssets: object profile colorOffset=%u paletteStart=%d paletteCount=%d configStyle=%d optionCount=%d backIndex=%d",
+        "LoadNetplayAssets: object profile colorOffset=%u paletteStart=%d paletteCount=%d configStyle=%d optionCount=%d backIndex=%d bgSize=%dx%d bgScrollSupported=%d",
         static_cast<unsigned>(objectProfile.colorOffset),
         objectProfile.paletteDestStart,
         objectProfile.paletteCount,
         g_netplayMenuState.useConfigStyleRender,
         g_netplayMenuState.optionCount,
-        g_netplayMenuState.backIndex);
+        g_netplayMenuState.backIndex,
+        g_netplayMenuState.backgroundWidth,
+        g_netplayMenuState.backgroundHeight,
+        g_netplayMenuState.backgroundSupportsScroll ? 1 : 0);
 
     const bool spriteFontLoaded = LoadNetplaySpriteFont();
     g_useRuntimeTextOverlay = spriteFontLoaded;

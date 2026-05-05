@@ -11,6 +11,234 @@
 namespace netplay::bridge::takeover
 {
 
+namespace
+{
+std::string WideToUtf8(const std::wstring& wide)
+{
+    if (wide.empty())
+    {
+        return std::string();
+    }
+
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        wide.data(),
+        static_cast<int>(wide.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (bytes <= 0)
+    {
+        return std::string();
+    }
+
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            wide.data(),
+            static_cast<int>(wide.size()),
+            utf8.data(),
+            bytes,
+            nullptr,
+            nullptr)
+        <= 0)
+    {
+        return std::string();
+    }
+
+    return utf8;
+}
+
+std::wstring Utf8ToWide(const std::string& utf8)
+{
+    if (utf8.empty())
+    {
+        return std::wstring();
+    }
+
+    const int chars = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        utf8.data(),
+        static_cast<int>(utf8.size()),
+        nullptr,
+        0);
+    if (chars <= 0)
+    {
+        return std::wstring();
+    }
+
+    std::wstring wide(static_cast<size_t>(chars), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            utf8.data(),
+            static_cast<int>(utf8.size()),
+            wide.data(),
+            chars)
+        <= 0)
+    {
+        return std::wstring();
+    }
+
+    return wide;
+}
+
+std::wstring ModuleDirectoryWide(HMODULE module)
+{
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+    {
+        return std::wstring();
+    }
+
+    std::wstring dir(path, path + n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return std::wstring();
+    }
+
+    dir.resize(slash);
+    return dir;
+}
+
+bool RemoveDirectoryTreeBestEffortW(const std::wstring& directory, DWORD* outError)
+{
+    DWORD lastError = ERROR_SUCCESS;
+    const std::wstring searchPath = directory + L"\\*";
+    WIN32_FIND_DATAW findData = {};
+    HANDLE find = FindFirstFileW(searchPath.c_str(), &findData);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (lstrcmpW(findData.cFileName, L".") == 0
+                || lstrcmpW(findData.cFileName, L"..") == 0)
+            {
+                continue;
+            }
+
+            const std::wstring childPath = directory + L"\\" + findData.cFileName;
+            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                if (!RemoveDirectoryTreeBestEffortW(childPath, &lastError))
+                {
+                    FindClose(find);
+                    if (outError != nullptr)
+                    {
+                        *outError = lastError;
+                    }
+                    return false;
+                }
+                continue;
+            }
+
+            (void)SetFileAttributesW(childPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(childPath.c_str()))
+            {
+                lastError = GetLastError();
+                if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND)
+                {
+                    FindClose(find);
+                    if (outError != nullptr)
+                    {
+                        *outError = lastError;
+                    }
+                    return false;
+                }
+            }
+        }
+        while (FindNextFileW(find, &findData) != FALSE);
+
+        lastError = GetLastError();
+        FindClose(find);
+        if (lastError != ERROR_NO_MORE_FILES)
+        {
+            if (outError != nullptr)
+            {
+                *outError = lastError;
+            }
+            return false;
+        }
+    }
+    else
+    {
+        lastError = GetLastError();
+        if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND)
+        {
+            if (outError != nullptr)
+            {
+                *outError = lastError;
+            }
+            return false;
+        }
+    }
+
+    if (!RemoveDirectoryW(directory.c_str()))
+    {
+        lastError = GetLastError();
+        if (lastError != ERROR_PATH_NOT_FOUND)
+        {
+            if (outError != nullptr)
+            {
+                *outError = lastError;
+            }
+            return false;
+        }
+    }
+
+    if (outError != nullptr)
+    {
+        *outError = ERROR_SUCCESS;
+    }
+    return true;
+}
+
+void ClearPeerQuitDiagnosticBlock(SharedBlock* block)
+{
+    if (block == nullptr)
+    {
+        return;
+    }
+
+    block->peerQuitDiagnosticText[0] = '\0';
+    InterlockedIncrement(&block->peerQuitDiagnosticSerial);
+}
+
+void AppendPeerQuitDiagnosticBlock(SharedBlock* block, const char* text)
+{
+    if (block == nullptr || text == nullptr || text[0] == '\0')
+    {
+        return;
+    }
+
+    const size_t capacity = sizeof(block->peerQuitDiagnosticText);
+    size_t used = std::strlen(block->peerQuitDiagnosticText);
+    if (used >= capacity - 1u)
+    {
+        return;
+    }
+
+    if (used > 0 && block->peerQuitDiagnosticText[used - 1] != '\n')
+    {
+        block->peerQuitDiagnosticText[used++] = '\n';
+        block->peerQuitDiagnosticText[used] = '\0';
+    }
+
+    strncpy_s(
+        block->peerQuitDiagnosticText + used,
+        capacity - used,
+        text,
+        _TRUNCATE);
+    InterlockedIncrement(&block->peerQuitDiagnosticSerial);
+}
+} // namespace
+
 void* EnsureRevivalErrorCodeNullGuardStub()
 {
     if (g_revivalErrorCodeNullGuardStub != nullptr)
@@ -252,6 +480,83 @@ void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize)
     }
 }
 
+void ClearPeerQuitDiagnostic()
+{
+    if (g_injectedBlock != nullptr)
+    {
+        ClearPeerQuitDiagnosticBlock(g_injectedBlock);
+        return;
+    }
+    if (g_hostBlock != nullptr)
+    {
+        ClearPeerQuitDiagnosticBlock(g_hostBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        ClearPeerQuitDiagnosticBlock(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void AppendPeerQuitDiagnostic(const char* text)
+{
+    if (text == nullptr || text[0] == '\0')
+    {
+        return;
+    }
+
+    if (g_injectedBlock != nullptr)
+    {
+        AppendPeerQuitDiagnosticBlock(g_injectedBlock, text);
+        return;
+    }
+    if (g_hostBlock != nullptr)
+    {
+        AppendPeerQuitDiagnosticBlock(g_hostBlock, text);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        AppendPeerQuitDiagnosticBlock(temp.block, text);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize)
+{
+    LONG serial = 0;
+    const char* text = nullptr;
+
+    if (g_hostBlock != nullptr)
+    {
+        serial = InterlockedCompareExchange(&g_hostBlock->peerQuitDiagnosticSerial, 0, 0);
+        text = g_hostBlock->peerQuitDiagnosticText;
+    }
+    else if (g_injectedBlock != nullptr)
+    {
+        serial = InterlockedCompareExchange(&g_injectedBlock->peerQuitDiagnosticSerial, 0, 0);
+        text = g_injectedBlock->peerQuitDiagnosticText;
+    }
+
+    if (outSerial != nullptr)
+    {
+        *outSerial = serial;
+    }
+    if (outText != nullptr && outTextSize > 0 && text != nullptr && text[0] != '\0')
+    {
+        CopyString(outText, static_cast<size_t>(outTextSize), text);
+    }
+    else if (outText != nullptr && outTextSize > 0)
+    {
+        outText[0] = '\0';
+    }
+}
+
 HMODULE SelfModule()
 {
     HMODULE module = nullptr;
@@ -271,6 +576,52 @@ std::string ModulePath(HMODULE module)
         return std::string();
     }
     return std::string(path);
+}
+
+void CleanupNativeHostShadowLogDirectory(const char* reason)
+{
+    if (IsCurrentProcessRevival())
+    {
+        return;
+    }
+
+    const std::wstring moduleDir = ModuleDirectoryWide(SelfModule());
+    if (moduleDir.empty())
+    {
+        mod::Log(
+            "CAPTURE_LOG: native_host cleanup skipped reason='%s' err=module_dir_unresolved",
+            reason != nullptr ? reason : "");
+        return;
+    }
+
+    const std::wstring shadowDir = moduleDir + L"\\native_host";
+    const DWORD attrs = GetFileAttributesW(shadowDir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+    {
+        const DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+        {
+            mod::Log(
+                "CAPTURE_LOG: native_host cleanup stat failed reason='%s' err=%lu",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(err));
+        }
+        return;
+    }
+
+    DWORD cleanupErr = ERROR_SUCCESS;
+    if (!RemoveDirectoryTreeBestEffortW(shadowDir, &cleanupErr))
+    {
+        mod::Log(
+            "CAPTURE_LOG: native_host cleanup incomplete reason='%s' err=%lu",
+            reason != nullptr ? reason : "",
+            static_cast<unsigned long>(cleanupErr));
+        return;
+    }
+
+    mod::Log(
+        "CAPTURE_LOG: native_host cleanup complete reason='%s'",
+        reason != nullptr ? reason : "");
 }
 
 bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag)
@@ -352,6 +703,25 @@ std::string GameDirectory()
     }
     *slash = '\0';
     return std::string(path);
+}
+
+std::wstring GameDirectoryWide()
+{
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0)
+    {
+        return std::wstring();
+    }
+
+    std::wstring directory = path;
+    const size_t slash = directory.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return std::wstring();
+    }
+
+    directory.resize(slash);
+    return directory;
 }
 
 bool TryWriteClipboardAscii(const char* text)
@@ -702,6 +1072,10 @@ bool EnsureHostIpc()
     g_hostBlock->version = kIpcVersion;
     g_hostBlock->hostPid = GetCurrentProcessId();
     g_hostBlock->hostRevivalBase = static_cast<uint32_t>(g_hostRevivalBase);
+    g_hostBlock->hostRevivalTimestamp =
+        (g_hostRevivalBase != 0 && g_activeRevival != nullptr)
+            ? g_activeRevival->peTimestamp
+            : 0;
     return true;
 }
 
@@ -942,14 +1316,25 @@ bool PatchRevivalErrorCodeNullGuard()
 void PublishHostRevivalBase()
 {
     const uintptr_t base = ResolveHostRevivalBase();
+    const uint32_t timestamp =
+        (base != 0 && g_activeRevival != nullptr)
+            ? g_activeRevival->peTimestamp
+            : 0;
     g_hostRevivalBase = base;
     if (g_hostBlock != nullptr)
     {
         g_hostBlock->hostRevivalBase = static_cast<uint32_t>(base);
+        g_hostBlock->hostRevivalTimestamp = timestamp;
     }
     if (base != 0)
     {
-        mod::Log("Takeover: host revival base=0x%08lX", static_cast<unsigned long>(base));
+        mod::Log(
+            "Takeover: host revival base=0x%08lX version=%s timestamp=0x%08X",
+            static_cast<unsigned long>(base),
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown",
+            static_cast<unsigned>(timestamp));
     }
 }
 
@@ -971,43 +1356,65 @@ uintptr_t ResolveInjectedExpectedRevivalBase()
 }
 
 bool WriteIni(
-    const std::string& gameDir,
     int role,
     uint16_t port,
     const char* address,
     const char* nickname,
     bool writeNicknameToIni)
 {
-    std::string iniPath = gameDir;
-    if (!iniPath.empty())
+    std::wstring wideIniPath = GameDirectoryWide();
+    if (!wideIniPath.empty())
     {
-        iniPath += "\\";
+        wideIniPath += L"\\";
     }
-    iniPath += "EfzRevival.ini";
+    wideIniPath += L"EfzRevival.ini";
 
-    const DWORD existingAttrs = GetFileAttributesA(iniPath.c_str());
+    std::string iniPath = WideToUtf8(wideIniPath);
+    if (iniPath.empty())
+    {
+        iniPath = "EfzRevival.ini";
+    }
+
+    const DWORD existingAttrs = GetFileAttributesW(wideIniPath.c_str());
     const bool existed = (existingAttrs != INVALID_FILE_ATTRIBUTES);
     const char* safeAddress = (address != nullptr) ? address : "";
     const char* safeNickname = (nickname != nullptr) ? nickname : "";
     const bool hasNickname = (safeNickname[0] != '\0');
     bool wroteNickname = false;
 
-    // Use WritePrivateProfileStringW for the nickname so that Unicode
-    // characters (CJK, Cyrillic, etc.) survive regardless of system codepage.
-    // Convert the UTF-8 nickname to a wide string, then write via the W API.
     char portText[16] = {};
     std::snprintf(portText, sizeof(portText), "%u", static_cast<unsigned>(port));
 
-    const std::wstring wideIniPath(iniPath.begin(), iniPath.end());
+    auto writeIniKeyUtf8 = [&wideIniPath, &iniPath](
+                               const wchar_t* sectionW,
+                               const wchar_t* keyW,
+                               const char* sectionA,
+                               const char* keyA,
+                               const std::string& valueUtf8) -> bool {
+        const std::wstring wideValue = Utf8ToWide(valueUtf8);
+        if (!valueUtf8.empty() && wideValue.empty())
+        {
+            mod::Log(
+                "Takeover: WriteIni key conversion failed section='%s' key='%s' value='%s' path='%s'",
+                sectionA != nullptr ? sectionA : "",
+                keyA != nullptr ? keyA : "",
+                valueUtf8.c_str(),
+                iniPath.c_str());
+            return false;
+        }
 
-    auto writeIniKeyA = [&iniPath](const char* section, const char* key, const char* value) -> bool {
-        if (WritePrivateProfileStringA(section, key, value, iniPath.c_str()) == FALSE)
+        if (WritePrivateProfileStringW(
+                sectionW,
+                keyW,
+                wideValue.c_str(),
+                wideIniPath.c_str())
+            == FALSE)
         {
             mod::Log(
                 "Takeover: WriteIni key failed section='%s' key='%s' value='%s' err=%s",
-                section != nullptr ? section : "",
-                key != nullptr ? key : "",
-                value != nullptr ? value : "",
+                sectionA != nullptr ? sectionA : "",
+                keyA != nullptr ? keyA : "",
+                valueUtf8.c_str(),
                 ErrorString(GetLastError()).c_str());
             return false;
         }
@@ -1017,33 +1424,10 @@ bool WriteIni(
 
     if (writeNicknameToIni && hasNickname)
     {
-        // Write nickname via W API to preserve Unicode characters.
-        const int wideLen = MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, nullptr, 0);
-        if (wideLen > 0)
-        {
-            std::wstring wideNickname(static_cast<std::size_t>(wideLen), L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, safeNickname, -1, wideNickname.data(), wideLen);
-            // wideLen includes null terminator; WritePrivateProfileStringW
-            // expects a null-terminated string, which .c_str() provides.
-            if (WritePrivateProfileStringW(L"Network", L"Name", wideNickname.c_str(), wideIniPath.c_str()) == FALSE)
-            {
-                mod::Log(
-                    "Takeover: WriteIni key failed section='Network' key='Name' value='%s' err=%s",
-                    safeNickname,
-                    ErrorString(GetLastError()).c_str());
-                ok = false;
-            }
-            else
-            {
-                wroteNickname = true;
-            }
-        }
-        else
-        {
-            const bool nameWriteOk = writeIniKeyA("Network", "Name", safeNickname);
-            wroteNickname = nameWriteOk;
-            ok = nameWriteOk && ok;
-        }
+        const bool nameWriteOk =
+            writeIniKeyUtf8(L"Network", L"Name", "Network", "Name", safeNickname);
+        wroteNickname = nameWriteOk;
+        ok = nameWriteOk && ok;
     }
     else if (writeNicknameToIni)
     {
@@ -1059,10 +1443,15 @@ bool WriteIni(
     bool wroteAddress = false;
     if (safeAddress[0] != '\0')
     {
-        wroteAddress = writeIniKeyA("Network", "Address", safeAddress);
+        wroteAddress = writeIniKeyUtf8(
+            L"Network",
+            L"Address",
+            "Network",
+            "Address",
+            safeAddress);
         ok = wroteAddress && ok;
     }
-    ok = writeIniKeyA("Network", "Port", portText) && ok;
+    ok = writeIniKeyUtf8(L"Network", L"Port", "Network", "Port", portText) && ok;
 
     mod::Log(
         "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",
@@ -1168,6 +1557,7 @@ void InitializeInjected()
     g_injectedReady = (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr);
     if (g_injectedReady)
     {
+        DetectRevivalVersion();
         HMODULE revival = GetModuleHandleA("EfzRevival.dll");
         if (revival != nullptr)
         {
@@ -1176,13 +1566,17 @@ void InitializeInjected()
         }
     }
     mod::Log(
-        "Takeover: injected initialized ready=%d block=0x%p init=0x%p console=0x%p initAddr=0x%p hostRevivalBase=0x%08lX",
+        "Takeover: injected initialized ready=%d block=0x%p init=0x%p console=0x%p initAddr=0x%p hostRevivalBase=0x%08lX hostRevivalTimestamp=0x%08X version=%s",
         g_injectedReady ? 1 : 0,
         g_injectedBlock,
         g_injectedInitEvent,
         g_injectedConsoleEvent,
         reinterpret_cast<void*>(g_injectedInitAddress),
-        static_cast<unsigned long>(g_injectedBlock != nullptr ? g_injectedBlock->hostRevivalBase : 0));
+        static_cast<unsigned long>(g_injectedBlock != nullptr ? g_injectedBlock->hostRevivalBase : 0),
+        static_cast<unsigned>(g_injectedBlock != nullptr ? g_injectedBlock->hostRevivalTimestamp : 0),
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown");
     InterlockedExchange(&g_injectedLazyBootstrapState, g_injectedReady ? 2 : 0);
 }
 

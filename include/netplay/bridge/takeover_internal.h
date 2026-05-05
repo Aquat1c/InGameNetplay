@@ -64,6 +64,7 @@ struct SharedBlock
     uint32_t version = 0;
     uint32_t hostPid = 0;
     uint32_t hostRevivalBase = 0;
+    uint32_t hostRevivalTimestamp = 0;
     volatile LONG initSerial = 0;
     int initParams[2] = {0, 0};
     volatile LONG consoleSerial = 0;
@@ -95,6 +96,8 @@ struct SharedBlock
     volatile LONG dbgCreateRemoteThreadHits = 0;
     volatile LONG consoleErrorSerial = 0;
     char consoleErrorText[128] = {};
+    volatile LONG peerQuitDiagnosticSerial = 0;
+    char peerQuitDiagnosticText[8192] = {};
 };
 #pragma pack(pop)
 
@@ -443,11 +446,16 @@ void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
+void ClearPeerQuitDiagnostic();
+void AppendPeerQuitDiagnostic(const char* text);
+void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize);
 HMODULE SelfModule();
 std::string ModulePath(HMODULE module);
+void CleanupNativeHostShadowLogDirectory(const char* reason);
 bool TryReadCaptureRevivalNativeLogsConfig(bool* outEnabled, std::string* outSourceTag);
 bool CaptureRevivalNativeLogsEnabled();
 std::string GameDirectory();
+std::wstring GameDirectoryWide();
 bool TryWriteClipboardAscii(const char* text);
 void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error);
 void CloseProcessHandle(NetbridgeStatus* status);
@@ -472,7 +480,6 @@ bool PatchRevivalErrorCodeNullGuard();
 void PublishHostRevivalBase();
 uintptr_t ResolveInjectedExpectedRevivalBase();
 bool WriteIni(
-    const std::string& gameDir,
     int role,
     uint16_t port,
     const char* address,
