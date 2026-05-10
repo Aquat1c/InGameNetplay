@@ -302,6 +302,70 @@ static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t times
     return nullptr;
 }
 
+static bool ModuleBytesMatch(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    size_t expectedSize)
+{
+    if (module == nullptr || expected == nullptr || expectedSize == 0)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        return std::memcmp(bytes, expected, expectedSize) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static const RevivalAddressProfile* FindLoadedRevivalProfile(
+    HMODULE module,
+    uint32_t timestamp)
+{
+    if (timestamp != kRevival_1_02f.peTimestamp)
+    {
+        return FindRevivalProfileByTimestamp(timestamp);
+    }
+
+    // Modified 1.02f DLLs can preserve the stock PE timestamp.  Only accept
+    // the stock 1.02f profile when its key code anchors still match stock.
+    static const uint8_t kStockFrameHookPrefix[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xC0,
+    };
+    static const uint8_t kStockStartInitPlayerPrefix[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8,
+    };
+
+    const bool frameHookMatches = ModuleBytesMatch(
+        module,
+        kRevival_1_02f.frameHookRva,
+        kStockFrameHookPrefix,
+        sizeof(kStockFrameHookPrefix));
+    const bool startInitMatches = ModuleBytesMatch(
+        module,
+        kRevival_1_02f.startInitPlayerRva,
+        kStockStartInitPlayerPrefix,
+        sizeof(kStockStartInitPlayerPrefix));
+
+    if (frameHookMatches && startInitMatches)
+    {
+        return &kRevival_1_02f;
+    }
+
+    mod::Log(
+        "DetectRevivalVersion: timestamp 0x%08X matches 1.02f but stock byte verification failed frameHook=%d startInit=%d",
+        static_cast<unsigned>(timestamp),
+        frameHookMatches ? 1 : 0,
+        startInitMatches ? 1 : 0);
+    return nullptr;
+}
+
 static bool TryReadModulePeTimestamp(HMODULE module, uint32_t* outTimestamp)
 {
     if (outTimestamp != nullptr)
@@ -373,10 +437,10 @@ void EnsureActiveRevivalProfile()
     DetectRevivalVersion();
 }
 
-/// Detect the loaded Revival DLL version by reading its PE TimeDateStamp
-/// and matching against known profiles.  Sets g_activeRevival to the
-/// matching profile (or leaves it at the default 1.02e if detection fails).
-/// Call this once early — before any profile-dependent code runs.
+/// Detect the loaded Revival DLL version by reading its PE TimeDateStamp and,
+/// for ambiguous 1.02f builds, verifying stock code bytes before accepting the
+/// stock profile. Unsupported builds switch to the zeroed unsupported profile
+/// so later hook installation fails closed.
 void DetectRevivalVersion()
 {
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
@@ -388,8 +452,8 @@ void DetectRevivalVersion()
         uint32_t timestamp = 0;
         if (!TryReadModulePeTimestamp(revival, &timestamp))
         {
-            SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
-            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header — keeping default");
+            SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
+            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header — fail closed");
             return;
         }
 
@@ -401,7 +465,7 @@ void DetectRevivalVersion()
                 static_cast<unsigned>(publishedTimestamp));
         }
 
-        if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(timestamp))
+        if (const RevivalAddressProfile* const profile = FindLoadedRevivalProfile(revival, timestamp))
         {
             SetActiveRevivalProfile(profile, RevivalProfileSource::DllTimestamp);
             mod::Log("DetectRevivalVersion: matched timestamp 0x%08X → %s",
@@ -410,8 +474,11 @@ void DetectRevivalVersion()
             return;
         }
 
-        mod::Log("DetectRevivalVersion: UNKNOWN timestamp 0x%08X from EfzRevival.dll — trying published host profile",
-                 static_cast<unsigned>(timestamp));
+        SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
+        mod::Log(
+            "DetectRevivalVersion: unsupported or modified DLL build timestamp=0x%08X — fail closed as %s",
+            static_cast<unsigned>(timestamp));
+        return;
     }
 
     if (publishedTimestamp != 0)
@@ -426,24 +493,24 @@ void DetectRevivalVersion()
             return;
         }
 
-        SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
+        SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::PublishedHostTimestamp);
         mod::Log(
-            "DetectRevivalVersion: published host timestamp 0x%08X unknown — keeping default %s. Addresses may be wrong!",
+            "DetectRevivalVersion: published host timestamp 0x%08X unknown — fail closed as %s",
             static_cast<unsigned>(publishedTimestamp),
             g_activeRevival->versionTag);
         return;
     }
 
-    SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
+    SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::Default);
     if (revival == nullptr)
     {
         mod::Log(
-            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile — keeping default %s",
+            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile — fail closed as %s",
             g_activeRevival->versionTag);
         return;
     }
 
-    mod::Log("DetectRevivalVersion: keeping default %s. Addresses may be wrong!",
+    mod::Log("DetectRevivalVersion: fail closed as %s",
              g_activeRevival->versionTag);
 }
 

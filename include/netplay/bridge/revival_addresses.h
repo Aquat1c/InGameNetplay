@@ -240,6 +240,68 @@ struct RevivalAddressProfile
 // Known profiles
 // ---------------------------------------------------------------------------
 
+// Unsupported / unknown Revival build — all hookable RVAs and offsets are
+// zeroed so detection can fail closed instead of reusing a nearby profile.
+constexpr RevivalAddressProfile kRevival_Unsupported = {
+    "unsupported",                                      // versionTag
+    0u,                                                  // peTimestamp
+    0x4386998Fu,                                        // efzFingerprint (EFZ.exe is unchanged)
+    0x10000000u,                                        // defaultImageBase
+    0u,                                                  // addrGameModeStructTable
+    0u,                                                  // addrGameModeCurrentIndex
+    {0u, 0u, 0u, 0u},                                  // roleFlagOffsets
+    0u,                                                 // roleFlagOffsetCount
+    {0u, 0u, 0u, 0u},                                  // sessionPtrOffsets
+    0u,                                                 // sessionPtrOffsetCount
+    0u,                                                 // globalStatePtrOffset
+    0u,                                                 // initFlagOffset
+    0u,                                                 // initByteOffset
+    0u,                                                 // initOnceGuardOffset
+    0u,                                                 // timerPtrOffset
+    0u,                                                 // renderContextBaseOffset
+    0u,                                                 // errorCodeIsZeroRva
+    0u,                                                 // errorCodeIsZeroPatchSize
+    0u,                                                 // startInitPlayerRva
+    0u,                                                 // inputSwapPairRva
+    0u,                                                 // frameHookRva
+    0u,                                                 // perFrameTickRva
+    0u,                                                 // sessionOffsetInitComplete
+    0u,                                                 // sessionOffsetInputDelay
+    0u,                                                 // sessionOffsetPingMs
+    0u,                                                 // sessionOffsetPingStructBase
+    0u,                                                 // sessionOffsetHelperHandle
+    0u,                                                 // sessionOffsetHelperPid
+    0u,                                                 // sessionOffsetActivePlayer
+    0u,                                                 // sessionOffsetQueuePlayer
+    0u,                                                 // sessionOffsetHistoryPrimaryPtr
+    0u,                                                 // sessionOffsetHistorySecondaryPtr
+    0u,                                                 // sessionOffsetHistoryPrimaryVec
+    0u,                                                 // sessionOffsetHistorySecondaryVec
+    0u,                                                 // sessionOffsetCurrentFrame
+    0u,                                                 // sessionOffsetGameModeSnapshot
+    0u,                                                 // sessionOffsetMatchId
+    0u,                                                 // sessionOffsetSentinel
+    0u,                                                 // sessionOffsetP1Name
+    0u,                                                 // sessionOffsetP2Name
+    0u,                                                 // sessionOffsetP1Wins
+    0u,                                                 // sessionOffsetP2Wins
+    0u,                                                 // globalStateOffsetFlag4964
+    0u,                                                 // globalStateOffsetFlag4965
+    0u,                                                 // globalStateOffsetSessionByte
+    0u,                                                 // tournamentInputQueueOffset
+    0u,                                                 // clearTextRva
+    0u,                                                 // setTextEnabledRva
+    0u,                                                 // renderContextGlobalOffset
+    {0u, 0u, 0u, 0u},                                  // tournamentExePatchAddr
+    {0u, 0u, 0u, 0u},                                  // tournamentExePatchSize
+    0u,                                                 // tournamentExePatchCount
+    {0u, 0u, 0u, 0u},                                  // exitProcessPatchRva
+    {0u, 0u, 0u, 0u},                                  // exitProcessPatchOriginal
+    0u,                                                 // exitProcessPatchCount
+    {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
+    0u,                                                 // exitProcessNearJccCount
+};
+
 // EfzRevival.dll v1.02e — original release, baseline for all addresses.
 constexpr RevivalAddressProfile kRevival_1_02e = {
     "1.02e",                                            // versionTag
@@ -363,9 +425,75 @@ constexpr RevivalAddressProfile kRevival_1_02f = {
     5,                                                  // exitProcessNearJccCount
 };
 
+// Custom framestepping 1.02f build: same data layout as stock 1.02f/1.02g,
+// most code RVAs shift by +0x210 from 1.02f, but StartInitPlayer only moves
+// by +0x200. Tournament ExitProcess guard sites were verified directly from
+// the added DLL binary at decompilations/revival_binaries/1.02f framestepping.
+constexpr RevivalAddressProfile kRevival_1_02f_framestepping = {
+    "1.02f-framestepping",                            // versionTag
+    0x6085E718u,                                       // peTimestamp
+    0x4386998Fu,                                       // efzFingerprint
+    0x10000000u,                                       // defaultImageBase
+    0x00790110u,                                       // addrGameModeStructTable
+    0x00790148u,                                       // addrGameModeCurrentIndex
+    {0x000A05D0u, 0x000A05F0u, 0u, 0u},                // roleFlagOffsets
+    2,                                                 // roleFlagOffsetCount
+    {0x000A02CCu, 0u, 0u, 0u},                         // sessionPtrOffsets
+    1,                                                 // sessionPtrOffsetCount
+    0x000A07B8u,                                       // globalStatePtrOffset
+    0x000A05D4u,                                       // initFlagOffset
+    0x000A0289u,                                       // initByteOffset
+    0x000A0774u,                                       // initOnceGuardOffset
+    0x000A0764u,                                       // timerPtrOffset
+    0x000A0760u,                                       // renderContextBaseOffset
+    0x000021E0u,                                       // errorCodeIsZeroRva
+    8u,                                                // errorCodeIsZeroPatchSize
+    0x00072AB0u,                                       // startInitPlayerRva
+    0x0006CCE0u,                                       // inputSwapPairRva
+    0x0006E7A0u,                                       // frameHookRva
+    0x0006E780u,                                       // perFrameTickRva
+    1220u,                                             // sessionOffsetInitComplete
+    688u,                                              // sessionOffsetInputDelay
+    936u,                                              // sessionOffsetPingMs
+    928u,                                              // sessionOffsetPingStructBase
+    700u,                                              // sessionOffsetHelperHandle
+    1216u,                                             // sessionOffsetHelperPid
+    680u,                                              // sessionOffsetActivePlayer
+    684u,                                              // sessionOffsetQueuePlayer
+    824u,                                              // sessionOffsetHistoryPrimaryPtr
+    828u,                                              // sessionOffsetHistorySecondaryPtr
+    788u,                                              // sessionOffsetHistoryPrimaryVec
+    800u,                                              // sessionOffsetHistorySecondaryVec
+    708u,                                              // sessionOffsetCurrentFrame
+    716u,                                              // sessionOffsetGameModeSnapshot
+    712u,                                              // sessionOffsetMatchId
+    1232u,                                             // sessionOffsetSentinel
+    958u,                                              // sessionOffsetP1Name (raw wchar_t[64] in config struct)
+    1086u,                                             // sessionOffsetP2Name (raw wchar_t[64] in config struct)
+    1224u,                                             // sessionOffsetP1Wins
+    1228u,                                             // sessionOffsetP2Wins
+    4964u,                                             // globalStateOffsetFlag4964
+    4965u,                                             // globalStateOffsetFlag4965
+    82563u,                                            // globalStateOffsetSessionByte
+    740u,                                              // tournamentInputQueueOffset
+    0x0006C280u,                                       // clearTextRva
+    0x0006C240u,                                       // setTextEnabledRva
+    0x000A0778u,                                       // renderContextGlobalOffset
+    {0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu},      // tournamentExePatchAddr
+    {7, 7, 1, 20},                                     // tournamentExePatchSize
+    4,                                                 // tournamentExePatchCount
+    {0x0007933Du, 0x0007254Fu, 0u, 0u},                // exitProcessPatchRva
+    {0x74u, 0x74u, 0u, 0u},                            // exitProcessPatchOriginal
+    2,                                                 // exitProcessPatchCount
+    {0x000723C6u, 0x0007274Bu, 0x0007275Eu, 0x00074531u,
+     0x00074544u, 0x00074551u, 0u, 0u},               // exitProcessNearJccRva
+    6,                                                 // exitProcessNearJccCount
+};
+
 // EfzRevival.dll v1.02g — session objects enlarged (host 0x5D0→0x690),
 // same .data layout as e/f.  Tournament results ExitProcess guard
 // encoding changed from 2-byte short JNZ to 6-byte near JNZ.
+
 constexpr RevivalAddressProfile kRevival_1_02g = {
     "1.02g",                                            // versionTag
     0x6240CE73u,                                        // peTimestamp
@@ -560,6 +688,7 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
 constexpr const RevivalAddressProfile* kAllRevivalProfiles[] = {
     &kRevival_1_02e,
     &kRevival_1_02f,
+    &kRevival_1_02f_framestepping,
     &kRevival_1_02g,
     &kRevival_1_02h,
     &kRevival_1_02i,
