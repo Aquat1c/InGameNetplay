@@ -2954,7 +2954,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     if (!LoadNetplayAssets(screenContext))
     {
         mod::Log("EnterNetplayMenu: assets load failed — netplay menu disabled");
-        mod::Log("EnterNetplayMenu: ensure netplay_bg.dat and netplay_ob.dat are next to the DLL or in mods\\efz_netplay_mod\\assets\\");
+        mod::Log("EnterNetplayMenu: ensure netplay_bgd.dat, netplay_bgn.dat, and netplay_ob.dat are next to the DLL or in mods\\efz_netplay_mod\\assets\\");
         g_netplayAssetsAvailable = false;
         if (!skipFadeOut)
         {

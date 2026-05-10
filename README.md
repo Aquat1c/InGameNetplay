@@ -39,7 +39,8 @@ At minimum, the mod expects this structure next to the DLL:
 mods\efz_netplay_mod\
   efz_netplay_mod.dll
   assets\
-    netplay_bg.dat
+    netplay_bgd.dat
+    netplay_bgn.dat
     netplay_ob.dat
 ```
 
@@ -63,7 +64,8 @@ mods\efz_netplay_mod\
 ```
 
 What they are used for:
-- `assets\netplay_bg.dat` - netplay menu background
+- `assets\netplay_bgd.dat` - daytime netplay menu background, selected from 09:00 through 17:59 local PC time
+- `assets\netplay_bgn.dat` - nighttime netplay menu background, selected from 18:00 through 08:59 local PC time
 - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
 - `assets\res_alert.wav` - custom lobby challenge alert sound
 - `assets\sprites\*.png` - Battle Log character portraits
@@ -121,7 +123,8 @@ Options:
 
 Netplay menu theming:
 - The menu background theme is currently read from `EfzRevival.ini` under `[NetplayMenu]` with `Theme=scroll` or `Theme=classic`.
-- The `scroll` theme uses a wrapped horizontal pan and expects `assets\netplay_bg.dat` to decode as `320x240`; unsupported background sizes fall back to the classic static draw.
+- The active background is selected from local PC time: `assets\netplay_bgd.dat` from 09:00 through 17:59, and `assets\netplay_bgn.dat` from 18:00 through 08:59.
+- The `scroll` theme uses a wrapped horizontal pan and expects the selected background DAT to decode as `320x240`; unsupported background sizes fall back to the classic static draw.
 
 Logging and diagnostics:
 - Logger banner includes version and build timestamp
@@ -193,7 +196,8 @@ it suitable for rich presence, overlays, stream tooling, and companion mods.
 ## Runtime Assets
 
 DLL-relative assets:
-- `<dll_folder>\\assets\\netplay_bg.dat`
+- `<dll_folder>\\assets\\netplay_bgd.dat`
+- `<dll_folder>\\assets\\netplay_bgn.dat`
 - `<dll_folder>\\assets\\netplay_ob.dat`
 - `<dll_folder>\\assets\\res_alert.wav`
 - `<dll_folder>\\assets\\netplay_font_map.txt` (optional)

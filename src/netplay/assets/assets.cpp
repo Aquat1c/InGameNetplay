@@ -54,6 +54,34 @@ struct RowRun
     int start = 0;
     int length = 0;
 };
+
+struct NetplayBackgroundChoice
+{
+    const char* period = "day";
+    const char* filename = "netplay_bgd.dat";
+    WORD hour = 0;
+    WORD minute = 0;
+};
+
+NetplayBackgroundChoice SelectLocalTimeNetplayBackground()
+{
+    constexpr WORD kDayStartHour = 9;
+    constexpr WORD kNightStartHour = 18;
+
+    SYSTEMTIME localTime = {};
+    GetLocalTime(&localTime);
+
+    const bool isDay =
+        localTime.wHour >= kDayStartHour
+        && localTime.wHour < kNightStartHour;
+
+    return {
+        isDay ? "day" : "night",
+        isDay ? "netplay_bgd.dat" : "netplay_bgn.dat",
+        localTime.wHour,
+        localTime.wMinute,
+    };
+}
 }
 
 namespace netplay::assets
@@ -138,18 +166,24 @@ std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory)
 
 std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory)
 {
-    mod::Log("ResolveNetplayBackgroundPath: searching for netplay_bg.dat");
+    const NetplayBackgroundChoice choice = SelectLocalTimeNetplayBackground();
+    mod::Log(
+        "ResolveNetplayBackgroundPath: local time %02u:%02u selects %s background '%s'",
+        static_cast<unsigned>(choice.hour),
+        static_cast<unsigned>(choice.minute),
+        choice.period,
+        choice.filename);
 
     // Asset filename variants to probe under each base directory.
-    const std::array<const char*, 2> assetCandidates = {
-        "assets\\netplay_bg.dat",
-        "netplay_bg.dat",
+    const std::array<std::string, 2> assetCandidates = {
+        std::string("assets\\") + choice.filename,
+        std::string(choice.filename),
     };
 
     // --- Tier 1: DLL directory (GetModuleFileNameA-derived) -----------------
-    for (const char* candidate : assetCandidates)
+    for (const std::string& candidate : assetCandidates)
     {
-        const std::string path = JoinPath(moduleDirectory, candidate);
+        const std::string path = JoinPath(moduleDirectory, candidate.c_str());
         mod::Log("ResolveNetplayBackgroundPath: [DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
@@ -164,9 +198,9 @@ std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory)
     const std::string modsRelDir = DeriveModsRelativeDirectory(moduleDirectory);
     if (!modsRelDir.empty())
     {
-        for (const char* candidate : assetCandidates)
+        for (const std::string& candidate : assetCandidates)
         {
-            const std::string path = JoinPath(modsRelDir, candidate);
+            const std::string path = JoinPath(modsRelDir, candidate.c_str());
             mod::Log("ResolveNetplayBackgroundPath: [mods dir] probing '%s'", path.c_str());
             if (FileExists(path))
             {
@@ -177,20 +211,28 @@ std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory)
     }
 
     // --- Tier 3: working-directory loose file -------------------------------
-    if (FileExists("netplay_bg.dat"))
+    if (FileExists(choice.filename))
     {
-        mod::Log("ResolveNetplayBackgroundPath: fallback working-directory file 'netplay_bg.dat'");
-        return "netplay_bg.dat";
+        mod::Log(
+            "ResolveNetplayBackgroundPath: fallback working-directory file '%s'",
+            choice.filename);
+        return choice.filename;
     }
 
     // --- Tier 4: system\ directory (user manually placed the file) ----------
-    if (FileExists("system\\netplay_bg.dat"))
+    const std::string systemCandidate = std::string("system\\") + choice.filename;
+    if (FileExists(systemCandidate))
     {
-        mod::Log("ResolveNetplayBackgroundPath: fallback system dir 'system\\netplay_bg.dat'");
-        return "system\\netplay_bg.dat";
+        mod::Log(
+            "ResolveNetplayBackgroundPath: fallback system dir '%s'",
+            systemCandidate.c_str());
+        return systemCandidate;
     }
 
-    mod::Log("ResolveNetplayBackgroundPath: no candidate found");
+    mod::Log(
+        "ResolveNetplayBackgroundPath: no %s background candidate found for '%s'",
+        choice.period,
+        choice.filename);
     return {};
 }
 
