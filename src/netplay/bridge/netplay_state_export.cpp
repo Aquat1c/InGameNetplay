@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
 #include "efz_netplay_state.h"
 #include "netplay/bridge/session_bridge.h"
@@ -30,6 +31,8 @@
 namespace netplay::bridge::state_export
 {
 
+void UpdateNow(const NetbridgeStatus& status);
+
 // ---------------------------------------------------------------------------
 // Module-local state
 // ---------------------------------------------------------------------------
@@ -38,6 +41,15 @@ namespace
 HANDLE g_shmHandle = nullptr;
 EFZNetplayState* g_shmView = nullptr;
 EFZNetplayState g_localCopy = {};   // returned via DLL export
+std::thread g_updateWorker;
+HANDLE g_updateEvent = nullptr;
+CRITICAL_SECTION g_updateRequestLock = {};
+bool g_updateRequestLockInitialized = false;
+NetbridgeStatus g_pendingStatus = {};
+volatile LONG g_updateRequestPending = 0;
+volatile LONG g_updateWorkerStop = 0;
+volatile LONG g_updateWorkerReady = 0;
+volatile LONG g_updatePublishDropped = 0;
 
 // Previous-tick flag values for transition logging.
 uint8_t g_prevInNetplayMenu = 0;
@@ -98,6 +110,85 @@ static int g_pingBaseline = -1;         // avg of first window fill
 static bool g_pingBaselineLocked = false;
 static uint32_t g_pingDriftWarnings = 0; // limit log spam
 static uint32_t g_lastPingDriftLogSeq = 0;
+
+void ExportWorkerMain()
+{
+    mod::Log("StateExport: async worker started");
+
+    while (g_updateEvent != nullptr)
+    {
+        const DWORD waitResult = WaitForSingleObject(g_updateEvent, INFINITE);
+        if (waitResult != WAIT_OBJECT_0)
+        {
+            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            {
+                break;
+            }
+            continue;
+        }
+
+        if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+        {
+            break;
+        }
+
+        for (;;)
+        {
+            if (InterlockedExchange(&g_updateRequestPending, 0) == 0)
+            {
+                break;
+            }
+
+            if (!g_updateRequestLockInitialized)
+            {
+                break;
+            }
+
+            NetbridgeStatus snapshot = {};
+            EnterCriticalSection(&g_updateRequestLock);
+            snapshot = g_pendingStatus;
+            LeaveCriticalSection(&g_updateRequestLock);
+
+            UpdateNow(snapshot);
+
+            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            {
+                break;
+            }
+        }
+    }
+
+    mod::Log("StateExport: async worker stopped");
+}
+
+void QueueUpdate(const NetbridgeStatus& status)
+{
+    if (InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) == 0
+        || g_updateEvent == nullptr
+        || !g_updateRequestLockInitialized)
+    {
+        UpdateNow(status);
+        return;
+    }
+
+    if (!TryEnterCriticalSection(&g_updateRequestLock))
+    {
+        const LONG dropCount = InterlockedIncrement(&g_updatePublishDropped);
+        if (dropCount <= 10 || (dropCount % 300) == 0)
+        {
+            mod::Log(
+                "StateExport: async queue skipped due contention dropCount=%ld",
+                static_cast<long>(dropCount));
+        }
+        return;
+    }
+
+    g_pendingStatus = status;
+    LeaveCriticalSection(&g_updateRequestLock);
+
+    InterlockedExchange(&g_updateRequestPending, 1);
+    (void)SetEvent(g_updateEvent);
+}
 
 // Previous-tick charselect context for change detection.
 uint8_t g_prevP1CharId = 0xFF;
@@ -427,13 +518,61 @@ void Initialize()
     }
     g_localCopy = init;
 
-    mod::Log("StateExport: initialized (shm=%s, view=%p)",
+    InitializeCriticalSection(&g_updateRequestLock);
+    g_updateRequestLockInitialized = true;
+    g_pendingStatus = {};
+    InterlockedExchange(&g_updateRequestPending, 0);
+    InterlockedExchange(&g_updateWorkerStop, 0);
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updatePublishDropped, 0);
+
+    g_updateEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (g_updateEvent != nullptr)
+    {
+        try
+        {
+            g_updateWorker = std::thread(ExportWorkerMain);
+            InterlockedExchange(&g_updateWorkerReady, 1);
+        }
+        catch (...)
+        {
+            CloseHandle(g_updateEvent);
+            g_updateEvent = nullptr;
+        }
+    }
+
+    mod::Log("StateExport: initialized (shm=%s, view=%p, async=%d)",
              g_shmHandle != nullptr ? "ok" : "FAIL",
-             static_cast<void*>(g_shmView));
+             static_cast<void*>(g_shmView),
+             InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) != 0 ? 1 : 0);
 }
 
 void Shutdown()
 {
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updateWorkerStop, 1);
+    if (g_updateEvent != nullptr)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+    if (g_updateWorker.joinable())
+    {
+        g_updateWorker.join();
+    }
+    if (g_updateEvent != nullptr)
+    {
+        CloseHandle(g_updateEvent);
+        g_updateEvent = nullptr;
+    }
+    InterlockedExchange(&g_updateRequestPending, 0);
+    InterlockedExchange(&g_updatePublishDropped, 0);
+    g_pendingStatus = {};
+    if (g_updateRequestLockInitialized)
+    {
+        DeleteCriticalSection(&g_updateRequestLock);
+        g_updateRequestLockInitialized = false;
+    }
+
     if (g_shmView != nullptr)
     {
         // Clear the magic so consumers know the data is stale.
@@ -451,7 +590,7 @@ void Shutdown()
     mod::Log("StateExport: shutdown");
 }
 
-void Update(const NetbridgeStatus& status)
+void UpdateNow(const NetbridgeStatus& status)
 {
     // --- Timing guard: detect when Update() itself takes too long ----------
     LARGE_INTEGER updateQpcStart = {};
@@ -1009,6 +1148,11 @@ void Update(const NetbridgeStatus& status)
             }
         }
     }
+}
+
+void Update(const NetbridgeStatus& status)
+{
+    QueueUpdate(status);
 }
 
 const EFZNetplayState* GetExportedState()

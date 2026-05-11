@@ -176,23 +176,28 @@ void Tick()
     LARGE_INTEGER tickQpcPre = {};
     QueryPerformanceCounter(&tickQpcPre);
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_initialized)
+    NetbridgeStatus statusSnapshot = {};
     {
-        return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_initialized)
+        {
+            return;
+        }
+
+        // Keep the main thread non-blocking while start worker owns takeover startup.
+        if (g_startWorkerRunning)
+        {
+            return;
+        }
+
+        JoinFinishedWorkerUnlocked();
+        takeover::Tick(&g_status, &g_connectStartTick);
+        statusSnapshot = g_status;
     }
 
-    // Keep the main thread non-blocking while start worker owns takeover startup.
-    if (g_startWorkerRunning)
-    {
-        return;
-    }
+    state_export::Update(statusSnapshot);
 
-    JoinFinishedWorkerUnlocked();
-    takeover::Tick(&g_status, &g_connectStartTick);
-    state_export::Update(g_status);
-
-    // --- Timing guard on full Tick (includes takeover::Tick + State Export) --
+    // --- Timing guard on full Tick (includes takeover::Tick + export enqueue) --
     {
         static uint32_t s_tickSlowCount = 0;
         LARGE_INTEGER tickQpcPost = {}, freq = {};
@@ -233,43 +238,33 @@ void TickExportOnly()
     // full Tick() ran — typically during connection, before any match was
     // played — so wins would read 0-0 even after a match ends.
 
-    // --- Mutex contention guard: detect if acquiring g_mutex blocks -------
-    LARGE_INTEGER teoQpcPre = {};
-    QueryPerformanceCounter(&teoQpcPre);
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    LARGE_INTEGER teoQpcPost = {};
-    QueryPerformanceCounter(&teoQpcPost);
-
-    if (!g_initialized)
+    NetbridgeStatus statusSnapshot = {};
     {
-        return;
-    }
-    takeover::RefreshRuntimeStatus(&g_status);
-    state_export::Update(g_status);
-
-    // Check mutex wait time — long waits indicate the worker thread holds
-    // the lock for extended periods (network I/O, process launch, etc.).
-    {
-        static uint32_t s_teoMutexSlowCount = 0;
-        LARGE_INTEGER freq = {};
-        QueryPerformanceFrequency(&freq);
-        const double waitMs =
-            static_cast<double>(teoQpcPost.QuadPart - teoQpcPre.QuadPart)
-            * 1000.0 / static_cast<double>(freq.QuadPart);
-        if (waitMs > 2.0)
+        std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+        if (!lock.owns_lock())
         {
-            ++s_teoMutexSlowCount;
-            if (s_teoMutexSlowCount <= 10 || (s_teoMutexSlowCount % 300 == 0))
+            static uint32_t s_teoSkippedCount = 0;
+            ++s_teoSkippedCount;
+            if (s_teoSkippedCount <= 10 || (s_teoSkippedCount % 300) == 0)
             {
                 mod::Log(
-                    "PERF_WARN: TickExportOnly mutex wait %.2fms "
-                    "(slowCount=%u) — bridge lock contention",
-                    waitMs, s_teoMutexSlowCount);
+                    "PERF_WARN: TickExportOnly skipped due to bridge lock contention "
+                    "(skipCount=%u)",
+                    s_teoSkippedCount);
             }
+            return;
         }
+
+        if (!g_initialized)
+        {
+            return;
+        }
+
+        takeover::RefreshRuntimeStatus(&g_status);
+        statusSnapshot = g_status;
     }
+
+    state_export::Update(statusSnapshot);
 }
 
 bool StartSession(
