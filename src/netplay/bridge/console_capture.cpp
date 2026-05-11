@@ -149,6 +149,34 @@ std::string ToLowerAscii(std::string text)
     return text;
 }
 
+bool StartsWithCaseInsensitive(const std::string& text, const char* prefix)
+{
+    if (prefix == nullptr || prefix[0] == '\0')
+    {
+        return false;
+    }
+
+    const size_t prefixLen = std::strlen(prefix);
+    if (text.size() < prefixLen)
+    {
+        return false;
+    }
+
+    for (size_t index = 0; index < prefixLen; ++index)
+    {
+        const char a =
+            static_cast<char>(std::tolower(static_cast<unsigned char>(text[index])));
+        const char b =
+            static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[index])));
+        if (a != b)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool TryExtractDiedEndpoint(const std::string& text, std::string* outEndpoint)
 {
     if (outEndpoint != nullptr)
@@ -174,6 +202,41 @@ bool TryExtractDiedEndpoint(const std::string& text, std::string* outEndpoint)
         *outEndpoint = endpoint;
     }
     return true;
+}
+
+bool TryExtractQuitEndpoint(const std::string& text, std::string* outEndpoint)
+{
+    if (outEndpoint != nullptr)
+    {
+        outEndpoint->clear();
+    }
+
+    static const char* const kQuitPrefixes[] = {
+        "Recv quit from:",
+        "Received quit from:",
+    };
+
+    for (const char* prefix : kQuitPrefixes)
+    {
+        if (!StartsWithCaseInsensitive(text, prefix))
+        {
+            continue;
+        }
+
+        const std::string endpoint = TrimAscii(text.substr(std::strlen(prefix)));
+        if (endpoint.empty())
+        {
+            return false;
+        }
+
+        if (outEndpoint != nullptr)
+        {
+            *outEndpoint = endpoint;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 std::string LoadConfiguredHolePunchServer()
@@ -481,6 +544,28 @@ void NoteConsolePromptLine(const std::string& text)
         g_nativeWorkflowTournamentSeen = true;
         mod::Log("Takeover: native workflow event=unexpected_tournament_mode text='%s'", text.c_str());
     }
+    std::string quitEndpoint;
+    if (TryExtractQuitEndpoint(text, &quitEndpoint))
+    {
+        bool isActivePeer = false;
+        bool isSpectator = false;
+        const bool classified = TryClassifyRevivalQuitEndpoint(
+            quitEndpoint.c_str(),
+            &isActivePeer,
+            &isSpectator);
+        mod::Log(
+            "Takeover: native workflow event=quit_packet endpoint='%s' classified=%d activePeer=%d spectator=%d text='%s'",
+            quitEndpoint.c_str(),
+            classified ? 1 : 0,
+            isActivePeer ? 1 : 0,
+            isSpectator ? 1 : 0,
+            text.c_str());
+        if (classified && isActivePeer)
+        {
+            PublishConsoleError("Source quit or timed out");
+        }
+        return;
+    }
     std::string diedEndpoint;
     if (TryExtractDiedEndpoint(text, &diedEndpoint))
     {
@@ -506,11 +591,6 @@ void NoteConsolePromptLine(const std::string& text)
                 "Takeover: native workflow event=peer_died endpoint='%s' text='%s'",
                 diedEndpoint.c_str(),
                 text.c_str());
-            // Also publish through IPC as a backup signal so the host process
-            // can detect the disconnect even if no explicit timeout message
-            // follows (e.g. "Host timed out" or "Remote timed out" may arrive
-            // later, but this ensures immediate detection).
-            PublishConsoleError("Peer died");
         }
     }
 
@@ -844,7 +924,8 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         {
             AppendOwnedLogEfzLine(sourceTag, trimmed);
         }
-        // Parse workflow signals (delay prompt, spectate confirm, peer died)
+        // Parse workflow signals (delay prompt, spectate confirm, quit packet,
+        // peer died diagnostics)
         // but don't echo Revival's debug text into the mod log — Revival
         // already writes to its own log files.
         NoteConsolePromptLine(trimmed);
@@ -888,6 +969,8 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
         static const char* kImmediateFlushKeywords[] = {
+            "Recv quit from:",
+            "Received quit from:",
             "Connection timed out",
             "Source quit or timed out",
             "Host timed out",

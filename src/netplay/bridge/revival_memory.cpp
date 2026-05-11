@@ -4801,12 +4801,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // remote opponent disconnects.  The helper process (EfzRevival.exe)
     // stays alive because ExitProcess is patched out, but its console
     // capture *does* detect the disconnect and publishes an error string
-    // to the IPC shared block.  Detected messages include:
+    // to the IPC shared block. Detected messages include:
     //   - "Connection timed out"      (initial handshake timeout)
-    //   - "Source quit or timed out"  (connected source peer died)
+    //   - "Source quit or timed out"  (connected source peer quit/timed out)
     //   - "Host timed out"            (host peer timed out)
     //   - "Remote timed out"          (remote peer timed out, general)
-    //   - "Peer died"                 (backup: any "<endpoint> died" trace)
     //   - "Socket error"              (low-level network failure)
     //
     // Check every frame (not just every ~60) to minimise the window where

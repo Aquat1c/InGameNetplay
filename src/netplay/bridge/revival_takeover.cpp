@@ -1,6 +1,9 @@
 // Session lifecycle: host/join/spectate management, tick loop, cancel, delay.
 // Internal helpers live in sister .cpp files; see takeover_internal.h.
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/options_menu.h"
@@ -548,6 +551,113 @@ static uintptr_t ResolveHelperSendQuitAllRva()
         return 0x425C0u;
     }
     return 0;
+}
+
+static uintptr_t ResolveHelperQuitRoleCheckRva()
+{
+    EnsureActiveRevivalProfile();
+
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return 0;
+    }
+
+    const char* const tag = g_activeRevival->versionTag;
+    if (std::strcmp(tag, "1.02e") == 0 || std::strcmp(tag, "1.02h") == 0)
+    {
+        return 0x201B0u;
+    }
+    if (std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0)
+    {
+        return 0x20140u;
+    }
+    if (std::strcmp(tag, "1.02g") == 0)
+    {
+        return 0x20040u;
+    }
+    if (std::strcmp(tag, "1.02i") == 0)
+    {
+        return 0x20C80u;
+    }
+    return 0;
+}
+
+struct RevivalQuitEndpointStorage
+{
+    uint16_t family = 0;
+    uint16_t reserved = 0;
+    uint32_t ipv4Address = 0;
+    uint8_t ipv6Address[16] = {};
+    uint32_t ipv6ScopeId = 0;
+};
+
+static_assert(
+    sizeof(RevivalQuitEndpointStorage) == 28,
+    "Revival quit endpoint storage must match the helper's 28-byte endpoint object");
+
+static bool TryBuildRevivalQuitEndpointFromText(
+    const char* endpointText,
+    RevivalQuitEndpointStorage* outEndpoint)
+{
+    if (outEndpoint != nullptr)
+    {
+        std::memset(outEndpoint, 0, sizeof(*outEndpoint));
+    }
+    if (endpointText == nullptr || endpointText[0] == '\0' || outEndpoint == nullptr)
+    {
+        return false;
+    }
+
+    const std::string trimmed = TrimAscii(endpointText);
+    if (trimmed.empty() || trimmed.size() >= 256)
+    {
+        return false;
+    }
+
+    char addressBuffer[256] = {};
+    std::memcpy(addressBuffer, trimmed.c_str(), trimmed.size());
+    addressBuffer[trimmed.size()] = '\0';
+
+    SOCKADDR_STORAGE storage = {};
+    int storageLen = sizeof(storage);
+    if (WSAStringToAddressA(
+            addressBuffer,
+            AF_INET,
+            nullptr,
+            reinterpret_cast<LPSOCKADDR>(&storage),
+            &storageLen)
+        == 0)
+    {
+        const sockaddr_in* const address =
+            reinterpret_cast<const sockaddr_in*>(&storage);
+        outEndpoint->family = AF_INET;
+        outEndpoint->ipv4Address = address->sin_addr.S_un.S_addr;
+        return true;
+    }
+
+    std::memset(&storage, 0, sizeof(storage));
+    storageLen = sizeof(storage);
+    if (WSAStringToAddressA(
+            addressBuffer,
+            AF_INET6,
+            nullptr,
+            reinterpret_cast<LPSOCKADDR>(&storage),
+            &storageLen)
+        != 0)
+    {
+        return false;
+    }
+
+    const sockaddr_in6* const address6 =
+        reinterpret_cast<const sockaddr_in6*>(&storage);
+    outEndpoint->family = AF_INET6;
+    std::memcpy(
+        outEndpoint->ipv6Address,
+        &address6->sin6_addr,
+        sizeof(outEndpoint->ipv6Address));
+    outEndpoint->ipv6ScopeId = address6->sin6_scope_id;
+    return true;
 }
 
 static bool IsWritableUserRegion(const MEMORY_BASIC_INFORMATION& mbi)
@@ -1881,6 +1991,172 @@ enum InjectedPeerQuitBroadcastResult : DWORD
 };
 
 constexpr DWORD kInjectedPeerQuitBroadcastResultMask = 0xFFu;
+
+bool TryClassifyRevivalQuitEndpoint(
+    const char* endpointText,
+    bool* outIsActivePeer,
+    bool* outIsSpectator)
+{
+    if (outIsActivePeer != nullptr)
+    {
+        *outIsActivePeer = false;
+    }
+    if (outIsSpectator != nullptr)
+    {
+        *outIsSpectator = false;
+    }
+
+    if (!IsCurrentProcessRevival())
+    {
+        mod::Log(
+            "Takeover: native quit packet classification skipped endpoint='%s' (not in EfzRevival.exe)",
+            endpointText != nullptr ? endpointText : "");
+        return false;
+    }
+
+    EnsureActiveRevivalProfile();
+
+    RevivalQuitEndpointStorage endpoint = {};
+    if (!TryBuildRevivalQuitEndpointFromText(endpointText, &endpoint))
+    {
+        mod::Log(
+            "Takeover: native quit packet classification failed endpoint='%s' reason=parse_failed version=%s",
+            endpointText != nullptr ? endpointText : "",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown");
+        return false;
+    }
+
+    const uintptr_t roleCheckRva = ResolveHelperQuitRoleCheckRva();
+    const uintptr_t helperBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (roleCheckRva == 0 || helperBase == 0)
+    {
+        mod::Log(
+            "Takeover: native quit packet classification failed endpoint='%s' reason=helper_unresolved version=%s roleCheckRva=0x%08lX helperBase=0x%08lX",
+            endpointText != nullptr ? endpointText : "",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown",
+            static_cast<unsigned long>(roleCheckRva),
+            static_cast<unsigned long>(helperBase));
+        return false;
+    }
+
+    bool isActivePeer = false;
+    bool isSpectator = false;
+    DWORD exceptionCode = 0;
+    const char* const versionTag =
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown";
+
+    if (std::strcmp(versionTag, "1.02i") == 0)
+    {
+        if (!HasInjectedContext())
+        {
+            (void)EnsureInjectedContextFast();
+        }
+
+        const DWORD hostPid =
+            (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
+        bool usedStrictHostMatch = false;
+        const uintptr_t managerPtr =
+            FindInjectedPeerManagerPointer(hostPid, &usedStrictHostMatch);
+        const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
+        if (managerPtr == 0 || layout.peerContainerOffset == 0)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=manager_unresolved version=%s hostPid=%lu manager=0x%08lX peerContainerOff=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(hostPid),
+                static_cast<unsigned long>(managerPtr),
+                static_cast<unsigned long>(layout.peerContainerOffset));
+            return false;
+        }
+
+        const uintptr_t peerContainerPtr = managerPtr + layout.peerContainerOffset;
+        typedef bool (__thiscall *RoleCheckFn)(void*, const void*, int);
+        const auto roleCheck =
+            reinterpret_cast<RoleCheckFn>(helperBase + roleCheckRva);
+        __try
+        {
+            isActivePeer = roleCheck(
+                reinterpret_cast<void*>(peerContainerPtr),
+                &endpoint,
+                2);
+            isSpectator = roleCheck(
+                reinterpret_cast<void*>(peerContainerPtr),
+                &endpoint,
+                3);
+        }
+        __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=exception version=%s helperBase=0x%08lX roleCheckRva=0x%08lX manager=0x%08lX peerContainer=0x%08lX exception=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(helperBase),
+                static_cast<unsigned long>(roleCheckRva),
+                static_cast<unsigned long>(managerPtr),
+                static_cast<unsigned long>(peerContainerPtr),
+                static_cast<unsigned long>(exceptionCode));
+            return false;
+        }
+
+        mod::Log(
+            "Takeover: native quit packet classified endpoint='%s' version=%s roleCheckRva=0x%08lX manager=0x%08lX peerContainer=0x%08lX strictHostMatch=%d activePeer=%d spectator=%d",
+            endpointText != nullptr ? endpointText : "",
+            versionTag,
+            static_cast<unsigned long>(roleCheckRva),
+            static_cast<unsigned long>(managerPtr),
+            static_cast<unsigned long>(peerContainerPtr),
+            usedStrictHostMatch ? 1 : 0,
+            isActivePeer ? 1 : 0,
+            isSpectator ? 1 : 0);
+    }
+    else
+    {
+        typedef bool (__stdcall *RoleCheckFn)(const void*, int);
+        const auto roleCheck =
+            reinterpret_cast<RoleCheckFn>(helperBase + roleCheckRva);
+        __try
+        {
+            isActivePeer = roleCheck(&endpoint, 2);
+            isSpectator = roleCheck(&endpoint, 3);
+        }
+        __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=exception version=%s helperBase=0x%08lX roleCheckRva=0x%08lX exception=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(helperBase),
+                static_cast<unsigned long>(roleCheckRva),
+                static_cast<unsigned long>(exceptionCode));
+            return false;
+        }
+
+        mod::Log(
+            "Takeover: native quit packet classified endpoint='%s' version=%s roleCheckRva=0x%08lX activePeer=%d spectator=%d",
+            endpointText != nullptr ? endpointText : "",
+            versionTag,
+            static_cast<unsigned long>(roleCheckRva),
+            isActivePeer ? 1 : 0,
+            isSpectator ? 1 : 0);
+    }
+
+    if (outIsActivePeer != nullptr)
+    {
+        *outIsActivePeer = isActivePeer;
+    }
+    if (outIsSpectator != nullptr)
+    {
+        *outIsSpectator = isSpectator;
+    }
+    return true;
+}
 constexpr unsigned kInjectedPeerQuitBroadcastDetailShift = 8u;
 
 static DWORD EncodeInjectedPeerQuitBroadcastExitCode(
@@ -3861,9 +4137,11 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     RefreshRuntimeStatus(ioStatus);
 
     // --- Console error detection ---
-    // If the Revival process reported a connection error (e.g., "Connection timed out",
-    // "Source quit or timed out", "Host timed out", "Remote timed out", "Peer died",
-    // "Socket error"), act immediately.
+    // If the helper published a connection error (e.g., "Connection timed out",
+    // "Source quit or timed out", "Host timed out", "Remote timed out",
+    // "Socket error"), act immediately. Active-opponent quit packets are
+    // promoted into this path earlier by console capture; raw "<endpoint> died"
+    // lines are no longer treated as fatal by themselves.
     if (ioStatus->consoleErrorSerial > 0)
     {
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)

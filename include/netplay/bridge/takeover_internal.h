@@ -419,6 +419,15 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs);
 // peer manager object and calls the native "send quit to every peer" routine.
 DWORD RunInjectedPeerQuitBroadcast();
 
+// Classify a native helper quit-packet sender using Revival's own peer-role
+// helpers. Returns true when classification ran successfully; the output flags
+// then indicate whether the endpoint is the active remote peer and/or a
+// spectator endpoint.
+bool TryClassifyRevivalQuitEndpoint(
+    const char* endpointText,
+    bool* outIsActivePeer,
+    bool* outIsSpectator);
+
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
 
