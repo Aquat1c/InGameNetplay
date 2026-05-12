@@ -740,6 +740,303 @@ static bool ShouldRedirectCreateProcessA(LPCSTR lpApplicationName, LPCSTR lpComm
         || ContainsInsensitiveAscii(lpCommandLine, "efz.exe");
 }
 
+static bool LooksLikePauseChildLaunchA(LPCSTR lpApplicationName, LPCSTR lpCommandLine)
+{
+    return ContainsInsensitiveAscii(lpApplicationName, "pause")
+        || ContainsInsensitiveAscii(lpCommandLine, "pause")
+        || ContainsInsensitiveAscii(lpApplicationName, "cmd.exe")
+        || ContainsInsensitiveAscii(lpCommandLine, "cmd.exe");
+}
+
+struct PendingConsoleSourceView
+{
+    const char* tag;
+    const std::string* text;
+};
+
+static bool TryMapBlockedChildConsoleErrorText(const std::string& text, std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty())
+    {
+        return false;
+    }
+
+    if (ContainsCaseInsensitive(trimmed, "Connection timed out"))
+    {
+        *outText = "Connection timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Source quit or timed out"))
+    {
+        *outText = "Source quit or timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Host timed out"))
+    {
+        *outText = "Host timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Remote timed out"))
+    {
+        *outText = "Remote timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Only one net instance allowed"))
+    {
+        *outText = "Only one net instance allowed";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Spectators have been disabled"))
+    {
+        *outText = "Spectators have been disabled by the host";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Socket error"))
+    {
+        *outText = trimmed.substr(0, 120);
+        return true;
+    }
+
+    return false;
+}
+
+static bool TryReadBlockedChildConsoleScreenText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    HANDLE hConsoleOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hConsoleOutput == nullptr || hConsoleOutput == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    CONSOLE_SCREEN_BUFFER_INFO info = {};
+    if (!GetConsoleScreenBufferInfo(hConsoleOutput, &info))
+    {
+        return false;
+    }
+
+    if (info.dwSize.X <= 0)
+    {
+        return false;
+    }
+
+    SHORT startY = static_cast<SHORT>(info.dwCursorPosition.Y - 4);
+    if (startY < info.srWindow.Top)
+    {
+        startY = info.srWindow.Top;
+    }
+
+    SHORT endY = info.dwCursorPosition.Y;
+    if (endY > info.srWindow.Bottom)
+    {
+        endY = info.srWindow.Bottom;
+    }
+
+    if (startY > endY)
+    {
+        return false;
+    }
+
+    std::string snapshot;
+    for (SHORT row = startY; row <= endY; ++row)
+    {
+        std::wstring wideLine(static_cast<size_t>(info.dwSize.X), L'\0');
+        DWORD charsRead = 0;
+        COORD readCoord = {0, row};
+        if (!ReadConsoleOutputCharacterW(
+                hConsoleOutput,
+                wideLine.data(),
+                static_cast<DWORD>(wideLine.size()),
+                readCoord,
+                &charsRead)
+            || charsRead == 0)
+        {
+            continue;
+        }
+
+        wideLine.resize(static_cast<size_t>(charsRead));
+
+        int utf8Bytes = WideCharToMultiByte(CP_UTF8, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        UINT codePage = CP_UTF8;
+        if (utf8Bytes <= 0)
+        {
+            codePage = CP_ACP;
+            utf8Bytes = WideCharToMultiByte(codePage, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        }
+        if (utf8Bytes <= 0)
+        {
+            continue;
+        }
+
+        std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+        if (WideCharToMultiByte(
+                codePage,
+                0,
+                wideLine.data(),
+                static_cast<int>(wideLine.size()),
+                utf8.data(),
+                utf8Bytes,
+                nullptr,
+                nullptr)
+            <= 0)
+        {
+            continue;
+        }
+
+        const std::string trimmed = TrimAscii(utf8);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!snapshot.empty())
+        {
+            snapshot.push_back('\n');
+        }
+        snapshot.append(trimmed);
+    }
+
+    if (snapshot.empty())
+    {
+        return false;
+    }
+
+    *outText = snapshot;
+    return true;
+}
+
+static std::string DescribeBlockedChildConsoleScreenText()
+{
+    std::string snapshot;
+    if (!TryReadBlockedChildConsoleScreenText(&snapshot))
+    {
+        return {};
+    }
+
+    const std::string trimmed = TrimAscii(snapshot);
+    if (trimmed.size() <= 120)
+    {
+        return trimmed;
+    }
+
+    return trimmed.substr(0, 120) + "...";
+}
+
+static bool TryExtractBlockedChildPendingConsoleErrorText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    std::string screenSnapshot;
+    if (TryReadBlockedChildConsoleScreenText(&screenSnapshot)
+        && TryMapBlockedChildConsoleErrorText(screenSnapshot, outText))
+    {
+        return true;
+    }
+
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string bestRawText;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (TryMapBlockedChildConsoleErrorText(trimmed, outText))
+        {
+            return true;
+        }
+
+        if (trimmed.size() > bestRawText.size())
+        {
+            bestRawText = trimmed;
+        }
+    }
+
+    if (bestRawText.empty())
+    {
+        return false;
+    }
+
+    *outText = bestRawText.substr(0, 120);
+    return true;
+}
+
+static std::string DescribeBlockedChildPendingConsoleText()
+{
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string summary;
+    constexpr size_t kMaxPreviewLen = 80;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!summary.empty())
+        {
+            summary.append(" | ");
+        }
+        summary.append(source.tag);
+        summary.push_back('=');
+        summary.push_back('\'');
+        if (trimmed.size() > kMaxPreviewLen)
+        {
+            summary.append(trimmed.substr(0, kMaxPreviewLen));
+            summary.append("...");
+        }
+        else
+        {
+            summary.append(trimmed);
+        }
+        summary.push_back('\'');
+    }
+
+    return summary;
+}
+
 enum class RedirectHostSource
 {
     InjectedBlock,
@@ -813,6 +1110,23 @@ static bool ResolveHostProcessForRedirect(HANDLE* outProcessHandle, uint32_t* ou
         *outSource = RedirectHostSource::TempIpc;
     }
     return true;
+}
+
+static LONG PeekPublishedConsoleErrorSerial()
+{
+    if (g_injectedBlock != nullptr)
+    {
+        return InterlockedCompareExchange(&g_injectedBlock->consoleErrorSerial, 0, 0);
+    }
+
+    TempIpcContext temp = {};
+    LONG serial = 0;
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        serial = InterlockedCompareExchange(&temp.block->consoleErrorSerial, 0, 0);
+    }
+    CloseTempIpcContext(&temp);
+    return serial;
 }
 
 static uintptr_t ResolveInjectedInitAddress()
@@ -929,17 +1243,45 @@ BOOL StubCreateProcessA(
 
     if (!ShouldRedirectCreateProcessA(lpApplicationName, lpCommandLine))
     {
-        return CreateProcessA(
-            lpApplicationName,
-            lpCommandLine,
-            lpProcessAttributes,
-            lpThreadAttributes,
-            bInheritHandles,
-            dwCreationFlags,
-            lpEnvironment,
-            lpCurrentDirectory,
-            lpStartupInfo,
-            lpProcessInformation);
+        const LONG errorSerialBefore = PeekPublishedConsoleErrorSerial();
+        const std::string pendingErrorTextBeforeFlush = []() {
+            std::string text;
+            TryExtractBlockedChildPendingConsoleErrorText(&text);
+            return text;
+        }();
+        const std::string screenPreviewBeforeFlush = DescribeBlockedChildConsoleScreenText();
+        const std::string pendingPreviewBeforeFlush = DescribeBlockedChildPendingConsoleText();
+        FlushPendingConsoleOutput("before_CreateProcessA_system");
+        LONG errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        const bool looksLikePause = LooksLikePauseChildLaunchA(lpApplicationName, lpCommandLine);
+        if (errorSerialAfter <= errorSerialBefore)
+        {
+            if (!pendingErrorTextBeforeFlush.empty())
+            {
+                PublishConsoleError(pendingErrorTextBeforeFlush.c_str());
+            }
+            else
+            {
+                PublishConsoleError(
+                    looksLikePause
+                        ? "Revival entered a native pause prompt"
+                        : "Revival attempted an unexpected child process");
+            }
+            errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        }
+
+        mod::Log(
+            "nb_stub_CreateProcessA: blocked helper child process app='%s' cmd='%s' pause=%d consoleErrorBefore=%ld consoleErrorAfter=%ld pendingError='%s' screenPreview='%s' pendingPreview=%s",
+            lpApplicationName != nullptr ? lpApplicationName : "",
+            lpCommandLine != nullptr ? lpCommandLine : "",
+            looksLikePause ? 1 : 0,
+            static_cast<long>(errorSerialBefore),
+            static_cast<long>(errorSerialAfter),
+            pendingErrorTextBeforeFlush.c_str(),
+            screenPreviewBeforeFlush.c_str(),
+            pendingPreviewBeforeFlush.empty() ? "<empty>" : pendingPreviewBeforeFlush.c_str());
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
     }
 
     if (lpProcessInformation == nullptr)
