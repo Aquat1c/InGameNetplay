@@ -1,6 +1,8 @@
 // Revival DLL memory introspection and session field manipulation.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "crash_handler.h"
 
 #include <cmath>
@@ -543,6 +545,35 @@ bool ReadRevivalSyncFlags(RevivalSyncFlags* outFlags)
 // save/restore logic further below.
 static bool g_dllExitProcessPatchesSaved = false;
 
+int ComputeDelaySetupReadyFromPromptState(
+    int promptSerial,
+    int promptServedSerial,
+    int phase,
+    int roleFlag)
+{
+    if (promptSerial > 0)
+    {
+        return 1;
+    }
+
+    if (promptServedSerial > 0)
+    {
+        static int s_lastSuppressedServedSerial = 0;
+        if (s_lastSuppressedServedSerial != promptServedSerial)
+        {
+            s_lastSuppressedServedSerial = promptServedSerial;
+            mod::Log(
+                "DelayPromptState: suppressed stale served-only signal promptSerial=%d servedSerial=%d phase=%d role=%d",
+                promptSerial,
+                promptServedSerial,
+                phase,
+                roleFlag);
+        }
+    }
+
+    return 0;
+}
+
 void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
 {
     if (ioStatus == nullptr)
@@ -640,9 +671,11 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
             ioStatus->rollbackFrames = promptMetrics.recommendedDelay;
         }
         ioStatus->delaySetupReady =
-            (ioStatus->delayPromptSerial > 0 || ioStatus->delayPromptServedSerial > 0)
-                ? 1
-                : 0;
+            ComputeDelaySetupReadyFromPromptState(
+                ioStatus->delayPromptSerial,
+                ioStatus->delayPromptServedSerial,
+                ioStatus->phase,
+                ioStatus->roleFlag);
         return;
     }
 
@@ -859,9 +892,11 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     }
 
     ioStatus->delaySetupReady =
-        (ioStatus->delayPromptSerial > 0 || ioStatus->delayPromptServedSerial > 0)
-            ? 1
-            : 0;
+        ComputeDelaySetupReadyFromPromptState(
+            ioStatus->delayPromptSerial,
+            ioStatus->delayPromptServedSerial,
+            ioStatus->phase,
+            ioStatus->roleFlag);
 
     // --- End timing guard ---------------------------------------------------
     QueryPerformanceCounter(&rrsQpcEnd);
@@ -1762,6 +1797,17 @@ bool ForceLocalPlayInit()
 
     IncrementForceLocalPlayInitCount();
     const int callCount = GetForceLocalPlayInitCount();
+    if (netplay::bridge::recovery::HasGameplayExitMenuEntryStarted()
+        || netplay::bridge::recovery::HasGameplayExitMenuEntryBeenConsumed()
+        || netplay::bridge::recovery::WasGameplayExitRecoveryCompleted()
+        || netplay::bridge::frontend_return::HasConsumedNetplayMenuContinuation())
+    {
+        mod::Log(
+            "GAMEPLAY_EXIT_INVARIANT_VIOLATION name=force_local_after_menu_entry callCount=%d state=%s frontendReturnState=%s",
+            callCount,
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+            netplay::bridge::frontend_return::CurrentStateName());
+    }
 
     // --- Full snapshot BEFORE init() ---
     LogInitWriteSnapshot("ForceLocalPlayInit_pre");
@@ -1994,7 +2040,7 @@ bool SaveRenderContext()
     return true;
 }
 
-bool RestoreRenderContext()
+static bool RestoreRenderContextInternal(bool consumeSaved)
 {
     if (!g_renderContextSaved || g_savedRenderContext == 0)
     {
@@ -2031,9 +2077,63 @@ bool RestoreRenderContext()
                                    : (currentRenderCtx == g_savedRenderContext
                                           ? "unchanged"
                                           : "was different"));
-    g_renderContextSaved = false;
+    if (consumeSaved)
+    {
+        g_renderContextSaved = false;
+    }
     return true;
 }
+
+bool RestoreRenderContext()
+{
+    return RestoreRenderContextInternal(/*consumeSaved=*/true);
+}
+
+bool RestoreRenderContextForGameplayExitCleanup()
+{
+    return RestoreRenderContextInternal(/*consumeSaved=*/false);
+}
+
+void MarkRenderContextConsumedForGameplayExitCleanup()
+{
+    g_renderContextSaved = false;
+}
+
+bool ClearRevivalTextWithCurrentRenderContext()
+{
+    if (g_activeRevival == nullptr
+        || g_activeRevival->clearTextRva == 0)
+    {
+        return false;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    const uintptr_t fnAddr = base + g_activeRevival->clearTextRva;
+
+    __try
+    {
+        typedef void(__cdecl* ClearTextFn)();
+        auto clearFn = reinterpret_cast<ClearTextFn>(fnAddr);
+        clearFn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mod::Log("ClearRevivalText: SEH exception 0x%08lX at 0x%08lX",
+                 static_cast<unsigned long>(GetExceptionCode()),
+                 static_cast<unsigned long>(fnAddr));
+        return false;
+    }
+
+    return true;
+}
+
+bool DisableRevivalTextRenderingWithCurrentRenderContext();
 
 // ---------------------------------------------------------------------------
 // ClearRevivalText — clear the Revival text overlay buffer.
@@ -2064,8 +2164,6 @@ bool ClearRevivalText()
         return false;
     }
 
-    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
-
     // Restore the EfzRender* global if it was zeroed by cleanup code.
     if (!RestoreRenderContext())
     {
@@ -2073,23 +2171,7 @@ bool ClearRevivalText()
         return false;
     }
 
-    const uintptr_t fnAddr = base + g_activeRevival->clearTextRva;
-
-    __try
-    {
-        typedef void(__cdecl* ClearTextFn)();
-        auto clearFn = reinterpret_cast<ClearTextFn>(fnAddr);
-        clearFn();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        mod::Log("ClearRevivalText: SEH exception 0x%08lX at 0x%08lX",
-                 static_cast<unsigned long>(GetExceptionCode()),
-                 static_cast<unsigned long>(fnAddr));
-        return false;
-    }
-
-    return true;
+    return ClearRevivalTextWithCurrentRenderContext();
 }
 
 // ---------------------------------------------------------------------------
@@ -2129,6 +2211,24 @@ bool DisableRevivalTextRendering()
         return false;
     }
 
+    return DisableRevivalTextRenderingWithCurrentRenderContext();
+}
+
+bool DisableRevivalTextRenderingWithCurrentRenderContext()
+{
+    if (g_activeRevival == nullptr
+        || g_activeRevival->setTextEnabledRva == 0
+        || g_activeRevival->renderContextGlobalOffset < 0x18)
+    {
+        return false;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return false;
+    }
+
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
     const uintptr_t fnAddr = base + g_activeRevival->setTextEnabledRva;
     void* contextBase = reinterpret_cast<void*>(
@@ -2152,6 +2252,176 @@ bool DisableRevivalTextRendering()
 
     mod::Log("DisableRevivalTextRendering: text rendering disabled");
     return true;
+}
+
+namespace
+{
+struct RevivalGraphicsPatchSite
+{
+    uintptr_t addr;
+    uint8_t disabledBytes[5];
+};
+
+constexpr RevivalGraphicsPatchSite kRevivalGraphicsPatchSites[] = {
+    {0x00409A90u, {0xE9, 0x17, 0x03, 0x00, 0x00}},
+    {0x0040A0B0u, {0xE9, 0x79, 0x03, 0x00, 0x00}},
+    {0x0040A440u, {0xE9, 0x59, 0x03, 0x00, 0x00}},
+    {0x0040A7B0u, {0xE9, 0x1E, 0x03, 0x00, 0x00}},
+    {0x0040B300u, {0xE9, 0x2C, 0x01, 0x00, 0x00}},
+    {0x0040B44Cu, {0xE9, 0x76, 0x01, 0x00, 0x00}},
+    {0x0040AAE0u, {0xE9, 0x20, 0x03, 0x00, 0x00}},
+};
+
+uintptr_t ResolveEfzImageVaForPatchVerify(uintptr_t va)
+{
+    constexpr uintptr_t kEfzImageBase = 0x00400000u;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (base == 0 || va < kEfzImageBase)
+    {
+        return va;
+    }
+    return base + (va - kEfzImageBase);
+}
+
+bool ReadFiveBytesForPatchVerify(uintptr_t address, uint8_t* outBytes)
+{
+    if (outBytes == nullptr)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < 5; ++i)
+    {
+        if (!SafeReadByte(
+                reinterpret_cast<const void*>(address + i),
+                &outBytes[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VerifyRevivalGraphicsPatchSitesEnabled(const char* reason)
+{
+    bool allOk = true;
+    for (size_t i = 0; i < sizeof(kRevivalGraphicsPatchSites) / sizeof(kRevivalGraphicsPatchSites[0]); ++i)
+    {
+        const RevivalGraphicsPatchSite& site = kRevivalGraphicsPatchSites[i];
+        const uintptr_t runtimeAddr = ResolveEfzImageVaForPatchVerify(site.addr);
+        uint8_t actual[5] = {};
+        const bool readOk = ReadFiveBytesForPatchVerify(runtimeAddr, actual);
+        const bool matchesDisabled =
+            readOk
+            && actual[0] == site.disabledBytes[0]
+            && actual[1] == site.disabledBytes[1]
+            && actual[2] == site.disabledBytes[2]
+            && actual[3] == site.disabledBytes[3]
+            && actual[4] == site.disabledBytes[4];
+        const bool ok = readOk && !matchesDisabled;
+        allOk = allOk && ok;
+        mod::Log(
+            "REVIVAL_GRAPHICS_PATCH_SITE_VERIFY addr=0x%08lX expected=not_%02X%02X%02X%02X%02X actual=%02X%02X%02X%02X%02X ok=%d reason=%s",
+            static_cast<unsigned long>(site.addr),
+            site.disabledBytes[0],
+            site.disabledBytes[1],
+            site.disabledBytes[2],
+            site.disabledBytes[3],
+            site.disabledBytes[4],
+            actual[0],
+            actual[1],
+            actual[2],
+            actual[3],
+            actual[4],
+            ok ? 1 : 0,
+            (reason != nullptr && reason[0] != '\0') ? reason : "unknown");
+    }
+    return allOk;
+}
+}
+
+int GetRevivalGraphicsPatchState()
+{
+    if (g_activeRevival == nullptr || g_activeRevival->initOnceGuardOffset == 0)
+    {
+        return -1;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return -1;
+    }
+
+    uint16_t guard = 0;
+    if (!SafeReadWord(
+            reinterpret_cast<const void*>(
+                reinterpret_cast<uintptr_t>(revival) + g_activeRevival->initOnceGuardOffset),
+            &guard))
+    {
+        return -1;
+    }
+
+    return static_cast<int>((guard >> 8) & 0x00FFu);
+}
+
+bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason)
+{
+    const char* reasonTag =
+        (reason != nullptr && reason[0] != '\0') ? reason : "unknown";
+    const int stateBefore = GetRevivalGraphicsPatchState();
+    mod::Log(
+        "REVIVAL_GRAPHICS_PATCH_RESTORE_CHECK reason=%s stateBefore=%d",
+        reasonTag,
+        stateBefore);
+
+    bool applyOk = stateBefore == 1;
+    if (stateBefore != 1)
+    {
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival != nullptr
+            && g_activeRevival != nullptr
+            && g_activeRevival->clearTextRva != 0)
+        {
+            // In the 1.02e decomp, EFZ_Patch_ToggleSet is at clearTextRva + 0x6D0.
+            // Supported profiles keep these render helpers in the same local cluster.
+            const uintptr_t fnAddr =
+                reinterpret_cast<uintptr_t>(revival)
+                + g_activeRevival->clearTextRva
+                + 0x6D0u;
+            __try
+            {
+                using TogglePatchSetFn = char(__thiscall*)(void* context, char enable);
+                auto togglePatchSet = reinterpret_cast<TogglePatchSetFn>(fnAddr);
+                const char result = togglePatchSet(nullptr, 1);
+                applyOk = result != 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                applyOk = false;
+                mod::Log(
+                    "REVIVAL_GRAPHICS_PATCH_RESTORE_APPLY_EXCEPTION reason=%s code=0x%08lX",
+                    reasonTag,
+                    static_cast<unsigned long>(GetExceptionCode()));
+            }
+        }
+    }
+
+    mod::Log(
+        "REVIVAL_GRAPHICS_PATCH_RESTORE_APPLY reason=%s result=%d stateBefore=%d",
+        reasonTag,
+        applyOk ? 1 : 0,
+        stateBefore);
+
+    const int stateAfter = GetRevivalGraphicsPatchState();
+    const bool sitesOk = VerifyRevivalGraphicsPatchSitesEnabled(reasonTag);
+    const bool ok = applyOk && stateAfter == 1 && sitesOk;
+    mod::Log(
+        "REVIVAL_GRAPHICS_PATCH_RESTORE_VERIFY reason=%s stateAfter=%d ok=%d",
+        reasonTag,
+        stateAfter,
+        ok ? 1 : 0);
+    return ok;
 }
 
 void ResetDebugCounters(SharedBlock* block)
@@ -3272,6 +3542,10 @@ static bool    g_perFrameMismatchLogged     = false;
 // mid-tick causes a use-after-free crash in SetEvent(this[2]).
 static volatile bool g_insideFrameTick = false;
 static volatile bool g_deferredCancelCleanup = false;
+static char g_deferredCancelCleanupReason[64] = {};
+static uint8_t g_deferredCancelCleanupSourceScreen = 0xFF;
+static int g_deferredCancelCleanupSourceRole = -1;
+static uint32_t g_deferredCancelCleanupSourceFrame = 0;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
 static volatile LONG g_localBattleEscQuitRingIgnoreArmed = 0;
 static volatile LONG* g_quitRingHeader = nullptr;
@@ -3312,6 +3586,726 @@ using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
 static PerFrameTickFn g_origPerFrameTick = nullptr;
 
 static uint32_t g_frameTick = 0;           // monotonic per-frame counter
+
+struct GameplayStallSample
+{
+    uint8_t screen = 0xFF;
+    int mode = -1;
+    uint32_t frameTick = 0;
+    bool originalTickBypassed = false;
+    bool originalTickSkipped = false;
+    bool originalTickRan = false;
+    int syncFrame = -1;
+    bool syncFrameValid = false;
+    LONG consoleErrorSerial = 0;
+    int phase = -1;
+    int role = -1;
+    DWORD nowMs = 0;
+    bool recoveryInProgress = false;
+    bool pendingMenuEntry = false;
+    bool recoveryCompleted = false;
+};
+
+struct GameplayStallTrackerState
+{
+    bool active = false;
+    bool syncFrameTracked = false;
+    DWORD stallStartMs = 0;
+    DWORD lastProgressLogMs = 0;
+    DWORD lastSyncFrameChangeMs = 0;
+    uint32_t stallStartFrameTick = 0;
+    uint32_t lastSyncFrameChangeTick = 0;
+    uint32_t bypassCount = 0;
+    int lastSyncFrame = -1;
+    uint8_t screen = 0xFF;
+    int mode = -1;
+};
+
+static GameplayStallTrackerState g_gameplayStall = {};
+static volatile LONG g_gameplayStallLocalProcessCloseActive = 0;
+static constexpr DWORD kGameplayStallConsoleErrorMs = 250u;
+static constexpr DWORD kGameplayStallSyncFrameMs = 5000u;
+static constexpr DWORD kGameplayStallWallTimeoutMs = 30000u;
+static constexpr DWORD kGameplayStallProgressLogMs = 1000u;
+
+static uint8_t ReadCurrentScreenIndexForRecovery()
+{
+    uint8_t screen = 0xFF;
+    __try
+    {
+        screen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return screen;
+}
+
+static int ReadCurrentGameModeForRecovery()
+{
+    constexpr uintptr_t kGameSystemPtr = 0x0079010C;
+    constexpr uint32_t kModeOffset = 4964;
+
+    uint8_t mode = 0xFF;
+    __try
+    {
+        const uint32_t gameSys =
+            *reinterpret_cast<const volatile uint32_t*>(kGameSystemPtr);
+        if (gameSys != 0)
+        {
+            mode = *reinterpret_cast<const volatile uint8_t*>(gameSys + kModeOffset);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return mode == 0xFF ? -1 : static_cast<int>(mode);
+}
+
+static bool IsGameplayExitRecoveryScreen(uint8_t screen)
+{
+    return screen == 3 || screen == 5;
+}
+
+static bool ReadGameplaySyncFrameForRecovery(uintptr_t sessionPtr, int* outSyncFrame)
+{
+    if (outSyncFrame == nullptr)
+    {
+        return false;
+    }
+    *outSyncFrame = -1;
+    if (sessionPtr == 0 || g_activeRevival == nullptr)
+    {
+        return false;
+    }
+
+    const uintptr_t gmBase =
+        sessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot;
+    return SafeReadInt(
+        reinterpret_cast<const void*>(gmBase + 20),
+        outSyncFrame);
+}
+
+struct RevivalRemoteInputDiagSnapshot
+{
+    bool valid = false;
+    uintptr_t session = 0;
+    uint8_t screen = 0xFF;
+    int state = -1;
+    int currentFrame = -1;
+    int inputDelay = -1;
+    int windowBaseDelay = -1;
+    int activePlayer = -1;
+    int localLen = -1;
+    int remoteLen = -1;
+    uint32_t pingStruct[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+    int waitDelay = -1;
+    int patchState = -1;
+    int initGuardLow = -1;
+    bool pauseRemoteInput = false;
+};
+
+static int ReadTwoByteSpanLengthForDiag(uintptr_t spanAddr)
+{
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(spanAddr), &begin)
+        || !SafeReadPtr(reinterpret_cast<const void*>(spanAddr + 4), &end)
+        || begin == 0
+        || end < begin)
+    {
+        return -1;
+    }
+
+    return static_cast<int>((end - begin) >> 1);
+}
+
+static void CaptureRevivalRemoteInputDiag(
+    uintptr_t sessionPtr,
+    RevivalRemoteInputDiagSnapshot* outSnapshot)
+{
+    if (outSnapshot == nullptr)
+    {
+        return;
+    }
+
+    *outSnapshot = RevivalRemoteInputDiagSnapshot{};
+    outSnapshot->session = sessionPtr;
+    outSnapshot->screen = ReadCurrentScreenIndexForRecovery();
+
+    if (sessionPtr == 0 || g_activeRevival == nullptr)
+    {
+        return;
+    }
+
+    outSnapshot->valid = true;
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(
+            sessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot + 4),
+        &outSnapshot->state);
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(
+            sessionPtr + g_activeRevival->sessionOffsetCurrentFrame),
+        &outSnapshot->currentFrame);
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(
+            sessionPtr + g_activeRevival->sessionOffsetInputDelay),
+        &outSnapshot->inputDelay);
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(
+            sessionPtr + g_activeRevival->sessionOffsetInputDelay + 4),
+        &outSnapshot->windowBaseDelay);
+    (void)SafeReadInt(
+        reinterpret_cast<const void*>(
+            sessionPtr + g_activeRevival->sessionOffsetActivePlayer),
+        &outSnapshot->activePlayer);
+
+    outSnapshot->localLen = ReadTwoByteSpanLengthForDiag(
+        sessionPtr + g_activeRevival->sessionOffsetHistoryPrimaryVec);
+    outSnapshot->remoteLen = ReadTwoByteSpanLengthForDiag(
+        sessionPtr + g_activeRevival->sessionOffsetHistorySecondaryVec);
+
+    const uintptr_t pingBase =
+        sessionPtr + g_activeRevival->sessionOffsetPingStructBase;
+    for (int i = 0; i < 4; ++i)
+    {
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(pingBase + static_cast<uintptr_t>(i) * 4u),
+            reinterpret_cast<int*>(&outSnapshot->pingStruct[i]));
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival != nullptr)
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+        uint16_t guard = 0;
+        if (g_activeRevival->initOnceGuardOffset != 0
+            && SafeReadWord(
+                reinterpret_cast<const void*>(
+                    base + g_activeRevival->initOnceGuardOffset),
+                &guard))
+        {
+            outSnapshot->initGuardLow = static_cast<int>(guard & 0x00FFu);
+            outSnapshot->patchState = static_cast<int>((guard >> 8) & 0x00FFu);
+        }
+
+        uintptr_t timerPtr = 0;
+        double timerScalar = 0.0;
+        if (g_activeRevival->timerPtrOffset != 0
+            && SafeReadPtr(
+                reinterpret_cast<const void*>(
+                    base + g_activeRevival->timerPtrOffset),
+                &timerPtr)
+            && timerPtr != 0
+            && SafeReadDouble(reinterpret_cast<const void*>(timerPtr + 32),
+                &timerScalar)
+            && timerScalar > 0.0)
+        {
+            outSnapshot->waitDelay = static_cast<int>(
+                ceil(static_cast<double>(outSnapshot->pingStruct[3])
+                     / (2.0 * timerScalar)));
+        }
+    }
+
+    if (outSnapshot->waitDelay < 0)
+    {
+        outSnapshot->waitDelay = 0;
+    }
+
+    const int waitLoopCandidate =
+        outSnapshot->localLen - outSnapshot->waitDelay - 1;
+    outSnapshot->pauseRemoteInput =
+        outSnapshot->valid
+        && outSnapshot->state == 3
+        && outSnapshot->windowBaseDelay == 0
+        && outSnapshot->localLen >= 0
+        && outSnapshot->remoteLen >= 0
+        && waitLoopCandidate >= outSnapshot->remoteLen;
+}
+
+static bool ShouldLogRevivalRemoteInputDiag(
+    const RevivalRemoteInputDiagSnapshot& snapshot)
+{
+    return snapshot.valid
+        && g_localRoleFlag == kLocalRoleOnline
+        && (snapshot.screen == 3 || snapshot.state == 3);
+}
+
+static const char* GameplayStallOriginToString(
+    netplay::bridge::recovery::GameplayExitOrigin origin)
+{
+    switch (origin)
+    {
+    case netplay::bridge::recovery::GameplayExitOrigin::BypassStallConsoleError:
+        return "bypass_stall_console_error";
+    case netplay::bridge::recovery::GameplayExitOrigin::BypassStallSyncFrameStalled:
+        return "bypass_stall_syncframe_stalled";
+    case netplay::bridge::recovery::GameplayExitOrigin::BypassStallWallTimeout:
+        return "bypass_stall_wall_timeout";
+    default:
+        return "unknown";
+    }
+}
+
+static DWORD GameplayStallElapsedMs(const GameplayStallSample& sample)
+{
+    return g_gameplayStall.active
+        ? sample.nowMs - g_gameplayStall.stallStartMs
+        : 0u;
+}
+
+static DWORD GameplayStallSyncFrameStallMs(const GameplayStallSample& sample)
+{
+    if (!g_gameplayStall.syncFrameTracked)
+    {
+        return GameplayStallElapsedMs(sample);
+    }
+    return sample.nowMs - g_gameplayStall.lastSyncFrameChangeMs;
+}
+
+static void ResetGameplayStallTracker(
+    const char* reason,
+    const GameplayStallSample& sample,
+    bool clearSyncTracking)
+{
+    if (g_gameplayStall.active)
+    {
+        mod::Log(
+            "STALL_TRACK_RESET reason=%s previousStallMs=%lu previousBypassCount=%u previousSyncFrame=%d currentSyncFrame=%d screen=%u mode=%d",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(GameplayStallElapsedMs(sample)),
+            g_gameplayStall.bypassCount,
+            g_gameplayStall.lastSyncFrame,
+            sample.syncFrameValid ? sample.syncFrame : -1,
+            static_cast<unsigned>(sample.screen),
+            sample.mode);
+    }
+
+    g_gameplayStall.active = false;
+    g_gameplayStall.stallStartMs = 0;
+    g_gameplayStall.lastProgressLogMs = 0;
+    g_gameplayStall.stallStartFrameTick = 0;
+    g_gameplayStall.bypassCount = 0;
+    g_gameplayStall.screen = 0xFF;
+    g_gameplayStall.mode = -1;
+
+    if (clearSyncTracking)
+    {
+        g_gameplayStall.syncFrameTracked = false;
+        g_gameplayStall.lastSyncFrame = -1;
+        g_gameplayStall.lastSyncFrameChangeMs = 0;
+        g_gameplayStall.lastSyncFrameChangeTick = 0;
+    }
+}
+
+void NotifyLocalProcessCloseForGameplayStall()
+{
+    InterlockedExchange(&g_gameplayStallLocalProcessCloseActive, 1);
+
+    GameplayStallSample sample = {};
+    sample.screen = ReadCurrentScreenIndexForRecovery();
+    sample.mode = ReadCurrentGameModeForRecovery();
+    sample.frameTick = g_frameTick;
+    sample.nowMs = GetTickCount();
+    sample.role = g_localRoleFlag;
+    sample.recoveryInProgress =
+        netplay::bridge::recovery::IsGameplayExitRecoveryInProgress();
+    sample.pendingMenuEntry =
+        netplay::bridge::recovery::HasPendingGameplayExitMenuEntry();
+    sample.recoveryCompleted =
+        netplay::bridge::recovery::WasGameplayExitRecoveryCompleted();
+    const NetbridgeStatus status = netplay::bridge::GetStatus();
+    sample.phase = status.phase;
+
+    ResetGameplayStallTracker("local_process_close", sample, true);
+}
+
+void ClearLocalProcessCloseForGameplayStall()
+{
+    InterlockedExchange(&g_gameplayStallLocalProcessCloseActive, 0);
+}
+
+static void BeginGameplayStallTracker(
+    const char* reason,
+    const GameplayStallSample& sample)
+{
+    const bool startsFromSyncFreeze =
+        !sample.originalTickBypassed
+        && !sample.originalTickSkipped
+        && sample.screen == 3
+        && sample.syncFrameValid
+        && g_gameplayStall.syncFrameTracked;
+
+    g_gameplayStall.active = true;
+    g_gameplayStall.stallStartMs = startsFromSyncFreeze
+        ? g_gameplayStall.lastSyncFrameChangeMs
+        : sample.nowMs;
+    g_gameplayStall.lastProgressLogMs = sample.nowMs;
+    g_gameplayStall.stallStartFrameTick = startsFromSyncFreeze
+        ? g_gameplayStall.lastSyncFrameChangeTick
+        : sample.frameTick;
+    g_gameplayStall.bypassCount =
+        (sample.originalTickBypassed || sample.originalTickSkipped) ? 1u : 0u;
+    g_gameplayStall.screen = sample.screen;
+    g_gameplayStall.mode = sample.mode;
+
+    if (sample.syncFrameValid && !g_gameplayStall.syncFrameTracked)
+    {
+        g_gameplayStall.syncFrameTracked = true;
+        g_gameplayStall.lastSyncFrame = sample.syncFrame;
+        g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
+        g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
+    }
+
+    mod::Log(
+        "STALL_TRACK_BEGIN screen=%u mode=%d frameTick=%u syncFrame=%d consoleErrorSerial=%ld reason=%s",
+        static_cast<unsigned>(sample.screen),
+        sample.mode,
+        sample.frameTick,
+        sample.syncFrameValid ? sample.syncFrame : -1,
+        static_cast<long>(sample.consoleErrorSerial),
+        reason != nullptr ? reason : "unknown");
+}
+
+static void LogGameplayStallProgressIfDue(const GameplayStallSample& sample)
+{
+    const DWORD stallMs = GameplayStallElapsedMs(sample);
+    if (sample.nowMs - g_gameplayStall.lastProgressLogMs
+        < kGameplayStallProgressLogMs)
+    {
+        return;
+    }
+
+    g_gameplayStall.lastProgressLogMs = sample.nowMs;
+    mod::Log(
+        "STALL_TRACK_PROGRESS screen=%u mode=%d stallMs=%lu syncFrame=%d syncFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld recoveryInProgress=%d phase=%d role=%d",
+        static_cast<unsigned>(sample.screen),
+        sample.mode,
+        static_cast<unsigned long>(stallMs),
+        sample.syncFrameValid ? sample.syncFrame : -1,
+        static_cast<unsigned long>(GameplayStallSyncFrameStallMs(sample)),
+        g_gameplayStall.bypassCount,
+        static_cast<long>(sample.consoleErrorSerial),
+        sample.recoveryInProgress ? 1 : 0,
+        sample.phase,
+        sample.role);
+}
+
+static void LogGameplayStallSuppressed(
+    const char* reason,
+    const GameplayStallSample& sample)
+{
+    mod::Log(
+        "STALL_RECOVERY_SUPPRESSED reason=%s screen=%u mode=%d stallMs=%lu recoveryInProgress=%d pendingMenuEntry=%d completed=%d phase=%d role=%d",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned>(sample.screen),
+        sample.mode,
+        static_cast<unsigned long>(GameplayStallElapsedMs(sample)),
+        sample.recoveryInProgress ? 1 : 0,
+        sample.pendingMenuEntry ? 1 : 0,
+        sample.recoveryCompleted ? 1 : 0,
+        sample.phase,
+        sample.role);
+}
+
+static bool TriggerGameplayStallRecovery(
+    netplay::bridge::recovery::GameplayExitOrigin origin,
+    const char* tier,
+    const GameplayStallSample& sample)
+{
+    const char* originTag = GameplayStallOriginToString(origin);
+    mod::Log(
+        "STALL_RECOVERY_TRIGGER origin=%s tier=%s screen=%u mode=%d stallMs=%lu syncFrame=%d syncFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld frameTick=%u phase=%d role=%d",
+        originTag,
+        tier != nullptr ? tier : "?",
+        static_cast<unsigned>(sample.screen),
+        sample.mode,
+        static_cast<unsigned long>(GameplayStallElapsedMs(sample)),
+        sample.syncFrameValid ? sample.syncFrame : -1,
+        static_cast<unsigned long>(GameplayStallSyncFrameStallMs(sample)),
+        g_gameplayStall.bypassCount,
+        static_cast<long>(sample.consoleErrorSerial),
+        sample.frameTick,
+        sample.phase,
+        sample.role);
+
+    const bool started = netplay::bridge::recovery::BeginGameplayExitRecovery(origin);
+    if (!started)
+    {
+        LogGameplayStallSuppressed("begin_recovery_failed", sample);
+    }
+    ResetGameplayStallTracker("shared_recovery_started", sample, true);
+    return true;
+}
+
+static bool UpdateGameplayStallTracker(
+    const char* reason,
+    uintptr_t currentSession,
+    bool originalTickBypassed,
+    bool originalTickSkipped,
+    bool originalTickRan)
+{
+    GameplayStallSample sample = {};
+    sample.screen = ReadCurrentScreenIndexForRecovery();
+    sample.mode = ReadCurrentGameModeForRecovery();
+    sample.frameTick = g_frameTick;
+    sample.originalTickBypassed = originalTickBypassed;
+    sample.originalTickSkipped = originalTickSkipped;
+    sample.originalTickRan = originalTickRan;
+    sample.nowMs = GetTickCount();
+    sample.role = g_localRoleFlag;
+    sample.recoveryInProgress =
+        netplay::bridge::recovery::IsGameplayExitRecoveryInProgress();
+    sample.pendingMenuEntry =
+        netplay::bridge::recovery::HasPendingGameplayExitMenuEntry();
+    sample.recoveryCompleted =
+        netplay::bridge::recovery::WasGameplayExitRecoveryCompleted();
+    if (g_hostBlock != nullptr)
+    {
+        sample.consoleErrorSerial =
+            InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0);
+    }
+    sample.syncFrameValid =
+        ReadGameplaySyncFrameForRecovery(currentSession, &sample.syncFrame);
+
+    if (!IsGameplayExitRecoveryScreen(sample.screen))
+    {
+        ResetGameplayStallTracker("screen_left_gameplay", sample, true);
+        return false;
+    }
+
+    if (InterlockedCompareExchange(
+            &g_gameplayStallLocalProcessCloseActive,
+            0,
+            0) != 0)
+    {
+        ResetGameplayStallTracker("local_process_close", sample, true);
+        return false;
+    }
+
+    const NetbridgeStatus status = netplay::bridge::GetStatus();
+    sample.phase = status.phase;
+
+    if (sample.recoveryInProgress
+        || sample.pendingMenuEntry
+        || sample.recoveryCompleted)
+    {
+        if (g_gameplayStall.active
+            || sample.originalTickBypassed
+            || sample.originalTickSkipped)
+        {
+            LogGameplayStallSuppressed("shared_recovery_active", sample);
+        }
+        ResetGameplayStallTracker("shared_recovery_active", sample, true);
+        return sample.recoveryInProgress || sample.pendingMenuEntry;
+    }
+
+    if (sample.phase != static_cast<int>(NetbridgePhase::Connected))
+    {
+        ResetGameplayStallTracker("phase_left_connected", sample, true);
+        return false;
+    }
+
+    if (sample.role != kLocalRoleOnline && sample.role != kLocalRoleSpectate)
+    {
+        ResetGameplayStallTracker("role_not_netplay", sample, true);
+        return false;
+    }
+
+    if (!g_localInitAppliedForSession || !g_dllExitProcessPatchesSaved)
+    {
+        ResetGameplayStallTracker("session_not_active", sample, true);
+        return false;
+    }
+
+    if (currentSession == 0)
+    {
+        ResetGameplayStallTracker("session_pointer_missing", sample, true);
+        return false;
+    }
+
+    if (g_revivalProcess == nullptr)
+    {
+        ResetGameplayStallTracker("helper_inactive", sample, true);
+        return false;
+    }
+
+    if (sample.syncFrameValid)
+    {
+        if (!g_gameplayStall.syncFrameTracked)
+        {
+            g_gameplayStall.syncFrameTracked = true;
+            g_gameplayStall.lastSyncFrame = sample.syncFrame;
+            g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
+            g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
+        }
+        else if (sample.syncFrame != g_gameplayStall.lastSyncFrame)
+        {
+            ResetGameplayStallTracker("syncFrame_advanced", sample, false);
+            g_gameplayStall.syncFrameTracked = true;
+            g_gameplayStall.lastSyncFrame = sample.syncFrame;
+            g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
+            g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
+            return false;
+        }
+    }
+    else if (sample.originalTickRan && !sample.originalTickBypassed)
+    {
+        ResetGameplayStallTracker("syncFrame_unavailable_after_normal_tick", sample, true);
+        return false;
+    }
+
+    const DWORD syncFrameStallMs = GameplayStallSyncFrameStallMs(sample);
+    const bool syncFrameFrozen =
+        sample.screen == 3
+        && sample.syncFrameValid
+        && g_gameplayStall.syncFrameTracked
+        && syncFrameStallMs >= kGameplayStallConsoleErrorMs;
+    const bool startCandidate =
+        sample.originalTickBypassed
+        || sample.originalTickSkipped
+        || (sample.screen == 3 && syncFrameFrozen)
+        || sample.consoleErrorSerial > 0;
+
+    if (!g_gameplayStall.active)
+    {
+        if (!startCandidate)
+        {
+            return false;
+        }
+        BeginGameplayStallTracker(reason, sample);
+    }
+    else if (sample.originalTickBypassed || sample.originalTickSkipped)
+    {
+        ++g_gameplayStall.bypassCount;
+    }
+
+    LogGameplayStallProgressIfDue(sample);
+
+    const DWORD stallMs = GameplayStallElapsedMs(sample);
+    if (sample.consoleErrorSerial > 0
+        && IsGameplayExitRecoveryScreen(sample.screen)
+        && stallMs >= kGameplayStallConsoleErrorMs)
+    {
+        return TriggerGameplayStallRecovery(
+            netplay::bridge::recovery::GameplayExitOrigin::BypassStallConsoleError,
+            "A",
+            sample);
+    }
+
+    if (sample.screen == 3
+        && sample.syncFrameValid
+        && stallMs >= kGameplayStallSyncFrameMs
+        && syncFrameStallMs >= kGameplayStallSyncFrameMs)
+    {
+        return TriggerGameplayStallRecovery(
+            netplay::bridge::recovery::GameplayExitOrigin::BypassStallSyncFrameStalled,
+            "B",
+            sample);
+    }
+
+    if (sample.screen == 3
+        && stallMs >= kGameplayStallWallTimeoutMs)
+    {
+        return TriggerGameplayStallRecovery(
+            netplay::bridge::recovery::GameplayExitOrigin::BypassStallWallTimeout,
+            "C",
+            sample);
+    }
+
+    return false;
+}
+
+static bool ShouldSuppressOldGameplayExitTeardown(const char* reason)
+{
+    if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+    {
+        mod::Log(
+            "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=%s inProgress=%d pendingMenu=%d completed=%d origin=%s state=%s frontendReturnState=%s",
+            reason != nullptr ? reason : "unknown",
+            netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+            netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+            netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+            netplay::bridge::frontend_return::CurrentStateName());
+        return true;
+    }
+    return false;
+}
+
+uint32_t GetGameplayExitRecoveryFrameTick()
+{
+    return g_frameTick;
+}
+
+bool IsGameplayExitRecoveryInsideFrameTick()
+{
+    return g_insideFrameTick;
+}
+
+bool ClearDeferredCancelCleanupForRecovery(const char* reason)
+{
+    const bool wasSet = g_deferredCancelCleanup;
+    g_deferredCancelCleanup = false;
+    mod::Log(
+        "GAMEPLAY_EXIT_CLEAR_STALE_DEFERRED_CLEANUP oldPending=%d reason=%s sourceReason=%s sourceScreen=%u sourceRole=%d sourceFrame=%u",
+        wasSet ? 1 : 0,
+        reason != nullptr ? reason : "unknown",
+        g_deferredCancelCleanupReason[0] != '\0' ? g_deferredCancelCleanupReason : "none",
+        static_cast<unsigned>(g_deferredCancelCleanupSourceScreen),
+        g_deferredCancelCleanupSourceRole,
+        g_deferredCancelCleanupSourceFrame);
+    g_deferredCancelCleanupReason[0] = '\0';
+    g_deferredCancelCleanupSourceScreen = 0xFF;
+    g_deferredCancelCleanupSourceRole = -1;
+    g_deferredCancelCleanupSourceFrame = 0;
+    return wasSet;
+}
+
+bool SuppressDeferredCancelCleanupAfterGameplayRecovery(const char* origin)
+{
+    const bool wasSet = g_deferredCancelCleanup;
+    mod::Log(
+        "GAMEPLAY_EXIT_SUPPRESS_DEFERRED_AFTER_MENU_ENTRY pending=%d origin=%s sourceReason=%s sourceScreen=%u state=%s frontendReturnState=%s",
+        wasSet ? 1 : 0,
+        origin != nullptr ? origin : "unknown",
+        g_deferredCancelCleanupReason[0] != '\0' ? g_deferredCancelCleanupReason : "none",
+        static_cast<unsigned>(g_deferredCancelCleanupSourceScreen),
+        netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+        netplay::bridge::frontend_return::CurrentStateName());
+    if (wasSet)
+    {
+        mod::Log("GAMEPLAY_EXIT_INVARIANT_VIOLATION name=deferred_cleanup_after_menu_entry");
+    }
+    (void)ClearDeferredCancelCleanupForRecovery("after_menu_entry");
+    return wasSet;
+}
+
+bool IsDeferredCancelCleanupPending()
+{
+    return g_deferredCancelCleanup;
+}
+
+bool IsDeferredCancelCleanupGameplaySource()
+{
+    return g_deferredCancelCleanup
+        && (g_deferredCancelCleanupSourceScreen == 3
+            || g_deferredCancelCleanupSourceScreen == 5);
+}
+
+const char* CurrentDeferredCancelCleanupReason()
+{
+    return g_deferredCancelCleanupReason[0] != '\0'
+        ? g_deferredCancelCleanupReason
+        : "none";
+}
+
+uint8_t CurrentDeferredCancelCleanupSourceScreen()
+{
+    return g_deferredCancelCleanupSourceScreen;
+}
 
 static bool EnsureQuitRingHeader();
 static void ReleaseQuitRingHeader();
@@ -3597,6 +4591,15 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             void* fixedThis = (currentSession != 0)
                 ? reinterpret_cast<void*>(currentSession)
                 : exeThis;
+            if (UpdateGameplayStallTracker(
+                    "double_tick_bypass",
+                    currentSession,
+                    true,
+                    false,
+                    false))
+            {
+                return 0;
+            }
             return g_origPerFrameTick(fixedThis);
         }
 
@@ -4033,15 +5036,133 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // active, in which case we skip the DLL's tick entirely.
     int result = 0;
     LARGE_INTEGER tickQpcBefore = {}, tickQpcAfter = {};
+    RevivalRemoteInputDiagSnapshot revivalTickBefore = {};
+    RevivalRemoteInputDiagSnapshot revivalTickAfter = {};
+    bool revivalRemoteDiagActive = false;
+    bool revivalBatchZeroFrameDiag = false;
+    static int s_lastZeroFrameLeftAloneFrame = -1;
+    static uint32_t s_lastZeroFrameLeftAloneTick = 0;
 
     if (!preTickDisconnect && !spectateTickHoldoff)
     {
+        CaptureRevivalRemoteInputDiag(currentSession, &revivalTickBefore);
+        revivalRemoteDiagActive =
+            ShouldLogRevivalRemoteInputDiag(revivalTickBefore);
+        if (revivalRemoteDiagActive)
+        {
+            mod::Log(
+                "REVIVAL_TICK_ENTER state=%d screen=%u currentFrame=%d "
+                "inputSizes=local:%d remote:%d delay=%d activePlayer=%d "
+                "patchState=%d",
+                revivalTickBefore.state,
+                static_cast<unsigned>(revivalTickBefore.screen),
+                revivalTickBefore.currentFrame,
+                revivalTickBefore.localLen,
+                revivalTickBefore.remoteLen,
+                revivalTickBefore.inputDelay,
+                revivalTickBefore.activePlayer,
+                revivalTickBefore.patchState);
+        }
+
+        if (revivalTickBefore.pauseRemoteInput)
+        {
+            mod::Log(
+                "REVIVAL_PAUSE_REMOTE_INPUT ping=%u delay=%d localLen=%d "
+                "remoteLen=%d returnIterations=0",
+                static_cast<unsigned>(revivalTickBefore.pingStruct[3]),
+                revivalTickBefore.waitDelay,
+                revivalTickBefore.localLen,
+                revivalTickBefore.remoteLen);
+
+            revivalBatchZeroFrameDiag = true;
+            mod::Log(
+                "REVIVAL_BATCH_RENDER_ENTER frameCount=0 patchStateBefore=%d",
+                revivalTickBefore.patchState);
+        }
+
         // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
         // point so NeutralizeExitProcess can longjmp back if ExitProcess fires
         // during the DLL's session tick (vtable[2] → RollbackLoopTick).
         QueryPerformanceCounter(&tickQpcBefore);
         result = RunPerFrameTickDispatch(fixedThis);
         QueryPerformanceCounter(&tickQpcAfter);
+
+        if (revivalRemoteDiagActive || revivalBatchZeroFrameDiag)
+        {
+            CaptureRevivalRemoteInputDiag(currentSession, &revivalTickAfter);
+            int iterations = result;
+            if (revivalTickBefore.currentFrame >= 0
+                && revivalTickAfter.currentFrame >= 0)
+            {
+                iterations =
+                    revivalTickAfter.currentFrame - revivalTickBefore.currentFrame;
+            }
+            mod::Log(
+                "REVIVAL_TICK_EXIT iterations=%d state=%d "
+                "currentFrameBefore=%d currentFrameAfter=%d rawResult=%d "
+                "patchState=%d",
+                iterations,
+                revivalTickAfter.state,
+                revivalTickBefore.currentFrame,
+                revivalTickAfter.currentFrame,
+                result,
+                revivalTickAfter.patchState);
+        }
+
+        if (revivalBatchZeroFrameDiag)
+        {
+            mod::Log(
+                "REVIVAL_BATCH_RENDER_EXIT frameCount=0 patchStateAfter=%d",
+                revivalTickAfter.patchState);
+            if (revivalTickBefore.state == 3
+                && revivalTickBefore.patchState == 1
+                && revivalTickAfter.patchState == 0)
+            {
+                mod::Log(
+                    "REVIVAL_ZERO_FRAME_PATCH_LEAK_DETECTED state=3 frameCount=0 before=1 after=0 currentFrame=%d",
+                    revivalTickBefore.currentFrame);
+                const bool restoreOk =
+                    EnsureRevivalGraphicsPatchSetEnabled(
+                        "zero_frame_patch_leak");
+                mod::Log(
+                    "REVIVAL_ZERO_FRAME_PATCH_LEAK_RESTORED result=%d",
+                    restoreOk ? 1 : 0);
+            }
+            else if (revivalTickAfter.patchState == 0)
+            {
+                const bool shouldLogLeftAlone =
+                    revivalTickBefore.currentFrame != s_lastZeroFrameLeftAloneFrame
+                    || (g_frameTick - s_lastZeroFrameLeftAloneTick) >= 60u;
+                if (shouldLogLeftAlone)
+                {
+                    s_lastZeroFrameLeftAloneFrame = revivalTickBefore.currentFrame;
+                    s_lastZeroFrameLeftAloneTick = g_frameTick;
+                    mod::Log(
+                        "REVIVAL_ZERO_FRAME_PATCH_LEAK_LEFT_ALONE reason=not_in_recovery state=%d frameCount=0 before=%d after=%d currentFrame=%d",
+                        revivalTickBefore.state,
+                        revivalTickBefore.patchState,
+                        revivalTickAfter.patchState,
+                        revivalTickBefore.currentFrame);
+                }
+            }
+        }
+    }
+
+    if (!preTickGracefulQuit)
+    {
+        const bool originalTickSkipped = preTickDisconnect || spectateTickHoldoff;
+        const bool originalTickRan = !originalTickSkipped;
+        if (UpdateGameplayStallTracker(
+                preTickDisconnect
+                    ? "pre_tick_disconnect_skip"
+                    : (spectateTickHoldoff ? "spectate_holdoff_skip" : "normal_tick"),
+                currentSession,
+                false,
+                originalTickSkipped,
+                originalTickRan))
+        {
+            return 0;
+        }
     }
 
     // ====================================================================
@@ -4675,12 +5796,28 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         const int recoveredRole = g_localRoleFlag;
         const DWORD recoveredPid = g_revivalProcessId;
+        const uint8_t recoveryScreen = ReadCurrentScreenIndexForRecovery();
         LogSessionDiagnosticState("TickHook_recovery_entry");
         mod::Log(
             "TICK_HOOK: ExitProcess intercepted during per-frame tick "
-            "(role=%d pid=%lu) — performing full cleanup",
+            "(role=%d pid=%lu screen=%u) — performing full cleanup",
             recoveredRole,
-            static_cast<unsigned long>(recoveredPid));
+            static_cast<unsigned long>(recoveredPid),
+            static_cast<unsigned>(recoveryScreen));
+
+        if (ShouldSuppressOldGameplayExitTeardown("tick_exitprocess"))
+        {
+            LogSessionDiagnosticState("TickHook_recovery_suppressed");
+            return 0;
+        }
+
+        if (IsGameplayExitRecoveryScreen(recoveryScreen))
+        {
+            (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+                netplay::bridge::recovery::GameplayExitOrigin::TickExitProcess);
+            LogSessionDiagnosticState("TickHook_recovery_shared_exit");
+            return 0;
+        }
 
         // Step 1: Reinstate a live local-play session.
         const bool initOk = ForceLocalPlayInit();
@@ -4836,65 +5973,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 static_cast<unsigned long>(deadPid),
                 consoleErrText);
 
-            // Mimic NeutralizeExitProcess: set exit-interception flags so
-            // ConsumeRevivalExitInterception fires on the title screen.
-            InterlockedExchange(&g_revivalExitMode,
-                                static_cast<LONG>(g_localRoleFlag));
-            InterlockedExchange(&g_revivalExitIntercepted, 1);
-
-            // Neutralise the session vtable so subsequent ticks are no-ops.
-            NeutralizeRevivalSessionVtable();
-
-            // Step 1: Reinstate a live local-play session.
-            const bool initOk = ForceLocalPlayInit();
-            mod::Log(
-                "TICK_HOOK: disconnect step 1 ForceLocalPlayInit result=%d",
-                initOk ? 1 : 0);
-
-            // Step 2: Terminate the dead helper process.
-            if (g_revivalProcess != nullptr)
-            {
-                const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
-                const DWORD termErr = termOk ? 0 : GetLastError();
-                CloseHandle(g_revivalProcess);
-                g_revivalProcess = nullptr;
-                g_revivalProcessId = 0;
-                mod::Log(
-                    "TICK_HOOK: disconnect step 2 helper terminated "
-                    "(pid=%lu termOk=%d err=%lu)",
-                    static_cast<unsigned long>(deadPid),
-                    termOk ? 1 : 0,
-                    static_cast<unsigned long>(termErr));
-            }
-
-            // Step 3: Restore DLL Jcc patches.
-            const bool patchOk = RestoreDllExitProcessPatches();
-            mod::Log(
-                "TICK_HOOK: disconnect step 3 RestoreDllExitProcessPatches result=%d",
-                patchOk ? 1 : 0);
-
-            // Step 4: Disable stale text overlays.
-            const bool textOk = DisableRevivalTextRendering();
-            mod::Log(
-                "TICK_HOOK: disconnect step 4 DisableRevivalTextRendering result=%d",
-                textOk ? 1 : 0);
-
-            // Step 5: Reset crash/validation state.
-            mod::ResetCrashRecoveryState();
-            ResetGameModeValidation();
-            mod::Log("TICK_HOOK: disconnect step 5 crash/validation state reset");
-
-            // Step 6: Force game mode to title screen.
-            const bool modeOk = ForceGameModeToTitle();
-            mod::Log(
-                "TICK_HOOK: disconnect step 6 ForceGameModeToTitle result=%d",
-                modeOk ? 1 : 0);
-
-            g_localInitAppliedForSession = false;
-            mod::Log(
-                "TICK_HOOK: disconnect recovery complete (was role=%d), "
-                "next title-screen frame will consume exit interception",
-                deadRole);
+            (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+                netplay::bridge::recovery::GameplayExitOrigin::ConsoleErrorDisconnect);
             LogSessionDiagnosticState("TickHook_disconnectDetected_exit");
 
             return 0;
@@ -4930,56 +6010,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 deadRole,
                 static_cast<unsigned long>(deadPid));
 
-            InterlockedExchange(&g_revivalExitMode,
-                                static_cast<LONG>(g_localRoleFlag));
-            InterlockedExchange(&g_revivalExitIntercepted, 1);
-
-            NeutralizeRevivalSessionVtable();
-
-            const bool initOk = ForceLocalPlayInit();
-            mod::Log(
-                "TICK_HOOK: spectator-esc step 1 ForceLocalPlayInit result=%d",
-                initOk ? 1 : 0);
-
-            if (g_revivalProcess != nullptr)
-            {
-                const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
-                const DWORD termErr = termOk ? 0 : GetLastError();
-                CloseHandle(g_revivalProcess);
-                g_revivalProcess = nullptr;
-                g_revivalProcessId = 0;
-                mod::Log(
-                    "TICK_HOOK: spectator-esc step 2 helper terminated "
-                    "(pid=%lu termOk=%d err=%lu)",
-                    static_cast<unsigned long>(deadPid),
-                    termOk ? 1 : 0,
-                    static_cast<unsigned long>(termErr));
-            }
-
-            const bool patchOk = RestoreDllExitProcessPatches();
-            mod::Log(
-                "TICK_HOOK: spectator-esc step 3 RestoreDllExitProcessPatches result=%d",
-                patchOk ? 1 : 0);
-
-            const bool textOk = DisableRevivalTextRendering();
-            mod::Log(
-                "TICK_HOOK: spectator-esc step 4 DisableRevivalTextRendering result=%d",
-                textOk ? 1 : 0);
-
-            mod::ResetCrashRecoveryState();
-            ResetGameModeValidation();
-            mod::Log("TICK_HOOK: spectator-esc step 5 crash/validation state reset");
-
-            const bool modeOk = ForceGameModeToTitle();
-            mod::Log(
-                "TICK_HOOK: spectator-esc step 6 ForceGameModeToTitle result=%d",
-                modeOk ? 1 : 0);
-
-            g_localInitAppliedForSession = false;
-            mod::Log(
-                "TICK_HOOK: spectator-esc recovery complete (was role=%d), "
-                "next title-screen frame will consume exit interception",
-                deadRole);
+            (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+                netplay::bridge::recovery::GameplayExitOrigin::SpectatorEsc);
             LogSessionDiagnosticState("TickHook_spectatorEsc_exit");
 
             return 0;
@@ -5046,6 +6078,22 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                         deadRole,
                         static_cast<unsigned long>(deadPid),
                         static_cast<unsigned int>(wdScreen));
+
+                    if (ShouldSuppressOldGameplayExitTeardown("helper_death_watchdog"))
+                    {
+                        g_watchdogDeadFrameCount = 0;
+                        LogSessionDiagnosticState("TickHook_hardFallback_suppressed");
+                        return 0;
+                    }
+
+                    if (IsGameplayExitRecoveryScreen(wdScreen))
+                    {
+                        (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+                            netplay::bridge::recovery::GameplayExitOrigin::HelperDeathWatchdog);
+                        g_watchdogDeadFrameCount = 0;
+                        LogSessionDiagnosticState("TickHook_hardFallback_shared_exit");
+                        return 0;
+                    }
 
                     // Synthesize exit interception so ConsumeRevivalExitInterception
                     // fires on the next title-screen frame and routes to the
@@ -5150,7 +6198,30 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // has completed safely.
     if (g_deferredCancelCleanup)
     {
+        if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+        {
+            mod::Log(
+                "GAMEPLAY_EXIT_SUPPRESS_DEFERRED_CLEANUP_AFTER_RECOVERY state=%s frontendReturnState=%s pending=%d sourceReason=%s sourceScreen=%u",
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+                netplay::bridge::frontend_return::CurrentStateName(),
+                g_deferredCancelCleanup ? 1 : 0,
+                CurrentDeferredCancelCleanupReason(),
+                static_cast<unsigned>(CurrentDeferredCancelCleanupSourceScreen()));
+            if (netplay::bridge::recovery::HasGameplayExitMenuEntryStarted()
+                || netplay::bridge::recovery::HasGameplayExitMenuEntryBeenConsumed()
+                || netplay::bridge::recovery::WasGameplayExitRecoveryCompleted()
+                || netplay::bridge::frontend_return::HasConsumedNetplayMenuContinuation())
+            {
+                mod::Log("GAMEPLAY_EXIT_INVARIANT_VIOLATION name=deferred_cleanup_after_menu_entry");
+            }
+            (void)ClearDeferredCancelCleanupForRecovery("tick_suppressed_after_recovery");
+            return result;
+        }
         g_deferredCancelCleanup = false;
+        g_deferredCancelCleanupReason[0] = '\0';
+        g_deferredCancelCleanupSourceScreen = 0xFF;
+        g_deferredCancelCleanupSourceRole = -1;
+        g_deferredCancelCleanupSourceFrame = 0;
         mod::Log(
             "TICK_HOOK: executing deferred cancel cleanup "
             "(ForceLocalPlayInit was unsafe mid-tick)");
@@ -5168,6 +6239,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         mod::Log("TICK_HOOK: deferred cancel cleanup complete");
     }
+
+    netplay::bridge::recovery::ObserveGameplayExitRecoveryProgress(
+        ReadCurrentScreenIndexForRecovery(),
+        -1,
+        g_localRoleFlag);
 
     // Pulse a lightweight export tick every frame so that activityPhase,
     // inNetplayMenu, stateSeq, and all other shared-memory fields remain
@@ -5217,9 +6293,22 @@ bool IsInsideFrameTick()
 }
 
 // Request deferred cancel cleanup after the frame tick returns.
-void RequestDeferredCancelCleanup()
+void RequestDeferredCancelCleanup(const char* reason)
 {
     g_deferredCancelCleanup = true;
+    CopyString(
+        g_deferredCancelCleanupReason,
+        sizeof(g_deferredCancelCleanupReason),
+        reason != nullptr ? reason : "unknown");
+    g_deferredCancelCleanupSourceScreen = ReadCurrentScreenIndexForRecovery();
+    g_deferredCancelCleanupSourceRole = g_localRoleFlag;
+    g_deferredCancelCleanupSourceFrame = g_frameTick;
+    mod::Log(
+        "GAMEPLAY_EXIT_DEFERRED_CANCEL_CLEANUP_REQUEST reason=%s sourceScreen=%u sourceRole=%d sourceFrame=%u",
+        g_deferredCancelCleanupReason,
+        static_cast<unsigned>(g_deferredCancelCleanupSourceScreen),
+        g_deferredCancelCleanupSourceRole,
+        g_deferredCancelCleanupSourceFrame);
 }
 
 void ArmOnlineMatchEscGracefulQuit()
@@ -5401,6 +6490,21 @@ static char FinalizeGracefulQuitTeardown(
         static_cast<long>(quitHeadBefore),
         static_cast<long>(quitTailBefore));
 
+    const uint8_t teardownScreen = ReadCurrentScreenIndexForRecovery();
+    if (ShouldSuppressOldGameplayExitTeardown("quit_ring_teardown"))
+    {
+        LogSessionDiagnosticState("TickHook_gracefulQuit_suppressed");
+        return 0;
+    }
+
+    if (IsGameplayExitRecoveryScreen(teardownScreen))
+    {
+        (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+            netplay::bridge::recovery::GameplayExitOrigin::QuitRing);
+        LogSessionDiagnosticState("TickHook_gracefulQuit_shared_exit");
+        return 0;
+    }
+
     NeutralizeRevivalSessionVtable();
 
     const bool initOk = ForceLocalPlayInit();
@@ -5456,6 +6560,7 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
 {
     const int deadRole = g_localRoleFlag;
     const DWORD deadPid = g_revivalProcessId;
+    const uint8_t quitScreen = ReadCurrentScreenIndexForRecovery();
     LogSessionDiagnosticState("TickHook_gracefulQuit_entry");
     mod::Log(
         "TICK_HOOK: *** %s GRACEFUL SESSION END *** frameTick=%u "
@@ -5467,8 +6572,11 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
         static_cast<long>(quitHeadBefore),
         static_cast<long>(quitTailBefore));
 
-    InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
-    InterlockedExchange(&g_revivalExitIntercepted, 1);
+    if (!IsGameplayExitRecoveryScreen(quitScreen))
+    {
+        InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(g_localRoleFlag));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+    }
 
     if (deadRole == kLocalRoleOnline)
     {
@@ -5539,6 +6647,22 @@ void ResetGameModeValidation()
     ResetLocalBattleEscQuitRingIgnore();
     ResetScheduledGracefulQuitTeardown();
     ReleaseQuitRingHeader();
+    if (g_gameplayStall.active)
+    {
+        GameplayStallSample sample = {};
+        sample.screen = ReadCurrentScreenIndexForRecovery();
+        sample.mode = ReadCurrentGameModeForRecovery();
+        sample.frameTick = g_frameTick;
+        sample.nowMs = GetTickCount();
+        sample.role = g_localRoleFlag;
+        (void)ReadGameplaySyncFrameForRecovery(ReadSessionPtrRaw(), &sample.syncFrame);
+        sample.syncFrameValid = sample.syncFrame >= 0;
+        ResetGameplayStallTracker("game_mode_validation_reset", sample, true);
+    }
+    else
+    {
+        g_gameplayStall = GameplayStallTrackerState();
+    }
 
     // Increment session number and reset cross-session change-detection state.
     ++g_sessionNumber;
@@ -5572,7 +6696,7 @@ void ResetGameModeValidation()
     if (g_deferredCancelCleanup)
     {
         mod::Log("ResetGameModeValidation: clearing stale g_deferredCancelCleanup");
-        g_deferredCancelCleanup = false;
+        (void)ClearDeferredCancelCleanupForRecovery("reset_game_mode_validation");
     }
     if (g_frameRecoveryPending)
     {
@@ -5625,12 +6749,28 @@ static void OurFrameDispatch()
         // --------------------------------------------------------------------
         const int recoveredRole = g_localRoleFlag;
         const DWORD recoveredPid = g_revivalProcessId;
+        const uint8_t recoveryScreen = ReadCurrentScreenIndexForRecovery();
         LogSessionDiagnosticState("OurFrameDispatch_recovery_entry");
         mod::Log(
             "OurFrameDispatch: ExitProcess intercepted during frame tick "
-            "(role=%d pid=%lu) — performing full cleanup",
+            "(role=%d pid=%lu screen=%u) — performing full cleanup",
             recoveredRole,
-            static_cast<unsigned long>(recoveredPid));
+            static_cast<unsigned long>(recoveredPid),
+            static_cast<unsigned>(recoveryScreen));
+
+        if (ShouldSuppressOldGameplayExitTeardown("frame_exitprocess"))
+        {
+            LogSessionDiagnosticState("OurFrameDispatch_recovery_suppressed");
+            return;
+        }
+
+        if (IsGameplayExitRecoveryScreen(recoveryScreen))
+        {
+            (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+                netplay::bridge::recovery::GameplayExitOrigin::FrameExitProcess);
+            LogSessionDiagnosticState("OurFrameDispatch_recovery_shared_exit");
+            return;
+        }
 
         // Step 1: Reinstate a live local-play session.
         const bool initOk = ForceLocalPlayInit();

@@ -2,6 +2,8 @@
 #include "netplay/core/battle_log_menu.h"
 #include "netplay/core/options_menu.h"
 
+#include "logger.h"
+
 #include <cctype>
 #include <string>
 
@@ -62,6 +64,19 @@ void AdvanceNetplayBackgroundAnimation()
     {
         g_netplayMenuState.backgroundScrollOffset -= kNetplayBackgroundWidth;
     }
+}
+
+void LogRecoveryConfigFullFrameIfNeeded(BOOL presentResult, const char* path)
+{
+    if (g_recoveryRenderTraceFramesRemaining <= 0)
+    {
+        return;
+    }
+
+    mod::Log(
+        "NETPLAY_RENDER_CONFIG_FULL_FRAME bgDraw=1 bgDest=0,0,320,240 present=%d path=%s",
+        presentResult ? 1 : 0,
+        path != nullptr ? path : "unknown");
 }
 
 void DrawNetplayBackgroundSurface(uint32_t screenContext)
@@ -491,6 +506,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawDebugOverlay(screenContext);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime_battlelog");
         if (!drewBattleLogImages)
         {
             (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
@@ -513,7 +529,9 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawDebugOverlay(screenContext);
-    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime");
+    return presentResult;
 }
 
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
@@ -532,6 +550,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawDebugOverlay(screenContext);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        LogRecoveryConfigFullFrameIfNeeded(presentResult, "config_battlelog");
         if (!drewBattleLogImages)
         {
             (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
@@ -547,6 +566,8 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawDebugOverlay(screenContext);
-    return present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    LogRecoveryConfigFullFrameIfNeeded(presentResult, "config");
+    return presentResult;
 }
 } // namespace netplay::hooks::internal

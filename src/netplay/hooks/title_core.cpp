@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 
+#include "netplay/bridge/takeover_internal.h"
 #include "logger.h"
 #include "netplay/core/player_rooms_menu.h"
 
@@ -350,6 +351,7 @@ LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         || message == WM_NCDESTROY;
     if (closeRequested)
     {
+        netplay::bridge::takeover::NotifyLocalProcessCloseForGameplayStall();
         (void)ShutdownLobbySessionForProcessExit(false, "window_close");
     }
 

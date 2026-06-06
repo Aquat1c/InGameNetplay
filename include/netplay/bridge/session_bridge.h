@@ -106,6 +106,7 @@ bool AnswerSpectatePromptChoice(int choice);
 bool PrepareVsHumanHandoff();
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
+void CompleteGameplayExitRecovery(int mode, const char* origin);
 bool NotifyTitleScreenActive();
 // Returns true if the EfzRevival.exe peer process is still running.
 // Advisory check (TOCTOU): the process may exit immediately after this call.

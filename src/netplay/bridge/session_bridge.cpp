@@ -26,6 +26,16 @@ std::thread g_startWorker;
 bool g_startWorkerRunning = false;
 uint32_t g_startRequestSerial = 0;
 
+bool ShouldCancelToIdle(const char* reason)
+{
+    return reason != nullptr
+        && (std::strcmp(reason, "user_cancel") == 0
+            || std::strcmp(reason, "leave_menu") == 0
+            || std::strcmp(reason, "external_cancel") == 0
+            || std::strcmp(reason, "dismissed_error") == 0
+            || std::strcmp(reason, "no_overlay_session_ended") == 0);
+}
+
 void SetPhase(NetbridgePhase phase, const char* error)
 {
     g_status.phase = static_cast<int>(phase);
@@ -300,6 +310,7 @@ bool StartSession(
         addressCopy.c_str(),
         nicknameCopy.c_str(),
         writeNicknameToIni ? 1 : 0);
+    takeover::ClearDelayPromptState("session_bridge_start_session");
 #if defined(_MSC_VER)
     strncpy_s(g_status.address, sizeof(g_status.address), addressCopy.c_str(), _TRUNCATE);
     strncpy_s(g_status.nickname, sizeof(g_status.nickname), nicknameCopy.c_str(), _TRUNCATE);
@@ -497,12 +508,12 @@ void CancelSession(const char* reason)
     if (g_startWorkerRunning)
     {
         takeover::RequestAbortStart();
-        if (reason != nullptr &&
-            (std::strcmp(reason, "user_cancel") == 0 ||
-             std::strcmp(reason, "leave_menu") == 0 ||
-             std::strcmp(reason, "external_cancel") == 0))
+        if (ShouldCancelToIdle(reason))
         {
             SetPhase(NetbridgePhase::Idle, nullptr);
+            mod::Log(
+                "SessionBridge: cancel acknowledged -> Idle reason='%s'",
+                reason != nullptr ? reason : "");
         }
         else
         {
@@ -530,6 +541,42 @@ bool ConsumeRevivalExitInterception(int* outMode)
 
     JoinFinishedWorkerUnlocked();
     return takeover::ConsumeRevivalExitInterception(outMode, &g_status);
+}
+
+void CompleteGameplayExitRecovery(int mode, const char* origin)
+{
+    NetbridgeStatus statusSnapshot = {};
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_initialized)
+        {
+            return;
+        }
+
+        ++g_startRequestSerial;
+        g_connectStartTick = 0;
+        JoinFinishedWorkerUnlocked();
+
+        takeover::RefreshRuntimeStatus(&g_status);
+        if (mode == takeover::kLocalRoleOnline
+            || mode == takeover::kLocalRoleSpectate)
+        {
+            SetPhase(NetbridgePhase::SessionEnded, nullptr);
+        }
+        else
+        {
+            SetPhase(NetbridgePhase::Idle, nullptr);
+        }
+
+        statusSnapshot = g_status;
+    }
+
+    state_export::Update(statusSnapshot);
+    mod::Log(
+        "SessionBridge: gameplay exit recovery completed origin=%s mode=%d phase=%d",
+        origin != nullptr ? origin : "",
+        mode,
+        statusSnapshot.phase);
 }
 
 bool NotifyTitleScreenActive()

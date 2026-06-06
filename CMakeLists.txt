@@ -32,6 +32,8 @@ add_library(efz_netplay_mod SHARED
     src/dllmain.cpp
     src/logger.cpp
     src/netplay/assets/assets.cpp
+    src/netplay/bridge/frontend_return.cpp
+    src/netplay/bridge/gameplay_exit_recovery.cpp
     src/netplay/bridge/session_bridge.cpp
     src/netplay/bridge/revival_takeover.cpp
     src/netplay/bridge/netplay_state_export.cpp

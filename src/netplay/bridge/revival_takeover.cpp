@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/options_menu.h"
 
@@ -67,6 +68,16 @@ enum class RevivalProfileSource : uint8_t
 };
 
 RevivalProfileSource g_activeRevivalSource = RevivalProfileSource::Default;
+
+bool ShouldCancelToIdle(const char* reason)
+{
+    return reason != nullptr
+        && (std::strcmp(reason, "user_cancel") == 0
+            || std::strcmp(reason, "leave_menu") == 0
+            || std::strcmp(reason, "external_cancel") == 0
+            || std::strcmp(reason, "dismissed_error") == 0
+            || std::strcmp(reason, "no_overlay_session_ended") == 0);
+}
 
 const char* RevivalProfileSourceToString(RevivalProfileSource source)
 {
@@ -2770,6 +2781,8 @@ bool StartSession(
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
     ResetGameModeValidation();
+    ClearLocalProcessCloseForGameplayStall();
+    netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
 
     // --- Session boundary cleanup logging ---
     // Log EXE hook bytes at both hook sites for cross-session tracking.
@@ -4309,6 +4322,21 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
 
+    const bool suppressSharedRecoveryTeardown =
+        netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup();
+    if (suppressSharedRecoveryTeardown)
+    {
+        mod::Log(
+            "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=cancel_session_unlocked inProgress=%d pendingMenu=%d completed=%d origin=%s state=%s",
+            netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+            netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+            netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName());
+        (void)SuppressDeferredCancelCleanupAfterGameplayRecovery(
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+    }
+
     const bool gameplayEscPeerQuitPending =
         g_localRoleFlag == kLocalRoleOnline
         && ConsumeOnlineMatchEscGracefulQuit();
@@ -4361,17 +4389,20 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     }
 
     const bool hadProcess = ProcessAlive(ioStatus);
-    if (hadProcess && g_revivalProcess != nullptr)
+    if (!suppressSharedRecoveryTeardown && hadProcess && g_revivalProcess != nullptr)
     {
         TerminateProcess(g_revivalProcess, 0);
     }
-    CloseProcessHandle(ioStatus);
-    // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
-    // spawned by EfzRevival.exe are also terminated.  A fresh job will be
-    // created for the next StartSession call.
-    CloseChildJobObject();
-    RestoreDllExitProcessPatches();
-    ReinitLocalPlay();
+    if (!suppressSharedRecoveryTeardown)
+    {
+        CloseProcessHandle(ioStatus);
+        // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
+        // spawned by EfzRevival.exe are also terminated.  A fresh job will be
+        // created for the next StartSession call.
+        CloseChildJobObject();
+        RestoreDllExitProcessPatches();
+        ReinitLocalPlay();
+    }
 
     // ---- Additional cleanup (Issues 1, 4, 5 in CONNECTION_INTERRUPTION doc) ----
     // During normal operation (not process shutdown), reinitialise the DLL
@@ -4384,7 +4415,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         (std::strcmp(reason, "shutdown") == 0 ||
          std::strcmp(reason, "emergency") == 0));
 
-    if (!isShutdown)
+    if (!isShutdown && !suppressSharedRecoveryTeardown)
     {
         // If we're inside the per-frame tick (sub_1006E570 -> vtable[2] ->
         // RollbackLoopTick), ForceLocalPlayInit MUST NOT run now because it
@@ -4397,7 +4428,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
             mod::Log(
                 "Takeover: cancel cleanup — DEFERRED (inside frame tick, "
                 "ForceLocalPlayInit would destroy active session)");
-            RequestDeferredCancelCleanup();
+            RequestDeferredCancelCleanup(reason);
         }
         else
         {
@@ -4513,9 +4544,13 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     if (ioStatus != nullptr)
     {
-        if (reason != nullptr && (std::strcmp(reason, "user_cancel") == 0 || std::strcmp(reason, "leave_menu") == 0 || std::strcmp(reason, "external_cancel") == 0))
+        if (ShouldCancelToIdle(reason))
         {
             SetPhase(ioStatus, NetbridgePhase::Idle, nullptr);
+            mod::Log(
+                "Takeover: cancel acknowledged -> Idle reason='%s' hadProcess=%d",
+                reason != nullptr ? reason : "",
+                hadProcess ? 1 : 0);
         }
         else if (hadProcess)
         {
@@ -4545,6 +4580,20 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // Fast unlocked pre-check avoids the mutex on every frame.
     if (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) == 0)
     {
+        return false;
+    }
+
+    if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+    {
+        const LONG clearedIntercepted =
+            InterlockedExchange(&g_revivalExitIntercepted, 0);
+        const LONG clearedMode =
+            InterlockedExchange(&g_revivalExitMode, -1);
+        mod::Log(
+            "GAMEPLAY_EXIT_SUPPRESS_OLD_EXIT_INTERCEPTION reason=frontend_return_owner exitIntercepted=%ld exitMode=%ld state=%s",
+            static_cast<long>(clearedIntercepted),
+            static_cast<long>(clearedMode),
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName());
         return false;
     }
 

@@ -321,6 +321,12 @@ bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
 bool DisableRevivalTextRendering();
+bool RestoreRenderContextForGameplayExitCleanup();
+void MarkRenderContextConsumedForGameplayExitCleanup();
+bool ClearRevivalTextWithCurrentRenderContext();
+bool DisableRevivalTextRenderingWithCurrentRenderContext();
+int GetRevivalGraphicsPatchState();
+bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason);
 
 // Reverse the P1/P2 input-config swap that Revival applied when we joined
 // as client (P2).  No-op unless g_netplayRole == kNetplayRoleClient.
@@ -390,6 +396,16 @@ void ResetForceLocalPlayInitCount();
 // Reset the per-frame game mode vtable validator state so the next session
 // gets fresh validation.  Call when a session starts or is cancelled.
 void ResetGameModeValidation();
+uint32_t GetGameplayExitRecoveryFrameTick();
+bool IsGameplayExitRecoveryInsideFrameTick();
+bool ClearDeferredCancelCleanupForRecovery(const char* reason = nullptr);
+bool SuppressDeferredCancelCleanupAfterGameplayRecovery(const char* origin);
+bool IsDeferredCancelCleanupPending();
+bool IsDeferredCancelCleanupGameplaySource();
+const char* CurrentDeferredCancelCleanupReason();
+uint8_t CurrentDeferredCancelCleanupSourceScreen();
+void NotifyLocalProcessCloseForGameplayStall();
+void ClearLocalProcessCloseForGameplayStall();
 
 // Returns true while the per-frame tick hook (OurPerFrameTickHook) is
 // executing the original sub_1006E570.  Used by CancelSessionUnlocked to
@@ -400,7 +416,7 @@ bool IsInsideFrameTick();
 
 // Request that ForceLocalPlayInit + associated cleanup run after the
 // current frame tick completes instead of immediately.
-void RequestDeferredCancelCleanup();
+void RequestDeferredCancelCleanup(const char* reason = nullptr);
 
 // Arm/consume the one-shot "online match ESC should trigger a native peer
 // quit broadcast" marker. The per-frame tick sets it when it detects a local
@@ -450,6 +466,7 @@ extern volatile bool g_netplayUiJmpActive;
 void* EnsureRevivalErrorCodeNullGuardStub();
 bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsoleEvent);
 void CloseTempIpcContext(TempIpcContext* ctx);
+void ClearDelayPromptState(const char* reason);
 void PublishDelayPromptSerial(LONG serial);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
 void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);

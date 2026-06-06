@@ -215,6 +215,7 @@ extern DWORD g_pendingVsHumanAutoConfirmTick;
 extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
 extern bool g_returnToNetplayAfterMatch;
 extern bool g_charSelectEntryHoldArmed;
+extern int g_recoveryRenderTraceFramesRemaining;
 extern InputSnapshot g_lastInputSnapshot;
 extern DelaySetupOverlayState g_delaySetupOverlay;
 extern SpectateConfirmOverlayState g_spectateConfirmOverlay;

@@ -1,5 +1,7 @@
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 
@@ -67,9 +69,95 @@ static int g_charSelectEntryHoldFramesRemaining = 0;
 static uint32_t g_charSelectUpdateSlotAddress = 0;
 static TitleUpdateFn g_originalCharSelectUpdate = nullptr;
 static constexpr int kCharSelectEntryHoldFrames = 8;
+static DWORD g_lastTitleUpdateRecoveryCheckLogMs = 0;
+static DWORD g_lastTitleRenderRecoveryPendingLogMs = 0;
+static constexpr DWORD kTitleRecoveryDiagThrottleMs = 1000u;
+int g_recoveryRenderTraceFramesRemaining = 0;
+static uint32_t g_titleRenderRecoveryTraceCall = 0;
+static constexpr int kRecoveryRenderTraceFrames = 180;
 
 extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext);
 extern "C" void HookedCharSelectUpdateThunk();
+
+static uint8_t ReadRecoveryDiagScreenIndex()
+{
+    uint8_t screen = 0xFF;
+    __try
+    {
+        screen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return screen;
+}
+
+static int ReadRecoveryDiagGameMode()
+{
+    uint8_t mode = 0xFF;
+    __try
+    {
+        const uint32_t gameSys =
+            *reinterpret_cast<const volatile uint32_t*>(0x0079010Cu);
+        if (gameSys != 0)
+        {
+            mode = *reinterpret_cast<const volatile uint8_t*>(gameSys + 4964);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return mode == 0xFF ? -1 : static_cast<int>(mode);
+}
+
+static void LogTitleUpdateRecoveryCheckIfDue(uint32_t screenContext)
+{
+    if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        && !netplay::bridge::frontend_return::HasPendingReturn())
+    {
+        return;
+    }
+
+    const DWORD nowMs = GetTickCount();
+    if (g_lastTitleUpdateRecoveryCheckLogMs != 0
+        && nowMs - g_lastTitleUpdateRecoveryCheckLogMs < kTitleRecoveryDiagThrottleMs)
+    {
+        return;
+    }
+    g_lastTitleUpdateRecoveryCheckLogMs = nowMs;
+
+    mod::Log(
+        "TITLE_UPDATE_RECOVERY_CHECK pending=1 screenContext=0x%08X screen=%u mode=%d netplayActive=%d",
+        screenContext,
+        static_cast<unsigned>(ReadRecoveryDiagScreenIndex()),
+        ReadRecoveryDiagGameMode(),
+        g_netplayMenuState.active ? 1 : 0);
+}
+
+static void LogTitleRenderRecoveryPendingIfDue(uint32_t screenContext)
+{
+    if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        && !netplay::bridge::frontend_return::HasPendingReturn()
+        && g_recoveryRenderTraceFramesRemaining <= 0)
+    {
+        return;
+    }
+
+    const DWORD nowMs = GetTickCount();
+    if (g_lastTitleRenderRecoveryPendingLogMs != 0
+        && nowMs - g_lastTitleRenderRecoveryPendingLogMs < kTitleRecoveryDiagThrottleMs)
+    {
+        return;
+    }
+    g_lastTitleRenderRecoveryPendingLogMs = nowMs;
+
+    mod::Log(
+        "TITLE_RENDER_RECOVERY_PENDING screenContext=0x%08X screen=%u mode=%d netplayActive=%d",
+        screenContext,
+        static_cast<unsigned>(ReadRecoveryDiagScreenIndex()),
+        ReadRecoveryDiagGameMode(),
+        g_netplayMenuState.active ? 1 : 0);
+}
 
 // ---- Replay screen hook (spectate bypass) ----
 // When spectating, the title flow transitions to screen 8 (Replay) so that
@@ -299,6 +387,147 @@ void ObserveOfflineSelectionConfirm(uint32_t screenContext)
     netplay::bridge::OnTitleSelectionConfirmed(selection);
 }
 
+static const char* FrontendReturnOwnerToString(
+    netplay::bridge::frontend_return::ReturnOwner owner)
+{
+    using netplay::bridge::frontend_return::ReturnOwner;
+    switch (owner)
+    {
+    case ReturnOwner::DisconnectRecovery:
+        return "disconnect_recovery";
+    case ReturnOwner::AsyncHostAccept:
+        return "async_host_accept";
+    case ReturnOwner::UserMenuExit:
+        return "user_menu_exit";
+    case ReturnOwner::Diagnostic:
+        return "diagnostic";
+    }
+    return "unknown";
+}
+
+static const char* FrontendReturnTargetToString(
+    netplay::bridge::frontend_return::ReturnTarget target)
+{
+    using netplay::bridge::frontend_return::ReturnTarget;
+    switch (target)
+    {
+    case ReturnTarget::Title:
+        return "title";
+    case ReturnTarget::NetplayMenu:
+        return "netplay_menu";
+    case ReturnTarget::CharacterSelect:
+        return "charselect";
+    }
+    return "unknown";
+}
+
+static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
+{
+    using namespace netplay::bridge::frontend_return;
+
+    TickFrontendReturn();
+
+    ReturnOwner owner = ReturnOwner::Diagnostic;
+    ReturnTarget target = ReturnTarget::Title;
+    if (!ConsumeTitleContinuation(&owner, &target))
+    {
+        return false;
+    }
+
+    mod::ResetCrashRecoveryState();
+    g_returnToNetplayAfterMatch = false;
+    DisarmSpectateReplayBypass();
+    g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+
+    netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
+    const bool completedRecovery =
+        owner == ReturnOwner::DisconnectRecovery
+        && netplay::bridge::recovery::CompleteFrontendReturnMenuEntry(
+            screenContext,
+            &gameplayExit);
+
+    if (completedRecovery && g_lobbySession)
+    {
+        if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleSpectate)
+        {
+            g_lobbySession->NotifyEndSpectate(true);
+        }
+        else if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleOnline)
+        {
+            g_lobbySession->NotifyEndMatch();
+        }
+    }
+
+    if (completedRecovery)
+    {
+        netplay::bridge::CompleteGameplayExitRecovery(
+            gameplayExit.mode,
+            gameplayExit.origin);
+    }
+
+    mod::Log(
+        "FRONTEND_RETURN_MENU_CONTINUATION_CONSUMED owner=%s target=%s",
+        FrontendReturnOwnerToString(owner),
+        FrontendReturnTargetToString(target));
+
+    if (target == ReturnTarget::NetplayMenu)
+    {
+        g_recoveryRenderTraceFramesRemaining = kRecoveryRenderTraceFrames;
+        const char* origin = completedRecovery ? gameplayExit.origin : FrontendReturnOwnerToString(owner);
+        const int mode = completedRecovery ? gameplayExit.mode : -1;
+        mod::Log(
+            "GAMEPLAY_EXIT_TITLE_CONTINUATION_ENTER_MENU skipFadeOut=1 screenContext=0x%08X origin=%s mode=%d",
+            screenContext,
+            origin,
+            mode);
+        EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
+        return true;
+    }
+
+    return target == ReturnTarget::Title;
+}
+
+static bool SuppressOldExitInterceptionIfRecoveryOwned()
+{
+    if (!netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+    {
+        return false;
+    }
+
+    const LONG exitIntercepted =
+        InterlockedCompareExchange(
+            &netplay::bridge::takeover::g_revivalExitIntercepted,
+            0,
+            0);
+    const LONG exitMode =
+        InterlockedCompareExchange(
+            &netplay::bridge::takeover::g_revivalExitMode,
+            0,
+            0);
+    if (exitIntercepted == 0 && exitMode == -1)
+    {
+        return false;
+    }
+
+    const LONG clearedIntercepted =
+        InterlockedExchange(
+            &netplay::bridge::takeover::g_revivalExitIntercepted,
+            0);
+    const LONG clearedMode =
+        InterlockedExchange(
+            &netplay::bridge::takeover::g_revivalExitMode,
+            -1);
+    mod::Log(
+        "GAMEPLAY_EXIT_SUPPRESS_OLD_EXIT_INTERCEPTION reason=frontend_return_owner exitIntercepted=%ld exitMode=%ld state=%s frontendReturnState=%s",
+        static_cast<long>(clearedIntercepted),
+        static_cast<long>(clearedMode),
+        netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+        netplay::bridge::frontend_return::CurrentStateName());
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // HookedTitleUpdateImplBody — the real title-screen update logic.
 // Called from HookedTitleUpdateImpl which wraps it in setjmp/longjmp
@@ -343,6 +572,14 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         netplay::bridge::takeover::DisableRevivalTextRendering();
     }
 
+    if (!g_netplayMenuState.active
+        && HandleFrontendReturnTitleContinuation(screenContext))
+    {
+        return 0;
+    }
+
+    LogTitleUpdateRecoveryCheckIfDue(screenContext);
+
     if (!g_netplayMenuState.active)
     {
         // When the tournament match ends and the game returns to mode 0 (title
@@ -356,13 +593,52 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             mod::Log("HookedTitleUpdateImpl: tournament return to title detected, clearing text");
         }
 
+        netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
+        if (!netplay::bridge::frontend_return::IsReturningToFrontend()
+            && netplay::bridge::recovery::ConsumePendingGameplayExitMenuEntry(
+                screenContext,
+                &gameplayExit))
+        {
+            mod::ResetCrashRecoveryState();
+            g_returnToNetplayAfterMatch = false;
+            DisarmSpectateReplayBypass();
+            g_pendingVsHumanAutoConfirm = false;
+            g_pendingVsHumanAutoConfirmTick = 0;
+            g_pendingVsHumanAutoConfirmLastLogTick = 0;
+
+            if (g_lobbySession)
+            {
+                if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleSpectate)
+                {
+                    g_lobbySession->NotifyEndSpectate(true);
+                }
+                else if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleOnline)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
+            }
+
+            netplay::bridge::CompleteGameplayExitRecovery(
+                gameplayExit.mode,
+                gameplayExit.origin);
+
+            mod::Log(
+                "GAMEPLAY_EXIT_TITLE_CONTINUATION_ENTER_MENU skipFadeOut=1 screenContext=0x%08X origin=%s mode=%d",
+                screenContext,
+                gameplayExit.origin,
+                gameplayExit.mode);
+            EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
+            return 0;
+        }
+
         // Check for Revival DLL ExitProcess interception BEFORE ticking.
         // If ExitProcess was intercepted, the session vtable has been
         // neutralized and we need to clean up and route the user to the
         // appropriate screen:  netplay menu for online modes, title screen
         // for tournament / offline modes.
         int exitMode = -1;
-        if (netplay::bridge::ConsumeRevivalExitInterception(&exitMode))
+        if (!SuppressOldExitInterceptionIfRecoveryOwned()
+            && netplay::bridge::ConsumeRevivalExitInterception(&exitMode))
         {
             mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
@@ -655,6 +931,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
     // Previously this was only called during the entry-hold window, which
     // caused the exported state to freeze as soon as the hold ended.
     netplay::bridge::Tick();
+    netplay::bridge::frontend_return::TickFrontendReturn();
 
     // Diagnostic: log charselect screen state on the first 5 frames
     // and then every 300 frames to track init/exit flags and game mode.
@@ -838,15 +1115,52 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 
 extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
 {
+    LogTitleRenderRecoveryPendingIfDue(screenContext);
+
+    netplay::bridge::recovery::ObserveGameplayExitRecoveryProgress(
+        0,
+        -1,
+        -1);
+
+    const bool traceRecoveryRender =
+        g_recoveryRenderTraceFramesRemaining > 0
+        || netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        || netplay::bridge::frontend_return::HasPendingReturn();
+    const char* path = "original_title";
+    BOOL result = FALSE;
     if (g_netplayMenuState.active && g_useRuntimeTextOverlay)
     {
-        return RenderNetplayMenuRuntimeText(screenContext);
+        path = "netplay_runtime";
+        result = RenderNetplayMenuRuntimeText(screenContext);
     }
-    if (g_netplayMenuState.active && g_netplayMenuState.useConfigStyleRender)
+    else if (g_netplayMenuState.active && g_netplayMenuState.useConfigStyleRender)
     {
-        return RenderNetplayMenuConfigStyle(screenContext);
+        path = "netplay_config";
+        result = RenderNetplayMenuConfigStyle(screenContext);
     }
-    return GetOriginalTitleRender()(screenContext);
+    else
+    {
+        result = GetOriginalTitleRender()(screenContext);
+    }
+
+    if (traceRecoveryRender)
+    {
+        ++g_titleRenderRecoveryTraceCall;
+        mod::Log(
+            "TITLE_RENDER_RECOVERY_TRACE call=%u path=%s result=%d",
+            g_titleRenderRecoveryTraceCall,
+            path,
+            result ? 1 : 0);
+        if (std::strcmp(path, "original_title") == 0)
+        {
+            mod::Log("TITLE_RENDER_RECOVERY_WRONG_PATH path=original_title");
+        }
+        if (g_recoveryRenderTraceFramesRemaining > 0)
+        {
+            --g_recoveryRenderTraceFramesRemaining;
+        }
+    }
+    return result;
 }
 
 #if defined(_M_IX86)

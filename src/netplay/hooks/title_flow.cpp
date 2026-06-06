@@ -1,5 +1,7 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/assets/assets.h"
+#include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
@@ -100,6 +102,13 @@ bool g_deferredLobbyRefreshPending = false;
 // released unconditionally.  Prevents a wedged bridge phase from leaving
 // the lobby list perma-stale with no user-visible escape.
 uint32_t g_deferredLobbyRefreshDeadlineTick = 0;
+uint32_t g_lastRecoveryNoOverlaySuppressedTick = 0;
+constexpr int kRecoveryMenuInputQuarantineFrames = 45;
+bool g_recoveryMenuInputQuarantineActive = false;
+bool g_recoveryMenuInputQuarantineLoggedSuppress = false;
+bool g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
+bool g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
+int g_recoveryMenuInputQuarantineFramesRemaining = 0;
 constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
 struct PendingLobbySpectateWait
 {
@@ -1494,6 +1503,158 @@ void ResetWindowFocusInputSuppression()
     g_netplayHotkeyDown.fill(0);
 }
 
+void ClearTitleInputLatches(uint32_t screenContext)
+{
+    __try
+    {
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+bool HasRecoveryMenuActionInput(const uint8_t* inputBytes)
+{
+    if (inputBytes == nullptr)
+    {
+        return false;
+    }
+    return inputBytes[16] != 0
+        || inputBytes[17] != 0
+        || inputBytes[18] != 0
+        || inputBytes[19] != 0
+        || inputBytes[20] != 0
+        || inputBytes[21] != 0
+        || inputBytes[22] != 0
+        || inputBytes[23] != 0;
+}
+
+bool HasRecoveryMenuAxisInput(const uint8_t* inputBytes)
+{
+    if (inputBytes == nullptr)
+    {
+        return false;
+    }
+    return inputBytes[12] != 0
+        || inputBytes[13] != 0
+        || inputBytes[14] != 0
+        || inputBytes[15] != 0;
+}
+
+void BeginRecoveryMenuInputQuarantine(uint32_t screenContext, const char* origin)
+{
+    g_recoveryMenuInputQuarantineActive = true;
+    g_recoveryMenuInputQuarantineLoggedSuppress = false;
+    g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
+    g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
+    g_recoveryMenuInputQuarantineFramesRemaining = kRecoveryMenuInputQuarantineFrames;
+    g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    g_joinWaitToSpectateButtonDown = {};
+    ClearTitleInputLatches(screenContext);
+    mod::Log(
+        "RECOVERY_MENU_INPUT_QUARANTINE_BEGIN screenContext=0x%08X frames=%d origin=%s",
+        screenContext,
+        g_recoveryMenuInputQuarantineFramesRemaining,
+        origin != nullptr ? origin : "unknown");
+}
+
+bool SuppressRecoveryMenuInputIfNeeded(
+    uint32_t screenContext,
+    const uint8_t* inputBytes,
+    uint32_t* inactivityCounter)
+{
+    if (!g_recoveryMenuInputQuarantineActive)
+    {
+        return false;
+    }
+
+    const bool escapeHeld = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    const bool actionHeld = HasRecoveryMenuActionInput(inputBytes);
+    const bool axisHeld = HasRecoveryMenuAxisInput(inputBytes);
+    const bool cancelHeld = inputBytes != nullptr
+        && (inputBytes[18] != 0 || inputBytes[19] != 0);
+    const bool suppress =
+        g_recoveryMenuInputQuarantineFramesRemaining > 0
+        || actionHeld
+        || escapeHeld;
+
+    if (!suppress)
+    {
+        g_recoveryMenuInputQuarantineActive = false;
+        g_recoveryMenuInputQuarantineLoggedSuppress = false;
+        g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
+        g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
+        mod::Log("RECOVERY_MENU_INPUT_QUARANTINE_END reason=released");
+        return false;
+    }
+
+    if (g_recoveryMenuInputQuarantineFramesRemaining > 0)
+    {
+        --g_recoveryMenuInputQuarantineFramesRemaining;
+    }
+
+    ClearTitleInputLatches(screenContext);
+    g_netplayEscapeDown = escapeHeld;
+    if (inputBytes != nullptr)
+    {
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            g_joinWaitToSpectateButtonDown[static_cast<size_t>(playerIndex)] =
+                inputBytes[playerIndex + 22] != 0 ? 1u : 0u;
+        }
+    }
+
+    const bool heldAfterWindow =
+        (actionHeld || escapeHeld)
+        && g_recoveryMenuInputQuarantineFramesRemaining == 0;
+    if (!g_recoveryMenuInputQuarantineLoggedSuppress
+        || (heldAfterWindow && !g_recoveryMenuInputQuarantineLoggedHeldAfterWindow))
+    {
+        mod::Log(
+            "RECOVERY_MENU_INPUT_QUARANTINE_SUPPRESS framesRemaining=%d actionHeld=%d axisHeld=%d escapeHeld=%d "
+            "p1(h=%d v=%d c=%u b=%u d=%u) p2(h=%d v=%d c=%u b=%u d=%u) menu=%s selection=%d",
+            g_recoveryMenuInputQuarantineFramesRemaining,
+            actionHeld ? 1 : 0,
+            axisHeld ? 1 : 0,
+            escapeHeld ? 1 : 0,
+            inputBytes != nullptr ? static_cast<int>(static_cast<int8_t>(inputBytes[12])) : 0,
+            inputBytes != nullptr ? static_cast<int>(static_cast<int8_t>(inputBytes[14])) : 0,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[16]) : 0u,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[18]) : 0u,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[22]) : 0u,
+            inputBytes != nullptr ? static_cast<int>(static_cast<int8_t>(inputBytes[13])) : 0,
+            inputBytes != nullptr ? static_cast<int>(static_cast<int8_t>(inputBytes[15])) : 0,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[17]) : 0u,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[19]) : 0u,
+            inputBytes != nullptr ? static_cast<unsigned>(inputBytes[23]) : 0u,
+            MenuIdToString(g_netplayMenuState.menuId),
+            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+        g_recoveryMenuInputQuarantineLoggedSuppress = true;
+        if (heldAfterWindow)
+        {
+            g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = true;
+        }
+    }
+
+    if ((cancelHeld || escapeHeld) && !g_recoveryMenuInputQuarantineLoggedLeaveSuppress)
+    {
+        mod::Log(
+            "RECOVERY_MENU_LEAVE_SUPPRESSED reason=input_quarantine cancelHeld=%d escapeHeld=%d framesRemaining=%d",
+            cancelHeld ? 1 : 0,
+            escapeHeld ? 1 : 0,
+            g_recoveryMenuInputQuarantineFramesRemaining);
+        g_recoveryMenuInputQuarantineLoggedLeaveSuppress = true;
+    }
+
+    if (inactivityCounter != nullptr)
+    {
+        ++(*inactivityCounter);
+    }
+    return true;
+}
+
 const uint8_t* FilterMenuInputsForWindowFocus(const uint8_t* rawInputBytes, bool windowFocused)
 {
     g_filteredMenuInputs.fill(0);
@@ -2418,8 +2579,9 @@ void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeSta
     }
 
     mod::Log(
-        "DelayOverlay: activated promptSerial=%d ping=%d current=%d min=%d max=%d recommended=%d names='%s' vs '%s'",
+        "DelayOverlay: activated promptSerial=%d servedSerial=%d ping=%d current=%d min=%d max=%d recommended=%d names='%s' vs '%s'",
         promptMetrics.serial,
+        bridgeStatus.delayPromptServedSerial,
         g_delaySetupOverlay.pingMs,
         g_delaySetupOverlay.currentDelay,
         g_delaySetupOverlay.minDelay,
@@ -2938,6 +3100,75 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
         return;
     }
 
+    bool recoveryOwnedMenuEntry = false;
+    if (skipFadeOut)
+    {
+        recoveryOwnedMenuEntry =
+            netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup()
+            || netplay::bridge::takeover::IsDeferredCancelCleanupGameplaySource();
+        if (recoveryOwnedMenuEntry)
+        {
+            netplay::bridge::recovery::NoteGameplayExitMenuEntryStarted(
+                screenContext,
+                "enter_netplay_menu_skipFadeOut");
+            (void)netplay::bridge::takeover::SuppressDeferredCancelCleanupAfterGameplayRecovery(
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+        }
+
+        const int patchStateBeforeEntry =
+            netplay::bridge::takeover::GetRevivalGraphicsPatchState();
+        mod::Log(
+            "RECOVERY_MENU_PATCH_STATE_BEFORE_ENTRY state=%d",
+            patchStateBeforeEntry);
+        const bool patchRestoreOk =
+            netplay::bridge::takeover::EnsureRevivalGraphicsPatchSetEnabled(
+                "before_recovery_menu_entry");
+        mod::Log(
+            "RECOVERY_MENU_PATCH_STATE_RESTORED result=%d",
+            patchRestoreOk ? 1 : 0);
+
+        const netplay::bridge::frontend_return::FrontendContext ctx =
+            netplay::bridge::frontend_return::CaptureFrontendContext();
+        mod::Log(
+            "RECOVERY_MENU_VISUAL_BEGIN screenContext=0x%08X screen=%u mode=%u +44=%u +45=%u active=%d configStyle=%d",
+            screenContext,
+            static_cast<unsigned>(ctx.rawScreen),
+            static_cast<unsigned>(ctx.gameModeRaw),
+            static_cast<unsigned>(ctx.lifecycle44),
+            static_cast<unsigned>(ctx.exit45),
+            g_netplayMenuState.active ? 1 : 0,
+            g_netplayMenuState.useConfigStyleRender ? 1 : 0);
+
+        uint8_t old44 = 255;
+        uint8_t old45 = 255;
+        uint8_t new44 = 255;
+        uint8_t new45 = 255;
+        __try
+        {
+            old44 = *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenInitState);
+            old45 = *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenExitState);
+            *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenInitState) = 0;
+            *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenExitState) = 0;
+            new44 = *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenInitState);
+            new45 = *reinterpret_cast<uint8_t*>(
+                screenContext + netplay::constants::kOffsetScreenExitState);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        mod::Log(
+            "RECOVERY_MENU_LIFECYCLE_NORMALIZE old44=%u old45=%u new44=%u new45=%u",
+            static_cast<unsigned>(old44),
+            static_cast<unsigned>(old45),
+            static_cast<unsigned>(new44),
+            static_cast<unsigned>(new45));
+    }
+
     if (!skipFadeOut)
     {
         RunTransitionFadeOut(screenContext, 0, 0);
@@ -3017,6 +3248,12 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
         "enter_netplay");
     const NetplayMenuId targetMenu = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     SwitchToMenu(screenContext, targetMenu, -1);
+    if (skipFadeOut && recoveryOwnedMenuEntry)
+    {
+        BeginRecoveryMenuInputQuarantine(
+            screenContext,
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+    }
     InstallNetplayWindowHook(screenContext);
 
     PlayNetplayBgm(screenContext);
@@ -3936,6 +4173,14 @@ char UpdateNetplayMenu(uint32_t screenContext)
     ApplyIgcrMenuControlCompatibility(gameSystem, menuInputBytes.data());
     const bool windowFocused = IsScreenWindowFocused(screenContext);
     const uint8_t* const inputBytes = FilterMenuInputsForWindowFocus(menuInputBytes.data(), windowFocused);
+    auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection);
+    auto* const inactivityCounter = reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter);
+
+    if (SuppressRecoveryMenuInputIfNeeded(screenContext, inputBytes, inactivityCounter))
+    {
+        return 0;
+    }
+
     InputSnapshot currentSnapshot = {
         static_cast<int8_t>(inputBytes[12]),
         static_cast<int8_t>(inputBytes[14]),
@@ -3947,9 +4192,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
         inputBytes[19],
     };
     const bool joinWaitToSpectatePressed = ConsumeJoinWaitToSpectateHotkeyEdge(inputBytes);
-
-    auto* const selectionPtr = reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection);
-    auto* const inactivityCounter = reinterpret_cast<uint32_t*>(screenContext + kOffsetInactivityCounter);
 
     if (!g_hasLoggedInputSnapshot
         || std::memcmp(&currentSnapshot, &g_lastInputSnapshot, sizeof(InputSnapshot)) != 0)
@@ -4776,18 +5018,34 @@ char UpdateNetplayMenu(uint32_t screenContext)
             return 0;
         }
 
-        // No joining overlay active — just reset and fall through to idle menu
-        mod::Log("UpdateNetplayMenu: session ended with no overlay active, resetting (inBattle will be cleared)");
-        ResetHostingOverlayState();
-        ResetJoiningOverlayState();
-        ClearPendingLobbySpectateWait("session_ended");
-        DisarmSpectateReplayBypass();
-        if (bridgeStatus.errorMsg[0] != '\0')
+        if (netplay::bridge::recovery::WasGameplayExitRecoveryCompleted())
         {
-            SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);
+            const DWORD suppressTick = GetTickCount();
+            if (g_lastRecoveryNoOverlaySuppressedTick == 0
+                || suppressTick - g_lastRecoveryNoOverlaySuppressedTick >= 1000u)
+            {
+                mod::Log(
+                    "RECOVERY_MENU_SUPPRESS_NO_OVERLAY_SESSION_ENDED origin=%s phase=%s completed=1",
+                    netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
+                    netplay::bridge::PhaseToString(bridgePhase));
+                g_lastRecoveryNoOverlaySuppressedTick = suppressTick;
+            }
         }
-        netplay::bridge::CancelSession("no_overlay_session_ended");
-        notifyLobbySessionEndedForCurrentBridgeRole(false);
+        else
+        {
+            // No joining overlay active — just reset and fall through to idle menu
+            mod::Log("UpdateNetplayMenu: session ended with no overlay active, resetting (inBattle will be cleared)");
+            ResetHostingOverlayState();
+            ResetJoiningOverlayState();
+            ClearPendingLobbySpectateWait("session_ended");
+            DisarmSpectateReplayBypass();
+            if (bridgeStatus.errorMsg[0] != '\0')
+            {
+                SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);
+            }
+            netplay::bridge::CancelSession("no_overlay_session_ended");
+            notifyLobbySessionEndedForCurrentBridgeRole(false);
+        }
     }
 
     if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)

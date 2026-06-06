@@ -1,4 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/battle_log_menu.h"
 #include "netplay/core/mod_settings.h"
@@ -512,7 +513,10 @@ std::string BuildFooterText()
 
     const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
     const auto bridgePhase = static_cast<netplay::bridge::NetbridgePhase>(bridgeStatus.phase);
-    if (bridgePhase != netplay::bridge::NetbridgePhase::Idle
+    const bool recoveryCompletedSessionEnded =
+        bridgePhase == netplay::bridge::NetbridgePhase::SessionEnded
+        && netplay::bridge::recovery::WasGameplayExitRecoveryCompleted();
+    if ((bridgePhase != netplay::bridge::NetbridgePhase::Idle && !recoveryCompletedSessionEnded)
         || g_delaySetupOverlay.active
         || g_spectateConfirmOverlay.active
         || g_hostingOverlay.active

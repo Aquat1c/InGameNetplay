@@ -1,6 +1,7 @@
 // IAT stub implementations and extern "C" nb_stub_* wrappers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "crash_handler.h"
 
 #include <array>
@@ -490,6 +491,19 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "caller=%s+0x%lX (%p) — performing inline cleanup (TOCTOU last resort)",
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+        {
+            mod::Log(
+                "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=neutralize_exitprocess_toctou inProgress=%d pendingMenu=%d completed=%d origin=%s",
+                netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+                netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+                netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            (void)SuppressDeferredCancelCleanupAfterGameplayRecovery(
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            Sleep(INFINITE);
+        }
 
         // Step 1: Reinstate a live local-play session so the game loop has
         // a valid vtable for subsequent frame dispatches.

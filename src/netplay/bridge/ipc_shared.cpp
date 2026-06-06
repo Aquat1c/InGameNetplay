@@ -333,6 +333,53 @@ void CloseTempIpcContext(TempIpcContext* ctx)
     }
 }
 
+void ClearDelayPromptState(const char* reason)
+{
+    const LONG oldPrompt =
+        InterlockedExchange(&g_injectedDelayPromptSerial, 0);
+    const LONG oldServed =
+        InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
+    const LONG oldConnected =
+        InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
+    g_injectedDelayPromptWaitStartTick = 0;
+
+    LONG oldSharedPrompt = 0;
+    LONG oldSharedServed = 0;
+    LONG oldMetricsSerial = 0;
+    LONG oldInputSerial = 0;
+    LONG oldInputServed = 0;
+    if (g_hostBlock != nullptr)
+    {
+        oldSharedPrompt = InterlockedExchange(&g_hostBlock->delayPromptSerial, 0);
+        oldSharedServed = InterlockedExchange(&g_hostBlock->delayPromptServedSerial, 0);
+        oldMetricsSerial = InterlockedExchange(&g_hostBlock->delayMetricsSerial, 0);
+        oldInputSerial = InterlockedExchange(&g_hostBlock->delayInputSerial, 0);
+        oldInputServed = InterlockedExchange(&g_hostBlock->delayInputServedSerial, 0);
+        g_hostBlock->delayInputValue = -1;
+        g_hostBlock->delayAveragePingMs = -1;
+        g_hostBlock->delayMinPingMs = -1;
+        g_hostBlock->delayMaxPingMs = -1;
+        g_hostBlock->delayRecommended = -1;
+        g_hostBlock->delayRangeMin = 0;
+        g_hostBlock->delayRangeMax = 20;
+    }
+
+    g_delayPromptMetrics = {};
+
+    mod::Log(
+        "DelayPromptState: cleared reason=%s oldPrompt=%ld oldServed=%ld oldConnected=%ld "
+        "oldSharedPrompt=%ld oldSharedServed=%ld oldMetrics=%ld oldInput=%ld/%ld",
+        reason != nullptr ? reason : "",
+        static_cast<long>(oldPrompt),
+        static_cast<long>(oldServed),
+        static_cast<long>(oldConnected),
+        static_cast<long>(oldSharedPrompt),
+        static_cast<long>(oldSharedServed),
+        static_cast<long>(oldMetricsSerial),
+        static_cast<long>(oldInputSerial),
+        static_cast<long>(oldInputServed));
+}
+
 void PublishDelayPromptSerial(LONG serial)
 {
     if (serial <= 0)
