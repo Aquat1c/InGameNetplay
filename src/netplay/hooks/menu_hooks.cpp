@@ -112,6 +112,11 @@ static int ReadRecoveryDiagGameMode()
 
 static void LogTitleUpdateRecoveryCheckIfDue(uint32_t screenContext)
 {
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics)
+    {
+        return;
+    }
+
     if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
         && !netplay::bridge::frontend_return::HasPendingReturn())
     {
@@ -136,6 +141,11 @@ static void LogTitleUpdateRecoveryCheckIfDue(uint32_t screenContext)
 
 static void LogTitleRenderRecoveryPendingIfDue(uint32_t screenContext)
 {
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics)
+    {
+        return;
+    }
+
     if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
         && !netplay::bridge::frontend_return::HasPendingReturn()
         && g_recoveryRenderTraceFramesRemaining <= 0)
@@ -474,7 +484,10 @@ static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
 
     if (target == ReturnTarget::NetplayMenu)
     {
-        g_recoveryRenderTraceFramesRemaining = kRecoveryRenderTraceFrames;
+        if (kEnableGameplayExitRecoveryRenderDiagnostics)
+        {
+            g_recoveryRenderTraceFramesRemaining = kRecoveryRenderTraceFrames;
+        }
         const char* origin = completedRecovery ? gameplayExit.origin : FrontendReturnOwnerToString(owner);
         const int mode = completedRecovery ? gameplayExit.mode : -1;
         mod::Log(
@@ -1143,7 +1156,7 @@ extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
         result = GetOriginalTitleRender()(screenContext);
     }
 
-    if (traceRecoveryRender)
+    if (traceRecoveryRender && kEnableGameplayExitRecoveryRenderDiagnostics)
     {
         ++g_titleRenderRecoveryTraceCall;
         mod::Log(

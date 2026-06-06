@@ -17,6 +17,9 @@
 
 namespace netplay::hooks::internal
 {
+// Per-frame render tracing for gameplay-exit menu recovery (issue fixed).
+inline constexpr bool kEnableGameplayExitRecoveryRenderDiagnostics = false;
+
 enum class NetplayNicknameSource : uint8_t
 {
     Placeholder = 0,

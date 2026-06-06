@@ -5020,15 +5020,18 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
         if (netplay::bridge::recovery::WasGameplayExitRecoveryCompleted())
         {
-            const DWORD suppressTick = GetTickCount();
-            if (g_lastRecoveryNoOverlaySuppressedTick == 0
-                || suppressTick - g_lastRecoveryNoOverlaySuppressedTick >= 1000u)
+            if (kEnableGameplayExitRecoveryRenderDiagnostics)
             {
-                mod::Log(
-                    "RECOVERY_MENU_SUPPRESS_NO_OVERLAY_SESSION_ENDED origin=%s phase=%s completed=1",
-                    netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
-                    netplay::bridge::PhaseToString(bridgePhase));
-                g_lastRecoveryNoOverlaySuppressedTick = suppressTick;
+                const DWORD suppressTick = GetTickCount();
+                if (g_lastRecoveryNoOverlaySuppressedTick == 0
+                    || suppressTick - g_lastRecoveryNoOverlaySuppressedTick >= 1000u)
+                {
+                    mod::Log(
+                        "RECOVERY_MENU_SUPPRESS_NO_OVERLAY_SESSION_ENDED origin=%s phase=%s completed=1",
+                        netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
+                        netplay::bridge::PhaseToString(bridgePhase));
+                    g_lastRecoveryNoOverlaySuppressedTick = suppressTick;
+                }
             }
         }
         else

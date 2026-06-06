@@ -68,7 +68,10 @@ void AdvanceNetplayBackgroundAnimation()
 
 void LogRecoveryConfigFullFrameIfNeeded(BOOL presentResult, const char* path)
 {
-    if (g_recoveryRenderTraceFramesRemaining <= 0)
+    (void)presentResult;
+    (void)path;
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics
+        || g_recoveryRenderTraceFramesRemaining <= 0)
     {
         return;
     }
