@@ -3824,10 +3824,19 @@ static void CaptureRevivalRemoteInputDiag(
         && waitLoopCandidate >= outSnapshot->remoteLen;
 }
 
+// Master gate for the per-frame Revival tick diagnostics: REVIVAL_TICK_ENTER /
+// REVIVAL_TICK_EXIT / REVIVAL_PAUSE_REMOTE_INPUT / REVIVAL_BATCH_RENDER_*.
+// These fire on EVERY online gameplay frame and accounted for ~91% of the log
+// volume — and that logging cost was itself stalling the tick (multi-hundred-ms
+// PERF_WARN spikes → dropped frames → desync). Off by default; flip to true
+// only when actively debugging the netplay tick.
+static constexpr bool kLogRevivalTickDiag = false;
+
 static bool ShouldLogRevivalRemoteInputDiag(
     const RevivalRemoteInputDiagSnapshot& snapshot)
 {
-    return snapshot.valid
+    return kLogRevivalTickDiag
+        && snapshot.valid
         && g_localRoleFlag == kLocalRoleOnline
         && (snapshot.screen == 3 || snapshot.state == 3);
 }
@@ -4535,77 +4544,14 @@ static int RunPerFrameTickDispatch(void* fixedThis)
 // before calling the original sub_1006E570.
 static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 {
-    // --- gameSys+4968 toggle double-tick detection & SKIP -------------------
-    // The EXE main loop toggles gameSys+4968 once per iteration.  If we see
-    // the same value on two consecutive calls, the per-frame tick hook is
-    // running more than once per main loop frame.  This MUST be checked
-    // BEFORE incrementing g_frameTick or doing any frame work — a double
-    // invocation processes the same frame's input twice, causing one-frame
-    // state divergence between peers (desync).
-    //
-    // When detected, we log the event and call the original function (so the
-    // EXE doesn't stall) but skip ALL mod-side per-frame processing.
-    {
-        constexpr uintptr_t kGameSystemPtr = 0x0079010C;
-        uint32_t toggleVal = 0xFFFFFFFFu;
-        __try {
-            const uint32_t gameSys =
-                *reinterpret_cast<const volatile uint32_t*>(kGameSystemPtr);
-            if (gameSys != 0)
-                toggleVal =
-                    *reinterpret_cast<const volatile uint32_t*>(gameSys + 4968);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        const bool isDoubleTick =
-            toggleVal != 0xFFFFFFFFu
-            && g_lastToggleValue != 0xFFFFFFFFu
-            && toggleVal == g_lastToggleValue;
-
-        if (isDoubleTick)
-        {
-            ++g_toggleSameCount;
-
-            // Capture the return address so we can identify WHICH code path
-            // triggered the duplicate invocation.
-            const void* retAddr = _ReturnAddress();
-
-            if (g_toggleSameCount <= 5 || (g_toggleSameCount % 300 == 0))
-            {
-                mod::Log(
-                    "TICK_HOOK: *** DOUBLE TICK SKIPPED *** frameTick=%u "
-                    "toggleVal=%u toggleSameCount=%u retAddr=0x%08lX — "
-                    "skipping duplicate frame to prevent desync",
-                    g_frameTick,
-                    toggleVal,
-                    g_toggleSameCount,
-                    static_cast<unsigned long>(
-                        reinterpret_cast<uintptr_t>(retAddr)));
-            }
-
-            // Still call the original so the DLL's internal state machine
-            // doesn't stall, but use the EXE's own this-pointer (unchanged)
-            // to avoid our mod doing any additional processing.
-            // The key insight: we skip g_frameTick++, MonitorScreenIndexChange,
-            // heartbeat, StateExport, disconnect checks, etc.
-            const uintptr_t currentSession = ReadSessionPtrRaw();
-            void* fixedThis = (currentSession != 0)
-                ? reinterpret_cast<void*>(currentSession)
-                : exeThis;
-            if (UpdateGameplayStallTracker(
-                    "double_tick_bypass",
-                    currentSession,
-                    true,
-                    false,
-                    false))
-            {
-                return 0;
-            }
-            return g_origPerFrameTick(fixedThis);
-        }
-
-        // Not a double tick — update toggle tracking.
-        g_lastToggleValue = toggleVal;
-    }
+    // NOTE: A "double-tick skip" heuristic used to live here. It compared
+    // gameSys+4968 across consecutive calls and, when it saw the same value
+    // twice, skipped ALL mod-side per-frame processing for that call (still
+    // calling the original tick). It misfired on Revival's legitimate rollback
+    // re-simulation — which validly re-enters this tick with the EXE toggle
+    // unchanged — so it dropped needed per-frame work and itself caused
+    // desyncs/crashes. Removed: every invocation now takes the normal path
+    // below and calls the original exactly once via RunPerFrameTickDispatch.
 
     // Track distinct return addresses (call sites) for diagnostics.
     {

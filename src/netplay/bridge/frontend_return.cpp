@@ -1316,41 +1316,52 @@ extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)
         g_nativeBattleUpdateReached = true;
     }
 
-    uint8_t pre44 = 255;
-    uint8_t pre45 = 255;
-    uint32_t pre1416 = 0xFFFFFFFFu;
-    ReadBattleUpdateDiag(screenContext, &pre44, &pre45, &pre1416);
-    const uint8_t rawScreen = ReadCurrentRawScreenForDiag();
-    mod::Log(
-        "EFZ_BATTLE_UPDATE_ENTER ctx=0x%08lX +44=%u +45=%u +1416=%lu",
-        static_cast<unsigned long>(screenContext),
-        static_cast<unsigned>(pre44),
-        static_cast<unsigned>(pre45),
-        static_cast<unsigned long>(pre1416));
-    mod::Log(
-        "BATTLE_PAUSE_STATE context=0x%08lX pause1416=%lu exit45=%u "
-        "init44=%u screen=%u",
-        static_cast<unsigned long>(screenContext),
-        static_cast<unsigned long>(pre1416),
-        static_cast<unsigned>(pre45),
-        static_cast<unsigned>(pre44),
-        static_cast<unsigned>(rawScreen));
+    // Per-frame battle-update diagnostics (EFZ_BATTLE_UPDATE_ENTER/EXIT,
+    // BATTLE_PAUSE_STATE). Off by default — these fired every gameplay frame
+    // and were a primary source of log bloat. The hook's actual return-flow
+    // logic below always runs. Flip to true only when debugging frontend return.
+    static constexpr bool kLogBattleUpdateDiag = false;
+    if (kLogBattleUpdateDiag)
+    {
+        uint8_t pre44 = 255;
+        uint8_t pre45 = 255;
+        uint32_t pre1416 = 0xFFFFFFFFu;
+        ReadBattleUpdateDiag(screenContext, &pre44, &pre45, &pre1416);
+        const uint8_t rawScreen = ReadCurrentRawScreenForDiag();
+        mod::Log(
+            "EFZ_BATTLE_UPDATE_ENTER ctx=0x%08lX +44=%u +45=%u +1416=%lu",
+            static_cast<unsigned long>(screenContext),
+            static_cast<unsigned>(pre44),
+            static_cast<unsigned>(pre45),
+            static_cast<unsigned long>(pre1416));
+        mod::Log(
+            "BATTLE_PAUSE_STATE context=0x%08lX pause1416=%lu exit45=%u "
+            "init44=%u screen=%u",
+            static_cast<unsigned long>(screenContext),
+            static_cast<unsigned long>(pre1416),
+            static_cast<unsigned>(pre45),
+            static_cast<unsigned>(pre44),
+            static_cast<unsigned>(rawScreen));
+    }
 
     char result = 3;
     if (g_originalBattleUpdate != nullptr)
     {
         result = g_originalBattleUpdate(screenContext);
     }
-    uint8_t post44 = 255;
-    uint8_t post45 = 255;
-    uint32_t post1416 = 0xFFFFFFFFu;
-    ReadBattleUpdateDiag(screenContext, &post44, &post45, &post1416);
-    mod::Log(
-        "EFZ_BATTLE_UPDATE_EXIT result=%d +44=%u +45=%u +1416=%lu",
-        static_cast<int>(result),
-        static_cast<unsigned>(post44),
-        static_cast<unsigned>(post45),
-        static_cast<unsigned long>(post1416));
+    if (kLogBattleUpdateDiag)
+    {
+        uint8_t post44 = 255;
+        uint8_t post45 = 255;
+        uint32_t post1416 = 0xFFFFFFFFu;
+        ReadBattleUpdateDiag(screenContext, &post44, &post45, &post1416);
+        mod::Log(
+            "EFZ_BATTLE_UPDATE_EXIT result=%d +44=%u +45=%u +1416=%lu",
+            static_cast<int>(result),
+            static_cast<unsigned>(post44),
+            static_cast<unsigned>(post45),
+            static_cast<unsigned long>(post1416));
+    }
 
     result = HandleNativeUpdateReturn(ScreenId::Battle, result);
     TickFrontendReturn();

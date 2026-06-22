@@ -235,7 +235,6 @@ private:
     bool DoAccept(int challengerPlayerId);
     bool DoEnd();
     bool TryRejoinIfNeeded();
-    bool TryDetachFromLobbyForSpectate();
     bool HandleServerRemovalFailure(const char* operation, const std::string& body);
 
     // Discover our public IP address via an external service.

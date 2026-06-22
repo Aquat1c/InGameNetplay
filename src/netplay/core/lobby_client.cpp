@@ -2058,21 +2058,18 @@ void LobbySession::NotifySpectateStarted()
 
     m_spectateActive.store(true);
     m_returningFromSpectate.store(false);
-    if (m_joinedRoom.lobbyNumericId != 0 && !m_spectateDetachedFromRoom.load())
-    {
-        m_spectateLeavePending.store(true);
-    }
+    // Concerto invariant: spectating does NOT leave the room. We keep polling
+    // status as a normal member and just launch the local watch session, so we
+    // stay visible and never churn our server identity (the old leave+rejoin
+    // detach was a primary source of ghost entries and stale state).
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.inBattle = true;
-        if (m_spectateLeavePending.load())
-        {
-            m_status.statusMessage = "Leaving room for spectate...";
-        }
     }
     mod::Log(
-        "LobbySession::NotifySpectateStarted: local spectate lifecycle active detachPending=%d roomCode='%s' origin=%d",
-        m_spectateLeavePending.load() ? 1 : 0,
+        "LobbySession::NotifySpectateStarted: local spectate active (no room detach) roomCode='%s' origin=%d",
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
     if (m_wakeEvent != nullptr)
@@ -2131,28 +2128,20 @@ void LobbySession::NotifyEndMatch()
         action.type = PendingAction::End;
         m_pendingActions.push_back(std::move(action));
     }
-    else if (wasHost)
-    {
-        // HOST: defer the End action until we re-enter the lobby menu
-        // (via RequestRefresh).  This keeps the playing-pair visible on
-        // the server and prevents us from appearing idle prematurely.
-        m_endDeferred.store(true);
-        m_endPending.store(false);
-        mod::Log("LobbySession::NotifyEndMatch (host): inBattle=false "
-                 "returningFromMatch=true (End deferred)");
-    }
     else
     {
-        // CLIENT: send End immediately so the server drops the playing
-        // pair.  The host is responsible for maintaining lobby presence;
-        // having the client also "post" would create duplicates.  We
-        // still set m_returningFromMatch so IsInBattle() returns true
-        // and local challenge acceptance is suppressed until we return
-        // to the lobby menu.
+        // Concerto invariant: send End immediately when a match/challenge ends
+        // (host AND client), so the server drops the playing pair right away
+        // instead of leaving a stale "playing" entry until menu re-entry. The
+        // old host-side deferral let a third party challenge an already-free
+        // host (double matches) and left ghost "playing" pairs on hard exit.
+        // m_returningFromMatch stays set so IsInBattle() suppresses local
+        // challenge acceptance until we return to the lobby menu.
         m_endDeferred.store(false);
         m_endPending.store(true);
-        mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
-                 "returningFromMatch=true, queuing End immediately");
+        mod::Log("LobbySession::NotifyEndMatch (%s): inBattle=false "
+                 "returningFromMatch=true, queuing End immediately",
+                 wasHost ? "host" : "client");
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = 0;
         m_pendingChallengeTargetName.clear();
@@ -2300,6 +2289,15 @@ bool LobbySession::TryRejoinIfNeeded()
         m_joinedRoom.playerId,
         static_cast<int>(m_joinedRoom.origin));
 
+    // One-identity invariant: leave our previous server registration before
+    // re-joining, so the server never carries a stale duplicate of us (the
+    // "I left but I'm still in the room" ghost). If our membership is already
+    // gone, DoLeave is a harmless no-op (it treats a missing lobby as success).
+    if (m_joinedRoom.lobbyNumericId != 0)
+    {
+        (void)DoLeave();
+    }
+
     if (!DoJoin())
     {
         mod::Log(
@@ -2313,72 +2311,6 @@ bool LobbySession::TryRejoinIfNeeded()
         "LobbySession::TryRejoinIfNeeded: rejoined lobby id=%d playerId=%d roomCode='%s' origin=%d",
         m_joinedRoom.lobbyNumericId,
         m_joinedRoom.playerId,
-        m_joinedRoom.roomCode.c_str(),
-        static_cast<int>(m_joinedRoom.origin));
-    return true;
-}
-
-bool LobbySession::TryDetachFromLobbyForSpectate()
-{
-    if (!m_spectateLeavePending.load())
-    {
-        return true;
-    }
-
-    if (m_spectateDetachedFromRoom.load())
-    {
-        m_spectateLeavePending.store(false);
-        return true;
-    }
-
-    if (m_joinedRoom.lobbyNumericId == 0)
-    {
-        m_spectateLeavePending.store(false);
-        m_spectateDetachedFromRoom.store(true);
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.pollState = PollState::NotJoined;
-        m_status.idlePlayers.clear();
-        m_status.challenges.clear();
-        m_status.displayEntries.clear();
-        m_status.playing.clear();
-        m_status.statusMessage = "Spectating...";
-        m_status.inBattle = true;
-        mod::Log("LobbySession::TryDetachFromLobbyForSpectate: no joined credentials, treating room as detached");
-        return true;
-    }
-
-    mod::Log(
-        "LobbySession::TryDetachFromLobbyForSpectate: leaving roomCode='%s' roomId=%d playerId=%d origin=%d",
-        m_joinedRoom.roomCode.c_str(),
-        m_joinedRoom.lobbyNumericId,
-        m_joinedRoom.playerId,
-        static_cast<int>(m_joinedRoom.origin));
-
-    if (!DoLeave())
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.statusMessage = "Leaving room for spectate...";
-        return false;
-    }
-
-    m_spectateLeavePending.store(false);
-    m_spectateDetachedFromRoom.store(true);
-    m_joinedRoom.lobbyNumericId = 0;
-    m_joinedRoom.playerId = 0;
-    m_joinedRoom.secret = 0;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.pollState = PollState::NotJoined;
-        m_status.idlePlayers.clear();
-        m_status.challenges.clear();
-        m_status.displayEntries.clear();
-        m_status.playing.clear();
-        m_status.statusMessage = "Spectating...";
-        m_status.inBattle = true;
-    }
-
-    mod::Log(
-        "LobbySession::TryDetachFromLobbyForSpectate: detached roomCode='%s' origin=%d",
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
     return true;
@@ -2432,44 +2364,24 @@ void LobbySession::PollThreadEntry()
     // Discover public IP in the background after joining so lobby entry is not blocked.
     StartPublicIpDiscoveryAsync();
 
-    // Poll loop.
+    // Poll loop. Concerto invariant: poll status every tick for BOTH host and
+    // client, throughout matches and spectating. The server treats the poll as
+    // the room keepalive, so we never stop polling or detach while joined —
+    // doing so lets the server expire or duplicate our membership (ghosts).
     while (!m_shouldStop.load())
     {
         m_refreshRequested.store(false);
 
-        // Process any queued challenge/accept actions before polling.
+        // Process any queued challenge/accept/end actions before polling.
         ProcessPendingActions();
         if (m_shouldStop.load())
         {
             break;
         }
 
-        if (m_spectateLeavePending.load() && !TryDetachFromLobbyForSpectate())
-        {
-            if (m_wakeEvent != nullptr)
-            {
-                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
-            }
-            else
-            {
-                Sleep(kPollIntervalMs);
-            }
-            continue;
-        }
-
-        if (m_spectateDetachedFromRoom.load() && !m_rejoinRequested.load())
-        {
-            if (m_wakeEvent != nullptr)
-            {
-                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
-            }
-            else
-            {
-                Sleep(kPollIntervalMs);
-            }
-            continue;
-        }
-
+        // Service a scheduled rejoin (error recovery only). TryRejoinIfNeeded
+        // always leaves the previous identity before re-joining, so we never
+        // orphan a server-side entry.
         if (!TryRejoinIfNeeded())
         {
             if (m_wakeEvent != nullptr)
@@ -2483,29 +2395,18 @@ void LobbySession::PollThreadEntry()
             continue;
         }
 
-        // CLIENT in an active match: skip polling to avoid "posting"
-        // our presence to the lobby — only the host maintains lobby
-        // visibility during a match.  We still process pending actions
-        // above (e.g. ConfirmAccept, End) so the server is notified.
         bool allowPoll = true;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             allowPoll = (m_status.pollState != PollState::Error);
         }
-        const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
         if (m_shouldStop.load())
         {
             break;
         }
-        if (!skipPoll && allowPoll)
+        if (allowPoll)
         {
-            if (!DoPollStatus() && m_rejoinRequested.load())
-            {
-                if (TryRejoinIfNeeded())
-                {
-                    (void)DoPollStatus();
-                }
-            }
+            (void)DoPollStatus();
         }
 
         // Wait for kPollIntervalMs or until woken early.
