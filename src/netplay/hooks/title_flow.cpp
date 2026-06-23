@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/assets/assets.h"
+#include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
@@ -2567,6 +2568,30 @@ void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeSta
     g_delaySetupOverlay.recommendedDelay =
         (std::min)(g_delaySetupOverlay.maxDelay, ClampDelaySelection((std::max)(recommendedDelay, g_delaySetupOverlay.minDelay)));
     g_delaySetupOverlay.selectedDelay = g_delaySetupOverlay.recommendedDelay;
+
+    // Guard against a spiked ping measurement. Async hosting measures RTT while
+    // the delay prompt is held during local gameplay — where EFZ is not
+    // servicing the netplay connection — so the helper's ping can inflate to
+    // absurd values (e.g. ~2000ms) and pin the recommendation to max delay. The
+    // ping is measured once and never re-pings, so the only sane workaround is to
+    // distrust it: when the ping is implausibly high, default the selection (and
+    // shown recommendation) to a reasonable value instead of dumping the user at
+    // max. The full range stays available for manual adjustment, and Revival
+    // allows further tuning the delay live during the match.
+    constexpr int kImplausiblePingMs = 500;
+    constexpr int kSpikeFallbackDelay = 3;
+    if (g_delaySetupOverlay.pingMs > kImplausiblePingMs)
+    {
+        const int fallback = (std::min)(
+            g_delaySetupOverlay.maxDelay,
+            (std::max)(g_delaySetupOverlay.minDelay, kSpikeFallbackDelay));
+        mod::Log(
+            "DelayOverlay: implausible ping=%d (held-prompt spike) -> default delay %d (was recommended=%d)",
+            g_delaySetupOverlay.pingMs, fallback, g_delaySetupOverlay.recommendedDelay);
+        g_delaySetupOverlay.recommendedDelay = fallback;
+        g_delaySetupOverlay.selectedDelay = fallback;
+    }
+
     if (bridgeStatus.p1Name[0] != '\0' && bridgeStatus.p2Name[0] != '\0')
     {
         CopyBoundedText(g_delaySetupOverlay.p1Name, sizeof(g_delaySetupOverlay.p1Name), bridgeStatus.p1Name);
@@ -3281,6 +3306,39 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     }
 
     RunTransitionFadeIn(screenContext);
+
+    // Async hosting: if a host listener is still active when the netplay menu is
+    // (re-)entered, make sure the hosting overlay is available so the minimized
+    // HOSTING badge shows again. We stay MINIMIZED (badge on Main); selecting
+    // HOST un-minimizes to the full prompt. The host session persists across
+    // menu exits (LeaveNetplayMenu keeps it alive while hosting).
+    if (netplay::bridge::async_host::IsActive())
+    {
+        if (!g_hostingOverlay.active)
+        {
+            ActivateHostingOverlay(netplay::bridge::async_host::HostPort());
+        }
+        if (netplay::bridge::async_host::ConsumeReturnKeyArrival())
+        {
+            // Arrived via the F1 return hotkey pressed in gameplay: show the FULL
+            // hosting overlay (un-minimized) in the HOST submenu so a held peer is
+            // auto-accepted (the connecting branch accepts when not minimized) and
+            // the user can act on the session.
+            netplay::bridge::async_host::SetMinimized(false);
+            SwitchToMenu(screenContext, NetplayMenuId::Host, -1);
+            mod::Log(
+                "AsyncHost: F1 return arrived — restored full HOST overlay (state=%d)",
+                static_cast<int>(netplay::bridge::async_host::GetState()));
+        }
+        else
+        {
+            netplay::bridge::async_host::SetMinimized(true);
+            mod::Log(
+                "AsyncHost: menu re-entry with active host — badge restored (state=%d)",
+                static_cast<int>(netplay::bridge::async_host::GetState()));
+        }
+    }
+
     mod::Log(
         "EnterNetplayMenu: active menu=%s selection=%d bgmTrack=%u configStyle=%d theme=%d bgScrollSupported=%d optionCount=%d backIndex=%d skipFadeOut=%d deferredLobbyRefresh=%d",
         MenuIdToString(g_netplayMenuState.menuId),
@@ -3295,10 +3353,11 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
         g_deferredLobbyRefreshPending ? 1 : 0);
 }
 
-void LeaveNetplayMenu(uint32_t screenContext)
+void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
 {
     PumpLobbySessionShutdown();
-    mod::Log("LeaveNetplayMenu: request active=%d bgmActive=%d", g_netplayMenuState.active, g_netplayMenuState.bgmActive);
+    mod::Log("LeaveNetplayMenu: request active=%d bgmActive=%d keepHostSession=%d",
+        g_netplayMenuState.active, g_netplayMenuState.bgmActive, keepHostSession ? 1 : 0);
     if (!g_netplayMenuState.active)
     {
         mod::Log("LeaveNetplayMenu: already inactive");
@@ -3316,16 +3375,29 @@ void LeaveNetplayMenu(uint32_t screenContext)
         &g_lobbyChallengeAlertBufferIndex,
         "leave_netplay");
 
-    netplay::bridge::CancelSession("leave_menu");
-
-    // Defensive: tear down any active lobby session so the server is
-    // notified (/leave) and the poll thread stops.  Normally unreachable
-    // because SwitchToMenu handles this when navigating away from the
-    // Lobby menu, but guards against future call-site additions.
-    if (g_lobbySession)
+    // Keep the host listener alive across menu exits whenever async hosting is
+    // active — leaving the netplay menu does NOT stop hosting. The user cancels
+    // hosting only by pressing B in the full HOSTING prompt (or via the
+    // "Stop hosting?" modal). EnterNetplayMenu restores the badge on re-entry,
+    // and HOST re-opens the full prompt.
+    const bool keepHost = keepHostSession || netplay::bridge::async_host::IsActive();
+    if (!keepHost)
     {
-        mod::Log("LeaveNetplayMenu: tearing down g_lobbySession defensively");
-        BeginLobbySessionShutdown(false);
+        netplay::bridge::CancelSession("leave_menu");
+
+        // Defensive: tear down any active lobby session so the server is
+        // notified (/leave) and the poll thread stops.  Normally unreachable
+        // because SwitchToMenu handles this when navigating away from the
+        // Lobby menu, but guards against future call-site additions.
+        if (g_lobbySession)
+        {
+            mod::Log("LeaveNetplayMenu: tearing down g_lobbySession defensively");
+            BeginLobbySessionShutdown(false);
+        }
+    }
+    else
+    {
+        mod::Log("LeaveNetplayMenu: preserving active host session across menu exit");
     }
 
     g_netplayMenuState.active = false;
@@ -3356,7 +3428,12 @@ void LeaveNetplayMenu(uint32_t screenContext)
     DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
-    ResetHostingOverlayState();
+    if (!keepHost)
+    {
+        // Preserve the hosting overlay state while a host session persists so the
+        // badge/full prompt can be restored when the menu is re-entered.
+        ResetHostingOverlayState();
+    }
     ResetJoiningOverlayState();
     ClearPendingLobbySpectateWait("leave_netplay_menu");
     ResetLobbyChallengeNotificationState();
@@ -3722,6 +3799,27 @@ NetplayMenuId ResolveCancelTargetMenu()
     return NetplayMenuId::Main;
 }
 
+// If an async-host listener is active, arm the "Stop hosting?" confirm modal for
+// |action| (deferred until the user confirms) and return true so the caller
+// skips the navigation. Returns false when not hosting (caller proceeds).
+bool RequestStopHostingConfirmIfHosting(
+    uint32_t screenContext,
+    NetplayMenuAction action,
+    int logicalSelection)
+{
+    if (!netplay::bridge::async_host::IsActive())
+    {
+        return false;
+    }
+    g_stopHostingConfirm.active = true;
+    g_stopHostingConfirm.selection = 1; // default: Keep hosting
+    g_stopHostingConfirm.pendingAction = action;
+    g_stopHostingConfirm.pendingLogicalSelection = logicalSelection;
+    PlayUiSound(screenContext, kSfxMove);
+    mod::Log("StopHostingConfirm: armed for action=%d", static_cast<int>(action));
+    return true;
+}
+
 void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int logicalSelection)
 {
     const HWND owner = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
@@ -3754,13 +3852,27 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
     case NetplayMenuAction::OpenHost:
         g_netplayMenuState.mainSelection = logicalSelection;
+        // Restore from minimized async hosting — the full hosting overlay shows
+        // again in the Host submenu.
+        if (netplay::bridge::async_host::IsActive())
+        {
+            netplay::bridge::async_host::SetMinimized(false);
+        }
         StartMenuSlideTransition(screenContext, NetplayMenuId::Host, -1, +1);
         break;
     case NetplayMenuAction::OpenJoin:
+        if (RequestStopHostingConfirmIfHosting(screenContext, action, logicalSelection))
+        {
+            break;
+        }
         g_netplayMenuState.mainSelection = logicalSelection;
         StartMenuSlideTransition(screenContext, NetplayMenuId::Join, -1, +1);
         break;
     case NetplayMenuAction::OpenPlayerRooms:
+        if (RequestStopHostingConfirmIfHosting(screenContext, action, logicalSelection))
+        {
+            break;
+        }
         if (g_lobbySessionShutdownInFlight.load())
         {
             ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
@@ -3770,6 +3882,10 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         StartMenuSlideTransition(screenContext, NetplayMenuId::PlayerRooms, -1, +1);
         break;
     case NetplayMenuAction::OpenLobby:
+        if (RequestStopHostingConfirmIfHosting(screenContext, action, logicalSelection))
+        {
+            break;
+        }
         if (g_lobbySessionShutdownInFlight.load())
         {
             ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
@@ -3815,6 +3931,16 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         break;
     case NetplayMenuAction::HostStart:
     {
+        // Guard against re-hosting an already-active async host session. If a peer
+        // already connected (PeerFoundHeld) this would tear down the held session;
+        // if still waiting it would just churn. The full overlay is already up, so
+        // ignore a stray Start. (Auto-accept handles the peer-found case.)
+        if (netplay::bridge::async_host::IsActive())
+        {
+            mod::Log("HostStart: ignored — async host already active (state=%d)",
+                static_cast<int>(netplay::bridge::async_host::GetState()));
+            break;
+        }
         const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
         const bool started = netplay::bridge::StartSession(
             NetbridgeRole::Host,
@@ -3825,6 +3951,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         if (started)
         {
             ActivateHostingOverlay(g_netplayMenuState.hostPort);
+            // Engage async hosting: the prompt will be HELD when a peer connects
+            // until the user accepts, instead of auto-showing the delay overlay.
+            netplay::bridge::async_host::OnHostStarted(
+                g_netplayMenuState.hostPort, g_netplayMenuState.nickname.c_str());
+            // Make sure the D3D9 EndScene overlay hook is live so the in-gameplay
+            // async-host indicator can render once minimized.
+            netplay::battle_log::EnsureGameplayOverlayHook();
         }
         else
         {
@@ -4341,13 +4474,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
-    // --- Debug overlay (D key) ---
-    // Always poll the D key toggle before menu-specific handlers so the
-    // debug overlay is truly modal once opened.
-    if (windowFocused && HandleDebugOverlayInput(screenContext, inputBytes, inactivityCounter))
-    {
-        return 0;
-    }
+    // NOTE: the old text "debug overlay" (toggled by the in-game D button) is
+    // removed — it collided with the hosting overlay's D button (accept/minimize)
+    // and is superseded by the ImGui debug panel (toggled with backslash, see
+    // netplay::debug_overlay). HandleDebugOverlayInput is no longer called.
 
     if (windowFocused
         && g_netplayMenuState.menuId == NetplayMenuId::Options
@@ -4808,7 +4938,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if ((bridgePhase == NetbridgePhase::DelaySetup
             || bridgePhase == NetbridgePhase::Connected
             || bridgePhase == NetbridgePhase::Connecting)
-        && bridgeDelaySetupReady)
+        && bridgeDelaySetupReady
+        && !netplay::bridge::async_host::ShouldSuppressDelayOverlay())
     {
         const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
         if (!g_delaySetupOverlay.active)
@@ -5051,7 +5182,81 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
     }
 
-    if (bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
+    // "Stop hosting?" confirm modal — intercepts all input while active.
+    if (g_stopHostingConfirm.active)
+    {
+        bool cancel = ConsumeNetplayEscapeEdge();
+        bool confirm = false;
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            auto* const latch = reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1 + playerIndex);
+            const int8_t horizontal = static_cast<int8_t>(inputBytes[playerIndex + 12]);
+            const int8_t vertical = static_cast<int8_t>(inputBytes[playerIndex + 14]);
+            if (horizontal != 0 || vertical != 0)
+            {
+                if (*latch == 0)
+                {
+                    g_stopHostingConfirm.selection = (g_stopHostingConfirm.selection == 0) ? 1 : 0;
+                    PlayUiSound(screenContext, kSfxMove);
+                }
+                *latch = 1;
+            }
+            else
+            {
+                *latch = 0;
+            }
+            if (inputBytes[playerIndex + 16] == 1) // A = confirm
+            {
+                confirm = true;
+            }
+            if (inputBytes[playerIndex + 18] == 1) // B = cancel
+            {
+                cancel = true;
+            }
+        }
+
+        if (cancel)
+        {
+            g_stopHostingConfirm.active = false;
+            PlayUiSound(screenContext, kSfxConfirm);
+            mod::Log("StopHostingConfirm: cancelled (keep hosting)");
+        }
+        else if (confirm)
+        {
+            const bool stopHosting = (g_stopHostingConfirm.selection == 0);
+            const netplay::menu::NetplayMenuAction pending = g_stopHostingConfirm.pendingAction;
+            const int pendingSel = g_stopHostingConfirm.pendingLogicalSelection;
+            g_stopHostingConfirm.active = false;
+            PlayUiSound(screenContext, kSfxConfirm);
+            if (stopHosting)
+            {
+                mod::Log("StopHostingConfirm: stopping host, proceeding to action=%d",
+                    static_cast<int>(pending));
+                netplay::bridge::async_host::Reset();
+                netplay::bridge::CancelSession("stop_hosting_for_menu");
+                ResetHostingOverlayState();
+                notifyLobbySessionEndedForCurrentBridgeRole(false);
+                // Re-dispatch the deferred navigation now that hosting is gone.
+                ExecuteNetplayAction(screenContext, pending, pendingSel);
+            }
+            else
+            {
+                mod::Log("StopHostingConfirm: keep hosting selected");
+            }
+        }
+
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
+    // While async hosting is MINIMIZED, do not run the connecting/hosting
+    // overlay input handler — let normal menu navigation work so the user can
+    // browse Battle Log / Options while the host listener stays alive (a small
+    // badge shows the hosting state). Selecting HOST again un-minimizes.
+    if ((bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
+        && !netplay::bridge::async_host::IsMinimized())
     {
         bool cancelRequested = ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
@@ -5070,6 +5275,56 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     bridgeStatus.roleFlag,
                     netplay::bridge::PhaseToString(bridgePhase));
                 break;
+            }
+        }
+
+        // Async hosting: once a peer has connected and the delay prompt is being
+        // held, accept AUTOMATICALLY as soon as the full hosting overlay is on
+        // screen — we only reach here when NOT minimized. The user no longer
+        // presses D to accept; releasing the hold makes the normal delay-setup
+        // overlay activate next frame. (While minimized the hold persists and a
+        // badge shows "OPPONENT FOUND!"; returning to HOST un-minimizes, lands
+        // here, and auto-accepts.) RequestAccept is idempotent — it only acts on
+        // the PeerFoundHeld -> Accepted edge, so the sound plays once.
+        if (!cancelRequested && netplay::bridge::async_host::IsPeerFoundHeld())
+        {
+            netplay::bridge::async_host::RequestAccept();
+            PlayUiSound(screenContext, kSfxConfirm);
+        }
+
+        // Async hosting: while waiting for a peer (no prompt held yet), the D
+        // button (offset 22/23) MINIMIZES — collapse the hosting overlay to a
+        // small badge and drop back to the Main netplay menu while the host
+        // listener stays alive, so the user can browse Battle Log / Options /
+        // etc. The hosting overlay (kept active) renders as a badge while
+        // minimized; selecting HOST again restores the full overlay.
+        if (!cancelRequested
+            && g_hostingOverlay.active
+            && !g_hostingOverlay.challengeMode
+            && netplay::bridge::async_host::GetState()
+                   == netplay::bridge::async_host::State::Hosting)
+        {
+            bool minimizeRequested = false;
+            for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+            {
+                if (inputBytes[playerIndex + 22] == 1)
+                {
+                    minimizeRequested = true;
+                    break;
+                }
+            }
+            if (minimizeRequested)
+            {
+                netplay::bridge::async_host::SetMinimized(true);
+                PlayUiSound(screenContext, kSfxConfirm);
+                mod::Log("AsyncHost: minimized to Main menu badge, host session kept alive");
+                // Stay in the netplay menu — go to Main. Keep g_hostingOverlay
+                // active so it renders as a badge (DrawHostingOverlayGdi checks
+                // async_host::IsMinimized()). Do NOT cancel the session.
+                SwitchToMenu(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection);
+                *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
+                *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
+                return 0;
             }
         }
 
@@ -5110,6 +5365,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
             ClearPendingLobbySpectateWait("user_cancel");
+            netplay::bridge::async_host::Reset();
             netplay::bridge::CancelSession("user_cancel");
             notifyLobbySessionEndedForCurrentBridgeRole(false);
             mod::Log("NetplayBridge: cancel requested during connecting");

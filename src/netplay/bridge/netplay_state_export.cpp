@@ -20,6 +20,7 @@
 #include <thread>
 
 #include "efz_netplay_state.h"
+#include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
@@ -511,6 +512,13 @@ void Initialize()
     init.localSide = -1;
     init.pingMs = -1;
     init.rollbackFrames = -1;
+    // v7 extended network metrics default to "unavailable".
+    init.avgPingMs = -1;
+    init.minPingMs = -1;
+    init.maxPingMs = -1;
+    init.recommendedDelay = -1;
+    init.minDelay = -1;
+    init.maxDelay = -1;
 
     if (g_shmView != nullptr)
     {
@@ -1011,6 +1019,66 @@ void UpdateNow(const NetbridgeStatus& status)
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
+    }
+
+    // --- Async hosting (v7) ------------------------------------------------
+    {
+        namespace ah = netplay::bridge::async_host;
+        const bool active = ah::IsActive();
+        s.asyncHostActive = active ? 1 : 0;
+        s.asyncHostMinimized = ah::IsMinimized() ? 1 : 0;
+        s.asyncHostPeerFound = ah::IsPeerFoundHeld() ? 1 : 0;
+        s.asyncHostTimedOut = ah::IsTimedOut() ? 1 : 0;
+        s.hostPort = active ? ah::HostPort() : 0;
+        if (active)
+        {
+            caps |= EFZ_CAP_ASYNC_HOST;
+            // Surface background hosting as HOST_IDLE + HOSTING so consumers know
+            // netplay is engaged (but NOT a live match) while the local player
+            // uses EFZ normally. Only override when not already in a live netplay
+            // match / charselect / menu flow.
+            if (ah::IsMinimized()
+                && !s.inNetplayMatch
+                && !s.inNetplayCharacterSelect
+                && !s.inNetplayMenu)
+            {
+                s.activityPhase = EFZ_ACTIVITY_HOST_IDLE;
+                s.sessionMode = EFZ_SESSION_HOSTING;
+                caps |= EFZ_CAP_ACTIVITY | EFZ_CAP_SESSION;
+            }
+        }
+    }
+
+    // --- Extended network metrics (v7) -------------------------------------
+    {
+        const DelayPromptMetrics m = netplay::bridge::GetDelayPromptMetrics();
+        s.avgPingMs = m.averagePingMs;
+        s.minPingMs = m.minPingMs;
+        s.maxPingMs = m.maxPingMs;
+        s.recommendedDelay = m.recommendedDelay;
+        s.minDelay = m.minDelay;
+        s.maxDelay = m.maxDelay;
+        if (m.serial != 0 && (m.averagePingMs >= 0 || m.recommendedDelay >= 0))
+        {
+            caps |= EFZ_CAP_NET_DETAIL;
+        }
+    }
+
+    // --- Connection endpoint (v7) ------------------------------------------
+    s.connectionAddress[0] = '\0';
+    if (status.address[0] != '\0')
+    {
+        if (status.port != 0)
+        {
+            std::snprintf(s.connectionAddress, sizeof(s.connectionAddress),
+                "%s:%u", status.address, static_cast<unsigned>(status.port));
+        }
+        else
+        {
+            std::snprintf(s.connectionAddress, sizeof(s.connectionAddress),
+                "%s", status.address);
+        }
+        caps |= EFZ_CAP_CONNECTION;
     }
 
     s.capabilityFlags = caps;

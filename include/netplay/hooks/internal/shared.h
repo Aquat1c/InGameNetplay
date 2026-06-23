@@ -225,6 +225,20 @@ extern SpectateConfirmOverlayState g_spectateConfirmOverlay;
 extern HostingOverlayState g_hostingOverlay;
 extern JoiningOverlayState g_joiningOverlay;
 extern DebugOverlayState g_debugOverlay;
+
+// "Stop hosting?" confirmation modal shown when the user selects a netplay-menu
+// option that conflicts with an active async-host listener (Join / Lobby /
+// Player Rooms). On confirm, the host session is cancelled and the deferred
+// action runs; on cancel, hosting continues.
+struct StopHostingConfirmState
+{
+    bool active = false;
+    int  selection = 1;  // 0 = Stop hosting (Yes), 1 = Keep hosting (No, default)
+    netplay::menu::NetplayMenuAction pendingAction = netplay::menu::NetplayMenuAction::BackToMain;
+    int  pendingLogicalSelection = 0;
+};
+extern StopHostingConfirmState g_stopHostingConfirm;
+bool DrawStopHostingConfirmGdi(uint32_t screenContext);
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 HMODULE ResolveCurrentModule();
@@ -311,7 +325,10 @@ void DrawAnimatedCompactMenuLayer(uint32_t screenContext);
 void DrawNetplayBaseLayer(uint32_t screenContext);
 
 void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut = false);
-void LeaveNetplayMenu(uint32_t screenContext);
+// |keepHostSession| true = "minimize": tear down the menu UI but DO NOT cancel
+// the active netplay session (async hosting keeps the host listener alive while
+// the user returns to the title screen).
+void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession = false);
 bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason);
 void ExecuteNetplayAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action, int logicalSelection);
 char UpdateNetplayMenu(uint32_t screenContext);

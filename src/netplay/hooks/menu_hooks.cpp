@@ -4,6 +4,8 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/battle_log_menu.h"
+#include "netplay/core/mod_settings.h"
 
 #include "crash_handler.h"
 #include "logger.h"
@@ -28,6 +30,7 @@ bool g_netplayAssetsAvailable = false;
 bool g_titleAssetsOverrideApplied = false;
 
 NetplayMenuState g_netplayMenuState;
+StopHostingConfirmState g_stopHostingConfirm;
 MenuSlideTransition g_menuSlideTransition;
 netplay::inline_edit::State g_inlineEditState;
 DWORD g_lastNetplayFrameLogTick = 0;
@@ -549,6 +552,14 @@ static bool SuppressOldExitInterceptionIfRecoveryOwned()
 static char HookedTitleUpdateImplBody(uint32_t screenContext)
 {
     ++g_titleUpdateCallCount;
+
+    // When the debug option is enabled, make sure the D3D9 EndScene overlay hook
+    // is installed early (from the title screen) so the ImGui debug overlay can
+    // be toggled with DELETE on any screen. Idempotent/cheap once installed.
+    if (netplay::mod_settings::IsDebugMenuEnabled())
+    {
+        (void)netplay::battle_log::EnsureGameplayOverlayHook();
+    }
     if ((g_titleUpdateCallCount % 300ull) == 0ull)
     {
         mod::Log(
@@ -1154,6 +1165,8 @@ extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
     else
     {
         result = GetOriginalTitleRender()(screenContext);
+        // (The HOSTING indicator outside the netplay menu is drawn by the ImGui
+        // top-middle badge via the D3D9 EndScene hook, not the indexed surface.)
     }
 
     if (traceRecoveryRender && kEnableGameplayExitRecoveryRenderDiagnostics)
@@ -1280,6 +1293,14 @@ extern "C" __declspec(naked) void HookedReplayScreenUpdateThunk()
 }
 #endif
 } // namespace netplay::hooks::internal
+
+namespace netplay::hooks
+{
+bool IsNetplayMenuActive()
+{
+    return internal::g_netplayMenuState.active;
+}
+} // namespace netplay::hooks
 
 namespace netplay
 {

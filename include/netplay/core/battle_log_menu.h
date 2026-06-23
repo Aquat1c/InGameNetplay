@@ -100,6 +100,10 @@ void ResetState();
 bool EnterMenu();
 void LeaveMenu();
 void ShutdownRenderOverlay();
+// Ensures the shared Direct3D9 EndScene overlay hook is installed. Used by the
+// battle-log overlay, the async-host in-gameplay indicator, and the ImGui debug
+// overlay. Idempotent and cheap after the first successful install.
+bool EnsureGameplayOverlayHook();
 
 std::string BuildRowLabel(netplay::menu::NetplayMenuAction action);
 std::string BuildRowPrimaryText(netplay::menu::NetplayMenuAction action);

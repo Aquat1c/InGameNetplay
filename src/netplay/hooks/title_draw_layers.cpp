@@ -507,6 +507,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawHostingOverlayGdi(screenContext, false);
         (void)DrawJoiningOverlayGdi(screenContext, false);
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawStopHostingConfirmGdi(screenContext);
         (void)DrawDebugOverlay(screenContext);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
         LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime_battlelog");
@@ -531,6 +532,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawStopHostingConfirmGdi(screenContext);
     (void)DrawDebugOverlay(screenContext);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime");
@@ -551,6 +553,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
         (void)DrawHostingOverlayGdi(screenContext, false);
         (void)DrawJoiningOverlayGdi(screenContext, false);
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawStopHostingConfirmGdi(screenContext);
         (void)DrawDebugOverlay(screenContext);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
         LogRecoveryConfigFullFrameIfNeeded(presentResult, "config_battlelog");
@@ -568,6 +571,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     (void)DrawHostingOverlayGdi(screenContext, false);
     (void)DrawJoiningOverlayGdi(screenContext, false);
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawStopHostingConfirmGdi(screenContext);
     (void)DrawDebugOverlay(screenContext);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     LogRecoveryConfigFullFrameIfNeeded(presentResult, "config");

@@ -7,6 +7,7 @@
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/text_utils.h"
+#include "netplay/hooks/debug_overlay.h"
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/render/draw_surface.h"
 #include "netplay/render/software_font.h"
@@ -2227,6 +2228,9 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
     if (device != nullptr)
     {
         (void)RenderBrowserIconsD3d9(device);
+        // ImGui debug overlay + async-host in-gameplay indicator (renders on any
+        // screen; no-op unless something is active).
+        netplay::debug_overlay::Render(device);
     }
 
     if (g_d3dOverlay.originalEndScene == nullptr)
@@ -2335,8 +2339,18 @@ bool EnsureD3d9OverlayHookInstalled()
         return false;
     }
 
-    void** vtable = *reinterpret_cast<void***>(tempDevice);
+    // Hook EndScene by MinHook'ing the FUNCTION BODY (vtable[42] resolves to the
+    // shared d3d9 EndScene). A vtable-slot patch on this *dummy* device does NOT
+    // work: the game's device uses a different vtable instance (EFZ Revival's
+    // present path), so patching the dummy slot never intercepts the game's
+    // EndScene (confirmed live — the hook installed but "first EndScene observed"
+    // never logged). MinHook patches the function itself, so every caller hits it.
+    // Coexistence with other EndScene MinHookers (efz-training-mode): MinHook
+    // relocates the existing prologue into our trampoline, so independent hooks
+    // chain through each other rather than corrupting.
+    void** vtable = (tempDevice != nullptr) ? *reinterpret_cast<void***>(tempDevice) : nullptr;
     g_d3dOverlay.endSceneTarget = (vtable != nullptr) ? vtable[42] : nullptr;
+
     tempDevice->Release();
     d3d9->Release();
     DestroyWindow(dummyWindow);
@@ -2358,6 +2372,7 @@ bool EnsureD3d9OverlayHookInstalled()
             "BattleLog::EnsureD3d9OverlayHookInstalled: MH_CreateHook failed status=%d target=%p",
             static_cast<int>(createHookStatus),
             g_d3dOverlay.endSceneTarget);
+        g_d3dOverlay.endSceneTarget = nullptr;
         return false;
     }
 
@@ -2365,9 +2380,8 @@ bool EnsureD3d9OverlayHookInstalled()
     if (enableHookStatus != MH_OK)
     {
         mod::Log(
-            "BattleLog::EnsureD3d9OverlayHookInstalled: MH_EnableHook failed status=%d target=%p",
-            static_cast<int>(enableHookStatus),
-            g_d3dOverlay.endSceneTarget);
+            "BattleLog::EnsureD3d9OverlayHookInstalled: MH_EnableHook failed status=%d",
+            static_cast<int>(enableHookStatus));
         (void)MH_RemoveHook(g_d3dOverlay.endSceneTarget);
         g_d3dOverlay.endSceneTarget = nullptr;
         g_d3dOverlay.originalEndScene = nullptr;
@@ -2376,7 +2390,7 @@ bool EnsureD3d9OverlayHookInstalled()
 
     g_d3dOverlay.hookInstalled = true;
     mod::Log(
-        "BattleLog::EnsureD3d9OverlayHookInstalled: installed target=%p original=%p",
+        "BattleLog::EnsureD3d9OverlayHookInstalled: MinHook EndScene installed target=%p original=%p",
         g_d3dOverlay.endSceneTarget,
         reinterpret_cast<void*>(g_d3dOverlay.originalEndScene));
     return true;
@@ -2390,11 +2404,6 @@ void ShutdownD3d9OverlayHook()
     {
         (void)MH_DisableHook(g_d3dOverlay.endSceneTarget);
         (void)MH_RemoveHook(g_d3dOverlay.endSceneTarget);
-    }
-
-    if (g_d3dOverlay.minhookInitialized)
-    {
-        (void)MH_Uninitialize();
     }
 
     g_d3dOverlay = {};
@@ -5998,6 +6007,11 @@ void DrawDetailRows(
 void ShutdownRenderOverlay()
 {
     ShutdownD3d9OverlayHook();
+}
+
+bool EnsureGameplayOverlayHook()
+{
+    return EnsureD3d9OverlayHookInstalled();
 }
 
 const NetplayMenuSpec* GetMenuSpec()

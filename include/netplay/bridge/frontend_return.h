@@ -93,6 +93,11 @@ struct ReturnResult
 
 FrontendContext CaptureFrontendContext();
 ReturnResult BeginReturnToFrontend(const ReturnRequest& request);
+// Installs the per-screen (loading/battle/result) update hooks if not already
+// installed. Normally lazy (first return request), but async hosting needs the
+// battle hook live during practice so its per-frame driver runs. Safe/idempotent
+// and a transparent passthrough while no return is pending.
+void EnsureFrontendReturnUpdateHooks();
 void TickFrontendReturn();
 bool HasPendingReturn();
 bool IsReturningToFrontend();

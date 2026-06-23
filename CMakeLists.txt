@@ -32,6 +32,7 @@ add_library(efz_netplay_mod SHARED
     src/dllmain.cpp
     src/logger.cpp
     src/netplay/assets/assets.cpp
+    src/netplay/bridge/async_hosting.cpp
     src/netplay/bridge/frontend_return.cpp
     src/netplay/bridge/gameplay_exit_recovery.cpp
     src/netplay/bridge/session_bridge.cpp
@@ -67,9 +68,19 @@ add_library(efz_netplay_mod SHARED
     src/netplay/render/menu_overlay.cpp
     src/netplay/render/software_font.cpp
     src/netplay/render/sprite_font_map.cpp
+    src/netplay/hooks/debug_overlay.cpp
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_dx9.cpp
+    third_party/imgui/backends/imgui_impl_win32.cpp
 )
 
 target_include_directories(efz_netplay_mod PRIVATE include)
+target_include_directories(efz_netplay_mod PRIVATE
+    third_party/imgui
+    third_party/imgui/backends)
 target_compile_features(efz_netplay_mod PRIVATE cxx_std_17)
 target_compile_definitions(efz_netplay_mod PRIVATE NOMINMAX)
 
@@ -97,6 +108,10 @@ if(WIN32)
 endif()
 
 if(MSVC)
+    # Emit a linker .map (and keep symbol RVAs) so crash return addresses — which
+    # EFZ Revival's crash handler dumps to logEfz.txt as "return to 0xADDR" — can
+    # be symbolized to function + offset (RVA = addr - module load base).
+    target_link_options(efz_netplay_mod PRIVATE /MAP /MAPINFO:EXPORTS)
     if(EFZ_XP_COMPAT)
         # The Windows 7.1A SDK shipped with the v141_xp toolset has headers
         # that do not compile under /permissive-.  Use relaxed conformance

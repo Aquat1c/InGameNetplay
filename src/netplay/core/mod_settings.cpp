@@ -147,6 +147,12 @@ void Reload()
         ReadBoolValue(L"Others", L"EnableDebugMenu", false, iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
+    loaded.asyncHostReturnKey =
+        ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
+    if (loaded.asyncHostReturnKey.empty())
+    {
+        loaded.asyncHostReturnKey = "DIK_F1";
+    }
 
     g_settings = loaded;
 }
@@ -189,5 +195,10 @@ bool IsDebugMenuEnabled()
 bool HideEmptySetsInBattleLogByDefault()
 {
     return g_settings.hideEmptySetsInBattleLog;
+}
+
+const std::string& AsyncHostReturnKeyBinding()
+{
+    return g_settings.asyncHostReturnKey;
 }
 } // namespace netplay::mod_settings

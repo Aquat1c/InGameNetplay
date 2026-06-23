@@ -1,5 +1,6 @@
 #include "netplay/bridge/frontend_return.h"
 
+#include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
@@ -10,6 +11,14 @@
 #include <cstdio>
 #include <cstring>
 #include <windows.h>
+
+// Rendered from the battle update hook below; defined in the hooks layer
+// (title_overlay_text.cpp). Forward-declared here to avoid pulling the whole
+// hooks/internal header into this bridge translation unit.
+namespace netplay::hooks::internal
+{
+void DrawAsyncHostGameplayOverlay(uint32_t screenContext);
+}
 
 namespace netplay::bridge::frontend_return
 {
@@ -482,7 +491,7 @@ bool InstallScreenUpdateHook(
 #endif
 }
 
-void EnsureFrontendReturnUpdateHooks()
+void EnsureFrontendReturnUpdateHooksImpl()
 {
 #if defined(_M_IX86)
     (void)InstallScreenUpdateHook(
@@ -728,7 +737,8 @@ void RequestForceTitleFallback(const char* reason)
         return;
     }
 
-    if (g_request.owner == ReturnOwner::DisconnectRecovery
+    if ((g_request.owner == ReturnOwner::DisconnectRecovery
+            || g_request.owner == ReturnOwner::AsyncHostAccept)
         && g_nativeStartScreen == ScreenId::Battle
         && (g_state == ReturnState::NativeExitRequested
             || g_state == ReturnState::WaitingForNativeExit)
@@ -1007,7 +1017,8 @@ char HandleNativeUpdateReturn(ScreenId updateScreen, char nativeResult)
         static_cast<unsigned>(rawResult),
         static_cast<unsigned long>(ElapsedMs(now, g_nativeStartTick)));
 
-    if (g_request.owner == ReturnOwner::DisconnectRecovery
+    if ((g_request.owner == ReturnOwner::DisconnectRecovery
+            || g_request.owner == ReturnOwner::AsyncHostAccept)
         && g_request.target == ReturnTarget::NetplayMenu
         && (updateScreen == ScreenId::Battle || updateScreen == ScreenId::Result)
         && resultScreen != ScreenId::Title
@@ -1044,6 +1055,11 @@ char HandleNativeUpdateReturn(ScreenId updateScreen, char nativeResult)
     return nativeResult;
 }
 } // namespace
+
+void EnsureFrontendReturnUpdateHooks()
+{
+    EnsureFrontendReturnUpdateHooksImpl();
+}
 
 FrontendContext CaptureFrontendContext()
 {
@@ -1193,6 +1209,13 @@ ReturnResult BeginReturnToFrontend(const ReturnRequest& request)
 
 void TickFrontendReturn()
 {
+    // Drive the async-hosting state machine from here too. This function is
+    // invoked from every screen update hook (title, battle, result, loading),
+    // so it is the per-frame chokepoint that lets async hosting detect a peer
+    // connecting while the user is in gameplay/practice — contexts where the
+    // full session_bridge::Tick() does not run. Cheap no-op while inactive.
+    netplay::bridge::async_host::Tick();
+
     if (!HasPendingReturn())
     {
         return;
@@ -1349,6 +1372,11 @@ extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)
     {
         result = g_originalBattleUpdate(screenContext);
     }
+
+    // Draw the minimized async-host indicator on top of the rendered battle
+    // frame (no-op unless async hosting is active and minimized).
+    netplay::hooks::internal::DrawAsyncHostGameplayOverlay(screenContext);
+
     if (kLogBattleUpdateDiag)
     {
         uint8_t post44 = 255;

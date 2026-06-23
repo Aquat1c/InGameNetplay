@@ -1,5 +1,6 @@
 #include "netplay/bridge/session_bridge.h"
 
+#include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
@@ -206,6 +207,11 @@ void Tick()
     }
 
     state_export::Update(statusSnapshot);
+
+    // Advance the async-hosting state machine (prompt-hold / peer-found / accept
+    // release). Cheap no-op while inactive. Runs here so it sees the freshly
+    // updated status snapshot in the title/netplay-menu context.
+    async_host::Tick();
 
     // --- Timing guard on full Tick (includes takeover::Tick + export enqueue) --
     {

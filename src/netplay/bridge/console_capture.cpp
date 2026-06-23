@@ -597,35 +597,38 @@ void NoteConsolePromptLine(const std::string& text)
     // --- Connection error detection ---
     // Revival prints these messages to console on failure. Publish them
     // through IPC so the host process can transition to Failed phase.
-    if (ContainsCaseInsensitive(text, "Connection timed out"))
+    // Map known Revival console error strings to friendly messages. Mirrors the
+    // set Concerto recognises (efz.py `error_strings`) plus Revival-specific
+    // ones. The published TEXT is display-only (the consoleErrorSerial drives
+    // recovery logic), so friendlier wording here is safe. More specific needles
+    // must precede more general ones (e.g. the "Already playing..." variant
+    // before the bare "Spectators have been disabled").
+    struct ConsoleErrorMapping
     {
-        mod::Log("Takeover: console error detected='Connection timed out' text='%s'", text.c_str());
-        PublishConsoleError("Connection timed out");
-        return;
-    }
-    if (ContainsCaseInsensitive(text, "Source quit or timed out"))
+        const char* needle;
+        const char* friendly;
+    };
+    static const ConsoleErrorMapping kConsoleErrorMap[] = {
+        {"Connection timed out", "Connection timed out."},
+        {"Source quit or timed out", "Opponent quit or timed out."},
+        {"Host timed out", "Host timed out - no one connected."},
+        {"Remote timed out", "Opponent timed out."},
+        {"Invalid address", "Invalid address - check the IP and port."},
+        {"Only one net instance allowed", "A netplay session is already running."},
+        {"Remote is using a deprecated version", "Opponent is on an outdated Revival version."},
+        {"New version available", "A new Revival version is available - please update."},
+        {"Invalid delay", "Invalid delay value."},
+        {"Already playing, spectators have been disabled", "Host is already playing; spectators are disabled."},
+        {"Spectators have been disabled", "Spectators have been disabled by the host."},
+    };
+    for (const ConsoleErrorMapping& mapping : kConsoleErrorMap)
     {
-        mod::Log("Takeover: console error detected='Source quit or timed out' text='%s'", text.c_str());
-        PublishConsoleError("Source quit or timed out");
-        return;
-    }
-    if (ContainsCaseInsensitive(text, "Host timed out"))
-    {
-        mod::Log("Takeover: console error detected='Host timed out' text='%s'", text.c_str());
-        PublishConsoleError("Host timed out");
-        return;
-    }
-    if (ContainsCaseInsensitive(text, "Remote timed out"))
-    {
-        mod::Log("Takeover: console error detected='Remote timed out' text='%s'", text.c_str());
-        PublishConsoleError("Remote timed out");
-        return;
-    }
-    if (ContainsCaseInsensitive(text, "Spectators have been disabled"))
-    {
-        mod::Log("Takeover: console error detected='Spectators disabled' text='%s'", text.c_str());
-        PublishConsoleError("Spectators have been disabled by the host");
-        return;
+        if (ContainsCaseInsensitive(text, mapping.needle))
+        {
+            mod::Log("Takeover: console error detected='%s' text='%s'", mapping.needle, text.c_str());
+            PublishConsoleError(mapping.friendly);
+            return;
+        }
     }
     if (ContainsCaseInsensitive(text, "Socket error"))
     {

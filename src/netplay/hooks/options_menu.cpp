@@ -1444,6 +1444,39 @@ void AppendSyntheticItems()
             static_cast<int>(g_state.items.size()) - 1);
     };
 
+    const auto upsertKeybindItem =
+        [&](const char* keyName, const char* defaultValue, const char* tooltip)
+    {
+        const int existingItemIndex = FindItemIndexBySectionAndKey("Others", keyName);
+        if (existingItemIndex >= 0)
+        {
+            Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+            item.kind = ItemKind::KeyBinding;
+            item.rawKeyName = Utf8ToWide(keyName);
+            item.tooltipSummary = tooltip;
+            if (!keybinds::IsBindableValue(item.currentValue))
+            {
+                item.currentValue = defaultValue;
+                item.originalValue = defaultValue;
+            }
+            return;
+        }
+
+        Item item;
+        item.kind = ItemKind::KeyBinding;
+        item.sectionName = "Others";
+        item.keyName = keyName;
+        item.rawKeyName = Utf8ToWide(keyName);
+        item.currentValue = defaultValue;
+        item.originalValue = defaultValue;
+        item.tooltipSummary = tooltip;
+        item.lineIndex = -1;
+
+        g_state.items.push_back(std::move(item));
+        g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
+            static_cast<int>(g_state.items.size()) - 1);
+    };
+
     upsertChoiceItem(
         "OfflineVsHumanMode",
         "Tournament",
@@ -1468,11 +1501,15 @@ void AppendSyntheticItems()
     upsertBoolIntItem(
         "EnableDebugMenu",
         false,
-        "Allow the D button to open the in-game debug menu.");
+        "Enable the ImGui debug overlay. Toggle it on any screen with the \\ (backslash) key.");
     upsertBoolIntItem(
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
+    upsertKeybindItem(
+        "AsyncHostReturnKey",
+        "DIK_F1",
+        "Hotkey to return to the netplay menu (or rehost) while the hosting overlay is minimized in-game.");
     upsertActionItem(
         "About",
         "Show the mod version and build information.");
