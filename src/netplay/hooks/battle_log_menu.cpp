@@ -370,7 +370,7 @@ std::string GetExecutableDirectory();
 std::string ResolveRevivalIniPath();
 std::string ResolveBattleLogPathFromIni(bool* outSaveEnabled);
 bool ParseLeadingDateTime(std::string_view line, std::string* outDate, std::string* outTime, size_t* outTailOffset);
-bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRight);
+bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRight, bool allowEmptySides = false);
 bool ParseTwoInts(std::string_view text, int* outLeft, int* outRight);
 bool ParseDurationField(std::string_view text, int* outTotalSeconds);
 bool LooksLikeMatchRow(std::string_view line);
@@ -2820,7 +2820,7 @@ bool ParseLeadingDateTime(std::string_view line, std::string* outDate, std::stri
     return tailOffset <= line.size();
 }
 
-bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRight)
+bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRight, bool allowEmptySides)
 {
     if (outLeft == nullptr || outRight == nullptr)
     {
@@ -2835,7 +2835,7 @@ bool SplitVsPair(std::string_view text, std::string* outLeft, std::string* outRi
 
     const std::string left = netplay::text::TrimAscii(std::string(text.substr(0, marker)));
     const std::string right = netplay::text::TrimAscii(std::string(text.substr(marker + 4)));
-    if (left.empty() || right.empty())
+    if (!allowEmptySides && (left.empty() || right.empty()))
     {
         return false;
     }
@@ -3140,7 +3140,7 @@ bool ParseHeaderLine(const std::string& line, int sessionIndex, int lineNumber, 
 
     std::string p1Name;
     std::string p2Name;
-    if (!SplitVsPair(std::string_view(line).substr(tailOffset), &p1Name, &p2Name))
+    if (!SplitVsPair(std::string_view(line).substr(tailOffset), &p1Name, &p2Name, /*allowEmptySides=*/true))
     {
         return false;
     }

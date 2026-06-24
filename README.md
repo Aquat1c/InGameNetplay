@@ -19,63 +19,88 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
 
 ## Installation
 
-- Build the DLL from source (see Building) or download a release.
-- Install EFZ Mod Manager if it's not installed already:
-  - EFZ Mod Manager download: https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing
-- Place `efz_netplay_mod.dll` in your EFZ mods folder, alongside the other mod assets.
-  Example path:
-  `EFZ\\mods\\efz_netplay_mod\\efz_netplay_mod.dll`
-- Edit `EfzModManager.ini` and add:
-  - `efz_netplay_mod=1`
-- Launch the game through `efz.exe`.
-  Do not start the mod through `EfzRevival.exe` or `Concerto.exe`; this project expects to be injected into the main game process and can crash if started from those executables directly.
-- After installing, a new `NETPLAY` option should appear on the title screen.
+1. **Get the mod DLL and assets**
+   - Build from source (see **Build** below), or download a release from [GitHub Releases](https://github.com/Aquat1c/InGameNetplay/releases).
+   - You need both `efz_netplay_mod.dll` and the bundled `assets\` folder (menu backgrounds, object sheet, optional alert sound, Battle Log portraits, etc.). A release package or a local build's `assets\deploy\` folder contains the files to copy.
 
-## Expected Mod Folder Layout
+2. **Install EFZ Mod Manager** (if you don't have it already)
+   - Download: [EFZ Mod Manager spreadsheet](https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing)
 
-At minimum, the mod expects this structure next to the DLL:
+3. **Place the mod in your game directory**
 
-```text
-mods\efz_netplay_mod\
-  efz_netplay_mod.dll
-  assets\
-    netplay_bgd.dat
-    netplay_bgn.dat
-    netplay_ob.dat
-```
+   The mod expects this layout inside your game folder (where `efz.exe` lives):
 
-Common optional files:
+   ```text
+   EFZ/                              ← your game folder
+   ├── efz.exe
+   ├── EfzRevival.dll                ← required for online play
+   ├── EfzRevival.exe                ← required for online play
+   ├── EfzRevival.ini
+   ├── EfzModManager.ini             ← mod enable list (edit this)
+   └── mods/
+       └── efz_netplay_mod/          ← mod folder (name matches the DLL)
+           ├── efz_netplay_mod.dll
+           └── assets/
+               ├── netplay_bgd.dat
+               ├── netplay_bgn.dat
+               ├── netplay_ob.dat
+               ├── res_alert.wav      ← optional
+               └── sprites/           ← optional Battle Log portraits
+                   ├── akane.png
+                   ├── akiko.png
+                   └── ...
+   ```
 
-```text
-mods\efz_netplay_mod\
-  assets\
-    res_alert.wav
-    sprites\
-      akane.png
-      akiko.png
-      ayu.png
-      ...
-      unknown.png
-  wave\
-    bgm\
-      bgm08.wav
-  system\
-    title_ob.dat
-```
+   Example full path: `EFZ\mods\efz_netplay_mod\efz_netplay_mod.dll`
 
-What they are used for:
-- `assets\netplay_bgd.dat` - daytime netplay menu background, selected from 09:00 through 17:59 local PC time
-- `assets\netplay_bgn.dat` - nighttime netplay menu background, selected from 18:00 through 08:59 local PC time
-- `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
-- `assets\res_alert.wav` - custom lobby challenge alert sound
-- `assets\sprites\*.png` - Battle Log character portraits
-- `wave\bgm\bgm08.wav` - optional netplay menu BGM override with proper loop information; this project may be packaged with a replacement based on track 14 from `ONE.` (2023)
-- `system\title_ob.dat` - optional title object-sheet override
+   Optional mod-local overrides (same folder as the DLL):
 
-Fallback behavior:
-- If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
-- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`(EFZ Bad Moon edition character selection OST).
-- Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
+   ```text
+   mods\efz_netplay_mod\
+     wave\
+       bgm\
+         bgm08.wav                    ← optional netplay menu BGM override
+     system\
+       title_ob.dat                   ← optional title object-sheet fallback
+   ```
+
+   What the bundled assets are used for:
+   - `assets\netplay_bgd.dat` — daytime netplay menu background (09:00–17:59 local PC time)
+   - `assets\netplay_bgn.dat` — nighttime netplay menu background (18:00–08:59)
+   - `assets\netplay_ob.dat` — netplay menu object/title-sheet UI graphics
+   - `assets\res_alert.wav` — custom lobby challenge alert sound
+   - `assets\sprites\*.png` — Battle Log character portraits
+   - `wave\bgm\bgm08.wav` — optional menu BGM override with proper loop info
+   - `system\title_ob.dat` — optional title object-sheet override
+
+   Fallback behavior:
+   - If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
+   - If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`.
+   - Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
+
+4. **Enable the mod in `EfzModManager.ini`**
+
+   Open `EfzModManager.ini` in your **game folder** (next to `efz.exe`, not inside `mods/`) and add:
+
+   ```ini
+   efz_netplay_mod=1
+   ```
+
+   If other mods are already listed, add this line alongside them.
+
+5. **Launch the game**
+
+   Launch through **`efz.exe`**. EFZ Mod Manager loads enabled mods automatically on startup.
+
+   > **Important:** Do **not** start the game through `EfzRevival.exe` or `Concerto.exe` when this mod is enabled. InGameNetplay expects to be injected into the main game process and can crash if those executables are used as the entry point.
+
+   After a successful install, a new **`NETPLAY`** option should appear on the title screen.
+
+**First Run**
+- Open **NETPLAY** from the title screen to reach the in-game host/join/lobby flow.
+- The mod writes `efz_netplay_mod.log` next to the DLL (`mods\efz_netplay_mod\`). File logging can be toggled from **Options → Others** in the netplay menu.
+- Nickname, port, and most online settings are read from / saved to `EfzRevival.ini` in the game folder. You do not need to drive the old Revival console window during normal use.
+- A `native_host\` subfolder may appear under the mod folder for captured Revival-side logs during host sessions.
 
 ## Current Feature Set
 
