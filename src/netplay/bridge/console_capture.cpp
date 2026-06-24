@@ -929,7 +929,7 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         }
         // Parse workflow signals (delay prompt, spectate confirm, quit packet,
         // peer died diagnostics)
-        // but don't echo Revival's debug text into the mod log — Revival
+        // but don't echo Revival's debug text into the mod log - Revival
         // already writes to its own log files.
         NoteConsolePromptLine(trimmed);
     };
@@ -1038,7 +1038,7 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
 }
 
 // ---------------------------------------------------------------------------
-// Managed logEfz capture — host-side ownership of the actual EFZ disk log.
+// Managed logEfz capture - host-side ownership of the actual EFZ disk log.
 //
 // Rather than trying to repair a corrupted native logEfz.txt after the fact,
 // we capture the host process's intercepted disk writes and append them to a
@@ -1530,7 +1530,7 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
 
     // Cap the in-memory history to prevent unbounded growth over long
     // sessions.  When the cap is exceeded, discard the oldest half of the
-    // buffer.  The disk file is **not** truncated — only the in-memory
+    // buffer.  The disk file is **not** truncated - only the in-memory
     // history used for session-rebuild is pruned.
     static constexpr size_t kHistoryCapBytes = 2u * 1024u * 1024u; // 2 MB
     if (g_ownedLogEfzHistory.size() > kHistoryCapBytes)
@@ -1576,7 +1576,7 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
             {
                 mod::Log(
                     "PERF_WARN: AppendOwnedLogEfzLine took %.1fms "
-                    "(slowCount=%u) — logEfz disk write stalling",
+                    "(slowCount=%u) - logEfz disk write stalling",
                     elapsedMs, s_appendSlowCount);
             }
         }
@@ -1767,7 +1767,7 @@ void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, CO
     }
 
     // Inject synthetic newline when cursor Y changes.  Revival uses cursor
-    // moves for newlines — actual '\n' characters are never written via
+    // moves for newlines - actual '\n' characters are never written via
     // WriteConsoleOutputCharacterA.
     static SHORT s_lastY = -1;
     if (s_lastY >= 0 && writeCoord.Y != s_lastY)
@@ -1787,7 +1787,7 @@ void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars, CO
     }
 
     // Inject synthetic newline when cursor Y changes.  Revival uses cursor
-    // moves for newlines — actual '\n' characters are never written via
+    // moves for newlines - actual '\n' characters are never written via
     // WriteConsoleOutputCharacterW.
     static SHORT s_lastY = -1;
     if (s_lastY >= 0 && writeCoord.Y != s_lastY)

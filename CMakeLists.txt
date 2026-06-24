@@ -108,8 +108,8 @@ if(WIN32)
 endif()
 
 if(MSVC)
-    # Emit a linker .map (and keep symbol RVAs) so crash return addresses — which
-    # EFZ Revival's crash handler dumps to logEfz.txt as "return to 0xADDR" — can
+    # Emit a linker .map (and keep symbol RVAs) so crash return addresses - which
+    # EFZ Revival's crash handler dumps to logEfz.txt as "return to 0xADDR" - can
     # be symbolized to function + offset (RVA = addr - module load base).
     target_link_options(efz_netplay_mod PRIVATE /MAP /MAPINFO:EXPORTS)
     if(EFZ_XP_COMPAT)

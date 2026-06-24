@@ -99,7 +99,7 @@ void AutoRehost(const char* reason)
     {
         // Keep state Hosting so the next eligible Tick retries after the cooldown.
         SetState(State::Hosting, "auto_rehost_retry");
-        mod::Log("ASYNC_HOST_AUTO_REHOST: StartSession failed — retry after cooldown");
+        mod::Log("ASYNC_HOST_AUTO_REHOST: StartSession failed - retry after cooldown");
     }
 }
 
@@ -136,7 +136,7 @@ void OnHostStarted(uint16_t port, const char* nickname)
 
     // Ensure the per-screen (battle/result/loading) update hooks are installed
     // now, so async_host::Tick() runs every frame while the user is minimized in
-    // practice/gameplay — otherwise the return hotkey and peer detection would
+    // practice/gameplay - otherwise the return hotkey and peer detection would
     // only work at the title/menu. (Normally these hooks install lazily on the
     // first frontend-return request.)
     frontend_return::EnsureFrontendReturnUpdateHooks();
@@ -156,7 +156,7 @@ void Tick()
     }
 
     // Cooldown after an auto-rehost: a freshly-spawned helper is briefly "not
-    // alive" and the phase briefly Idle while the new session spins up — don't
+    // alive" and the phase briefly Idle while the new session spins up - don't
     // mistake that for another disconnect.
     if (g_autoRehostCooldownTicks > 0)
     {
@@ -200,7 +200,7 @@ void Tick()
             return;
         }
 
-        // Clean idle (session cancelled/ended cleanly elsewhere) — release. A
+        // Clean idle (session cancelled/ended cleanly elsewhere) - release. A
         // user-initiated cancel calls Reset() directly, so this only catches an
         // out-of-band clean teardown. Phase is never spuriously Idle in gameplay.
         if (phase == NetbridgePhase::Idle)
@@ -215,18 +215,18 @@ void Tick()
     // screen (practice / VS-CPU / charselect / result / replay), pressing it
     // drives EFZ back to the netplay menu and un-minimizes to the HOST overlay,
     // where a held peer is auto-accepted. Gating on gameplay screens is what
-    // makes this safe — firing a return-to-menu transition while ALREADY at the
+    // makes this safe - firing a return-to-menu transition while ALREADY at the
     // title / netplay menu was the latent bug that got the whole block removed
     // before. There is nothing to return from at the title, so we skip it there.
     // Safety net: a return that fails to reach the menu (e.g. the drive aborts)
     // would otherwise leave g_returnInProgress stuck true and block EVERY later
     // F1 press. A successful return clears it via ConsumeReturnKeyArrival within a
-    // second or two, so anything lingering much longer is stuck — clear it.
+    // second or two, so anything lingering much longer is stuck - clear it.
     if (g_returnInProgress)
     {
         if (++g_returnInProgressTicks > 1200) // ~20s at 64fps
         {
-            mod::Log("ASYNC_HOST_RETURN_KEY return stuck >20s — clearing to re-enable F1");
+            mod::Log("ASYNC_HOST_RETURN_KEY return stuck >20s - clearing to re-enable F1");
             g_returnInProgress = false;
             g_returnInProgressTicks = 0;
         }
@@ -236,7 +236,7 @@ void Tick()
         g_returnInProgressTicks = 0;
     }
 
-    // F1 returns to the netplay HOST menu from ANYWHERE the host is active —
+    // F1 returns to the netplay HOST menu from ANYWHERE the host is active -
     // gameplay, title, character select, settings, etc. The ONLY place it must
     // not fire is when the netplay menu overlay is already open (the user is
     // already there; firing a return-to-menu transition there was the original
@@ -276,7 +276,7 @@ void Tick()
                 {
                     g_returnInProgress = true;
                     mod::Log(
-                        "ASYNC_HOST_RETURN_KEY accepted — returning to netplay HOST menu (had_peer=%d)",
+                        "ASYNC_HOST_RETURN_KEY accepted - returning to netplay HOST menu (had_peer=%d)",
                         g_state == State::PeerFoundHeld ? 1 : 0);
                 }
                 else
@@ -313,7 +313,7 @@ void Tick()
         // the menu input handler when not minimized).
         break;
     case State::Accepted:
-        mod::Log("ASYNC_HOST_HANDOFF_BEGIN — releasing to normal delay flow");
+        mod::Log("ASYNC_HOST_HANDOFF_BEGIN - releasing to normal delay flow");
         Reset();
         break;
     case State::Idle:

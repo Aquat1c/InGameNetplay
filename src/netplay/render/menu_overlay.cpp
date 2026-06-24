@@ -297,7 +297,7 @@ bool DrawDynamicFieldValuesGdi(
         }
     }
 
-    // Surface lock failed — nothing we can do without flickering.
+    // Surface lock failed - nothing we can do without flickering.
     return false;
 }
 }

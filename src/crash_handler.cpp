@@ -144,7 +144,7 @@ std::string BuildArtifactPath(const char* extension)
     return path;
 }
 
-// Read a DWORD safely using SEH — returns 0xDEADBEEF on fault.
+// Read a DWORD safely using SEH - returns 0xDEADBEEF on fault.
 // Isolated in its own function to avoid __try / C++ object unwinding conflict.
 static uintptr_t SafeReadDword(uintptr_t addr)
 {
@@ -251,7 +251,7 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
     //
     // The game mode struct table at 0x790110 holds up to 14 object pointers.
     // 0x790148 holds the current index.  EFZ_GameMode_InvokeAdvance() calls
-    // vtable[1] on table[curIdx] — if corrupt, this is the crash site.
+    // vtable[1] on table[curIdx] - if corrupt, this is the crash site.
     // -----------------------------------------------------------------------
     {
         constexpr uintptr_t kTableAddr = 0x00790110u;
@@ -436,11 +436,11 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
     // Scenario: IsPeerProcessAlive() returned true so we returned global state=1
     // to EFZ.exe; the peer died between that check and EFZ.exe calling the DLL
     // rollback tick in state-4 (VS Human in-game).  NeutralizeExitProcess ran on
-    // the main thread (frameJmpActive=0 — game-state-4 dispatches DLL sessions
+    // the main thread (frameJmpActive=0 - game-state-4 dispatches DLL sessions
     // via a direct vtable call, not through 0x401582/OurFrameDispatch), neutralised
     // the session vtable, and returned.  The instruction after 'call ExitProcess'
     // in EFZ_Main_RollbackLoopTick is a privileged instruction placed by the
-    // compiler as unreachable marker code — executing it raises
+    // compiler as unreachable marker code - executing it raises
     // STATUS_PRIV_INSTRUCTION (0xC0000096).
     //
     // Recovery: simulate 'leave; ret' from the crashing function, returning
@@ -511,7 +511,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                         if (!retInRevival)
                         {
                             // This frame's return address is outside
-                            // EfzRevival.dll — it's EFZ.exe (or our mod DLL).
+                            // EfzRevival.dll - it's EFZ.exe (or our mod DLL).
                             foundRet = curRet;
                             foundEbp = curSavedEbp;
                             foundEsp = walkEbp + 8; // EBP+4 = retaddr, +4 = size
@@ -525,7 +525,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                     if (foundExeFrame)
                     {
                         mod::Log(
-                            "CrashHandler: TOCTOU netplay recovery — "
+                            "CrashHandler: TOCTOU netplay recovery - "
                             "walked %d DLL frame(s) from RVA 0x%lX, "
                             "resuming at EXE addr 0x%08lX "
                             "(EBP 0x%08lX ESP 0x%08lX)",
@@ -557,7 +557,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                         // end naturally.
                         const bool modeForced = netplay::bridge::ForceGameModeToTitle();
                         mod::Log(
-                            "CrashHandler: TOCTOU recovery — ForceGameModeToTitle "
+                            "CrashHandler: TOCTOU recovery - ForceGameModeToTitle "
                             "result=%d",
                             modeForced ? 1 : 0);
 
@@ -569,7 +569,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                     }
 
                     mod::Log(
-                        "CrashHandler: TOCTOU netplay recovery — "
+                        "CrashHandler: TOCTOU netplay recovery - "
                         "could not find EXE frame after %d steps "
                         "(crashRVA=0x%lX EBP=0x%08lX), falling through",
                         depth,

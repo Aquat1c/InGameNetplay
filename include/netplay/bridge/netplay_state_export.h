@@ -1,5 +1,5 @@
 // ===========================================================================
-// EFZ Netplay State Export — Internal header
+// EFZ Netplay State Export - Internal header
 // ===========================================================================
 //
 // Internal API used by session_bridge to drive the state-export lifecycle.

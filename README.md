@@ -65,13 +65,13 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
    ```
 
    What the bundled assets are used for:
-   - `assets\netplay_bgd.dat` — daytime netplay menu background (09:00–17:59 local PC time)
-   - `assets\netplay_bgn.dat` — nighttime netplay menu background (18:00–08:59)
-   - `assets\netplay_ob.dat` — netplay menu object/title-sheet UI graphics
-   - `assets\res_alert.wav` — custom lobby challenge alert sound
-   - `assets\sprites\*.png` — Battle Log character portraits
-   - `wave\bgm\bgm08.wav` — optional menu BGM override with proper loop info
-   - `system\title_ob.dat` — optional title object-sheet override
+   - `assets\netplay_bgd.dat` - daytime netplay menu background (09:00–17:59 local PC time)
+   - `assets\netplay_bgn.dat` - nighttime netplay menu background (18:00–08:59)
+   - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
+   - `assets\res_alert.wav` - custom lobby challenge alert sound
+   - `assets\sprites\*.png` - Battle Log character portraits
+   - `wave\bgm\bgm08.wav` - optional menu BGM override with proper loop info
+   - `system\title_ob.dat` - optional title object-sheet override
 
    Fallback behavior:
    - If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
@@ -117,6 +117,7 @@ Online flow:
 - Integrated Revival takeover bridge
 - Host / Join / Spectate session startup from the in-game menu
 - Delay prompt overlay and connected-session handoff back into EFZ
+- **Async hosting** - start a host listener, minimize the overlay, and keep using EFZ while waiting (see **Async Hosting** below)
 - Cancel / disconnect / recovery paths back into the netplay menu
 - Runtime state export for companion mods/tools
 
@@ -144,6 +145,7 @@ Options:
   - `EnableConsole`
   - `EnableDebugMenu`
   - `HideEmptySetsInBattleLog`
+  - `AsyncHostReturnKey` - hotkey to return to the HOST menu (or rehost) while async hosting is minimized (default: `F1`)
 - `About` modal with version/build information
 
 Netplay menu theming:
@@ -155,6 +157,60 @@ Logging and diagnostics:
 - Logger banner includes version and build timestamp
 - Optional console and optional file logging
 - Crash handler writes crash logs / diagnostics
+
+## Async Hosting
+
+Async hosting lets you **start a host session and keep playing EFZ** while the listener waits for an opponent. The host process stays alive in the background; you are not stuck on the hosting overlay.
+
+### Quick flow
+
+```text
+NETPLAY → Host → start hosting
+→ full HOSTING panel shows your IP / port
+→ D: minimize — listener stays open, small badge appears
+→ browse the netplay menu, leave to title, or play offline/practice
+→ opponent connects — badge changes to OPPONENT FOUND!
+→ return to the full HOST overlay (select Host, or press F1 from outside the menu)
+→ normal delay setup runs, then charselect / match as usual
+```
+
+### While waiting for an opponent
+
+- The full **HOSTING** panel shows your public IP and port (press **C** to copy).
+- **D** minimizes hosting: the overlay collapses to a small top-right badge (`HOSTING`) and you return to the main netplay menu. The listener **stays active**.
+- You can browse **Battle Log**, **Options**, and other netplay pages, or leave the netplay menu entirely — hosting is **not** cancelled when you exit the menu.
+- Select **Host** again (or re-enter NETPLAY) to restore the full hosting panel.
+
+### When an opponent connects
+
+- The mod **holds** Revival at the delay prompt instead of jumping straight into the delay overlay.
+- The badge updates to **OPPONENT FOUND!**
+- Once the full HOST overlay is visible again, accept happens automatically and the normal delay-setup / handoff flow continues.
+- If you are outside the netplay menu (title screen, practice, etc.), press the **return hotkey** (default **F1**) to drive back to the HOST menu; a held opponent is accepted on arrival.
+
+### Controls and settings
+
+| Action | Input |
+|---|---|
+| Minimize hosting (keep listening) | **D** on the full HOSTING panel |
+| Cancel hosting | **B** / **Esc** on the full HOSTING panel |
+| Copy IP:port | **C** on the full HOSTING panel |
+| Return to HOST menu from gameplay / title | **F1** (default; configurable) |
+
+Configure the return hotkey under **Options → Others → AsyncHostReturnKey** in the netplay menu (saved to `EfzRevival.ini` as a `DIK_*` keyboard binding).
+
+### Indicators
+
+- **Inside the netplay menu** (minimized): a small indexed badge in the top-right — `HOSTING`, `OPPONENT FOUND!`, or `TIMED OUT`.
+- **Outside the netplay menu** (minimized): a top-center on-screen message with the same state (e.g. `Hosting... Press F1 to return to HOST menu`).
+
+### Conflicts and cancellation
+
+- Starting **Join**, **Lobby**, or **Player Rooms** while async hosting is active shows a **Stop hosting?** confirmation. Choose **Stop hosting** to proceed, or **Keep hosting** to stay listening.
+- **B** / **Esc** on the full hosting panel cancels the listener.
+- If a connected opponent drops before you accept, the mod **auto-rehosts** on the same port so you return to waiting without manual restart.
+
+Companion mods can read async-host state through the shared export (`EFZ_CAP_ASYNC_HOST`: active, minimized, peer found, timed out, host port). See **Shared Netplay Exports** below.
 
 ## How Revival Is Used
 
@@ -214,6 +270,7 @@ Exported state currently includes:
 - activity phase and last end reason
 - online character-select state
 - match context such as stage, round index, and timer
+- async hosting state (listener active, minimized, peer found, timed out, host port)
 
 The shared state is refreshed continuously while the mod is active, which makes
 it suitable for rich presence, overlays, stream tooling, and companion mods.

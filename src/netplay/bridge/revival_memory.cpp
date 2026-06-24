@@ -712,7 +712,7 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     }
     else if (isSpectatorSession)
     {
-        // Spectator sessions have no activePlayer, inputDelay, or ping —
+        // Spectator sessions have no activePlayer, inputDelay, or ping -
         // only wins are meaningful.
         (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + kSpectatorOffsetP1Wins), &sessionP1Wins);
         (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + kSpectatorOffsetP2Wins), &sessionP2Wins);
@@ -875,7 +875,7 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
         // We gate on g_dllExitProcessPatchesSaved (set at the end of the
         // init sequence) instead of phase==Connected because spectator
         // sessions may not be promoted to Connected until the next
-        // takeover::Tick() call — and TickExportOnly() (per-frame tick
+        // takeover::Tick() call - and TickExportOnly() (per-frame tick
         // hook) only calls RefreshRuntimeStatus(), not the full Tick().
         tryReadInlineName(sessionPtr + kSpectatorOffsetP1Name, ioStatus->p1Name, sizeof(ioStatus->p1Name));
         tryReadInlineName(sessionPtr + kSpectatorOffsetP2Name, ioStatus->p2Name, sizeof(ioStatus->p2Name));
@@ -914,7 +914,7 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
             {
                 mod::Log(
                     "PERF_WARN: RefreshRuntimeStatus took %.2fms "
-                    "(slowCount=%u) — reading session memory is slow",
+                    "(slowCount=%u) - reading session memory is slow",
                     elapsedMs, s_rrsSlowCount);
             }
         }
@@ -1067,7 +1067,7 @@ bool SetRoleFlagDirect(int roleFlag, const char* reason)
 }
 
 // ---------------------------------------------------------------------------
-// NeutralizeTournamentAutoNav — zero all entries in the tournament session's
+// NeutralizeTournamentAutoNav - zero all entries in the tournament session's
 // auto-navigation input queue.
 //
 // After init(3,102), the tournament constructor populates a deque with 22
@@ -1159,10 +1159,10 @@ bool NeutralizeTournamentAutoNav()
 // Tournament EXE patch save / restore.
 //
 // The tournament constructor patches 4 locations in the EFZ executable:
-//   0x763F04 (7 bytes) — inline hook → sub_1006E260
-//   0x763E50 (7 bytes) — inline hook → sub_1006E260
-//   0x754C1A (1 byte)  — byte set to 0
-//   0x7599ED (20 bytes) — NOP pad
+//   0x763F04 (7 bytes) - inline hook → sub_1006E260
+//   0x763E50 (7 bytes) - inline hook → sub_1006E260
+//   0x754C1A (1 byte)  - byte set to 0
+//   0x7599ED (20 bytes) - NOP pad
 //
 // In Concerto the process exits after every match, so these are never
 // reverted.  For our in-process mode switching we save the original bytes
@@ -1257,8 +1257,8 @@ bool SaveAndApplyDllExitProcessPatches()
         // stale saved bytes from the previous session's save.  Log a
         // warning so we can detect this in the trace.
         mod::Log("SaveAndApplyDllExitProcessPatches: SKIPPED (flag already true) "
-                 "— H4: next restore will use previously saved bytes!");
-        return true; // Already applied — don't overwrite saved originals.
+                 "- H4: next restore will use previously saved bytes!");
+        return true; // Already applied - don't overwrite saved originals.
     }
     if (g_activeRevival == nullptr || g_activeRevival->exitProcessPatchCount == 0)
     {
@@ -1293,7 +1293,7 @@ bool SaveAndApplyDllExitProcessPatches()
         if (*ptr != expected)
         {
             mod::Log("SaveAndApplyDllExitProcessPatches: site %zu at RVA 0x%lX: "
-                     "expected 0x%02X, found 0x%02X — skipping",
+                     "expected 0x%02X, found 0x%02X - skipping",
                      i, static_cast<unsigned long>(rva),
                      static_cast<unsigned>(expected),
                      static_cast<unsigned>(*ptr));
@@ -1339,7 +1339,7 @@ bool SaveAndApplyDllExitProcessPatches()
         if (ptr[0] != 0x0F || (ptr[1] != 0x84 && ptr[1] != 0x85))
         {
             mod::Log("SaveAndApplyDllExitProcessPatches: near-Jcc %zu at RVA 0x%lX: "
-                     "expected 0F 84/85, found %02X %02X — skipping",
+                     "expected 0F 84/85, found %02X %02X - skipping",
                      i, static_cast<unsigned long>(rva),
                      static_cast<unsigned>(ptr[0]),
                      static_cast<unsigned>(ptr[1]));
@@ -1408,7 +1408,7 @@ bool SaveAndApplyDllExitProcessPatches()
     }
     if (verifyFail > 0)
     {
-        mod::Log("SaveAndApplyDllExitProcessPatches: WARNING — %d patches failed verification!",
+        mod::Log("SaveAndApplyDllExitProcessPatches: WARNING - %d patches failed verification!",
                  verifyFail);
     }
     else
@@ -1518,18 +1518,18 @@ bool AreDllExitPatchesSaved()
 }
 
 // ---------------------------------------------------------------------------
-// ForceLocalPlayInit — unconditionally call init(2,102) to create a fresh
+// ForceLocalPlayInit - unconditionally call init(2,102) to create a fresh
 // local play session, then invoke the session's vtable[1] init method to
 // fully initialize it (audio, BGM, etc.) before any other hooks dispatch
 // to the new session.
 //
 // ---------------------------------------------------------------------------
-// DestroyCurrentSession — tear down the current Revival session object
+// DestroyCurrentSession - tear down the current Revival session object
 // BEFORE calling init() to create a new one.
 //
 // Root cause fix for the 2nd-session crash: init() allocates a new session
 // via operator new, runs the constructor, and writes the pointer to
-// dword_100A02CC — WITHOUT freeing or destructing the old session.  Every
+// dword_100A02CC - WITHOUT freeing or destructing the old session.  Every
 // init() call therefore leaks the previous session's memory and OS handles.
 // After several init() calls, heap corruption from these leaked objects
 // causes a vtable dispatch crash in EFZ_GameMode_InvokeAdvance.
@@ -1543,14 +1543,14 @@ bool AreDllExitPatchesSaved()
 //
 // We replicate that pattern here.  Additionally, we close the process
 // handle at session offset +700 (helperHandle) for online/spectator
-// sessions because the DLL's destructor does NOT close it — the vanilla
+// sessions because the DLL's destructor does NOT close it - the vanilla
 // DLL relies on ExitProcess for final handle cleanup.
 //
 // Session sizes per mode (from init() at RVA 0x6E830):
-//   Mode 0 (Online):     0x5D0 = 1488 bytes — offset 700 IN BOUNDS
-//   Mode 1 (Spectator):  0x440 = 1088 bytes — offset 700 IN BOUNDS
-//   Mode 2 (Local play): 0x2B0 =  688 bytes — offset 700 OUT OF BOUNDS
-//   Mode 3 (Tournament): 0x310 =  784 bytes — offset 700 in bounds (unused)
+//   Mode 0 (Online):     0x5D0 = 1488 bytes - offset 700 IN BOUNDS
+//   Mode 1 (Spectator):  0x440 = 1088 bytes - offset 700 IN BOUNDS
+//   Mode 2 (Local play): 0x2B0 =  688 bytes - offset 700 OUT OF BOUNDS
+//   Mode 3 (Tournament): 0x310 =  784 bytes - offset 700 in bounds (unused)
 // ---------------------------------------------------------------------------
 bool DestroyCurrentSession(const char* caller)
 {
@@ -1626,7 +1626,7 @@ bool DestroyCurrentSession(const char* caller)
         static_cast<unsigned long>(vtablePtr),
         static_cast<unsigned long>(vtablePtr - base));
 
-    // Read vtable[0] — the scalar deleting destructor.
+    // Read vtable[0] - the scalar deleting destructor.
     {
         uintptr_t vtableSlot0 = 0;
         if (!SafeReadPtr(reinterpret_cast<const void*>(vtablePtr),
@@ -1647,7 +1647,7 @@ bool DestroyCurrentSession(const char* caller)
             if (vtableSlot0 < revBase || vtableSlot0 >= revEnd)
             {
                 mod::Log(
-                    "%s: DestroyCurrentSession SKIPPED — vtable[0]=0x%08lX "
+                    "%s: DestroyCurrentSession SKIPPED - vtable[0]=0x%08lX "
                     "outside DLL [0x%08lX..0x%08lX], zeroing ptr only",
                     caller,
                     static_cast<unsigned long>(vtableSlot0),
@@ -1696,7 +1696,7 @@ zero_globals:
     // Reset the mode-constructor trampoline fixup cache.  The destructor
     // unhooks 0x763E50/0x763F04 and frees the old trampolines.  If a
     // subsequent init() allocates a new trampoline at the same heap
-    // address, the g_lastFixedTrampoline[] guard must NOT skip it —
+    // address, the g_lastFixedTrampoline[] guard must NOT skip it -
     // the new trampoline has fresh unrelocated bytes that need fixup.
     ResetModeConstructorTrampolineCache();
 
@@ -1724,7 +1724,7 @@ zero_globals:
 // the same here.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// InvokeSessionVtableInit — read the session pointer from dword_100A02CC and
+// InvokeSessionVtableInit - read the session pointer from dword_100A02CC and
 // call vtable slot 1 (vtable+4 = the init method).  This must be called
 // immediately after init() so that field initialization (BGM manager,
 // audio, etc.) completes before any other JMP-patched hook dispatches to
@@ -1838,7 +1838,7 @@ bool ForceLocalPlayInit()
     // Restore original (pre-hook) bytes at mode-ctor hook sites BEFORE
     // init() so the new trampoline copies clean EXE bytes instead of
     // stale hooks from a previous session's mode (prevents chaining
-    // trampolines across sessions — root cause of the 0x26D19881 crash).
+    // trampolines across sessions - root cause of the 0x26D19881 crash).
     RestoreModeCtorOriginalBytes();
     ResetModeConstructorTrampolineCache();
 
@@ -1870,7 +1870,7 @@ bool ForceLocalPlayInit()
             post[5], post[6], post[7], post[8], post[9]);
     }
 
-    // Undo the trampoline chain growth at 0x401582 — restore saved bytes.
+    // Undo the trampoline chain growth at 0x401582 - restore saved bytes.
     mod::Log("ForceLocalPlayInit: restoring saved EXE hook bytes");
     RestoreExeFrameHookBytes();
     // Restore saved 0x401642 bytes to undo init()'s new trampoline.
@@ -1917,7 +1917,7 @@ bool ForceLocalPlayInit()
 }
 
 // ---------------------------------------------------------------------------
-// ReverseInputSwapIfClient — calls Revival's EFZ_Obj_SubStruct448_CleanupPair
+// ReverseInputSwapIfClient - calls Revival's EFZ_Obj_SubStruct448_CleanupPair
 // on dword_100A0760 to toggle the P1/P2 input-config swap back to its
 // original state.  Only fires when g_netplayRole == kNetplayRoleClient,
 // meaning we joined as P2 and Revival swapped the two 4-DWORD controller
@@ -1983,7 +1983,7 @@ bool ReverseInputSwapIfClient()
 }
 
 // ---------------------------------------------------------------------------
-// SaveRenderContext / RestoreRenderContext — saves the EfzRender* pointer
+// SaveRenderContext / RestoreRenderContext - saves the EfzRender* pointer
 // (dword_100A0778) before entering tournament mode, and writes it back when
 // needed.  Tournament cleanup code (sub_1006CC30) zeros this global before
 // calling ExitProcess, and init(2,102) can zero it again.  The EfzRender
@@ -2035,8 +2035,8 @@ bool SaveRenderContext()
              static_cast<unsigned long>(g_activeRevival->renderContextGlobalOffset),
              static_cast<unsigned>(initOnceGuard),
              (initOnceGuard & 0xFF) != 0
-                 ? "guard SET — init() will NOT refresh renderCtx"
-                 : "guard CLEAR — init() will refresh renderCtx");
+                 ? "guard SET - init() will NOT refresh renderCtx"
+                 : "guard CLEAR - init() will refresh renderCtx");
     return true;
 }
 
@@ -2073,7 +2073,7 @@ static bool RestoreRenderContextInternal(bool consumeSaved)
     mod::Log("RestoreRenderContext: restored EfzRender* 0x%08lX (was 0x%08lX, %s)",
              static_cast<unsigned long>(g_savedRenderContext),
              static_cast<unsigned long>(currentRenderCtx),
-             currentRenderCtx == 0 ? "was NULL — H2 confirmed stale!"
+             currentRenderCtx == 0 ? "was NULL - H2 confirmed stale!"
                                    : (currentRenderCtx == g_savedRenderContext
                                           ? "unchanged"
                                           : "was different"));
@@ -2136,7 +2136,7 @@ bool ClearRevivalTextWithCurrentRenderContext()
 bool DisableRevivalTextRenderingWithCurrentRenderContext();
 
 // ---------------------------------------------------------------------------
-// ClearRevivalText — clear the Revival text overlay buffer.
+// ClearRevivalText - clear the Revival text overlay buffer.
 //
 // The EfzRender object lives in EFZ.exe memory. Revival's wrapper function
 // EFZ_Render_ClearText (RVA clearTextRva = 0x6C070) reads the global
@@ -2147,7 +2147,7 @@ bool DisableRevivalTextRenderingWithCurrentRenderContext();
 // saved value each time before calling clearTextRender so it always sees a
 // valid pointer.
 //
-// The call is wrapped in SEH as a safety net — if the EfzRender object is
+// The call is wrapped in SEH as a safety net - if the EfzRender object is
 // in a bad state, we log and return false instead of crashing.
 // ---------------------------------------------------------------------------
 bool ClearRevivalText()
@@ -2175,7 +2175,7 @@ bool ClearRevivalText()
 }
 
 // ---------------------------------------------------------------------------
-// DisableRevivalTextRendering — disable the EFZ.exe text overlay.
+// DisableRevivalTextRendering - disable the EFZ.exe text overlay.
 //
 // This mirrors the logic that the character-select mode transition
 // (sub_10078600) uses to hide tournament nicknames / win counts:
@@ -2837,7 +2837,7 @@ void RepairRollbackHistoryBindingsIfNeeded()
 }
 
 // ---------------------------------------------------------------------------
-// NetplayFrameHook — wraps sub_1006E590 (the DLL per-frame dispatcher,
+// NetplayFrameHook - wraps sub_1006E590 (the DLL per-frame dispatcher,
 // RVA 0x6E590 in EfzRevival.dll 1.02e) with a setjmp recovery point.
 //
 // For tournament sessions, Jcc patches make ExitProcess calls unreachable.
@@ -2885,12 +2885,12 @@ static FrameDispatchFn g_origFrameDispatch = nullptr;
 // Revival DLL's init() calls sub_1006F160(0x401582, 10, sub_1006E590) EVERY
 // TIME it runs.  sub_1006F160 is an inline-hook installer that:
 //   1. Reads the current 10 bytes at 0x401582 into a new malloc'd trampoline
-//      (raw memcpy — no relocation of relative branches).
+//      (raw memcpy - no relocation of relative branches).
 //   2. Overwrites 0x401582 with a JMP to the new trampoline + NOP padding.
 //
 // After the very first init() (run by Revival DLL at startup), 0x401582
 // contains a JMP to Trampoline-1, whose displaced bytes are the genuine
-// original EXE instructions — safe to execute from any address.
+// original EXE instructions - safe to execute from any address.
 //
 // When our code calls init() again (Tick_init_handshake, ForceLocalPlayInit,
 // SetLocalRoleFlag), sub_1006F160 creates Trampoline-2 whose displaced bytes
@@ -2928,7 +2928,7 @@ void RestoreExeFrameHookBytes()
 {
     if (!g_exeFrameHookSavedValid)
     {
-        mod::Log("RestoreExeFrameHookBytes: no saved bytes — skipped");
+        mod::Log("RestoreExeFrameHookBytes: no saved bytes - skipped");
         return;
     }
 
@@ -2978,7 +2978,7 @@ void RestoreExeFrameHookBytes()
 // EFZ_BufferProcess_WithSize (sub_1006EFB0).  Each init() call mallocs a
 // NEW 10‑byte trampoline and overwrites 0x401642 with E9 rel32 + 3 NOPs.
 // Without save/restore the old trampoline leaks and the JMP target changes
-// — which is benign per se, but accumulates memory and makes the hook
+// - which is benign per se, but accumulates memory and makes the hook
 // inconsistent across sessions.  Save/restore keeps the same JMP bytes as
 // session 1, eliminating any target-address drift.
 // ---------------------------------------------------------------------------
@@ -3007,7 +3007,7 @@ void RestoreExeDispatchHookBytes()
 {
     if (!g_exeDispatchHookSavedValid)
     {
-        mod::Log("RestoreExeDispatchHookBytes: no saved bytes — skipped");
+        mod::Log("RestoreExeDispatchHookBytes: no saved bytes - skipped");
         return;
     }
 
@@ -3050,13 +3050,13 @@ void RestoreExeDispatchHookBytes()
 
 // ---------------------------------------------------------------------------
 // Save / restore bytes at EXE addresses 0x763E50 (7 bytes) and 0x763F04
-// (7 bytes) — the mode-constructor hook sites.  Prevents trampoline chain
+// (7 bytes) - the mode-constructor hook sites.  Prevents trampoline chain
 // growth in the same way SaveExeFrameHookBytes prevents it at 0x401582.
 //
 // Each init() call has the mode constructor run sub_1006F160 which reads
 // the bytes at the hook site, allocates a new trampoline, copies the bytes,
 // and overwrites the hook site with JMP trampoline.  Without save/restore
-// the chain grows by one link per init() call — leaking ~16 bytes of
+// the chain grows by one link per init() call - leaking ~16 bytes of
 // malloc'd memory per link and adding hot-path PUSHAD/POPFD overhead.
 // ---------------------------------------------------------------------------
 static constexpr size_t kModeCtorHookCount = 2;
@@ -3140,7 +3140,7 @@ void RestoreModeCtorOriginalBytes()
     SaveModeCtorOriginalBytesOnce();
     if (!g_modeCtorOriginalsSaved)
     {
-        mod::Log("RestoreModeCtorOriginalBytes: no originals captured — skipped");
+        mod::Log("RestoreModeCtorOriginalBytes: no originals captured - skipped");
         return;
     }
 
@@ -3191,7 +3191,7 @@ void RestoreModeCtorHookBytes()
 {
     if (!g_modeCtorHookSavedValid)
     {
-        mod::Log("RestoreModeCtorHookBytes: no saved bytes — skipped");
+        mod::Log("RestoreModeCtorHookBytes: no saved bytes - skipped");
         return;
     }
 
@@ -3278,7 +3278,7 @@ static constexpr size_t kModeCtorTrampolinePrologueSize = 9; // PUSHAD+PUSHFD+CA
 
 // Track trampoline addresses we've already fixed up, per hook site.
 // If the same trampoline is seen again, its displacements are already
-// relative to the trampoline — re-fixing would drift the targets
+// relative to the trampoline - re-fixing would drift the targets
 // further with each call, eventually causing a wild-EIP crash.
 static uintptr_t g_lastFixedTrampoline[sizeof(kModeCtorHookSites) /
                                         sizeof(kModeCtorHookSites[0])] = {};
@@ -3360,7 +3360,7 @@ void FixupModeConstructorTrampolines(const char* caller)
 
         bool anyFixed = false;
 
-        // Scan for E8 (CALL rel32) and E9 (JMP rel32) — 5-byte instructions.
+        // Scan for E8 (CALL rel32) and E9 (JMP rel32) - 5-byte instructions.
         for (size_t i = 0; i + 5 <= site.patchSize; ++i)
         {
             if (origBytes[i] != 0xE8 && origBytes[i] != 0xE9)
@@ -3402,7 +3402,7 @@ void FixupModeConstructorTrampolines(const char* caller)
             i += 4; // skip displacement bytes
         }
 
-        // Scan for 0F 8x (near conditional JMP rel32) — 6-byte instructions.
+        // Scan for 0F 8x (near conditional JMP rel32) - 6-byte instructions.
         for (size_t i = 0; i + 6 <= site.patchSize; ++i)
         {
             if (origBytes[i] != 0x0F || (origBytes[i + 1] & 0xF0) != 0x80)
@@ -3472,7 +3472,7 @@ static volatile bool g_frameRecoveryPending = false;
 // commonly fires here when the peer process dies mid-match.
 static volatile bool g_tickRecoveryPending = false;
 
-// RunFrameDispatch — MSVC C4611 guard: no C++ objects with destructors in scope.
+// RunFrameDispatch - MSVC C4611 guard: no C++ objects with destructors in scope.
 // Only POD types here.
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -3510,7 +3510,7 @@ static void RunFrameDispatch()
 // it patches EXE address 0x401642 to JMP into sub_1006E570.  From that point
 // the EXE's main loop calls sub_1006E570 on EVERY frame.
 //
-// sub_1006E570 is __thiscall — ECX comes from the EXE.  It reads the session
+// sub_1006E570 is __thiscall - ECX comes from the EXE.  It reads the session
 // pointer from dword_100A02CC, looks up vtable[2], and calls it PASSING ECX
 // (the EXE-supplied this) as the first argument:
 //
@@ -3827,7 +3827,7 @@ static void CaptureRevivalRemoteInputDiag(
 // Master gate for the per-frame Revival tick diagnostics: REVIVAL_TICK_ENTER /
 // REVIVAL_TICK_EXIT / REVIVAL_PAUSE_REMOTE_INPUT / REVIVAL_BATCH_RENDER_*.
 // These fire on EVERY online gameplay frame and accounted for ~91% of the log
-// volume — and that logging cost was itself stalling the tick (multi-hundred-ms
+// volume - and that logging cost was itself stalling the tick (multi-hundred-ms
 // PERF_WARN spikes → dropped frames → desync). Off by default; flip to true
 // only when actively debugging the netplay tick.
 static constexpr bool kLogRevivalTickDiag = false;
@@ -4415,7 +4415,7 @@ static uintptr_t ReadSessionPtrRaw()
     return sessionPtr;
 }
 
-// Screen-index change monitor — logs every time byte_790148 transitions.
+// Screen-index change monitor - logs every time byte_790148 transitions.
 static uint8_t g_lastMonitoredScreenIndex = 0xFF;
 
 // ---------------------------------------------------------------------------
@@ -4511,7 +4511,7 @@ static void MonitorScreenIndexChange()
     g_lastMonitoredScreenIndex = currentIdx;
 }
 
-// RunPerFrameTickDispatch — setjmp guard for the per-frame tick hook.
+// RunPerFrameTickDispatch - setjmp guard for the per-frame tick hook.
 // Same pattern as RunFrameDispatch: isolates setjmp into a POD-only
 // function so C++ recovery can run safely in OurPerFrameTickHook.
 #if defined(_MSC_VER)
@@ -4548,8 +4548,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // gameSys+4968 across consecutive calls and, when it saw the same value
     // twice, skipped ALL mod-side per-frame processing for that call (still
     // calling the original tick). It misfired on Revival's legitimate rollback
-    // re-simulation — which validly re-enters this tick with the EXE toggle
-    // unchanged — so it dropped needed per-frame work and itself caused
+    // re-simulation - which validly re-enters this tick with the EXE toggle
+    // unchanged - so it dropped needed per-frame work and itself caused
     // desyncs/crashes. Removed: every invocation now takes the normal path
     // below and calls the original exactly once via RunPerFrameTickDispatch.
 
@@ -4603,7 +4603,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     ? 1000.0 / frameDeltaMs : 0.0;
                 mod::Log(
                     "FPS_WARN: *** FRAME DROP *** tick=%u deltaMs=%.1f "
-                    "fps=%.1f drops=%u — game running below 30fps",
+                    "fps=%.1f drops=%u - game running below 30fps",
                     g_frameTick, frameDeltaMs, measuredFps, g_fpsDropCount);
                 g_fpsDropLastLogTick = g_frameTick;
             }
@@ -4628,7 +4628,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         g_perFrameMismatchLogged = true;
         mod::Log(
             "TICK_HOOK: *** ECX MISMATCH *** frameTick=%u "
-            "exeECX=0x%08lX dllSession=0x%08lX — "
+            "exeECX=0x%08lX dllSession=0x%08lX - "
             "overriding ECX with current session",
             g_frameTick,
             static_cast<unsigned long>(exeThisAddr),
@@ -4712,7 +4712,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 if (psapi != nullptr)
                     s_pfnMemInfo = reinterpret_cast<PFN_GetProcessMemoryInfo>(
                         GetProcAddress(psapi, "GetProcessMemoryInfo"));
-                // Intentionally leak the psapi HMODULE — we need it for the
+                // Intentionally leak the psapi HMODULE - we need it for the
                 // lifetime of the process and it's tiny.
             }
 
@@ -4757,7 +4757,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             {
                 mod::Log(
                     "TICK_HOOK: *** PRE-TICK GRACEFUL SESSION END *** frameTick=%u "
-                    "quitHead=%ld quitTail=%ld — skipping DLL tick",
+                    "quitHead=%ld quitTail=%ld - skipping DLL tick",
                     g_frameTick,
                     static_cast<long>(preTickQuitHead),
                     static_cast<long>(preTickQuitTail));
@@ -4774,7 +4774,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             {
                 mod::Log(
                     "TICK_HOOK: *** PRE-TICK DISCONNECT *** frameTick=%u "
-                    "consoleErrorSerial=%ld — skipping DLL tick to prevent "
+                    "consoleErrorSerial=%ld - skipping DLL tick to prevent "
                     "corrupted render",
                     g_frameTick,
                     static_cast<long>(preTickErrSerial));
@@ -4864,7 +4864,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             {
                 g_spectateHoldoffLogged = true;
                 mod::Log(
-                    "TICK_HOOK: spectator tick holdoff engaged — preventing "
+                    "TICK_HOOK: spectator tick holdoff engaged - preventing "
                     "input consumption while on title screen (frameTick=%u)",
                     g_frameTick);
             }
@@ -4875,7 +4875,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             // While the holdoff was active (game on title screen), the child
             // EfzRevival.exe received the host's entire replay history and
             // wrote it to the shared-memory ring buffers.  This history
-            // starts from the host's session start — which was on the *host's*
+            // starts from the host's session start - which was on the *host's*
             // title screen, NOT charselect.  The first T frames contain inputs
             // the host's online session captured while the player navigated
             // the mod's netplay menu (potentially Down, Enter, Escape, etc.).
@@ -4883,7 +4883,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             // The spectator is now entering charselect directly.  If the DLL's
             // spectator tick processes those T title-screen-era inputs on the
             // charselect screen, they would be interpreted as cursor movements
-            // and character selections — causing an immediate desync ("inputs
+            // and character selections - causing an immediate desync ("inputs
             // became misaligned ... spectator side don't even see characters
             // picked").
             //
@@ -4894,7 +4894,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             // picks up from the current match state going forward.
             //
             // The trade-off is that the spectator won't replay the charselect
-            // from the beginning — it joins the match in progress.  This
+            // from the beginning - it joins the match in progress.  This
             // matches what users observe in practice and avoids the desync.
             // ----------------------------------------------------------------
             if (g_spectateHoldoffWasActive)
@@ -4964,7 +4964,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             }
 
             mod::Log(
-                "TICK_HOOK: spectator tick holdoff released — screen=%u, "
+                "TICK_HOOK: spectator tick holdoff released - screen=%u, "
                 "DLL session tick now active (frameTick=%u)",
                 static_cast<unsigned>(holdoffScreen),
                 g_frameTick);
@@ -4977,7 +4977,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         g_spectateHoldoffLogged = false;
     }
 
-    // Call the original sub_1006E570 with the corrected ECX — unless
+    // Call the original sub_1006E570 with the corrected ECX - unless
     // a pre-tick disconnect was detected or spectator tick holdoff is
     // active, in which case we skip the DLL's tick entirely.
     int result = 0;
@@ -5168,7 +5168,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             (void)SafeReadDword(reinterpret_cast<const void*>(
                 currentSession + g_activeRevival->sessionOffsetSentinel), &sentinelVal);
 
-            // Game mode fields — always 4 bytes after sessionOffsetGameModeSnapshot.
+            // Game mode fields - always 4 bytes after sessionOffsetGameModeSnapshot.
             const uintptr_t gmBase = currentSession + g_activeRevival->sessionOffsetGameModeSnapshot;
             (void)SafeReadInt(reinterpret_cast<const void*>(gmBase), &prevGameMode);       // +716
             (void)SafeReadInt(reinterpret_cast<const void*>(gmBase + 4), &curGameMode);    // +720
@@ -5547,8 +5547,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                         static_cast<unsigned>(g_lastInitOnceGuard),
                         static_cast<unsigned>(initOnceGuard),
                         (initOnceGuard & 0xFF) != 0
-                            ? "SET — global init SKIPPED"
-                            : "CLEAR — global init WILL RUN");
+                            ? "SET - global init SKIPPED"
+                            : "CLEAR - global init WILL RUN");
                     g_lastInitOnceGuard = initOnceGuard;
                 }
 
@@ -5567,7 +5567,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                         static_cast<unsigned long>(g_lastRenderCtxPtr),
                         static_cast<unsigned long>(renderCtxPtr),
                         renderCtxPtr == 0
-                            ? " — NOW NULL (H2 stale context!)"
+                            ? " - NOW NULL (H2 stale context!)"
                             : "");
                     g_lastRenderCtxPtr = renderCtxPtr;
                 }
@@ -5651,7 +5651,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     }
 
     // ====================================================================
-    // Desync detection — periodic game-state snapshot logging
+    // Desync detection - periodic game-state snapshot logging
     // ====================================================================
     // During active online matches, periodically log key game state values
     // that BOTH peers should agree on.  If logs from both sides are compared
@@ -5746,7 +5746,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         LogSessionDiagnosticState("TickHook_recovery_entry");
         mod::Log(
             "TICK_HOOK: ExitProcess intercepted during per-frame tick "
-            "(role=%d pid=%lu screen=%u) — performing full cleanup",
+            "(role=%d pid=%lu screen=%u) - performing full cleanup",
             recoveredRole,
             static_cast<unsigned long>(recoveredPid),
             static_cast<unsigned>(recoveryScreen));
@@ -5913,7 +5913,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             LogSessionDiagnosticState("TickHook_disconnectDetected_entry");
             mod::Log(
                 "TICK_HOOK: *** NETWORK DISCONNECT *** frameTick=%u "
-                "role=%d pid=%lu consoleError='%s' — synthesizing exit interception",
+                "role=%d pid=%lu consoleError='%s' - synthesizing exit interception",
                 g_frameTick,
                 deadRole,
                 static_cast<unsigned long>(deadPid),
@@ -5951,7 +5951,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             LogSessionDiagnosticState("TickHook_spectatorEsc_entry");
             mod::Log(
                 "TICK_HOOK: *** SPECTATOR ESC EXIT *** frameTick=%u "
-                "role=%d pid=%lu — user requested spectate disconnect",
+                "role=%d pid=%lu - user requested spectate disconnect",
                 g_frameTick,
                 deadRole,
                 static_cast<unsigned long>(deadPid));
@@ -5990,7 +5990,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (!processAlive && processWasCreated && !exitAlreadyPending)
         {
-            // Read screen index — only trigger on non-title screens.
+            // Read screen index - only trigger on non-title screens.
             uint8_t wdScreen = 0;
             __try {
                 wdScreen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
@@ -6017,7 +6017,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     LogSessionDiagnosticState("TickHook_hardFallback_entry");
                     mod::Log(
                         "TICK_HOOK: *** HARD FALLBACK *** frameTick=%u "
-                        "role=%d pid=%lu screen=%u — Revival process died "
+                        "role=%d pid=%lu screen=%u - Revival process died "
                         "without ExitProcess/consoleError, performing "
                         "emergency cleanup",
                         g_frameTick,
@@ -6122,7 +6122,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             }
             else
             {
-                // On title screen — existing title-hook mechanisms handle it.
+                // On title screen - existing title-hook mechanisms handle it.
                 g_watchdogDeadFrameCount = 0;
             }
         }
@@ -6193,7 +6193,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
     // Pulse a lightweight export tick every frame so that activityPhase,
     // inNetplayMenu, stateSeq, and all other shared-memory fields remain
-    // current during loading (screenIdx=2) and battle (screenIdx=3) — screens
+    // current during loading (screenIdx=2) and battle (screenIdx=3) - screens
     // that have no title/charselect hook calling the full session_bridge::Tick().
     // TickExportOnly() only calls state_export::Update(g_status) under the
     // bridge mutex; it does NOT call takeover::Tick() and is safe here.
@@ -6220,7 +6220,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 {
                     mod::Log(
                         "PERF_WARN: *** TICK OVER BUDGET *** tick=%u "
-                        "costMs=%.2f budget=%.1fms exceeded=%u — mod "
+                        "costMs=%.2f budget=%.1fms exceeded=%u - mod "
                         "processing is stalling the game",
                         g_frameTick, tickCostMs, kTickBudgetMs,
                         g_tickBudgetExceededCount);
@@ -6510,7 +6510,7 @@ static char RecoverFromQuitRingSignal(const char* phaseTag, LONG quitHeadBefore,
     LogSessionDiagnosticState("TickHook_gracefulQuit_entry");
     mod::Log(
         "TICK_HOOK: *** %s GRACEFUL SESSION END *** frameTick=%u "
-        "role=%d pid=%lu quitHead=%ld quitTail=%ld — synthesizing exit interception",
+        "role=%d pid=%lu quitHead=%ld quitTail=%ld - synthesizing exit interception",
         phaseTag != nullptr ? phaseTag : "POST-TICK",
         g_frameTick,
         deadRole,
@@ -6662,7 +6662,7 @@ void ResetGameModeValidation()
     }
 }
 
-// OurFrameDispatch — entry point patched over sub_1006E590's prologue.
+// OurFrameDispatch - entry point patched over sub_1006E590's prologue.
 //
 // On the normal path, delegates to RunFrameDispatch (→ trampoline → original).
 //
@@ -6699,7 +6699,7 @@ static void OurFrameDispatch()
         LogSessionDiagnosticState("OurFrameDispatch_recovery_entry");
         mod::Log(
             "OurFrameDispatch: ExitProcess intercepted during frame tick "
-            "(role=%d pid=%lu screen=%u) — performing full cleanup",
+            "(role=%d pid=%lu screen=%u) - performing full cleanup",
             recoveredRole,
             static_cast<unsigned long>(recoveredPid),
             static_cast<unsigned>(recoveryScreen));
@@ -6771,7 +6771,7 @@ static void OurFrameDispatch()
         // Step 6: Force game mode to 0 (title screen).  On the next main-
         // loop iteration, HookedTitleUpdateImplBody runs, detects
         // g_revivalExitIntercepted, calls ConsumeRevivalExitInterception,
-        // and re-enters the netplay menu — skipping the rest of the match.
+        // and re-enters the netplay menu - skipping the rest of the match.
         const bool modeOk = ForceGameModeToTitle();
         mod::Log(
             "OurFrameDispatch: step 6 ForceGameModeToTitle result=%d",
@@ -6832,7 +6832,7 @@ bool InstallNetplayFrameHook()
     if (!SafeReadByte(target, &firstByte) || firstByte != 0x55)
     {
         mod::Log(
-            "InstallNetplayFrameHook: unexpected byte 0x%02X at RVA 0x%lX — skipping",
+            "InstallNetplayFrameHook: unexpected byte 0x%02X at RVA 0x%lX - skipping",
             static_cast<unsigned>(firstByte),
             static_cast<unsigned long>(frameHookRva));
         return false;
@@ -6895,7 +6895,7 @@ bool InstallNetplayFrameHook()
     //   (a) Fix the stale ECX that the EXE passes after session replacement.
     //   (b) Run per-frame diagnostic heartbeats.
     //
-    // sub_1006E570 prologue — may start with either:
+    // sub_1006E570 prologue - may start with either:
     //   55        push ebp       (standard frame-pointer prologue)
     //   51        push ecx       (__thiscall saving this)
     // We overwrite the first 6 bytes with a 5-byte JMP + NOP.
@@ -6912,7 +6912,7 @@ bool InstallNetplayFrameHook()
         {
             mod::Log(
                 "InstallNetplayFrameHook: per-frame tick unexpected byte "
-                "0x%02X at RVA 0x%lX — skipping",
+                "0x%02X at RVA 0x%lX - skipping",
                 static_cast<unsigned>(tickFirstByte),
                 static_cast<unsigned long>(perFrameTickRva));
         }
@@ -7016,7 +7016,7 @@ bool InstallNetplayFrameHook()
 }
 
 // ---------------------------------------------------------------------------
-// ForceGameModeToTitle — write 0 to the EFZ.exe game-mode index so the
+// ForceGameModeToTitle - write 0 to the EFZ.exe game-mode index so the
 // next main-loop iteration dispatches to the title-screen update, where
 // HookedTitleUpdateImplBody can run ConsumeRevivalExitInterception and
 // re-enter the netplay menu.
@@ -7071,19 +7071,19 @@ bool ForceGameModeToTitle()
         currentGameMode);
 
     // -----------------------------------------------------------------------
-    // Battle resource cleanup — replicate the EFZ battle screen's exit
+    // Battle resource cleanup - replicate the EFZ battle screen's exit
     // cleanup that we bypass when force-transitioning mid-match.
     //
     // Verified against the EXE's own replay exit path in
     // updateBattleScreenLogic (0x763C20), byte[45]==2 replay branch:
-    //   1. safelyCloseFileHandle(gameSys+82564) — close replay file
-    //   2. gameSys+82563 = 0                   — clear replay I/O state
-    //   3. stopBackgroundMusic(gameSys)         — stop battle BGM
-    //   4. cleanupPlayerObject(P1, 1)           — release surfaces/sounds/free
+    //   1. safelyCloseFileHandle(gameSys+82564) - close replay file
+    //   2. gameSys+82563 = 0                   - clear replay I/O state
+    //   3. stopBackgroundMusic(gameSys)         - stop battle BGM
+    //   4. cleanupPlayerObject(P1, 1)           - release surfaces/sounds/free
     //   5. null P1 slot
     //   6. cleanupPlayerObject(P2, 1)
     //   7. null P2 slot
-    //   8. free(gameSys+4988)                   — free animated stage-bg
+    //   8. free(gameSys+4988)                   - free animated stage-bg
     //   9. gameSys+4988 = 0
     //
     // We additionally reset:
@@ -7349,7 +7349,7 @@ bool ForceGameModeToTitle()
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic logging — session lifecycle state dump
+// Diagnostic logging - session lifecycle state dump
 // ---------------------------------------------------------------------------
 
 static int g_forceLocalPlayInitCount = 0;
@@ -7427,7 +7427,7 @@ void LogSessionDiagnosticState(const char* context)
             static_cast<unsigned long>(renderCtx),
             static_cast<unsigned long>(globalState));
 
-        // Init-once guard, timer pointer, timer scalar — persistent across sessions
+        // Init-once guard, timer pointer, timer scalar - persistent across sessions
         uint16_t initOnceGuard = 0;
         uintptr_t timerPtr = 0;
         int initFlag = -1;
@@ -7593,7 +7593,7 @@ void LogSessionDiagnosticState(const char* context)
 }
 
 // ---------------------------------------------------------------------------
-// LogInitWriteSnapshot — comprehensive snapshot of every value init() writes.
+// LogInitWriteSnapshot - comprehensive snapshot of every value init() writes.
 //
 // Captures ALL DLL globals and session object fields that init() modifies,
 // in a format designed for before/after diff comparison.  Call this
@@ -7633,7 +7633,7 @@ void LogInitWriteSnapshot(const char* context)
         reinterpret_cast<const void*>(base + g_activeRevival->sessionPtrOffsets[0]),
         &sessionPtr);
 
-    // Init flag (dword_100A05D4) — zeroed at top of init()
+    // Init flag (dword_100A05D4) - zeroed at top of init()
     int initFlag = -1;
     if (g_activeRevival->initFlagOffset != 0)
     {
@@ -7642,7 +7642,7 @@ void LogInitWriteSnapshot(const char* context)
             &initFlag);
     }
 
-    // Init byte (byte_100A0289) — zeroed after version check
+    // Init byte (byte_100A0289) - zeroed after version check
     uint8_t initByte = 0xFF;
     if (g_activeRevival->initByteOffset != 0)
     {
@@ -7669,7 +7669,7 @@ void LogInitWriteSnapshot(const char* context)
             &renderCtxBase);
     }
 
-    // Init-once guard (word_100A0774) — critical for H2
+    // Init-once guard (word_100A0774) - critical for H2
     int initOnceGuard = -1;
     if (g_activeRevival->initOnceGuardOffset != 0)
     {

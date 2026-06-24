@@ -215,7 +215,7 @@ __declspec(naked) static void DummyVtableRet8()
 }
 
 #else
-// Fallback for non-MSVC or x64 — should never be reached in practice.
+// Fallback for non-MSVC or x64 - should never be reached in practice.
 static int  __cdecl DummyVtableRet()    { return 0; }
 static int  __cdecl DummyVtableRet4()   { return 0; }
 static int  __cdecl DummyVtableRet8()   { return 0; }
@@ -249,7 +249,7 @@ static void EnsureDummyVtable()
 }
 
 // ---------------------------------------------------------------------------
-// NeutralizeRevivalSessionVtable — overwrite the Revival DLL's active session
+// NeutralizeRevivalSessionVtable - overwrite the Revival DLL's active session
 // object vtable pointer with the dummy vtable.  This makes every per-frame
 // dispatch a harmless no-op, preventing further ExitProcess triggers.
 // ---------------------------------------------------------------------------
@@ -283,9 +283,9 @@ void NeutralizeRevivalSessionVtable()
 }
 
 // ---------------------------------------------------------------------------
-// ExitProcess interception — installed into EfzRevival.dll's IAT.
+// ExitProcess interception - installed into EfzRevival.dll's IAT.
 //
-// ExitProcess is __noreturn — the compiler emits no valid code past the call.
+// ExitProcess is __noreturn - the compiler emits no valid code past the call.
 // The primary defense against ExitProcess is patching the conditional-jump
 // bytes guarding each call site in the DLL binary (see
 // SaveAndApplyDllExitProcessPatches).  This makes the calls unreachable.
@@ -448,7 +448,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     if (g_netplayFrameJmpActive)
     {
         mod::Log(
-            "NeutralizeExitProcess: longjmp — returning control to game "
+            "NeutralizeExitProcess: longjmp - returning control to game "
             "thread (role=%d)",
             g_localRoleFlag);
         g_netplayFrameJmpActive = false;
@@ -464,7 +464,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     if (g_netplayUiJmpActive)
     {
         mod::Log(
-            "NeutralizeExitProcess: ui longjmp — escaping title/menu path "
+            "NeutralizeExitProcess: ui longjmp - escaping title/menu path "
             "(role=%d)",
             g_localRoleFlag);
         g_netplayUiJmpActive = false;
@@ -488,7 +488,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     {
         mod::Log(
             "NeutralizeExitProcess: no jmp recovery for online role=%d screen=%d "
-            "caller=%s+0x%lX (%p) — performing inline cleanup (TOCTOU last resort)",
+            "caller=%s+0x%lX (%p) - performing inline cleanup (TOCTOU last resort)",
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
 
@@ -567,7 +567,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     if (currentRole == kLocalRoleTournament)
     {
         mod::Log(
-            "NeutralizeExitProcess: tournament fallback cleanup — no jmp "
+            "NeutralizeExitProcess: tournament fallback cleanup - no jmp "
             "recovery role=%d screen=%d caller=%s+0x%lX (%p)",
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
@@ -616,9 +616,9 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         while (true) { Sleep(INFINITE); }
     }
 
-    // Truly unguarded path — unknown role or unexpected state.
+    // Truly unguarded path - unknown role or unexpected state.
     mod::Log(
-        "NeutralizeExitProcess: no longjmp recovery point active — "
+        "NeutralizeExitProcess: no longjmp recovery point active - "
         "suspending thread (role=%d screen=%d caller=%s+0x%lX, safety fallback)",
         currentRole, currentScreenIndex,
         callerModule, static_cast<unsigned long>(callerRva));
@@ -626,7 +626,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 }
 
 // ---------------------------------------------------------------------------
-// PatchRevivalDllExitProcess — walk the Revival DLL's PE import table and
+// PatchRevivalDllExitProcess - walk the Revival DLL's PE import table and
 // redirect its ExitProcess IAT entry to NeutralizeExitProcess.
 // ---------------------------------------------------------------------------
 bool PatchRevivalDllExitProcess()
@@ -1936,7 +1936,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                             {
                                 InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPS);
                                 InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPS);
-                                mod::Log("Takeover: aux auto-answered spectate confirm — synced servedSerial=%ld", static_cast<long>(scPS));
+                                mod::Log("Takeover: aux auto-answered spectate confirm - synced servedSerial=%ld", static_cast<long>(scPS));
                             }
                         }
 

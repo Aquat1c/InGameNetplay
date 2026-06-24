@@ -1212,7 +1212,7 @@ void TickFrontendReturn()
     // Drive the async-hosting state machine from here too. This function is
     // invoked from every screen update hook (title, battle, result, loading),
     // so it is the per-frame chokepoint that lets async hosting detect a peer
-    // connecting while the user is in gameplay/practice — contexts where the
+    // connecting while the user is in gameplay/practice - contexts where the
     // full session_bridge::Tick() does not run. Cheap no-op while inactive.
     netplay::bridge::async_host::Tick();
 
@@ -1340,7 +1340,7 @@ extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)
     }
 
     // Per-frame battle-update diagnostics (EFZ_BATTLE_UPDATE_ENTER/EXIT,
-    // BATTLE_PAUSE_STATE). Off by default — these fired every gameplay frame
+    // BATTLE_PAUSE_STATE). Off by default - these fired every gameplay frame
     // and were a primary source of log bloat. The hook's actual return-flow
     // logic below always runs. Flip to true only when debugging frontend return.
     static constexpr bool kLogBattleUpdateDiag = false;

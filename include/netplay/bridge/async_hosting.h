@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// Async hosting — lets a host start a listener, optionally minimize the hosting
+// Async hosting - lets a host start a listener, optionally minimize the hosting
 // overlay and keep using EFZ, and HOLD the Revival delay prompt when a peer
 // connects until the user explicitly accepts. See
 // shared_documentation/ASYNC_HOSTING_DESIGN.md.
@@ -43,7 +43,7 @@ bool IsActive();
 
 // True while the user has minimized the hosting overlay (HOST_IDLE). The
 // listener stays alive; the netplay menu may be closed. Phase 1 tracks the flag
-// only — gameplay-context driving lands in a later phase.
+// only - gameplay-context driving lands in a later phase.
 bool IsMinimized();
 void SetMinimized(bool minimized);
 
@@ -68,7 +68,7 @@ const char* ReturnKeyDisplay();
 bool OnNetplayMenuRestored();
 
 // Called by the menu layer when the netplay menu is entered. Returns true if the
-// entry was triggered by the return hotkey (F1) pressed in gameplay — in which
+// entry was triggered by the return hotkey (F1) pressed in gameplay - in which
 // case the caller should un-minimize to the HOST overlay (so a held peer
 // auto-accepts) instead of restoring the minimized badge. Clears the flag.
 bool ConsumeReturnKeyArrival();

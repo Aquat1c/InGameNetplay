@@ -452,7 +452,7 @@ void ShutdownLogger()
 
 void Log(const char* fmt, ...)
 {
-    // Format on the caller's stack — no mutex held during vsnprintf.
+    // Format on the caller's stack - no mutex held during vsnprintf.
     char message[1024];
     va_list args;
     va_start(args, fmt);
@@ -476,7 +476,7 @@ void Log(const char* fmt, ...)
         return;
     }
 
-    // OutputDebugStringA on the caller — lock-free and very fast when no
+    // OutputDebugStringA on the caller - lock-free and very fast when no
     // debugger is attached; callers that attach a debugger get immediate
     // output without waiting on the writer thread.
     OutputDebugStringA(line);

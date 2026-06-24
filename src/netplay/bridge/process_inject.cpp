@@ -788,7 +788,7 @@ bool EnsureInjectedContextFast()
 }
 
 // ---------------------------------------------------------------------------
-// SelfPatchIat — in-process IAT patching for Wine/Proton
+// SelfPatchIat - in-process IAT patching for Wine/Proton
 // ---------------------------------------------------------------------------
 // Called from DllMain(DLL_PROCESS_ATTACH) under Wine so that all IAT entries
 // in the host EXE already point to our nb_stub_* exports BEFORE the loader
@@ -797,16 +797,16 @@ bool EnsureInjectedContextFast()
 // and the host-side remote PatchIat() call.
 //
 // Safety notes for DllMain context:
-//   - GetModuleHandleA(nullptr) — safe (no DLL load)
-//   - Direct PE header reads — safe (in-process memory)
-//   - VirtualProtect — safe (no cross-process call)
+//   - GetModuleHandleA(nullptr) - safe (no DLL load)
+//   - Direct PE header reads - safe (in-process memory)
+//   - VirtualProtect - safe (no cross-process call)
 //   - No heap allocation beyond the patch map (std::unordered_map)
 //   - No logging (mod::Log not initialised yet); use OutputDebugStringA
 // ---------------------------------------------------------------------------
 int SelfPatchIat()
 {
     // Build a local patch map: function name → address of our stub.
-    // Since we are in-process, the stub addresses are direct — no
+    // Since we are in-process, the stub addresses are direct - no
     // base-relocation arithmetic needed.
     struct PatchEntry { const char* name; uint32_t address; };
     const PatchEntry entries[] = {
@@ -861,7 +861,7 @@ int SelfPatchIat()
     const DWORD importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     if (importRva == 0)
     {
-        // No imports — nothing to patch (unusual but not an error).
+        // No imports - nothing to patch (unusual but not an error).
         return 0;
     }
 
@@ -900,7 +900,7 @@ int SelfPatchIat()
                 imageBase + oft[i].u1.AddressOfData);
             const char* importName = reinterpret_cast<const char*>(importByName->Name);
 
-            // Linear scan through entries — the list is small (21 entries).
+            // Linear scan through entries - the list is small (21 entries).
             uint32_t targetAddr = 0;
             for (int e = 0; e < kEntryCount; ++e)
             {

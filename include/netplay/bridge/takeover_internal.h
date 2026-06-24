@@ -1,6 +1,6 @@
 #pragma once
 // Internal shared header for the revival_takeover module decomposition.
-// Not part of the public API — only included by src/netplay/bridge/*.cpp files.
+// Not part of the public API - only included by src/netplay/bridge/*.cpp files.
 
 #include "netplay/bridge/revival_addresses.h"
 #include "netplay/bridge/session_bridge.h"
@@ -45,12 +45,12 @@ constexpr int kLocalRoleSpectate = 1;
 constexpr int kLocalRoleLocalPlay = 2;
 constexpr int kLocalRoleTournament = 3;
 
-// Netplay connection role — distinguishes host from client (joiner) within
+// Netplay connection role - distinguishes host from client (joiner) within
 // the kLocalRoleOnline umbrella.  Tracked by the mod so we know whether
 // the P1/P2 input-config swap needs to be reversed on disconnect.
 constexpr int kNetplayRoleNone      = 0;  // not in a netplay session
 constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
-constexpr int kNetplayRoleClient    = 2;  // joined (P2 side — inputs swapped)
+constexpr int kNetplayRoleClient    = 2;  // joined (P2 side - inputs swapped)
 constexpr int kNetplayRoleSpectator = 3;  // spectating
 
 // ---------------------------------------------------------------------------
@@ -155,7 +155,7 @@ struct RuntimeReadyProbe
 extern std::mutex g_mutex;
 extern const RevivalAddressProfile* g_activeRevival;
 
-// Runtime version detection — reads PE TimeDateStamp, sets g_activeRevival.
+// Runtime version detection - reads PE TimeDateStamp, sets g_activeRevival.
 void DetectRevivalVersion();
 void EnsureActiveRevivalProfile();
 
@@ -410,7 +410,7 @@ void ClearLocalProcessCloseForGameplayStall();
 // Returns true while the per-frame tick hook (OurPerFrameTickHook) is
 // executing the original sub_1006E570.  Used by CancelSessionUnlocked to
 // defer ForceLocalPlayInit (which destroys the session object) until after
-// the frame tick completes — destroying it mid-tick would cause
+// the frame tick completes - destroying it mid-tick would cause
 // RollbackLoopTick to use a freed 'this' pointer.
 bool IsInsideFrameTick();
 
@@ -540,7 +540,7 @@ bool PatchIatModule(
     bool verboseLogs);
 std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase);
 bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs);
-// In-process IAT patching for Wine — safe to call from DllMain.
+// In-process IAT patching for Wine - safe to call from DllMain.
 // Returns number of entries patched, or -1 on error.
 int SelfPatchIat();
 HANDLE CreateFakeThread(DWORD exitCode);

@@ -433,7 +433,7 @@ bool LoadTitleAssets(uint32_t screenContext)
     auto const readPixelValue = reinterpret_cast<ReadPixelValueFn>(RuntimeAddress(kVaReadPixelValue));
     auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
 
-    // Resolve title_ob.dat — prefer mod folder override, fallback to vanilla.
+    // Resolve title_ob.dat - prefer mod folder override, fallback to vanilla.
     const std::string titleObjPath = ResolveTitleObjectsPath(g_moduleDirectory);
     const char* titleObjPathC = titleObjPath.c_str();
     const uint32_t oldBackgroundSurface =

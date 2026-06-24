@@ -914,7 +914,7 @@ bool IsSyncReadyForVsHuman(const NetbridgeStatus* status)
 
     // Spectator sync ready: EFZ game mode 8 (spectate), connection flag 4.
     // Spectators don't use the same session object layout so we don't check
-    // sessionByte here — the lightweight spectator wrapper has different
+    // sessionByte here - the lightweight spectator wrapper has different
     // offsets and a smaller object (160 bytes vs 688 for players).
     if (status->syncGameMode == 8 && status->syncMode0Flag1084 == 4)
     {
@@ -1217,7 +1217,7 @@ bool EnsureLocalRevivalLoaded()
 
     if (!PatchRevivalDllExitProcess())
     {
-        mod::Log("Takeover: warning — failed to patch EfzRevival ExitProcess IAT");
+        mod::Log("Takeover: warning - failed to patch EfzRevival ExitProcess IAT");
     }
 
     // Install a setjmp recovery wrapper around sub_1006E590 (the DLL's per-
@@ -1225,7 +1225,7 @@ bool EnsureLocalRevivalLoaded()
     // safety instead of freezing the main game thread during netplay exit.
     if (!InstallNetplayFrameHook())
     {
-        mod::Log("Takeover: warning — failed to install netplay frame hook");
+        mod::Log("Takeover: warning - failed to install netplay frame hook");
     }
 
     return true;

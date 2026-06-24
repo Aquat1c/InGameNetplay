@@ -75,7 +75,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
         {
             // Under Wine/Proton the helper process is NOT created suspended,
             // so main() will start as soon as the loader lock is released.
-            // Patch the EXE's IAT right here — inside DllMain — so all
+            // Patch the EXE's IAT right here - inside DllMain - so all
             // import entries point to our stubs BEFORE main() can call
             // ReadConsoleA, CreateProcessA, etc. through the original IAT.
             // This eliminates the race between main() and the host-side

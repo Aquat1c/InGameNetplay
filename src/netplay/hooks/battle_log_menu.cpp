@@ -2343,7 +2343,7 @@ bool EnsureD3d9OverlayHookInstalled()
     // shared d3d9 EndScene). A vtable-slot patch on this *dummy* device does NOT
     // work: the game's device uses a different vtable instance (EFZ Revival's
     // present path), so patching the dummy slot never intercepts the game's
-    // EndScene (confirmed live — the hook installed but "first EndScene observed"
+    // EndScene (confirmed live - the hook installed but "first EndScene observed"
     // never logged). MinHook patches the function itself, so every caller hits it.
     // Coexistence with other EndScene MinHookers (efz-training-mode): MinHook
     // relocates the existing prologue into our trampoline, so independent hooks

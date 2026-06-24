@@ -199,7 +199,7 @@ public:
     // Called when the netplay menu is re-entered after a match.  Sends
     // the deferred host End immediately (if queued) and clears the
     // returning-from-match latch so the lobby unwedges as soon as we
-    // exit the match back to the menu — regardless of whether
+    // exit the match back to the menu - regardless of whether
     // RequestRefresh() fires on this tick.
     void FlushDeferredEndOnReturn();
 

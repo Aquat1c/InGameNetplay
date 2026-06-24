@@ -519,7 +519,7 @@ std::string BuildFooterText()
         && netplay::bridge::recovery::WasGameplayExitRecoveryCompleted();
     // While async hosting is minimized, the user is browsing the menu normally
     // (the hosting overlay is just a corner badge), so the per-entry footer
-    // tooltip should still show — the session being in the Connecting phase and
+    // tooltip should still show - the session being in the Connecting phase and
     // g_hostingOverlay being active must NOT suppress it here.
     const bool minimizedHosting =
         netplay::bridge::async_host::IsActive() && netplay::bridge::async_host::IsMinimized();
@@ -732,7 +732,7 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const uint8_t dimColor = netplay::draw::ResolveBestPaletteColor(screenContext, 176, 198, 198);
     const uint8_t errorColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 130, 130);
 
-    // Panel background and frame — centered on 320x240 surface
+    // Panel background and frame - centered on 320x240 surface
     constexpr int delayPanelW = 296;
     constexpr int delayPanelH = 96;
     constexpr int delayPanelX = (320 - delayPanelW) / 2;
@@ -907,7 +907,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         }
         else if (netplay::bridge::async_host::IsPeerFoundHeld())
         {
-            // Accept is automatic once this overlay is on screen — no manual key.
+            // Accept is automatic once this overlay is on screen - no manual key.
             netplay::font::DrawTextCentered5x7(sv, "OPPONENT FOUND!", cL, cR, panelY + 58, 1, 1, greenColor);
         }
         else
@@ -922,7 +922,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
 // Compile-time switch for the in-gameplay async-host indicator.
 //
-// NOTE: This indexed-surface path does NOT render during battle/practice —
+// NOTE: This indexed-surface path does NOT render during battle/practice -
 // EFZ Revival presents the gameplay frame through Direct3D9, so drawing onto the
 // DirectDraw-style menu backbuffer here is never shown in-match. The working
 // in-battle indicator must go through the D3D9 EndScene hook (see
@@ -930,7 +930,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 // work. Disabled until that D3D9 text path lands.
 static constexpr bool kEnableAsyncHostGameplayOverlay = false;
 
-// "Stop hosting?" confirmation modal — shown over the netplay menu when the
+// "Stop hosting?" confirmation modal - shown over the netplay menu when the
 // user picks a host-conflicting option (Join / Lobby / Player Rooms) while an
 // async-host listener is active. YES stops hosting and proceeds; NO keeps it.
 bool DrawStopHostingConfirmGdi(uint32_t screenContext)
@@ -1185,7 +1185,7 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
         g_spectateConfirmOverlay.promptKind
             == static_cast<int>(netplay::bridge::NetbridgeSpectatePromptKind::HostNotYetPlaying);
 
-    // Panel background and frame — centered on 320x240 surface
+    // Panel background and frame - centered on 320x240 surface
     constexpr int specPanelW = 240;
     const int specPanelH = hostNotYetPlayingPrompt ? 130 : 112;
     constexpr int specPanelX = (320 - specPanelW) / 2;
@@ -1258,7 +1258,7 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
 }
 
 // ---------------------------------------------------------------------------
-// Debug overlay — toggled with keyboard D key
+// Debug overlay - toggled with keyboard D key
 // ---------------------------------------------------------------------------
 
 static constexpr int kDebugMenuItemCount = 6;
@@ -1329,7 +1329,7 @@ bool DrawDebugOverlay(uint32_t screenContext)
         g_debugOverlay.forceSpectateOverlay,
         g_debugOverlay.forceRuntimeTextOverlay,
         g_debugOverlay.showConsole,
-        false, // "Wait to Spectate" — action, no toggle
+        false, // "Wait to Spectate" - action, no toggle
         false, // "Close" has no toggle state
     };
 

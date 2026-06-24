@@ -189,7 +189,7 @@ std::string g_configuredHolePunchServer;
 
 // Job object for automatic child-process cleanup.  When the host process
 // terminates (even by crash), the kernel closes all handles to the job,
-// which kills every process assigned to it — ensuring EfzRevival.exe and
+// which kills every process assigned to it - ensuring EfzRevival.exe and
 // any grandchildren (cmd.exe / conhost.exe) never linger in the background.
 static HANDLE g_childJobObject = nullptr;
 
@@ -467,7 +467,7 @@ void DetectRevivalVersion()
         if (!TryReadModulePeTimestamp(revival, &timestamp))
         {
             SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
-            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header — fail closed");
+            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header - fail closed");
             return;
         }
 
@@ -490,7 +490,7 @@ void DetectRevivalVersion()
 
         SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
         mod::Log(
-            "DetectRevivalVersion: unsupported or modified DLL build timestamp=0x%08X — fail closed as %s",
+            "DetectRevivalVersion: unsupported or modified DLL build timestamp=0x%08X - fail closed as %s",
             static_cast<unsigned>(timestamp));
         return;
     }
@@ -509,7 +509,7 @@ void DetectRevivalVersion()
 
         SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::PublishedHostTimestamp);
         mod::Log(
-            "DetectRevivalVersion: published host timestamp 0x%08X unknown — fail closed as %s",
+            "DetectRevivalVersion: published host timestamp 0x%08X unknown - fail closed as %s",
             static_cast<unsigned>(publishedTimestamp),
             g_activeRevival->versionTag);
         return;
@@ -519,7 +519,7 @@ void DetectRevivalVersion()
     if (revival == nullptr)
     {
         mod::Log(
-            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile — fail closed as %s",
+            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile - fail closed as %s",
             g_activeRevival->versionTag);
         return;
     }
@@ -2704,7 +2704,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     // If we're currently in tournament mode, perform full cleanup before
     // doing anything else.  The DLL call-site patches make ExitProcess
     // unreachable, so the old ConsumeRevivalExitInterception path never
-    // fires — we must clean up here instead.
+    // fires - we must clean up here instead.
     //
     // This also handles tournament re-entry (selection == 2 a second
     // time): without cleanup the EXE patches would be saved in their
@@ -2804,7 +2804,7 @@ bool StartSession(
     // Clear stale exit-interception flags from a previous session.
     // If g_revivalExitIntercepted leaked from session 1 (e.g. ExitProcess
     // raced with CancelSession), ConsumeRevivalExitInterception would fire
-    // during session 2's setup — running the full reverse-init cleanup and
+    // during session 2's setup - running the full reverse-init cleanup and
     // destroying the new session.
     if (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0)
     {
@@ -2863,7 +2863,7 @@ bool StartSession(
     // Save the EfzRender* pointer now so that ClearRevivalText /
     // DisableRevivalTextRendering can restore it during CancelSession.
     // Tournament mode already does this in OnTitleSelectionConfirmed,
-    // but online sessions (host/join/spectate) skipped it — causing
+    // but online sessions (host/join/spectate) skipped it - causing
     // both clear and disable to silently fail on the cleanup path.
     (void)SaveRenderContext();
 
@@ -2954,7 +2954,7 @@ bool StartSession(
         }
 
         // Build the override string: "efz_netplay_mod=n"
-        // n = native — tells Wine to load the DLL from the filesystem.
+        // n = native - tells Wine to load the DLL from the filesystem.
         std::string baseName = BaseLower(selfPath);
         {
             // Strip .dll extension if present.
@@ -2973,7 +2973,7 @@ bool StartSession(
             overrideValue = std::string(existingOverride) + ";" + overrideValue;
         }
 
-        // Build an environment block — a double-null-terminated sequence of
+        // Build an environment block - a double-null-terminated sequence of
         // "KEY=VALUE\0" strings.  We inherit the current environment and
         // append/override WINEDLLOVERRIDES.
         std::vector<char> envBlock;
@@ -3297,8 +3297,8 @@ bool StartSession(
     // --- Pre-launch ring buffer flush (spectate only) ----------------------
     // Revival's named shared-memory ring buffers ("InputP1", "InputP2", etc.)
     // may still contain stale data from a previous session if the kernel
-    // objects haven't been destroyed.  Flush them NOW — before the child
-    // process is resumed — so that only fresh data from the new session is
+    // objects haven't been destroyed.  Flush them NOW - before the child
+    // process is resumed - so that only fresh data from the new session is
     // present when the DLL eventually starts consuming.
     //
     // Previously this flush lived inside the Tick() init-handshake block
@@ -3307,8 +3307,8 @@ bool StartSession(
     // signalling the init event and the next game-frame's Tick() detecting
     // it (~16 ms), the child had already started writing the host's
     // historical input stream into the ring buffers.  The flush then
-    // discarded those early entries — the very beginning of the charselect
-    // replay — leaving the DLL to start mid-stream against a freshly-
+    // discarded those early entries - the very beginning of the charselect
+    // replay - leaving the DLL to start mid-stream against a freshly-
     // initialised charselect state.
     //
     // By flushing here (child still suspended), we clear only genuinely
@@ -3368,7 +3368,7 @@ bool StartSession(
                     static_cast<unsigned long>(oldTail));
             }
         }
-        // Alignment verification is unnecessary here — no producer is
+        // Alignment verification is unnecessary here - no producer is
         // running yet, so no interleaved writes can occur.
         for (int mi = 0; mi < kMappingCount; ++mi)
         {
@@ -3726,7 +3726,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             ReinitLocalPlay();
             if (runtimeReady)
             {
-                mod::Log("Takeover: helper process exited during Connected phase — forcing SessionEnded (runtime was still ready)");
+                mod::Log("Takeover: helper process exited during Connected phase - forcing SessionEnded (runtime was still ready)");
             }
         }
         return;
@@ -3995,7 +3995,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // calling InvokeStartInitPlayer.  When the heap reuses the same
             // address as a previous session, initComplete may still be 1
             // (stale), which would cause InvokeStartInitPlayer to skip the
-            // critical sub_10072880 call — leaving the session in an
+            // critical sub_10072880 call - leaving the session in an
             // uninitialized state and freezing the game.
             //
             // Only meaningful for online sessions (mode 0) where
@@ -4026,7 +4026,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     else
                     {
                         mod::Log(
-                            "Takeover: FAILED to clear stale initComplete=1 on session 0x%08lX — "
+                            "Takeover: FAILED to clear stale initComplete=1 on session 0x%08lX - "
                             "VirtualProtect err=%lu (StartInitPlayer will likely skip sub_10072880!)",
                             static_cast<unsigned long>(newSessionPtr),
                             static_cast<unsigned long>(GetLastError()));
@@ -4045,7 +4045,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             else if (initParams[0] == kLocalRoleOnline && startInitOk)
             {
                 // Read the activePlayer field that StartInitPlayer just wrote.
-                // 0 = host (P1), 1 = joiner/client (P2 — inputs were swapped).
+                // 0 = host (P1), 1 = joiner/client (P2 - inputs were swapped).
                 const uintptr_t sessionPtr = ReadSessionPointerFromRevival();
                 int activePlayer = -1;
                 if (sessionPtr != 0)
@@ -4084,7 +4084,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // 0x401582 fires, it dispatches to the uninitialized spectator
             // and crashes on the NULL BGM manager.  Calling vtable+4 here
             // ensures the spectator is fully initialized before any hook
-            // can dispatch to it — identical to what ForceLocalPlayInit
+            // can dispatch to it - identical to what ForceLocalPlayInit
             // does for mode 2.
             if (initParams[0] == kLocalRoleSpectate)
             {
@@ -4115,8 +4115,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // NOTE: The spectate ring-buffer flush that used to live here
             // has been moved to StartSession (before ResumeThread).  Flushing
-            // here — after the child process has already been running for up
-            // to a game frame — discarded the beginning of the host's input
+            // here - after the child process has already been running for up
+            // to a game frame - discarded the beginning of the host's input
             // replay stream, causing spectator desync at charselect.
             // See the "Pre-launch ring buffer flush" block in StartSession.
 
@@ -4160,7 +4160,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         {
             mod::Log(
-                "Takeover: console error detected serial=%d text='%s' phase=%d — transitioning to Failed",
+                "Takeover: console error detected serial=%d text='%s' phase=%d - transitioning to Failed",
                 ioStatus->consoleErrorSerial,
                 ioStatus->consoleErrorText,
                 static_cast<int>(phase));
@@ -4178,7 +4178,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // has ended.  The heavy recovery (ForceLocalPlayInit, restore
             // patches, ForceGameModeToTitle) is handled by the tick hook.
             mod::Log(
-                "Takeover: console error detected serial=%d text='%s' phase=Connected — transitioning to SessionEnded",
+                "Takeover: console error detected serial=%d text='%s' phase=Connected - transitioning to SessionEnded",
                 ioStatus->consoleErrorSerial,
                 ioStatus->consoleErrorText);
             SetPhase(ioStatus, NetbridgePhase::SessionEnded, ioStatus->consoleErrorText);
@@ -4271,7 +4271,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 }
 
 // ---------------------------------------------------------------------------
-// CancelSessionUnlocked — shared body for CancelSession and exit interception.
+// CancelSessionUnlocked - shared body for CancelSession and exit interception.
 // Caller MUST hold g_mutex.
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
@@ -4426,7 +4426,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (IsInsideFrameTick())
         {
             mod::Log(
-                "Takeover: cancel cleanup — DEFERRED (inside frame tick, "
+                "Takeover: cancel cleanup - DEFERRED (inside frame tick, "
                 "ForceLocalPlayInit would destroy active session)");
             RequestDeferredCancelCleanup(reason);
         }
@@ -4434,30 +4434,30 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         {
             const bool initOk = ForceLocalPlayInit();
             mod::Log(
-                "Takeover: cancel cleanup — ForceLocalPlayInit result=%d",
+                "Takeover: cancel cleanup - ForceLocalPlayInit result=%d",
                 initOk ? 1 : 0);
 
             const bool clearOk = ClearRevivalText();
             mod::Log(
-                "Takeover: cancel cleanup — ClearRevivalText result=%d",
+                "Takeover: cancel cleanup - ClearRevivalText result=%d",
                 clearOk ? 1 : 0);
 
             const bool textOk = DisableRevivalTextRendering();
             mod::Log(
-                "Takeover: cancel cleanup — DisableRevivalTextRendering result=%d",
+                "Takeover: cancel cleanup - DisableRevivalTextRendering result=%d",
                 textOk ? 1 : 0);
 
             mod::ResetCrashRecoveryState();
-            mod::Log("Takeover: cancel cleanup — crash recovery state reset");
+            mod::Log("Takeover: cancel cleanup - crash recovery state reset");
 
             ResetGameModeValidation();
-            mod::Log("Takeover: cancel cleanup — game mode validation reset");
+            mod::Log("Takeover: cancel cleanup - game mode validation reset");
         }
     }
     else
     {
         mod::Log(
-            "Takeover: cancel cleanup — skipped DLL re-init (shutdown path reason='%s')",
+            "Takeover: cancel cleanup - skipped DLL re-init (shutdown path reason='%s')",
             reason != nullptr ? reason : "");
         // Still reset the netplay role even on shutdown so stale state
         // doesn't leak to a future session (belt-and-suspenders).
@@ -4472,13 +4472,13 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         const size_t oldFakeCount = g_fakeThreads.size();
         // Unlock before calling ClearFakeThreads which takes the same lock,
         // so log the count first then clear outside the lock.
-        mod::Log("Takeover: cancel cleanup — clearing g_fakeThreads (count=%zu)",
+        mod::Log("Takeover: cancel cleanup - clearing g_fakeThreads (count=%zu)",
                  oldFakeCount);
     }
     ClearFakeThreads();
     {
         std::lock_guard<std::mutex> raLock(g_redirectAllocMutex);
-        mod::Log("Takeover: cancel cleanup — clearing g_redirectAllocations (count=%zu)",
+        mod::Log("Takeover: cancel cleanup - clearing g_redirectAllocations (count=%zu)",
                  g_redirectAllocations.size());
     }
     ClearRedirectAllocations();
@@ -4639,13 +4639,13 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // frame-by-frame patches every tick and they are self-healing after step 3).
     if (mode == kLocalRoleTournament)
     {
-        mod::Log("Takeover: exit interception step 2 — RestoreTournamentExePatches");
+        mod::Log("Takeover: exit interception step 2 - RestoreTournamentExePatches");
         RestoreTournamentExePatches();
     }
     else
     {
         mod::Log(
-            "Takeover: exit interception step 2 — no EXE patch restore "
+            "Takeover: exit interception step 2 - no EXE patch restore "
             "needed for mode=%d (online/spectate)",
             mode);
     }
@@ -4657,7 +4657,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // the earlier calls were bypassed (e.g. VEH TOCTOU path or a code
     // path that doesn't go through OurFrameDispatch), the session is
     // always replaced here.  Repeated calls are harmless.
-    mod::Log("Takeover: exit interception step 3 — ForceLocalPlayInit (defence-in-depth)");
+    mod::Log("Takeover: exit interception step 3 - ForceLocalPlayInit (defence-in-depth)");
     ForceLocalPlayInit();
 
     // step 4: clear any DLL-side text overlay state left by the session.
@@ -4668,7 +4668,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // Online/spectate do not write to the EfzRender buffer (they use ImGui
     // overlays), but we call DisableRevivalTextRendering as a defensive
     // clean-up in case the session left the DLL text-draw hook active.
-    mod::Log("Takeover: exit interception step 4 — clear text / disable renderer");
+    mod::Log("Takeover: exit interception step 4 - clear text / disable renderer");
     // Both tournament and online/spectate paths share the same cleanup now.
     // SaveRenderContext() is called in StartSession for all session types,
     // so RestoreRenderContext inside ClearRevivalText works for all modes.
@@ -4726,7 +4726,7 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
         return false;
     }
 
-    mod::Log("Takeover: tournament returned to title screen (mode 0) — cleaning up proactively");
+    mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
 
     RestoreDllExitProcessPatches();
     RestoreTournamentExePatches();

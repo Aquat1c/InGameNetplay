@@ -50,7 +50,7 @@ bool InstallHooks()
     g_netplayAssetsAvailable = !probeBg.empty();
     if (!g_netplayAssetsAvailable)
     {
-        mod::Log("InstallHooks: WARNING — netplay assets not found, netplay menu will be disabled");
+        mod::Log("InstallHooks: WARNING - netplay assets not found, netplay menu will be disabled");
         mod::Log("InstallHooks: looked in DLL dir '%s', mods\\efz_netplay_mod\\, working dir, system\\", g_moduleDirectory.c_str());
     }
     else

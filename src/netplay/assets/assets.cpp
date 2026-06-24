@@ -139,7 +139,7 @@ std::string BuildModuleDirectory(HMODULE moduleHandle)
 // ---------------------------------------------------------------------------
 std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory)
 {
-    // Find the last path separator — that gives us the mod folder name.
+    // Find the last path separator - that gives us the mod folder name.
     const std::size_t sep = moduleDirectory.find_last_of("\\/");
     if (sep == std::string::npos || sep == 0)
     {
@@ -389,7 +389,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] FOUND — using base '%s'", moduleDirectory.c_str());
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] FOUND - using base '%s'", moduleDirectory.c_str());
             return moduleDirectory;
         }
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] not found");
@@ -411,7 +411,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] FOUND — using base '%s'", absoluteModsDir.c_str());
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] FOUND - using base '%s'", absoluteModsDir.c_str());
             return absoluteModsDir;
         }
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] not found");
@@ -435,7 +435,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         if (FileExists(path))
         {
             mod::Log(
-                "ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] FOUND — using base '%s'",
+                "ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] FOUND - using base '%s'",
                 absoluteWellKnownDir.c_str());
             return absoluteWellKnownDir;
         }
@@ -503,7 +503,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
     // This allows mods to replace the vanilla title menu sprite sheet.
 
     // --- Tier 1: DLL directory (e.g. mods\efz_netplay_mod\system\title_ob.dat)
-    // Skip when moduleDirectory is "." — under Wine / Proton the DLL path
+    // Skip when moduleDirectory is "." - under Wine / Proton the DLL path
     // is often unresolvable, leaving moduleDirectory as ".".  Probing
     // ".\system\title_ob.dat" would falsely match the *vanilla* file and
     // prevent the real mod override from being found.
@@ -513,14 +513,14 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] FOUND — using '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] FOUND - using '%s'", path.c_str());
             return path;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] not found");
     }
     else
     {
-        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.' — Wine/Proton fallback to avoid vanilla false positive)");
+        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.' - Wine/Proton fallback to avoid vanilla false positive)");
     }
 
     // --- Tier 2: mods\<modname>\ relative to working directory
@@ -531,7 +531,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] FOUND — using '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] FOUND - using '%s'", path.c_str());
             return path;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] not found");
@@ -551,7 +551,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] probing '%s'", wellKnownPath);
         if (FileExists(wellKnownPath))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] FOUND — using '%s'", wellKnownPath);
+            mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] FOUND - using '%s'", wellKnownPath);
             return wellKnownPath;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] not found");

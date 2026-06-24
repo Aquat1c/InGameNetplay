@@ -61,7 +61,7 @@ struct NetbridgeStatus
     int consoleErrorSerial = 0;
     char consoleErrorText[128] = {};
 
-    // Revival session-object fields — populated when an online session is
+    // Revival session-object fields - populated when an online session is
     // active and the session pointer has been validated.
     int activePlayer = -1;      // 0 = P1 (host), 1 = P2 (client), -1 = unknown
     int sessionP1Wins = 0;      // P1 win count from Revival session object
@@ -83,7 +83,7 @@ struct DelayPromptMetrics
 
 bool IsCurrentProcessRevival();
 bool IsRunningUnderWine();
-// In-process IAT patching for Wine — safe to call from DllMain.
+// In-process IAT patching for Wine - safe to call from DllMain.
 int SelfPatchIat();
 void Initialize();
 void Shutdown();
@@ -91,7 +91,7 @@ void EmergencyShutdown();
 void InitializeInjectedProcess();
 void ShutdownInjectedProcess();
 void Tick();
-// Lightweight per-frame export pulse — refreshes shared-memory state from
+// Lightweight per-frame export pulse - refreshes shared-memory state from
 // the current g_status snapshot without calling takeover::Tick().  Safe to
 // call from any game thread context (loading screen, battle, frame hook).
 void TickExportOnly();
@@ -111,7 +111,7 @@ bool NotifyTitleScreenActive();
 // Returns true if the EfzRevival.exe peer process is still running.
 // Advisory check (TOCTOU): the process may exit immediately after this call.
 // Used to abort the state-1 handoff before returning a global-state-transition
-// value to EFZ.exe — preventing ExitProcess from firing on the main thread
+// value to EFZ.exe - preventing ExitProcess from firing on the main thread
 // in the absence of a setjmp recovery point.
 bool IsPeerProcessAlive();
 // Returns true if NeutralizeExitProcess has fired and the exit interception
@@ -127,7 +127,7 @@ bool ForceLocalPlayInit();
 // hook runs on the next main-loop iteration.  Returns true on success.
 // Safe to call from the VEH crash handler.
 bool ForceGameModeToTitle();
-// Crash-handler diagnostic accessors — return active Revival profile offsets.
+// Crash-handler diagnostic accessors - return active Revival profile offsets.
 // Returns 0 if no profile is active yet.
 uintptr_t GetRevivalRenderContextOffset();
 uintptr_t GetRevivalSessionPtrOffset();

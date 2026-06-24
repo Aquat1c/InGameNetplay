@@ -2036,7 +2036,7 @@ void LobbySession::NotifyMatchConnected()
         m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::ConfirmAccept;
-        // targetPlayerId is not needed for accept — the server tracks the
+        // targetPlayerId is not needed for accept - the server tracks the
         // pending challenge state.  We send 0 and DoAccept will use
         // the last pre_accept target if needed.
         action.targetPlayerId = 0;
@@ -2366,7 +2366,7 @@ void LobbySession::PollThreadEntry()
 
     // Poll loop. Concerto invariant: poll status every tick for BOTH host and
     // client, throughout matches and spectating. The server treats the poll as
-    // the room keepalive, so we never stop polling or detach while joined —
+    // the room keepalive, so we never stop polling or detach while joined -
     // doing so lets the server expire or duplicate our membership (ghosts).
     while (!m_shouldStop.load())
     {
@@ -2702,7 +2702,7 @@ bool LobbySession::DoPollStatus()
     if (abandonIncomingChallenge)
     {
         // We hadn't sent 'accept' yet (we were still waiting on the bridge
-        // to connect), so there's nothing to End on the server — our
+        // to connect), so there's nothing to End on the server - our
         // pre_accept state will expire naturally once the challenger's
         // challenge record is gone. Just drop the local pending-accept
         // target so a late-arriving ConfirmAccept turns into a no-op.
@@ -3243,7 +3243,7 @@ void LobbySession::BuildDisplayEntries(
         return std::string();
     };
 
-    // Challenges first — they are actionable and time-sensitive.
+    // Challenges first - they are actionable and time-sensitive.
     for (const auto& ch : effectiveChallenges)
     {
         std::string playingSpectateIp;
@@ -3292,7 +3292,7 @@ void LobbySession::BuildDisplayEntries(
         }
 
         // Skip if this exact player ID already appears (e.g. challenger
-        // with the same ID).  We no longer deduplicate by name alone —
+        // with the same ID).  We no longer deduplicate by name alone -
         // two different players can legitimately share a nickname.
         if (isIdAlreadyListed(p.playerId))
         {
@@ -3388,7 +3388,7 @@ bool LobbySession::DoPreAccept(int challengerPlayerId)
 
     if (!IsJsonStatusOk(body))
     {
-        // Server rejected pre_accept — most commonly because the challenger
+        // Server rejected pre_accept - most commonly because the challenger
         // already left the lobby or their challenge expired. Signal the
         // title layer so it can cancel the bridge and close the overlay.
         mod::Log("LobbySession::DoPreAccept: server rejected pre_accept, marking incoming challenge abandoned");
@@ -3649,7 +3649,7 @@ void LobbySession::ProcessPendingActions()
             if (!endOk && m_joinedRoom.lobbyNumericId != 0)
             {
                 // DoEnd failed (network error or server rejection that
-                // wasn't a stale-session failure — HandleServerRemovalFailure
+                // wasn't a stale-session failure - HandleServerRemovalFailure
                 // already self-heals that case).  Force a rejoin so our
                 // server-side presence matches the freshly cleared local
                 // state; otherwise we'd keep appearing as "playing" to

@@ -70,7 +70,7 @@ struct RevivalAddressProfile
     uintptr_t globalStatePtrOffset;
 
     // -----------------------------------------------------------------------
-    // Additional DLL globals written by init() — used for diagnostic logging
+    // Additional DLL globals written by init() - used for diagnostic logging
     // -----------------------------------------------------------------------
 
     // RVA of dword_100A05D4: unknown flag zeroed at top of init().
@@ -102,7 +102,7 @@ struct RevivalAddressProfile
     // RVA of EFZ_Obj_SubStruct448_CleanupPair (sub_1006CAD0 in 1.02e).
     // A __thiscall(void* &dword_100A0760) function that swaps the two
     // adjacent 4-DWORD input-config blocks (P1 ↔ P2 controllers).
-    // The swap is a toggle — calling it twice restores the original state.
+    // The swap is a toggle - calling it twice restores the original state.
     // Used to reverse the P2 input swap when a client disconnects.
     uintptr_t inputSwapPairRva;
 
@@ -112,7 +112,7 @@ struct RevivalAddressProfile
     uintptr_t frameHookRva;
 
     // RVA of the per-frame tick dispatcher (sub_1006E570 in 1.02e).
-    // A __thiscall(void* this) function — first 6 bytes are overwritten
+    // A __thiscall(void* this) function - first 6 bytes are overwritten
     // with an absolute JMP trampoline into our per-frame tick handler.
     uintptr_t perFrameTickRva;
 
@@ -143,21 +143,21 @@ struct RevivalAddressProfile
     uintptr_t sessionOffsetHistorySecondaryVec;
 
     // Additional session fields written by constructors / StartInitPlayer.
-    uintptr_t sessionOffsetCurrentFrame;       // +708 in 1.02e — frame counter
-    uintptr_t sessionOffsetGameModeSnapshot;   // +716 — game mode at session start
-    uintptr_t sessionOffsetMatchId;            // +712 — match identifier
-    uintptr_t sessionOffsetSentinel;           // +1232 — INT_MAX-1 sentinel value
+    uintptr_t sessionOffsetCurrentFrame;       // +708 in 1.02e - frame counter
+    uintptr_t sessionOffsetGameModeSnapshot;   // +716 - game mode at session start
+    uintptr_t sessionOffsetMatchId;            // +712 - match identifier
+    uintptr_t sessionOffsetSentinel;           // +1232 - INT_MAX-1 sentinel value
 
     // Raw wchar_t[64] player-name buffers inside the 276-byte config
     // snapshot at sessionOffsetConfigStruct + 14 / + 142.
     // NOT the std::wstring SSO objects at +740/+764 (which require heap
     // indirection for names > 7 wchars and cannot be read as flat arrays).
-    uintptr_t sessionOffsetP1Name;             // +958 in 1.02e — P1 nickname
-    uintptr_t sessionOffsetP2Name;             // +1086 in 1.02e — P2 nickname
+    uintptr_t sessionOffsetP1Name;             // +958 in 1.02e - P1 nickname
+    uintptr_t sessionOffsetP2Name;             // +1086 in 1.02e - P2 nickname
 
     // Win counters stored in the session object.
-    uintptr_t sessionOffsetP1Wins;             // +1224 in 1.02e — P1 win count
-    uintptr_t sessionOffsetP2Wins;             // +1228 in 1.02e — P2 win count
+    uintptr_t sessionOffsetP1Wins;             // +1224 in 1.02e - P1 win count
+    uintptr_t sessionOffsetP2Wins;             // +1228 in 1.02e - P2 win count
 
     // -----------------------------------------------------------------------
     // Global state offsets (byte offsets from global-state pointer)
@@ -208,7 +208,7 @@ struct RevivalAddressProfile
     //
     // The tournament session's per-frame tick calls ExitProcess when it
     // detects game mode 0 (title screen).  Since ExitProcess is __noreturn,
-    // the compiler emits no valid code after the call — we cannot return
+    // the compiler emits no valid code after the call - we cannot return
     // from our IAT stub.  Instead, we patch the conditional-jump bytes
     // that guard each ExitProcess call to unconditional jumps (74/75→EB),
     // making the calls unreachable.  The IAT hook remains as a safety net.
@@ -240,7 +240,7 @@ struct RevivalAddressProfile
 // Known profiles
 // ---------------------------------------------------------------------------
 
-// Unsupported / unknown Revival build — all hookable RVAs and offsets are
+// Unsupported / unknown Revival build - all hookable RVAs and offsets are
 // zeroed so detection can fail closed instead of reusing a nearby profile.
 constexpr RevivalAddressProfile kRevival_Unsupported = {
     "unsupported",                                      // versionTag
@@ -302,7 +302,7 @@ constexpr RevivalAddressProfile kRevival_Unsupported = {
     0u,                                                 // exitProcessNearJccCount
 };
 
-// EfzRevival.dll v1.02e — original release, baseline for all addresses.
+// EfzRevival.dll v1.02e - original release, baseline for all addresses.
 constexpr RevivalAddressProfile kRevival_1_02e = {
     "1.02e",                                            // versionTag
     0x5EA876B0u,                                        // peTimestamp
@@ -363,7 +363,7 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     5,                                                  // exitProcessNearJccCount
 };
 
-// EfzRevival.dll v1.02f — minor revision, same .data layout as 1.02e.
+// EfzRevival.dll v1.02f - minor revision, same .data layout as 1.02e.
 // Code shift of +0x30 for most (but not all) functions.
 constexpr RevivalAddressProfile kRevival_1_02f = {
     "1.02f",                                            // versionTag
@@ -490,7 +490,7 @@ constexpr RevivalAddressProfile kRevival_1_02f_framestepping = {
     6,                                                 // exitProcessNearJccCount
 };
 
-// EfzRevival.dll v1.02g — session objects enlarged (host 0x5D0→0x690),
+// EfzRevival.dll v1.02g - session objects enlarged (host 0x5D0→0x690),
 // same .data layout as e/f.  Tournament results ExitProcess guard
 // encoding changed from 2-byte short JNZ to 6-byte near JNZ.
 
@@ -557,7 +557,7 @@ constexpr RevivalAddressProfile kRevival_1_02g = {
     7,                                                  // exitProcessNearJccCount
 };
 
-// EfzRevival.dll v1.02h — .data shifted +0x20 from e/f/g.
+// EfzRevival.dll v1.02h - .data shifted +0x20 from e/f/g.
 // Code shift +0x880 from 1.02e baseline (non-uniform).
 constexpr RevivalAddressProfile kRevival_1_02h = {
     "1.02h",                                            // versionTag
@@ -620,7 +620,7 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
     7,                                                  // exitProcessNearJccCount
 };
 
-// EfzRevival.dll v1.02i — largest version (SizeOfImage 0xB3000 vs 0xB2000).
+// EfzRevival.dll v1.02i - largest version (SizeOfImage 0xB3000 vs 0xB2000).
 // .data shifted non-uniformly (~+0x1028-0x1030) from e.
 // Session objects grew by 8 bytes; all field offsets from byte 488 shift +8.
 constexpr RevivalAddressProfile kRevival_1_02i = {

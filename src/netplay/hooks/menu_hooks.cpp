@@ -276,7 +276,7 @@ void ArmCharSelectEntryHold()
 }
 
 // ---------------------------------------------------------------------------
-// Replay screen hook — spectate bypass
+// Replay screen hook - spectate bypass
 // ---------------------------------------------------------------------------
 bool EnsureReplayScreenHook()
 {
@@ -545,7 +545,7 @@ static bool SuppressOldExitInterceptionIfRecoveryOwned()
 }
 
 // ---------------------------------------------------------------------------
-// HookedTitleUpdateImplBody — the real title-screen update logic.
+// HookedTitleUpdateImplBody - the real title-screen update logic.
 // Called from HookedTitleUpdateImpl which wraps it in setjmp/longjmp
 // protection so NeutralizeExitProcess can safely escape.
 // ---------------------------------------------------------------------------
@@ -580,7 +580,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         g_titleAssetsOverrideApplied = true;
         if (netplay::bridge::IsRunningUnderWine())
         {
-            mod::Log("HookedTitleUpdateImpl: Wine detected — applying one-shot title assets override");
+            mod::Log("HookedTitleUpdateImpl: Wine detected - applying one-shot title assets override");
             (void)LoadTitleAssets(screenContext);
         }
     }
@@ -673,7 +673,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 
             if (exitMode == 0 || exitMode == 1)
             {
-                // Online or spectate netplay — return to the netplay menu.
+                // Online or spectate netplay - return to the netplay menu.
                 // Schedule multi-frame text clearing to ensure any DLL-side
                 // text overlays (nicknames, ping, delay) are fully purged.
                 g_postExitTextClearFrames = 5;
@@ -695,7 +695,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
                 return 0;
             }
 
-            // Tournament or other — stay on the normal title screen.
+            // Tournament or other - stay on the normal title screen.
             // Schedule a few frames of ClearRevivalText to ensure stale
             // tournament text overlays are fully cleared.
             g_postExitTextClearFrames = 5;
@@ -853,7 +853,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
-// Replay screen bypass — hooked update implementation.
+// Replay screen bypass - hooked update implementation.
 // ---------------------------------------------------------------------------
 static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
 {
@@ -861,7 +861,7 @@ static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
     {
         // Clear init flag to skip BGM playback and replay file scanning.
         // The native init code plays track 6 BGM and calls
-        // initializeReplaySystem — both are undesirable for spectating.
+        // initializeReplaySystem - both are undesirable for spectating.
         __try
         {
             *reinterpret_cast<int8_t*>(screenContext + 44) = 0;
@@ -877,7 +877,7 @@ static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
             return 8; // Stay on replay screen to let DLL detect 0→8 transition
         }
 
-        // Done waiting — transition to character select.
+        // Done waiting - transition to character select.
         g_spectateReplayBypassActive = false;
         mod::Log("SpectateReplayBypass: advancing to charselect (return 1)");
         return 1;
@@ -890,7 +890,7 @@ static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
-// HookedReplayScreenUpdateImpl — dispatches to HookedReplayScreenUpdateImplBody.
+// HookedReplayScreenUpdateImpl - dispatches to HookedReplayScreenUpdateImplBody.
 //
 // Spectate and join-spectate both pass through the replay screen during the
 // lightweight watcher handoff. ExitProcess can fire here if the spectate
@@ -917,7 +917,7 @@ extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
 
         mod::Log(
             "HookedReplayScreenUpdateImpl: recovered from ExitProcess via "
-            "ui longjmp — forcing game mode to title");
+            "ui longjmp - forcing game mode to title");
 
         mod::ResetCrashRecoveryState();
         DisarmSpectateReplayBypass();
@@ -941,7 +941,7 @@ extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
 // ---------------------------------------------------------------------------
 // Charselect intro animation input suppression.
 // ---------------------------------------------------------------------------
-// HookedCharSelectUpdateImplBody — the real charselect update logic.
+// HookedCharSelectUpdateImplBody - the real charselect update logic.
 // Called from HookedCharSelectUpdateImpl which wraps it in setjmp/longjmp
 // protection so NeutralizeExitProcess can safely escape.
 // ---------------------------------------------------------------------------
@@ -1054,7 +1054,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
-// HookedCharSelectUpdateImpl — dispatches to HookedCharSelectUpdateImplBody.
+// HookedCharSelectUpdateImpl - dispatches to HookedCharSelectUpdateImplBody.
 //
 // ExitProcess can fire during charselect when the DLL detects a desync (e.g.
 // State mismatch at early rollback frames).  The frame-hook setjmp
@@ -1063,7 +1063,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 // NeutralizeExitProcess falls through to the fragile VEH TOCTOU last-resort
 // recovery which fails silently (game closes, no crash logs).
 //
-// Wrap the body in setjmp on g_netplayUiJmpBuf — the same buffer used by
+// Wrap the body in setjmp on g_netplayUiJmpBuf - the same buffer used by
 // HookedTitleUpdateImpl.  Only one screen update runs at a time (title OR
 // charselect), so reusing the UI jmpbuf is safe.  On longjmp recovery: force
 // game mode to 0 so the title hook can consume the exit interception and
@@ -1082,7 +1082,7 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
 
         mod::Log(
             "HookedCharSelectUpdateImpl: recovered from ExitProcess via "
-            "ui longjmp — forcing game mode to title");
+            "ui longjmp - forcing game mode to title");
 
         // Reset the one-shot VEH TOCTOU guard so future sessions can still
         // be recovered if needed.
@@ -1114,7 +1114,7 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
 #endif
 
 // ---------------------------------------------------------------------------
-// HookedTitleUpdateImpl — dispatches to HookedTitleUpdateImplBody.
+// HookedTitleUpdateImpl - dispatches to HookedTitleUpdateImplBody.
 //
 // ExitProcess interception no longer uses longjmp.  The DLL call-site
 // patches (SaveAndApplyDllExitProcessPatches) make ExitProcess unreachable

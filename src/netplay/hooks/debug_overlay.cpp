@@ -37,13 +37,13 @@ constexpr float kBadgeFontPx = 22.0f;
 
 // EFZ renders its scene to a fixed 640x480 D3D9 render target; EFZ Revival then
 // composites/upscales that to the window backbuffer. Our overlay must draw on the
-// 640x480 GAME surface (so it scales with the game) — NOT on Revival's window
+// 640x480 GAME surface (so it scales with the game) - NOT on Revival's window
 // backbuffer. EndScene fires for both; we filter by render-target size. (This is
 // exactly how efz-training-mode picks the correct surface.)
 constexpr int kGameRtW = 640;
 constexpr int kGameRtH = 480;
 
-// Backbuffer dimensions last seen — used to detect a device RESET (window
+// Backbuffer dimensions last seen - used to detect a device RESET (window
 // resize / borderless-fullscreen toggle), which invalidates ImGui's
 // D3DPOOL_DEFAULT resources and makes the overlay vanish until rebuilt.
 int g_lastBackBufferW = 0;
@@ -187,7 +187,7 @@ bool EnsureInited(IDirect3DDevice9* device)
     }
     if (g_inited && g_device != device)
     {
-        // Device recreated (e.g. reset) — rebuild against the new one.
+        // Device recreated (e.g. reset) - rebuild against the new one.
         ShutdownImGui();
     }
 
@@ -320,7 +320,7 @@ void Render(IDirect3DDevice9* device)
         return;
     }
 
-    // Surface filter — only draw on the 640x480 game render target. EndScene also
+    // Surface filter - only draw on the 640x480 game render target. EndScene also
     // fires for Revival's window-backbuffer present (different size); drawing there
     // put the overlay on the wrong surface. Skip non-game frames entirely (do not
     // even init, so ImGui binds to the correct device).
@@ -336,7 +336,7 @@ void Render(IDirect3DDevice9* device)
 
     namespace ah = netplay::bridge::async_host;
     const bool debugAvailable = netplay::mod_settings::IsDebugMenuEnabled();
-    // Suppress the top-middle ImGui badge while the netplay menu is open — the
+    // Suppress the top-middle ImGui badge while the netplay menu is open - the
     // menu already shows the indexed top-right HOSTING badge there. The ImGui
     // badge is for every OTHER screen (title / gameplay / etc.).
     const bool wantIndicator =
@@ -368,7 +368,7 @@ void Render(IDirect3DDevice9* device)
             if (g_lastBackBufferW != 0 || g_lastBackBufferH != 0)
             {
                 mod::Log(
-                    "DebugOverlay: window backbuffer %dx%d -> %dx%d (device reset) — rebuilding ImGui objects",
+                    "DebugOverlay: window backbuffer %dx%d -> %dx%d (device reset) - rebuilding ImGui objects",
                     g_lastBackBufferW, g_lastBackBufferH, bbW, bbH);
                 ImGui_ImplDX9_InvalidateDeviceObjects();
             }
@@ -405,7 +405,7 @@ void Render(IDirect3DDevice9* device)
     // We draw onto the 640x480 GAME render target, but ImGui_ImplWin32_NewFrame
     // just set io.DisplaySize to the WINDOW client size (e.g. 1920x1080 in
     // borderless fullscreen). If we leave it, ImGui lays out in window space but
-    // renders into the 640-wide viewport, squishing everything to ~1/3 — small
+    // renders into the 640-wide viewport, squishing everything to ~1/3 - small
     // text (the HOSTING badge) effectively vanishes while the big panel still
     // shows. Override DisplaySize to the render-target size (what training mode
     // does) so layout matches the surface; scale MousePos into that space so the

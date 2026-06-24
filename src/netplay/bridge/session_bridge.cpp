@@ -229,7 +229,7 @@ void Tick()
             {
                 mod::Log(
                     "PERF_WARN: session_bridge::Tick took %.2fms "
-                    "(slowCount=%u) — full tick is slow",
+                    "(slowCount=%u) - full tick is slow",
                     elapsedMs, s_tickSlowCount);
             }
         }
@@ -241,7 +241,7 @@ void TickExportOnly()
     // Lightweight per-frame export pulse.  Called every game frame from
     // OurPerFrameTickHook (revival_memory.cpp) so that activityPhase,
     // inNetplayMenu, stateSeq, scores, ping, delay, and all other exported
-    // fields remain current during loading screen and battle — screens that
+    // fields remain current during loading screen and battle - screens that
     // have no title/charselect hook calling the full Tick().
     //
     // Also called immediately after g_netplayMenuState.active is cleared in
@@ -251,8 +251,8 @@ void TickExportOnly()
     // We call RefreshRuntimeStatus() here to re-read volatile session fields
     // (wins, ping, delay, activePlayer, etc.) from Revival memory.  Without
     // this, those fields stay stale at whatever value they had when the last
-    // full Tick() ran — typically during connection, before any match was
-    // played — so wins would read 0-0 even after a match ends.
+    // full Tick() ran - typically during connection, before any match was
+    // played - so wins would read 0-0 even after a match ends.
 
     NetbridgeStatus statusSnapshot = {};
     {

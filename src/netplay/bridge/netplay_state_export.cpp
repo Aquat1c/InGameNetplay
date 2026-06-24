@@ -1,5 +1,5 @@
 // ===========================================================================
-// EFZ Netplay State Export — Implementation
+// EFZ Netplay State Export - Implementation
 // ===========================================================================
 //
 // Creates a named shared memory block ("EFZNetplay_State") and populates it
@@ -9,7 +9,7 @@
 // can use GetProcAddress instead of shared memory if preferred.
 //
 // This module is intentionally self-contained.  It reads the fields it needs
-// from the bridge status struct and raw EFZ game memory — no changes to
+// from the bridge status struct and raw EFZ game memory - no changes to
 // existing game logic or hook flow are required.
 // ===========================================================================
 #include "netplay/bridge/netplay_state_export.h"
@@ -68,7 +68,7 @@ uint32_t g_stateSeq = 0;
 uint32_t g_sessionId = 0;
 uint32_t g_setId = 0;
 
-// Latched end reason — persists until next session starts.
+// Latched end reason - persists until next session starts.
 uint8_t g_latchedEndReason = EFZ_END_NONE;
 
 // Last tick (GetTickCount) at which Update() completed a write.
@@ -206,7 +206,7 @@ constexpr uint32_t kGameSystemOffsetMatchCtr = 4952;
 // Character-select screen object offsets.
 constexpr uint32_t kCharSelectP1CharId = 1340;
 constexpr uint32_t kCharSelectP2CharId = 1341;
-constexpr uint32_t kCharSelectP1Timer  = 1344;  // uint16_t — non-zero = locked
+constexpr uint32_t kCharSelectP1Timer  = 1344;  // uint16_t - non-zero = locked
 constexpr uint32_t kCharSelectP2Timer  = 1346;
 constexpr uint32_t kCharSelectP1GridCol = 1336;
 constexpr uint32_t kCharSelectP1GridRow = 1338;
@@ -216,7 +216,7 @@ constexpr uint32_t kCharSelectGridMap   = 1209;  // charId = gridMap[row*3 + col
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Helpers — read game state from EFZ game memory (same process)
+// Helpers - read game state from EFZ game memory (same process)
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -267,7 +267,7 @@ static void ReadScores(int32_t& p1Wins, int32_t& p2Wins, int32_t& matchCtr)
     if (gameSys == 0)
         return;
 
-    // EFZ.exe does NOT have win counters — only Revival does.
+    // EFZ.exe does NOT have win counters - only Revival does.
     // We only read the match counter (round counter) from the game system.
     __try
     {
@@ -317,7 +317,7 @@ static int32_t ResolveSessionMode(int netplayRole, int localRoleFlag, int bridge
 }
 
 // Map local side.  Prefer the session object's activePlayer field (0=P1,
-// 1=P2) when available — it reflects the actual assignment after init.
+// 1=P2) when available - it reflects the actual assignment after init.
 // Fall back to role-based inference (host=P1, client=P2) during connecting.
 static int32_t ResolveLocalSide(int netplayRole, int activePlayer)
 {
@@ -627,7 +627,7 @@ void UpdateNow(const NetbridgeStatus& status)
             if (elapsed > kExportStallWarningMs)
             {
                 mod::Log(
-                    "StateExport: STALL detected — %u ms since last update "
+                    "StateExport: STALL detected - %u ms since last update "
                     "(seq=%u phase=%d)",
                     static_cast<unsigned>(elapsed),
                     g_stateSeq,
@@ -685,13 +685,13 @@ void UpdateNow(const NetbridgeStatus& status)
     s.sessionId = g_sessionId;
     s.endReason = g_latchedEndReason;
 
-    // Capability bits — filled in as each group is populated.
+    // Capability bits - filled in as each group is populated.
     uint32_t caps = 0;
 
     // Session identity is always available.
     caps |= EFZ_CAP_SESSION;
 
-    // Scores — Revival session is the sole authority for win counts.
+    // Scores - Revival session is the sole authority for win counts.
     // EFZ.exe does NOT track wins at all; only the Revival DLL does,
     // via the session object at the version-specific offsets.
     //
@@ -751,7 +751,7 @@ void UpdateNow(const NetbridgeStatus& status)
     g_prevP2Wins = s.p2Wins;
     s.setId = g_setId;
 
-    // Nicknames — copy from bridge status
+    // Nicknames - copy from bridge status
     std::memcpy(s.localNickname, status.nickname, sizeof(s.localNickname));
     std::memcpy(s.p1Name, status.p1Name, sizeof(s.p1Name));
     std::memcpy(s.p2Name, status.p2Name, sizeof(s.p2Name));
@@ -869,7 +869,7 @@ void UpdateNow(const NetbridgeStatus& status)
     if (s.inNetplayMenu && screenIdx != 0)
     {
         mod::Log(
-            "StateExport: reconcile — inNetplayMenu=1 but screenIdx=%u, clearing",
+            "StateExport: reconcile - inNetplayMenu=1 but screenIdx=%u, clearing",
             static_cast<unsigned>(screenIdx));
         s.inNetplayMenu = 0;
         s.netplayMenuScreen = 0;
@@ -893,7 +893,7 @@ void UpdateNow(const NetbridgeStatus& status)
             caps |= EFZ_CAP_REVIVAL;
     }
 
-    // Game-flow flags (v3) — mutually exclusive with inNetplayMenu.
+    // Game-flow flags (v3) - mutually exclusive with inNetplayMenu.
     // When g_returnToNetplayAfterMatch is true we are inside an online
     // session flow (charselect → loading → match).  The EFZ screen index
     // tells us exactly which phase we are in:
@@ -1083,7 +1083,7 @@ void UpdateNow(const NetbridgeStatus& status)
 
     s.capabilityFlags = caps;
 
-    // Transition logging (v3 + v4) — log when flags or activity phase change.
+    // Transition logging (v3 + v4) - log when flags or activity phase change.
     {
         if (s.inNetplayMenu != g_prevInNetplayMenu
             || s.inNetplayCharacterSelect != g_prevInNetplayCharacterSelect
@@ -1154,8 +1154,8 @@ void UpdateNow(const NetbridgeStatus& status)
         }
     }
 
-    // Periodic heartbeat — every 600 ticks (~10s at 60fps) and on the very
-    // first tick — dump all key fields so we can verify the export without
+    // Periodic heartbeat - every 600 ticks (~10s at 60fps) and on the very
+    // first tick - dump all key fields so we can verify the export without
     // needing a phase transition to trigger the transition logs.
     if (g_stateSeq == 1 || (g_stateSeq % 600) == 0)
     {
@@ -1211,7 +1211,7 @@ void UpdateNow(const NetbridgeStatus& status)
             {
                 mod::Log(
                     "PERF_WARN: StateExport::Update took %.2fms "
-                    "(slowCount=%u seq=%u) — export path is slow",
+                    "(slowCount=%u seq=%u) - export path is slow",
                     elapsedMs, s_updateSlowCount, s.stateSeq);
             }
         }

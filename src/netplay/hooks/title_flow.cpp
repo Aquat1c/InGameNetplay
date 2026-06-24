@@ -1974,7 +1974,7 @@ void ResetSpectateConfirmOverlayState()
 } // namespace (close anonymous to expose hosting overlay functions)
 
 // ---------------------------------------------------------------------------
-// Hosting overlay — shows "Hosting on IP:PORT" while waiting for a client.
+// Hosting overlay - shows "Hosting on IP:PORT" while waiting for a client.
 // A background thread fetches the public IPv4 from api4.ipify.org.
 // ---------------------------------------------------------------------------
 void ResetHostingOverlayState()
@@ -1989,7 +1989,7 @@ static bool TryFetchIpFromUrl(const char* url, const char* label)
     std::string error;
     // verifyPeer=false: the embedded mbedTLS build has no CA root store,
     // so certificate verification always fails.  This request only fetches
-    // a plain-text public IP address — no sensitive data.
+    // a plain-text public IP address - no sensitive data.
     if (!netplay::tls::HttpGet(url, false, kTimeoutMs, &body, &error))
     {
         mod::Log("HostingOverlay: %s fetch failed: %s", label, error.c_str());
@@ -2060,7 +2060,7 @@ void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port)
 }
 
 // ---------------------------------------------------------------------------
-// Joining overlay — shows "Connecting to IP:PORT ..." while connecting.
+// Joining overlay - shows "Connecting to IP:PORT ..." while connecting.
 // Transitions to delay setup on success, or shows the error on failure.
 // ---------------------------------------------------------------------------
 void ResetJoiningOverlayState()
@@ -2451,7 +2451,7 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
         {
             CancelPendingSpectateConfirmSession("spectate_declined_confirm_no");
         }
-        // If accepted, the session continues — Revival will proceed to delay
+        // If accepted, the session continues - Revival will proceed to delay
         // setup or straight to game. The normal delay/connected flow handles it.
         return true;
     }
@@ -2570,8 +2570,8 @@ void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeSta
     g_delaySetupOverlay.selectedDelay = g_delaySetupOverlay.recommendedDelay;
 
     // Guard against a spiked ping measurement. Async hosting measures RTT while
-    // the delay prompt is held during local gameplay — where EFZ is not
-    // servicing the netplay connection — so the helper's ping can inflate to
+    // the delay prompt is held during local gameplay - where EFZ is not
+    // servicing the netplay connection - so the helper's ping can inflate to
     // absurd values (e.g. ~2000ms) and pin the recommendation to max delay. The
     // ping is measured once and never re-pings, so the only sane workaround is to
     // distrust it: when the ping is implausibly high, default the selection (and
@@ -2878,7 +2878,7 @@ void PrepareVsHumanGameState(uint32_t screenContext)
         const uint32_t charSelectObj = screenTable[1];
         if (charSelectObj != 0)
         {
-            // Read the current exit flag BEFORE we clear it — diagnostic.
+            // Read the current exit flag BEFORE we clear it - diagnostic.
             const uint8_t staleExitFlag =
                 *reinterpret_cast<const uint8_t*>(charSelectObj + kOffsetScreenExitState);
 
@@ -2904,7 +2904,7 @@ void PrepareVsHumanGameState(uint32_t screenContext)
             {
                 g_charSelectResetPending = false;
 
-                // The reinit does NOT reset grid col/row — those are only set
+                // The reinit does NOT reset grid col/row - those are only set
                 // by the constructor.  Explicitly reset them to the constructor
                 // defaults so both players start at a known position every time.
                 *reinterpret_cast<uint8_t*>(charSelectObj + kOffsetCharSelectP1GridCol) = kCharSelectDefaultP1Col;
@@ -2969,10 +2969,10 @@ void PrepareVsHumanGameState(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
-// PrepareSpectateReplayState — set the title screen's menu selection to
+// PrepareSpectateReplayState - set the title screen's menu selection to
 // "Replay" (4) so the Revival DLL's mode-transition detector recognises the
 // spectate context.  The DLL checks EFZ_Mode0_ReadFlag1084() == 4 which is
-// byte 1084 (0x43C) of the mode-0 screen object — the menu selection field.
+// byte 1084 (0x43C) of the mode-0 screen object - the menu selection field.
 // ---------------------------------------------------------------------------
 void PrepareSpectateReplayState(uint32_t screenContext)
 {
@@ -3004,10 +3004,10 @@ bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason)
 }
 
 // ---------------------------------------------------------------------------
-// HandoffSpectateSession — transition directly to Character Select (mode 1)
+// HandoffSpectateSession - transition directly to Character Select (mode 1)
 // for spectating.  The DLL creates a client session (type 1) for spectating
 // which uses shared-memory IPC and input replay.  The client session
-// survives all mode transitions (no watcher is created — the DLL's watcher
+// survives all mode transitions (no watcher is created - the DLL's watcher
 // creation path requires session type 2 which the mod never uses).  Going
 // directly to charselect allows the client session's input replay to drive
 // the character selection from the host's captured inputs.
@@ -3032,7 +3032,7 @@ void HandoffSpectateSession(uint32_t screenContext)
     // The spectator's charselect screen requires the same game-system state
     // as online VS Human: mode 4, CPU flags 0, rounds, and a clean
     // charselect init/exit flag pair.  The DLL's spectator never sets these
-    // — it relies on the host EXE having the right state.  Without this
+    // - it relies on the host EXE having the right state.  Without this
     // call the spectator enters charselect with stale flags (wrong mode,
     // possibly CPU players, stale exit flag) which causes silent desync.
     PrepareVsHumanGameState(screenContext);
@@ -3043,7 +3043,7 @@ void HandoffSpectateSession(uint32_t screenContext)
     // requires dword_100A05D0==2 (practice session) which never matches the
     // mod's spectate sessions.  Therefore no watcher is ever created and the
     // client session survives through all mode transitions.  We transition
-    // directly to charselect (mode 1) — bypassing the replay screen (mode 8)
+    // directly to charselect (mode 1) - bypassing the replay screen (mode 8)
     // avoids wasting shared-memory input frames on a screen that serves no
     // purpose for the client session.
     {
@@ -3093,13 +3093,13 @@ void HandoffSpectateSession(uint32_t screenContext)
     // Mark a local spectate-busy state here instead of driving accept/end.
     if (g_lobbySession)
     {
-        mod::Log("HandoffSpectateSession: notifying lobby — entering spectate lifecycle");
+        mod::Log("HandoffSpectateSession: notifying lobby - entering spectate lifecycle");
         g_lobbySession->NotifySpectateStarted();
     }
 
     // Transition directly to charselect (mode 1).  The DLL's client
     // session (type 1) survives mode transitions and drives the game via
-    // input replay from shared memory — the mode-8 replay screen detour
+    // input replay from shared memory - the mode-8 replay screen detour
     // is unnecessary because the DLL's watcher creation path only triggers
     // for session type 2 (dword_100A05D0==2), not the mod's type 1.
     // Going directly to charselect avoids wasting shared-memory input
@@ -3202,14 +3202,14 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     {
         // Disconnect recovery: the DirectDraw front/back buffers still
         // contain stale battle-scene pixels with a mismatched palette.
-        // Skip the fade-out entirely — we will load fresh assets and
+        // Skip the fade-out entirely - we will load fresh assets and
         // set the hardware palette before doing a clean fade-in.
         mod::Log("EnterNetplayMenu: skipping fade-out (disconnect recovery)");
     }
 
     if (!LoadNetplayAssets(screenContext))
     {
-        mod::Log("EnterNetplayMenu: assets load failed — netplay menu disabled");
+        mod::Log("EnterNetplayMenu: assets load failed - netplay menu disabled");
         mod::Log("EnterNetplayMenu: ensure netplay_bgd.dat, netplay_bgn.dat, and netplay_ob.dat are next to the DLL or in mods\\efz_netplay_mod\\assets\\");
         g_netplayAssetsAvailable = false;
         if (!skipFadeOut)
@@ -3235,7 +3235,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 
     // As soon as we re-enter the menu after a match, flush any deferred
     // host End so the server drops the playing-pair right away.  This is
-    // independent of the deferred-refresh gate — we want the End to go out
+    // independent of the deferred-refresh gate - we want the End to go out
     // even if the bridge takes a while to reach a terminal phase.
     if (returnToLobby)
     {
@@ -3302,7 +3302,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
             auto const render = GetOriginalTitleRender();
             (void)render(screenContext);
         }
-        mod::Log("EnterNetplayMenu: disconnect recovery — rendered initial clean frame");
+        mod::Log("EnterNetplayMenu: disconnect recovery - rendered initial clean frame");
     }
 
     RunTransitionFadeIn(screenContext);
@@ -3327,14 +3327,14 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
             netplay::bridge::async_host::SetMinimized(false);
             SwitchToMenu(screenContext, NetplayMenuId::Host, -1);
             mod::Log(
-                "AsyncHost: F1 return arrived — restored full HOST overlay (state=%d)",
+                "AsyncHost: F1 return arrived - restored full HOST overlay (state=%d)",
                 static_cast<int>(netplay::bridge::async_host::GetState()));
         }
         else
         {
             netplay::bridge::async_host::SetMinimized(true);
             mod::Log(
-                "AsyncHost: menu re-entry with active host — badge restored (state=%d)",
+                "AsyncHost: menu re-entry with active host - badge restored (state=%d)",
                 static_cast<int>(netplay::bridge::async_host::GetState()));
         }
     }
@@ -3376,7 +3376,7 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
         "leave_netplay");
 
     // Keep the host listener alive across menu exits whenever async hosting is
-    // active — leaving the netplay menu does NOT stop hosting. The user cancels
+    // active - leaving the netplay menu does NOT stop hosting. The user cancels
     // hosting only by pressing B in the full HOSTING prompt (or via the
     // "Stop hosting?" modal). EnterNetplayMenu restores the badge on re-entry,
     // and HOST re-opens the full prompt.
@@ -3852,7 +3852,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
     case NetplayMenuAction::OpenHost:
         g_netplayMenuState.mainSelection = logicalSelection;
-        // Restore from minimized async hosting — the full hosting overlay shows
+        // Restore from minimized async hosting - the full hosting overlay shows
         // again in the Host submenu.
         if (netplay::bridge::async_host::IsActive())
         {
@@ -3937,7 +3937,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         // ignore a stray Start. (Auto-accept handles the peer-found case.)
         if (netplay::bridge::async_host::IsActive())
         {
-            mod::Log("HostStart: ignored — async host already active (state=%d)",
+            mod::Log("HostStart: ignored - async host already active (state=%d)",
                 static_cast<int>(netplay::bridge::async_host::GetState()));
             break;
         }
@@ -4022,7 +4022,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
 
         if (g_lobbySession->IsInBattle())
         {
-            mod::Log("LobbyPlaying0: BLOCKED spectate — lobby session still busy");
+            mod::Log("LobbyPlaying0: BLOCKED spectate - lobby session still busy");
             ShowStubActionMessage(owner, "Cannot spectate right now.");
             break;
         }
@@ -4102,7 +4102,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             // --- Spectating a playing player ---
             if (g_lobbySession->IsInBattle())
             {
-                mod::Log("LobbySpectate: BLOCKED spectate for '%s' id=%d — lobby session still busy",
+                mod::Log("LobbySpectate: BLOCKED spectate for '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
                 ShowStubActionMessage(owner, "Cannot spectate right now.");
                 break;
@@ -4166,7 +4166,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             // against race conditions.
             if (g_lobbySession && g_lobbySession->IsInBattle())
             {
-                mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d — lobby session still busy",
+                mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
                 ShowStubActionMessage(owner, "Cannot accept challenges\nright now.");
                 break;
@@ -4222,7 +4222,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             // Safety guard: if we are in a match, do not send challenges.
             if (g_lobbySession && g_lobbySession->IsInBattle())
             {
-                mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d — lobby session still busy",
+                mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
                 ShowStubActionMessage(owner, "Cannot send challenges\nright now.");
                 break;
@@ -4475,7 +4475,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
 
     // NOTE: the old text "debug overlay" (toggled by the in-game D button) is
-    // removed — it collided with the hosting overlay's D button (accept/minimize)
+    // removed - it collided with the hosting overlay's D button (accept/minimize)
     // and is superseded by the ImGui debug panel (toggled with backslash, see
     // netplay::debug_overlay). HandleDebugOverlayInput is no longer called.
 
@@ -4642,7 +4642,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (latestPhase == NetbridgePhase::Failed || latestPhase == NetbridgePhase::SessionEnded)
         {
             mod::Log(
-                "NetplayTransition: ABORT — bridge entered terminal phase=%s before state=%d error='%s', re-entering netplay menu",
+                "NetplayTransition: ABORT - bridge entered terminal phase=%s before state=%d error='%s', re-entering netplay menu",
                 netplay::bridge::PhaseToString(latestPhase),
                 nextState,
                 latestStatus.errorMsg[0] != '\0' ? latestStatus.errorMsg : "");
@@ -4658,7 +4658,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (!netplay::bridge::IsPeerProcessAlive())
         {
             mod::Log(
-                "NetplayTransition: ABORT — peer exited before state=%d, re-entering netplay menu",
+                "NetplayTransition: ABORT - peer exited before state=%d, re-entering netplay menu",
                 nextState);
             if (disarmSpectateReplayBypass)
             {
@@ -4885,7 +4885,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     //
     // Unlike online play, we cannot wait for vsHumanSyncReady (which
     // requires syncGameMode==8) because the game mode will only BECOME 8
-    // after we perform this transition — waiting would deadlock.  Instead,
+    // after we perform this transition - waiting would deadlock.  Instead,
     // we trigger the handoff as soon as DLL init is applied and any
     // spectate-confirm prompt has been resolved.
     if (bridgeStatus.roleFlag == kRoleFlagSpectate
@@ -4896,7 +4896,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         && !spectateConfirmPending)
     {
         mod::Log(
-            "SpectateHandoff: triggered — role=%d init=%d phase=%s "
+            "SpectateHandoff: triggered - role=%d init=%d phase=%s "
             "sync(mode=%d flag1084=%d session=%d flags=%d/%d) "
             "confirmSerial=%d/%d screen=%d menuSel=%d peerAlive=%d",
             bridgeStatus.roleFlag,
@@ -4950,7 +4950,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             // can send the deferred 'accept' and transition to "playing".
             if (g_lobbySession)
             {
-                mod::Log("DelaySetupOverlay: notifying lobby — setting inBattle=true (P2P match path)");
+                mod::Log("DelaySetupOverlay: notifying lobby - setting inBattle=true (P2P match path)");
                 g_lobbySession->NotifyMatchConnected();
             }
         }
@@ -5101,7 +5101,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     {
         if (g_joiningOverlay.active && !g_joiningOverlay.failed)
         {
-            // First frame of failure — populate the overlay with the error
+            // First frame of failure - populate the overlay with the error
             g_joiningOverlay.failed = true;
             if (bridgeStatus.errorMsg[0] != '\0')
             {
@@ -5115,7 +5115,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     bridgePhase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error",
                     _TRUNCATE);
             }
-            mod::Log("JoiningOverlay: connection failed — %s", g_joiningOverlay.errorText);
+            mod::Log("JoiningOverlay: connection failed - %s", g_joiningOverlay.errorText);
         }
 
         // While the joining overlay is showing the error, wait for any button press to dismiss
@@ -5167,7 +5167,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
         else
         {
-            // No joining overlay active — just reset and fall through to idle menu
+            // No joining overlay active - just reset and fall through to idle menu
             mod::Log("UpdateNetplayMenu: session ended with no overlay active, resetting (inBattle will be cleared)");
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
@@ -5182,7 +5182,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
     }
 
-    // "Stop hosting?" confirm modal — intercepts all input while active.
+    // "Stop hosting?" confirm modal - intercepts all input while active.
     if (g_stopHostingConfirm.active)
     {
         bool cancel = ConsumeNetplayEscapeEdge();
@@ -5252,7 +5252,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
 
     // While async hosting is MINIMIZED, do not run the connecting/hosting
-    // overlay input handler — let normal menu navigation work so the user can
+    // overlay input handler - let normal menu navigation work so the user can
     // browse Battle Log / Options while the host listener stays alive (a small
     // badge shows the hosting state). Selecting HOST again un-minimizes.
     if ((bridgePhase == NetbridgePhase::Connecting || bridgePhase == NetbridgePhase::DelaySetup)
@@ -5280,11 +5280,11 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
         // Async hosting: once a peer has connected and the delay prompt is being
         // held, accept AUTOMATICALLY as soon as the full hosting overlay is on
-        // screen — we only reach here when NOT minimized. The user no longer
+        // screen - we only reach here when NOT minimized. The user no longer
         // presses D to accept; releasing the hold makes the normal delay-setup
         // overlay activate next frame. (While minimized the hold persists and a
         // badge shows "OPPONENT FOUND!"; returning to HOST un-minimizes, lands
-        // here, and auto-accepts.) RequestAccept is idempotent — it only acts on
+        // here, and auto-accepts.) RequestAccept is idempotent - it only acts on
         // the PeerFoundHeld -> Accepted edge, so the sound plays once.
         if (!cancelRequested && netplay::bridge::async_host::IsPeerFoundHeld())
         {
@@ -5293,7 +5293,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         // Async hosting: while waiting for a peer (no prompt held yet), the D
-        // button (offset 22/23) MINIMIZES — collapse the hosting overlay to a
+        // button (offset 22/23) MINIMIZES - collapse the hosting overlay to a
         // small badge and drop back to the Main netplay menu while the host
         // listener stays alive, so the user can browse Battle Log / Options /
         // etc. The hosting overlay (kept active) renders as a badge while
@@ -5318,7 +5318,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 netplay::bridge::async_host::SetMinimized(true);
                 PlayUiSound(screenContext, kSfxConfirm);
                 mod::Log("AsyncHost: minimized to Main menu badge, host session kept alive");
-                // Stay in the netplay menu — go to Main. Keep g_hostingOverlay
+                // Stay in the netplay menu - go to Main. Keep g_hostingOverlay
                 // active so it renders as a badge (DrawHostingOverlayGdi checks
                 // async_host::IsMinimized()). Do NOT cancel the session.
                 SwitchToMenu(screenContext, NetplayMenuId::Main, g_netplayMenuState.mainSelection);
@@ -5328,7 +5328,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
         }
 
-        // C button (heavy attack, offset 20/21) — copy IP:PORT to clipboard
+        // C button (heavy attack, offset 20/21) - copy IP:PORT to clipboard
         if (g_hostingOverlay.active
             && !g_hostingOverlay.challengeMode
             && g_hostingOverlay.ipFetchDone
