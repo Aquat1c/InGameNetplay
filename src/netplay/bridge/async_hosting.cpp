@@ -8,6 +8,7 @@
 
 #include "logger.h"
 
+#include <cstring>
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
@@ -165,6 +166,17 @@ void Tick()
 
     const NetbridgeStatus status = GetStatus();
     const NetbridgePhase phase = static_cast<NetbridgePhase>(status.phase);
+    const bool fatalProfileFailure =
+        phase == NetbridgePhase::Failed
+        && std::strcmp(status.errorMsg, "Unsupported EfzRevival.dll profile") == 0;
+    if (fatalProfileFailure)
+    {
+        mod::Log(
+            "ASYNC_HOST_FATAL_STOP reason=unsupported_revival_profile error='%s'",
+            status.errorMsg);
+        Reset();
+        return;
+    }
 
     if (g_autoRehostCooldownTicks == 0
         && (g_state == State::Hosting || g_state == State::PeerFoundHeld))

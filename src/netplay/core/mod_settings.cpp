@@ -145,6 +145,24 @@ void Reload()
         ReadBoolValue(L"Others", L"EnableConsole", false, iniPath);
     loaded.enableDebugMenu =
         ReadBoolValue(L"Others", L"EnableDebugMenu", false, iniPath);
+    if (!TryReadBoolValue(
+            L"Others",
+            L"VerboseBridgePatchLogging",
+            &loaded.verboseBridgePatchLogging,
+            iniPath))
+    {
+        loaded.verboseBridgePatchLogging =
+            ReadBoolValue(L"Others", L"EnableBridgePatchDiagnostics", true, iniPath);
+    }
+    if (!TryReadBoolValue(
+            L"Others",
+            L"VerboseSyncDiagnostics",
+            &loaded.verboseSyncDiagnostics,
+            iniPath))
+    {
+        loaded.verboseSyncDiagnostics =
+            ReadBoolValue(L"Others", L"EnableSyncDiagnostics", true, iniPath);
+    }
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
     loaded.asyncHostReturnKey =
@@ -190,6 +208,16 @@ bool IsConsoleEnabled()
 bool IsDebugMenuEnabled()
 {
     return g_settings.enableDebugMenu;
+}
+
+bool IsVerboseBridgePatchLoggingEnabled()
+{
+    return g_settings.verboseBridgePatchLogging;
+}
+
+bool IsVerboseSyncDiagnosticsEnabled()
+{
+    return g_settings.verboseSyncDiagnostics;
 }
 
 bool HideEmptySetsInBattleLogByDefault()

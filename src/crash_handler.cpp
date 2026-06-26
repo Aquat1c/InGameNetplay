@@ -560,6 +560,8 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                             "CrashHandler: TOCTOU recovery - ForceGameModeToTitle "
                             "result=%d",
                             modeForced ? 1 : 0);
+                        (void)netplay::bridge::RestoreRevivalTitleDispatchForRecovery(
+                            "CrashHandler_TOCTOU");
 
                         ctx->Eip = static_cast<DWORD>(foundRet);
                         ctx->Esp = static_cast<DWORD>(foundEsp);

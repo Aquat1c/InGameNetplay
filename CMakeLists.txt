@@ -5,6 +5,8 @@ option(EFZ_STATIC_RUNTIME "Link MSVC runtime statically for single-DLL deploymen
 option(EFZ_XP_COMPAT "Enable Windows XP-oriented compile settings (requires compatible toolset)" OFF)
 option(EFZ_EMBEDDED_TLS "Enable embedded TLS HTTPS backend using bundled mbedTLS" ON)
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 if(MSVC AND EFZ_STATIC_RUNTIME)
     # Apply static CRT globally so third-party static libraries (mbedTLS) use the same runtime model.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
@@ -137,3 +139,10 @@ set_target_properties(efz_netplay_mod PROPERTIES
     OUTPUT_NAME "efz_netplay_mod"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+if(Python3_Interpreter_FOUND)
+    add_custom_target(verify_revival_102j
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_revival_102j.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Verifying EfzRevival 1.02j profile and hook contracts against raw binaries")
+endif()

@@ -104,10 +104,12 @@ bool StartSession(
 bool ApplyInputDelay(int delayFrames);
 bool AnswerSpectatePromptChoice(int choice);
 bool PrepareVsHumanHandoff();
+bool RequiresNativeVsHumanSyncForHandoff();
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
 void CompleteGameplayExitRecovery(int mode, const char* origin);
 bool NotifyTitleScreenActive();
+bool CompletePendingTournamentReturnCleanup();
 // Returns true if the EfzRevival.exe peer process is still running.
 // Advisory check (TOCTOU): the process may exit immediately after this call.
 // Used to abort the state-1 handoff before returning a global-state-transition
@@ -127,6 +129,9 @@ bool ForceLocalPlayInit();
 // hook runs on the next main-loop iteration.  Returns true on success.
 // Safe to call from the VEH crash handler.
 bool ForceGameModeToTitle();
+// Restore the EFZ title dispatch site for Revival builds that need it during
+// recovery.  Returns false for builds where no restore is needed.
+bool RestoreRevivalTitleDispatchForRecovery(const char* caller);
 // Crash-handler diagnostic accessors - return active Revival profile offsets.
 // Returns 0 if no profile is active yet.
 uintptr_t GetRevivalRenderContextOffset();

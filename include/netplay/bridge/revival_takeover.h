@@ -28,6 +28,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick);
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus);
 bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus);
 bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus);
+bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus);
 DelayPromptMetrics GetDelayPromptMetrics();
 bool IsPeerProcessAlive();
 bool IsNetplayExitInterceptionPending();

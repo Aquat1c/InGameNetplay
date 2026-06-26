@@ -585,6 +585,15 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         }
     }
 
+    if (!g_netplayMenuState.active
+        && netplay::bridge::CompletePendingTournamentReturnCleanup())
+    {
+        g_postExitTextClearFrames = 5;
+        mod::Log(
+            "HookedTitleUpdateImpl: completed pending 1.02j tournament return cleanup");
+        return 0;
+    }
+
     // Post-exit text clearing: keep issuing ClearRevivalText for a few
     // frames after an ExitProcess interception to guarantee stale
     // tournament text (nicknames, win counts) is removed even if
@@ -593,7 +602,8 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
     {
         --g_postExitTextClearFrames;
         netplay::bridge::takeover::ClearRevivalText();
-        netplay::bridge::takeover::DisableRevivalTextRendering();
+        netplay::bridge::takeover::ResetRevivalTextRenderingAfterCleanup(
+            "post_exit_text_clear_loop");
     }
 
     if (!g_netplayMenuState.active
@@ -615,6 +625,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         {
             g_postExitTextClearFrames = 5;
             mod::Log("HookedTitleUpdateImpl: tournament return to title detected, clearing text");
+            return 0;
         }
 
         netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
@@ -924,6 +935,8 @@ extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
         g_restoreReplaySelectionOnNextTitleUpdate = false;
         g_replaySelectionGuardFramesRemaining = 0;
         netplay::bridge::ForceGameModeToTitle();
+        (void)netplay::bridge::RestoreRevivalTitleDispatchForRecovery(
+            "HookedReplayScreenUpdateImpl");
 
         // Exit interception is already armed; skip this frame and let the
         // title-screen update consume/cleanup in a clean state.
@@ -1094,6 +1107,8 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
         // (which does full teardown: terminate helper, restore patches,
         // ForceLocalPlayInit, disable text), and re-enters the netplay menu.
         netplay::bridge::ForceGameModeToTitle();
+        (void)netplay::bridge::RestoreRevivalTitleDispatchForRecovery(
+            "HookedCharSelectUpdateImpl");
 
         // Clear charselect hold state so it doesn't carry over.
         g_charSelectEntryHoldActive = false;

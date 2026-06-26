@@ -530,8 +530,12 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "NeutralizeExitProcess: TOCTOU step 3 RestoreDllExitProcessPatches=%d",
             patchOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
+        // Step 4: Reset stale text renderer state.
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "exitprocess_toctou");
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 4 ResetRevivalTextRenderingAfterCleanup=%d",
+            textOk ? 1 : 0);
 
         // Step 5: Reset VEH one-shot guard.
         mod::ResetCrashRecoveryState();
@@ -541,6 +545,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         mod::Log(
             "NeutralizeExitProcess: TOCTOU step 6 ForceGameModeToTitle=%d",
             modeOk ? 1 : 0);
+        (void)RestoreExeDispatchOriginalBytesForTitle("NeutralizeExitProcess_TOCTOU");
 
         // ExitProcess is __noreturn.  The DLL code after `call ExitProcess`
         // is a compiler-emitted unreachable marker (HLT / privileged insn).
@@ -591,8 +596,16 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "NeutralizeExitProcess: tournament step 3 ForceLocalPlayInit=%d",
             initOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
+        // Step 4: Clear tournament text and reset stale renderer state.
+        const bool clearOk = ClearRevivalText();
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 4 ClearRevivalText=%d",
+            clearOk ? 1 : 0);
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "exitprocess_tournament_fallback");
+        mod::Log(
+            "NeutralizeExitProcess: tournament step 4 ResetRevivalTextRenderingAfterCleanup=%d",
+            textOk ? 1 : 0);
 
         // Step 5: Reset VEH one-shot guard and game-mode validation.
         mod::ResetCrashRecoveryState();
@@ -603,6 +616,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         mod::Log(
             "NeutralizeExitProcess: tournament step 6 ForceGameModeToTitle=%d",
             modeOk ? 1 : 0);
+        (void)RestoreExeDispatchOriginalBytesForTitle("NeutralizeExitProcess_tournament");
 
         // Reset tournament role so the title-screen code doesn't think
         // we're still in tournament mode.

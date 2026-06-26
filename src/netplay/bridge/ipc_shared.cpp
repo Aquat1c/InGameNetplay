@@ -87,6 +87,14 @@ std::wstring Utf8ToWide(const std::string& utf8)
     return wide;
 }
 
+bool IsActiveRevivalVersionTag(const char* versionTag)
+{
+    return versionTag != nullptr
+        && g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, versionTag) == 0;
+}
+
 std::wstring ModuleDirectoryWide(HMODULE module)
 {
     wchar_t path[MAX_PATH] = {};
@@ -924,6 +932,24 @@ bool IsSyncReadyForVsHuman(const NetbridgeStatus* status)
     return false;
 }
 
+bool RequiresNativeVsHumanSyncForHandoff(const NetbridgeStatus* status)
+{
+    // 1.02j's native "sync ready" fields describe the post-handoff EFZ VS
+    // state: game mode 3 plus the mode-0 flag set by PrepareVsHumanGameState.
+    // The infinite-sync capture showed those fields stay 0 while both native
+    // rollback sessions already exist and wait at frame 0 for remote input.
+    // Waiting for them before handoff deadlocks the startup path; the safe
+    // input hook protects the early remote-empty window instead.
+    if (IsActiveRevivalVersionTag("1.02j")
+        && (g_localRoleFlag == kLocalRoleOnline
+            || (status != nullptr && status->roleFlag == kLocalRoleOnline)))
+    {
+        return false;
+    }
+
+    return false;
+}
+
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial)
 {
     LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
@@ -992,6 +1018,12 @@ RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status)
         || (inputSerial <= 0 && promptServedSerial >= promptSerial);
     if (!probe.delayInputApplied)
     {
+        return probe;
+    }
+
+    if (RequiresNativeVsHumanSyncForHandoff(status))
+    {
+        probe.source = "await_native_sync_102j";
         return probe;
     }
 
@@ -1247,6 +1279,12 @@ void ReinitLocalPlay()
         "Takeover: local re-init deferred (from role=%d -> local play, no init call)",
         g_localRoleFlag);
     SetRoleFlagDirect(kLocalRoleLocalPlay, "reinit_local_play");
+    const bool titleDispatchOk =
+        RestoreExeDispatchOriginalBytesForTitle("ReinitLocalPlay");
+    if (titleDispatchOk)
+    {
+        mod::Log("Takeover: local re-init restored 1.02j title dispatch");
+    }
 }
 
 uintptr_t ResolveHostRevivalBase()
@@ -1271,6 +1309,18 @@ bool PatchRevivalErrorCodeNullGuard()
     if (base == 0)
     {
         return false;
+    }
+
+    if (g_activeRevival == nullptr
+        || g_activeRevival->errorCodeIsZeroRva == 0
+        || g_activeRevival->errorCodeIsZeroPatchSize == 0)
+    {
+        mod::Log(
+            "Takeover: null-guard patch not required for Revival version=%s",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown");
+        return true;
     }
 
     void* const stub = EnsureRevivalErrorCodeNullGuardStub();

@@ -92,6 +92,13 @@ const char* RevivalProfileSourceToString(RevivalProfileSource source)
         return "default";
     }
 }
+
+bool IsActiveRevival102jProfile()
+{
+    return g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
+}
 } // namespace
 
 HMODULE g_localRevivalModule = nullptr;
@@ -151,6 +158,7 @@ DWORD g_latePatchRetrySuccesses = 0;
 bool g_lastLatePatchRetryResultValid = false;
 bool g_lastLatePatchRetryResult = false;
 bool g_observedTakeoverCreatePath = false;
+bool g_tournamentReturnCleanupPending = false;
 std::mutex g_fakeThreadMutex;
 std::vector<FakeThreadInfo> g_fakeThreads;
 std::mutex g_redirectAllocMutex;
@@ -338,10 +346,489 @@ static bool ModuleBytesMatch(
     }
 }
 
+static bool ModuleEntryLooksLikeInstalledJmp(HMODULE module, uintptr_t rva, size_t patchSize)
+{
+    if (module == nullptr || patchSize < 5)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        if (bytes[0] != 0xE9)
+        {
+            return false;
+        }
+        for (size_t i = 5; i < patchSize; ++i)
+        {
+            if (bytes[i] != 0x90)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ModuleBytesMatchOrInstalledJmp(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    size_t expectedSize,
+    size_t patchSize)
+{
+    return ModuleBytesMatch(module, rva, expected, expectedSize)
+        || ModuleEntryLooksLikeInstalledJmp(module, rva, patchSize);
+}
+
+static bool ModuleBytesMatchMasked(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    const char* mask,
+    size_t expectedSize)
+{
+    if (module == nullptr || expected == nullptr || mask == nullptr || expectedSize == 0)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        for (size_t i = 0; i < expectedSize; ++i)
+        {
+            if (mask[i] == 'x' && bytes[i] != expected[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ModuleWindowContainsU32(
+    HMODULE module,
+    uintptr_t rva,
+    size_t size,
+    uint32_t value)
+{
+    if (module == nullptr || size < sizeof(uint32_t))
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        for (size_t i = 0; i + sizeof(uint32_t) <= size; ++i)
+        {
+            uint32_t current = 0;
+            std::memcpy(&current, bytes + i, sizeof(current));
+            if (current == value)
+            {
+                return true;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return false;
+}
+
+static bool ModuleDirectCallCountEquals(
+    HMODULE module,
+    uintptr_t windowRva,
+    size_t windowSize,
+    uintptr_t targetRva,
+    size_t expectedCount)
+{
+    if (module == nullptr || windowSize < 5)
+    {
+        return false;
+    }
+
+    size_t count = 0;
+    __try
+    {
+        const auto* const bytes =
+            reinterpret_cast<const uint8_t*>(module) + windowRva;
+        for (size_t i = 0; i + 5 <= windowSize; ++i)
+        {
+            if (bytes[i] != 0xE8)
+            {
+                continue;
+            }
+
+            int32_t disp = 0;
+            std::memcpy(&disp, bytes + i + 1, sizeof(disp));
+            const uintptr_t callTarget = windowRva + i + 5 + disp;
+            if (callTarget == targetRva)
+            {
+                ++count;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return count == expectedCount;
+}
+
+static bool ModuleVtableSlotsMatch(
+    HMODULE module,
+    uintptr_t vtableRva,
+    const uintptr_t* expectedTargetRvas,
+    size_t expectedCount)
+{
+    if (module == nullptr || expectedTargetRvas == nullptr || expectedCount == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    __try
+    {
+        const auto* const slots =
+            reinterpret_cast<const uintptr_t*>(base + vtableRva);
+        for (size_t i = 0; i < expectedCount; ++i)
+        {
+            if (slots[i] != base + expectedTargetRvas[i])
+            {
+                return false;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool SectionNameEquals(const IMAGE_SECTION_HEADER& section, const char* expected)
+{
+    char name[9] = {};
+    std::memcpy(name, section.Name, 8);
+    return std::strcmp(name, expected) == 0;
+}
+
+static bool ModuleRvaInNamedSection(
+    const IMAGE_NT_HEADERS32* nt,
+    const char* sectionName,
+    uintptr_t rva,
+    size_t size)
+{
+    if (nt == nullptr || sectionName == nullptr || size == 0)
+    {
+        return false;
+    }
+
+    const IMAGE_SECTION_HEADER* const sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const IMAGE_SECTION_HEADER& section = sections[i];
+        if (!SectionNameEquals(section, sectionName))
+        {
+            continue;
+        }
+
+        const uintptr_t sectionStart = section.VirtualAddress;
+        const uintptr_t rawSectionEnd =
+            sectionStart + std::max(section.Misc.VirtualSize, section.SizeOfRawData);
+        const uintptr_t sectionEnd = (rawSectionEnd > sectionStart) ? rawSectionEnd : sectionStart;
+        const uintptr_t rvaEnd = rva + size;
+        return rva >= sectionStart && rvaEnd >= rva && rvaEnd <= sectionEnd;
+    }
+
+    return false;
+}
+
+static bool TryGetModuleNtHeaders32(HMODULE module, const IMAGE_NT_HEADERS32** outNt)
+{
+    if (outNt != nullptr)
+    {
+        *outNt = nullptr;
+    }
+    if (module == nullptr)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const base = reinterpret_cast<const uint8_t*>(module);
+        const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x1000)
+        {
+            return false;
+        }
+
+        const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE
+            || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        {
+            return false;
+        }
+
+        if (outNt != nullptr)
+        {
+            *outNt = nt;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool VerifyRevival102jBinary(HMODULE module)
+{
+    const IMAGE_NT_HEADERS32* nt = nullptr;
+    if (!TryGetModuleNtHeaders32(module, &nt))
+    {
+        mod::Log("DetectRevivalVersion: 1.02j binary verification failed (bad PE32 header)");
+        return false;
+    }
+
+    bool ok = true;
+    auto require = [&ok](bool condition, const char* label) {
+        if (!condition)
+        {
+            mod::Log("DetectRevivalVersion: 1.02j binary verification failed (%s)", label);
+            ok = false;
+        }
+    };
+
+    require(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386, "machine");
+    require(nt->FileHeader.NumberOfSections == 9, "section_count");
+    require(nt->OptionalHeader.SizeOfImage == 0x001D9000u, "size_of_image");
+    require(nt->OptionalHeader.AddressOfEntryPoint == 0x000011F0u, "entry_point");
+    if (nt->OptionalHeader.ImageBase != kRevival_1_02j.defaultImageBase)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j PE image base relocated in memory "
+            "header=0x%08lX expectedPreferred=0x%08lX loadedBase=%p",
+            static_cast<unsigned long>(nt->OptionalHeader.ImageBase),
+            static_cast<unsigned long>(kRevival_1_02j.defaultImageBase),
+            static_cast<void*>(module));
+    }
+
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.frameHookRva, 14), "frameHook section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.perFrameTickRva, 20), "perFrameTick section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.inputSwapPairRva, 24), "inputSwap section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.startInitPlayerRva, 20), "startInit section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.clearTextRva, 8), "clearText section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.setTextEnabledRva, 17), "setText section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.sessionPtrOffsets[0], sizeof(uintptr_t)), "sessionPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.roleFlagOffsets[0], sizeof(int)), "roleFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.globalStatePtrOffset, sizeof(uintptr_t)), "globalState section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.initFlagOffset, sizeof(int)), "initFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.initByteOffset, sizeof(uint8_t)), "initByte section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.timerPtrOffset, sizeof(uintptr_t)), "timerPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.renderContextBaseOffset, sizeof(uintptr_t)), "renderContextBase section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.renderContextGlobalOffset, sizeof(uintptr_t)), "renderContextGlobal section");
+
+    const uintptr_t loadedBase = reinterpret_cast<uintptr_t>(module);
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.roleFlagOffsets[0])),
+        "init roleFlag ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.sessionPtrOffsets[0])),
+        "init sessionPtr ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.initFlagOffset)),
+        "init initFlag ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.initByteOffset)),
+        "init initByte ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        0x00401582u),
+        "init frame EXE hook addr");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.frameHookRva)),
+        "init frame hook target");
+
+    static const uint8_t kFrameHookPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x53, 0x31, 0xDB,
+        0x81, 0xEC, 0xF0, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kPerFrameTickPrefix[] = {
+        0x83, 0xEC, 0x28, 0xE8, 0x48, 0xE0, 0xFF, 0xFF,
+        0x8D, 0x44, 0x24, 0x0C, 0xC7, 0x44, 0x24, 0x0C,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kInputSwapPrefix[] = {
+        0xA1, 0x00, 0x00, 0x00, 0x00, 0xA8, 0x1F, 0x74,
+        0x0F, 0x83, 0xC0, 0x01, 0xA3, 0x00, 0x00, 0x00,
+        0x00, 0xC3, 0x8D, 0xB6, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kStartInitPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x8D, 0x85, 0xF0,
+        0xFE, 0xFF, 0xFF, 0x53, 0x89, 0xCB, 0x81, 0xEC,
+        0x38, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kSetTextPrefix[] = {
+        0x8B, 0x49, 0x18, 0x0F, 0xB6, 0x44, 0x24, 0x04,
+        0x89, 0x44, 0x24, 0x04, 0xE9, 0x2F, 0x96, 0x00,
+        0x00,
+    };
+    static const uint8_t kClearTextPrefix[] = {
+        0x8B, 0x49, 0x18, 0xE9, 0xF8, 0x94, 0x00, 0x00,
+    };
+    static const uint8_t kTournamentExitGuardPrefix[] = {
+        0x74, 0x7A,
+    };
+    static const uint8_t kTournamentExitGuardPatched[] = {
+        0x90, 0x90,
+    };
+    static const uint8_t kCompactDequeInitPrefix[] = {
+        0xC7, 0x83, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x48, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x4C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x50, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x54, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x58, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uintptr_t kCompactVtableSlots[] = {
+        0x000486B0u, 0x00048550u, 0x00046770u,
+        0x000467C0u, 0x000458F0u, 0x00046060u,
+        0x000465E0u, 0x00064610u, 0x00064630u,
+        0x00064660u,
+    };
+    static const uintptr_t kRollbackVtableSlots[] = {
+        0x000585A0u, 0x00058580u, 0x000533B0u,
+        0x00054CD0u, 0x00050FF0u, 0x00052740u,
+        0x00052800u, 0x0004E9E0u, 0x0004EDE0u,
+        0x00051A80u,
+    };
+    static const uintptr_t kSpectatorVtableSlots[] = {
+        0x00062920u, 0x00062900u, 0x0005E640u,
+        0x0005F790u, 0x0005D720u, 0x0005E380u,
+        0x0005E3E0u, 0x0005C400u, 0x0005C4E0u,
+        0x0005DE40u,
+    };
+    static const uintptr_t kPracticeVtableSlots[] = {
+        0x00080650u, 0x00080630u, 0x0007DE40u,
+        0x0007E140u, 0x0007CF60u, 0x0007DBC0u,
+        0x00064680u, 0x0007CCC0u, 0x0007CDA0u,
+        0x0007D780u,
+    };
+
+    require(ModuleBytesMatchOrInstalledJmp(
+        module,
+        kRevival_1_02j.frameHookRva,
+        kFrameHookPrefix,
+        sizeof(kFrameHookPrefix),
+        6), "frameHook bytes");
+    require(ModuleBytesMatchOrInstalledJmp(
+        module,
+        kRevival_1_02j.perFrameTickRva,
+        kPerFrameTickPrefix,
+        sizeof(kPerFrameTickPrefix),
+        8), "perFrameTick bytes");
+    require(ModuleBytesMatchMasked(module, kRevival_1_02j.inputSwapPairRva, kInputSwapPrefix, "x????xxxxxxxx????xxxxxxx", sizeof(kInputSwapPrefix)), "inputSwap bytes");
+    require(ModuleWindowContainsU32(
+        module,
+        kRevival_1_02j.inputSwapPairRva,
+        0x80u,
+        static_cast<uint32_t>(kRevival_1_02j.sessionOffsetActivePlayer)),
+        "inputSwap activePlayer offset ref");
+    require(ModuleDirectCallCountEquals(
+        module,
+        0x00054CD0u,
+        0x800u,
+        kRevival_1_02j.inputSwapPairRva,
+        1), "inputSwap rollback call count");
+    require(ModuleBytesMatch(module, kRevival_1_02j.startInitPlayerRva, kStartInitPrefix, sizeof(kStartInitPrefix)), "startInit bytes");
+    require(ModuleBytesMatch(module, kRevival_1_02j.setTextEnabledRva, kSetTextPrefix, sizeof(kSetTextPrefix)), "setText bytes");
+    require(ModuleBytesMatch(module, kRevival_1_02j.clearTextRva, kClearTextPrefix, sizeof(kClearTextPrefix)), "clearText bytes");
+    static const uint32_t kInstallExeHookTargets[] = {
+        0x00776053u, 0x0040D131u, 0x007656A7u, 0x00401642u,
+        0x0076479Cu, 0x00777D61u, 0x00406020u, 0x00405FB0u,
+        0x00405F00u, 0x00405E90u, 0x00405F50u, 0x0040DE98u,
+        0x0040DE80u, 0x007668E5u, 0x0040DE56u, 0x0040DE40u,
+        0x0040E5E0u, 0x0040E5D0u,
+    };
+    for (size_t i = 0; i < sizeof(kInstallExeHookTargets) / sizeof(kInstallExeHookTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(
+            module,
+            kRevival_1_02j.frameHookRva,
+            0x800u,
+            kInstallExeHookTargets[i]),
+            "install_exe_hooks target ref");
+    }
+    require(
+        ModuleBytesMatch(module, 0x0004683Fu, kTournamentExitGuardPrefix, sizeof(kTournamentExitGuardPrefix))
+        || ModuleBytesMatch(module, 0x0004683Fu, kTournamentExitGuardPatched, sizeof(kTournamentExitGuardPatched)),
+        "tournamentExitGuard bytes");
+    require(ModuleVtableSlotsMatch(module, 0x0016FEB0u, kCompactVtableSlots, sizeof(kCompactVtableSlots) / sizeof(kCompactVtableSlots[0])), "compact vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FEF0u, kRollbackVtableSlots, sizeof(kRollbackVtableSlots) / sizeof(kRollbackVtableSlots[0])), "rollback vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF20u, kSpectatorVtableSlots, sizeof(kSpectatorVtableSlots) / sizeof(kSpectatorVtableSlots[0])), "spectator vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF80u, kPracticeVtableSlots, sizeof(kPracticeVtableSlots) / sizeof(kPracticeVtableSlots[0])), "practice vtable slots");
+    require(ModuleBytesMatch(module, 0x00047BA8u, kCompactDequeInitPrefix, sizeof(kCompactDequeInitPrefix)), "compact deque init bytes");
+    require(ModuleDirectCallCountEquals(module, 0x000479B0u, 0xA00u, 0x00102A20u, 22), "compact deque push count");
+    require(kRevival_1_02j.tournamentInputQueueOffset == 0x340u, "compact deque profile offset");
+    static const uint32_t kCompactExePatchTargets[] = {
+        0x00763F04u, 0x00763E50u, 0x00754C1Au, 0x007599EDu,
+    };
+    for (size_t i = 0; i < sizeof(kCompactExePatchTargets) / sizeof(kCompactExePatchTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(module, 0x000479B0u, 0xA00u, kCompactExePatchTargets[i]), "compact EXE patch target ref");
+    }
+
+    if (ok)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j binary verification OK preferredImageBase=0x%08lX loadedBase=%p size=0x%08lX",
+            static_cast<unsigned long>(nt->OptionalHeader.ImageBase),
+            static_cast<void*>(module),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
+    }
+    return ok;
+}
+
 static const RevivalAddressProfile* FindLoadedRevivalProfile(
     HMODULE module,
     uint32_t timestamp)
 {
+    if (timestamp == kRevival_1_02j.peTimestamp)
+    {
+        return VerifyRevival102jBinary(module) ? &kRevival_1_02j : nullptr;
+    }
+
     if (timestamp != kRevival_1_02f.peTimestamp)
     {
         return FindRevivalProfileByTimestamp(timestamp);
@@ -451,6 +938,27 @@ void EnsureActiveRevivalProfile()
     DetectRevivalVersion();
 }
 
+bool ActiveRevivalProfileSupportsSessionStart()
+{
+    EnsureActiveRevivalProfile();
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return false;
+    }
+    if (std::strcmp(g_activeRevival->versionTag, "unsupported") == 0)
+    {
+        return false;
+    }
+
+    return g_activeRevival->roleFlagOffsetCount > 0
+        && g_activeRevival->roleFlagOffsets[0] != 0
+        && g_activeRevival->sessionPtrOffsetCount > 0
+        && g_activeRevival->sessionPtrOffsets[0] != 0
+        && g_activeRevival->startInitPlayerRva != 0
+        && g_activeRevival->frameHookRva != 0
+        && g_activeRevival->perFrameTickRva != 0;
+}
+
 /// Detect the loaded Revival DLL version by reading its PE TimeDateStamp and,
 /// for ambiguous 1.02f builds, verifying stock code bytes before accepting the
 /// stock profile. Unsupported builds switch to the zeroed unsupported profile
@@ -491,7 +999,8 @@ void DetectRevivalVersion()
         SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
         mod::Log(
             "DetectRevivalVersion: unsupported or modified DLL build timestamp=0x%08X - fail closed as %s",
-            static_cast<unsigned>(timestamp));
+            static_cast<unsigned>(timestamp),
+            g_activeRevival->versionTag);
         return;
     }
 
@@ -533,8 +1042,8 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     EnsureActiveRevivalProfile();
 
     // Native helper routine that broadcasts EfzPackets::MessageQuit to every
-    // connected peer. RVAs were confirmed from the 1.02e/h/i decompilations
-    // and resolved for 1.02f/g by matching the helper EXE disassembly.
+    // connected peer. RVAs were confirmed from the versioned decompilations
+    // and, for 1.02j, by checking the helper EXE bytes at RVA 0x86390.
     if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
     {
         return 0;
@@ -560,6 +1069,10 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     if (std::strcmp(tag, "1.02i") == 0)
     {
         return 0x425C0u;
+    }
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        return 0x86390u;
     }
     return 0;
 }
@@ -590,6 +1103,10 @@ static uintptr_t ResolveHelperQuitRoleCheckRva()
     if (std::strcmp(tag, "1.02i") == 0)
     {
         return 0x20C80u;
+    }
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        return 0x81CF0u;
     }
     return 0;
 }
@@ -793,6 +1310,18 @@ static InjectedPeerManagerLayout ResolveInjectedPeerManagerLayout()
         layout.peerContainerOffset = kInjectedPeerManagerPeerContainerOffset;
         layout.peerBackingOffset = 684u;
         layout.quitRingOffset = 4624u;
+        return layout;
+    }
+
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        // 1.02j MinGW helper:
+        //   sendQuitAll uses this + 0x218 for the peer container.
+        //   ctor allocates 0x1488 bytes and initializes Quit_Spec at +0x1338.
+        layout.objectSize = 0x1488u;
+        layout.peerContainerOffset = 0x218u;
+        layout.peerBackingOffset = 0x300u;
+        layout.quitRingOffset = 0x1338u;
         return layout;
     }
 
@@ -2062,7 +2591,8 @@ bool TryClassifyRevivalQuitEndpoint(
             ? g_activeRevival->versionTag
             : "unknown";
 
-    if (std::strcmp(versionTag, "1.02i") == 0)
+    if (std::strcmp(versionTag, "1.02i") == 0
+        || std::strcmp(versionTag, "1.02j") == 0)
     {
         if (!HasInjectedContext())
         {
@@ -2713,11 +3243,25 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     // kLocalRoleLocalPlay lets SetLocalRoleFlag call init(3,102) again.
     if (g_localRoleFlag == kLocalRoleTournament)
     {
+        if (g_tournamentReturnCleanupPending)
+        {
+            mod::Log(
+                "Takeover: clearing stale 1.02j tournament return pending flag "
+                "before selection cleanup");
+            g_tournamentReturnCleanupPending = false;
+        }
         RestoreDllExitProcessPatches();
         RestoreTournamentExePatches();
         ForceLocalPlayInit();
-        ClearRevivalText();
-        DisableRevivalTextRendering();
+        const bool clearOk = ClearRevivalText();
+        mod::Log(
+            "Takeover: tournament cleanup before selection ClearRevivalText=%d",
+            clearOk ? 1 : 0);
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "tournament_cleanup_before_selection");
+        mod::Log(
+            "Takeover: tournament cleanup before selection ResetRevivalTextRenderingAfterCleanup=%d",
+            textOk ? 1 : 0);
         g_localRoleFlag = kLocalRoleLocalPlay;
         mod::Log("Takeover: tournament cleanup before selection=%d", selection);
     }
@@ -2738,10 +3282,29 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
             // returns, because the tournament session's tick function runs
             // on the very next frame and would call ExitProcess immediately
             // (mode is still 0 = title screen).
-            (void)SaveRenderContext();
+            const bool renderSavedBefore = SaveRenderContext();
+            mod::Log(
+                "Takeover: tournament pre-init SaveRenderContext=%d",
+                renderSavedBefore ? 1 : 0);
             (void)SaveTournamentExePatches();
             (void)SaveAndApplyDllExitProcessPatches();
             (void)SetLocalRoleFlag(kLocalRoleTournament, "title_vs_human_tournament");
+            if (!renderSavedBefore)
+            {
+                const bool renderSavedAfter = SaveRenderContext();
+                mod::Log(
+                    "Takeover: tournament post-init SaveRenderContext=%d",
+                    renderSavedAfter ? 1 : 0);
+            }
+            if (IsActiveRevival102jProfile())
+            {
+                const bool textEnableOk = SetRevivalTextRenderingEnabled(
+                    true,
+                    "title_vs_human_tournament_102j_start");
+                mod::Log(
+                    "Takeover: 1.02j tournament start text rendering enable=%d",
+                    textEnableOk ? 1 : 0);
+            }
             (void)NeutralizeTournamentAutoNav();
         }
         else
@@ -2783,6 +3346,24 @@ bool StartSession(
     ResetGameModeValidation();
     ClearLocalProcessCloseForGameplayStall();
     netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
+    if (g_tournamentReturnCleanupPending)
+    {
+        mod::Log(
+            "StartSession: completing stale 1.02j tournament return cleanup before new session");
+        g_tournamentReturnCleanupPending = false;
+        const bool initOk = ForceLocalPlayInit();
+        const bool patchOk = RestoreDllExitProcessPatches();
+        const bool clearOk = ClearRevivalText();
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "stale_102j_tournament_cleanup_before_session");
+        g_localRoleFlag = kLocalRoleLocalPlay;
+        mod::Log(
+            "StartSession: stale 1.02j tournament cleanup init=%d patch=%d clear=%d text=%d",
+            initOk ? 1 : 0,
+            patchOk ? 1 : 0,
+            clearOk ? 1 : 0,
+            textOk ? 1 : 0);
+    }
 
     // --- Session boundary cleanup logging ---
     // Log EXE hook bytes at both hook sites for cross-session tracking.
@@ -2857,6 +3438,34 @@ bool StartSession(
     if (!EnsureLocalRevivalLoaded())
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
+        return false;
+    }
+    if (!ActiveRevivalProfileSupportsSessionStart())
+    {
+        const char* const tag =
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "(null)";
+        const uintptr_t roleOffset =
+            (g_activeRevival != nullptr && g_activeRevival->roleFlagOffsetCount > 0)
+                ? g_activeRevival->roleFlagOffsets[0]
+                : 0;
+        const uintptr_t sessionOffset =
+            (g_activeRevival != nullptr && g_activeRevival->sessionPtrOffsetCount > 0)
+                ? g_activeRevival->sessionPtrOffsets[0]
+                : 0;
+        mod::Log(
+            "Takeover: StartSession rejected Revival profile version=%s roleCount=%u role0=0x%08lX "
+            "sessionCount=%u session0=0x%08lX startInit=0x%08lX frameHook=0x%08lX tick=0x%08lX",
+            tag,
+            (g_activeRevival != nullptr) ? static_cast<unsigned>(g_activeRevival->roleFlagOffsetCount) : 0u,
+            static_cast<unsigned long>(roleOffset),
+            (g_activeRevival != nullptr) ? static_cast<unsigned>(g_activeRevival->sessionPtrOffsetCount) : 0u,
+            static_cast<unsigned long>(sessionOffset),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->startInitPlayerRva : 0),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->frameHookRva : 0),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->perFrameTickRva : 0));
+        SetPhase(ioStatus, NetbridgePhase::Failed, "Unsupported EfzRevival.dll profile");
         return false;
     }
 
@@ -3614,6 +4223,7 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     RefreshRuntimeStatus(ioStatus);
 
     const bool syncReady = IsSyncReadyForVsHuman(ioStatus);
+    const bool strictNativeSync = RequiresNativeVsHumanSyncForHandoff(ioStatus);
     const int mode = ioStatus != nullptr ? ioStatus->syncGameMode : -1;
     const int flag1084 = ioStatus != nullptr ? ioStatus->syncMode0Flag1084 : -1;
     const int sessionByte = ioStatus != nullptr ? ioStatus->syncSessionByte : -1;
@@ -3630,10 +4240,12 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     static int s_lastFlag4964 = std::numeric_limits<int>::min();
     static int s_lastFlag4965 = std::numeric_limits<int>::min();
     static int s_lastRoleFlag = std::numeric_limits<int>::min();
+    static int s_lastStrictNativeSync = -1;
     const DWORD now = GetTickCount();
     const bool changed =
         s_lastRoleSet != (roleSet ? 1 : 0)
         || s_lastSyncReady != (syncReady ? 1 : 0)
+        || s_lastStrictNativeSync != (strictNativeSync ? 1 : 0)
         || s_lastMode != mode
         || s_lastFlag1084 != flag1084
         || s_lastSessionByte != sessionByte
@@ -3644,6 +4256,7 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     {
         s_lastRoleSet = roleSet ? 1 : 0;
         s_lastSyncReady = syncReady ? 1 : 0;
+        s_lastStrictNativeSync = strictNativeSync ? 1 : 0;
         s_lastMode = mode;
         s_lastFlag1084 = flag1084;
         s_lastSessionByte = sessionByte;
@@ -3652,9 +4265,10 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
         s_lastRoleFlag = roleFlag;
         s_lastLogTick = now;
         mod::Log(
-            "Takeover: PrepareVsHumanHandoff roleSet=%d syncReady=%d mode=%d flag1084=%d sessionByte=%d flags=%d/%d roleFlag=%d",
+            "Takeover: PrepareVsHumanHandoff roleSet=%d syncReady=%d strictNativeSync=%d mode=%d flag1084=%d sessionByte=%d flags=%d/%d roleFlag=%d",
             roleSet ? 1 : 0,
             syncReady ? 1 : 0,
+            strictNativeSync ? 1 : 0,
             mode,
             flag1084,
             sessionByte,
@@ -3662,7 +4276,7 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
             flag4965,
             roleFlag);
     }
-    return roleSet || syncReady;
+    return syncReady || (roleSet && !strictNativeSync);
 }
 
 void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
@@ -3950,7 +4564,9 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             }
 
             // Restore saved 0x401642 bytes to undo init()'s new trampoline.
-            RestoreExeDispatchHookBytes();
+            // For 1.02j, an online init can start from the clean EFZ bytes
+            // after exit recovery; in that case keep init()'s fresh hook.
+            RestoreExeDispatchHookBytesAfterSessionInit(initParams[0]);
 
             // Fix up relative instructions in mode-constructor trampolines.
             FixupModeConstructorTrampolines("Tick_init_handshake");
@@ -4003,7 +4619,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // sessions, the initComplete offset overlaps with different
             // fields in the smaller session object.
             if (initParams[0] == kLocalRoleOnline
-                && newSessionPtr != 0 && newSessionPtr >= 0x00100000u)
+                && newSessionPtr != 0 && newSessionPtr >= 0x00100000u
+                && g_activeRevival->sessionOffsetInitComplete != 0)
             {
                 int prevInitComplete = -1;
                 (void)SafeReadInt(
@@ -4071,28 +4688,41 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // --- Snapshot after StartInitPlayer (writes session fields) ---
             LogInitWriteSnapshot("Tick_startInitPlayer_post");
 
+            if (initParams[0] == kLocalRoleOnline && IsActiveRevival102jProfile())
+            {
+                const bool safeInputOk =
+                    InstallRevival102jSafeInputReadPatch("Tick_startInitPlayer_post");
+                mod::Log(
+                    "Takeover: 1.02j safe input read patch result=%d",
+                    safeInputOk ? 1 : 0);
+            }
+
             mod::Log(
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
 
-            // For spectator mode, init(1,102) creates the spectator object
-            // but does NOT allocate its BGM manager (offset +1068).  The
-            // full init (EFZ_Spectator_Init) only runs when the game hits
-            // address 0x401582 → sub_1006E590 → vtable+4.  However, the
-            // BGM dispatch hook at 0x40DE80 is already installed from a
-            // previous session, and if the game triggers a BGM event before
-            // 0x401582 fires, it dispatches to the uninitialized spectator
-            // and crashes on the NULL BGM manager.  Calling vtable+4 here
-            // ensures the spectator is fully initialized before any hook
-            // can dispatch to it - identical to what ForceLocalPlayInit
-            // does for mode 2.
+            // For legacy spectator mode, init(1,102) creates the object
+            // before the frame hook runs the full post-init vtable path, so
+            // we force that path immediately.  1.02j is explicitly excluded:
+            // MinGW changed this vtable layout and slot 1 is a deleting
+            // destructor/free thunk for the spectator object.
             if (initParams[0] == kLocalRoleSpectate)
             {
-                const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
-                mod::Log(
-                    "Takeover: spectator vtable init result=%d [deferred]",
-                    vtableInitOk ? 1 : 0);
-                LogInitWriteSnapshot("Tick_spectateVtable1_post");
+                if (IsActiveRevival102jProfile())
+                {
+                    mod::Log(
+                        "Takeover: spectator vtable init skipped for 1.02j "
+                        "(manual vtable[1] corrupts MinGW spectator object)");
+                    LogInitWriteSnapshot("Tick_spectateVtable1_skipped_102j");
+                }
+                else
+                {
+                    const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
+                    mod::Log(
+                        "Takeover: spectator vtable init result=%d [deferred]",
+                        vtableInitOk ? 1 : 0);
+                    LogInitWriteSnapshot("Tick_spectateVtable1_post");
+                }
             }
 
             // Init-snapshot: record the DLL ExitProcess Jcc call-site bytes
@@ -4113,6 +4743,19 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
 
+            if (initParams[0] == kLocalRoleOnline
+                || initParams[0] == kLocalRoleSpectate
+                || initParams[0] == kLocalRoleTournament)
+            {
+                const bool textEnableOk = SetRevivalTextRenderingEnabled(
+                    true,
+                    "Tick_initSequence_session_start");
+                mod::Log(
+                    "Takeover: session text rendering enable mode=%d result=%d",
+                    initParams[0],
+                    textEnableOk ? 1 : 0);
+            }
+
             // NOTE: The spectate ring-buffer flush that used to live here
             // has been moved to StartSession (before ResumeThread).  Flushing
             // here - after the child process has already been running for up
@@ -4122,6 +4765,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // --- Final snapshot after all init steps complete ---
             LogInitWriteSnapshot("Tick_initSequence_complete");
+            MarkRevivalSyncDiagnosticsSessionStart("Tick_initSequence_complete");
             LogSessionDiagnosticState("Tick_init_handshake_post");
         }
     }
@@ -4414,8 +5058,16 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     const bool isShutdown = (reason != nullptr &&
         (std::strcmp(reason, "shutdown") == 0 ||
          std::strcmp(reason, "emergency") == 0));
+    const bool isExitInterception =
+        reason != nullptr && std::strcmp(reason, "exit_intercepted") == 0;
+    const bool alreadyRecoveredLocal102j =
+        IsActiveRevival102jProfile()
+        && isExitInterception
+        && g_localRoleFlag == kLocalRoleLocalPlay
+        && GetForceLocalPlayInitCount() > 0
+        && ReadSessionPointerFromRevival() != 0;
 
-    if (!isShutdown && !suppressSharedRecoveryTeardown)
+    if (!isShutdown && !suppressSharedRecoveryTeardown && !alreadyRecoveredLocal102j)
     {
         // If we're inside the per-frame tick (sub_1006E570 -> vtable[2] ->
         // RollbackLoopTick), ForceLocalPlayInit MUST NOT run now because it
@@ -4442,9 +5094,10 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
                 "Takeover: cancel cleanup - ClearRevivalText result=%d",
                 clearOk ? 1 : 0);
 
-            const bool textOk = DisableRevivalTextRendering();
+            const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+                "cancel_cleanup");
             mod::Log(
-                "Takeover: cancel cleanup - DisableRevivalTextRendering result=%d",
+                "Takeover: cancel cleanup - ResetRevivalTextRenderingAfterCleanup result=%d",
                 textOk ? 1 : 0);
 
             mod::ResetCrashRecoveryState();
@@ -4457,8 +5110,12 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     else
     {
         mod::Log(
-            "Takeover: cancel cleanup - skipped DLL re-init (shutdown path reason='%s')",
-            reason != nullptr ? reason : "");
+            "Takeover: cancel cleanup - skipped DLL re-init "
+            "(reason='%s' shutdown=%d suppressShared=%d alreadyRecoveredLocal102j=%d)",
+            reason != nullptr ? reason : "",
+            isShutdown ? 1 : 0,
+            suppressSharedRecoveryTeardown ? 1 : 0,
+            alreadyRecoveredLocal102j ? 1 : 0);
         // Still reset the netplay role even on shutdown so stale state
         // doesn't leak to a future session (belt-and-suspenders).
         g_netplayRole = kNetplayRoleNone;
@@ -4622,7 +5279,8 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     //   b) DLL ExitProcess Jcc patched   →  step 1: RestoreDllExitProcessPatches
     //   c) EXE patches (tournament only) →  step 2: RestoreTournamentExePatches
     //   d) Online session object created →  step 3: ForceLocalPlayInit (new local)
-    //   e) Text rendering active         →  step 4: ClearRevivalText / Disable
+    //   e) Text rendering active         →  step 4: ClearRevivalText /
+    //                                               version-aware renderer reset
     //                                               (tournament: both;
     //                                                online/spectate: Disable only)
     // -----------------------------------------------------------------------
@@ -4653,27 +5311,42 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // step 3: reinstate a live local-play session.
     // Both OurFrameDispatch (frame-hook longjmp recovery) and
     // CancelSessionUnlocked (step 1 above) now call ForceLocalPlayInit
-    // eagerly.  This third call is a defence-in-depth guarantee: even if
-    // the earlier calls were bypassed (e.g. VEH TOCTOU path or a code
-    // path that doesn't go through OurFrameDispatch), the session is
-    // always replaced here.  Repeated calls are harmless.
-    mod::Log("Takeover: exit interception step 3 - ForceLocalPlayInit (defence-in-depth)");
-    ForceLocalPlayInit();
+    // eagerly.  This third call is a defence-in-depth guarantee for the
+    // older MSVC-built DLLs where repeated calls are harmless.  On 1.02j,
+    // avoid re-running init once recovery has already produced a local
+    // session because the MinGW object lifecycle is not ABI-compatible with
+    // our old scalar-deleting destructor path.
+    const bool alreadyRecoveredLocal102j =
+        IsActiveRevival102jProfile()
+        && g_localRoleFlag == kLocalRoleLocalPlay
+        && GetForceLocalPlayInitCount() > 0
+        && ReadSessionPointerFromRevival() != 0;
+    if (alreadyRecoveredLocal102j)
+    {
+        mod::Log(
+            "Takeover: exit interception step 3 - skipped ForceLocalPlayInit "
+            "(1.02j already has recovered local session, count=%d)",
+            GetForceLocalPlayInitCount());
+    }
+    else
+    {
+        mod::Log("Takeover: exit interception step 3 - ForceLocalPlayInit (defence-in-depth)");
+        ForceLocalPlayInit();
+    }
 
     // step 4: clear any DLL-side text overlay state left by the session.
     // Tournament writes win counters and nicknames to the EfzRender text
     // buffer.  init(2,102) zeroes dword_100A0778 so we must RestoreRenderContext
     // before the clear; ClearRevivalText does this internally.
     //
-    // Online/spectate do not write to the EfzRender buffer (they use ImGui
-    // overlays), but we call DisableRevivalTextRendering as a defensive
-    // clean-up in case the session left the DLL text-draw hook active.
-    mod::Log("Takeover: exit interception step 4 - clear text / disable renderer");
+    // 1.02j keeps the renderer usable after cleanup; older builds retain the
+    // historical defensive disable.
+    mod::Log("Takeover: exit interception step 4 - clear text / reset renderer");
     // Both tournament and online/spectate paths share the same cleanup now.
     // SaveRenderContext() is called in StartSession for all session types,
     // so RestoreRenderContext inside ClearRevivalText works for all modes.
     ClearRevivalText();
-    DisableRevivalTextRendering();
+    ResetRevivalTextRenderingAfterCleanup("exit_interception");
 
     mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
     LogSessionDiagnosticState("ConsumeExitInterception_exit");
@@ -4728,13 +5401,70 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
 
     mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
 
+    if (IsActiveRevival102jProfile())
+    {
+        if (g_tournamentReturnCleanupPending)
+        {
+            mod::Log(
+                "Takeover: 1.02j tournament return cleanup already pending");
+            return false;
+        }
+
+        // 1.02j's MinGW practice/local session requires a post-init vtable[2]
+        // call before its shared input writer can run.  Arm the re-init for
+        // the next title-hook turn and leave the DLL ExitProcess guard patched
+        // until the new local session is fully initialized.
+        RestoreTournamentExePatches();
+        g_tournamentReturnCleanupPending = true;
+        mod::Log(
+            "Takeover: 1.02j tournament return cleanup stage 1 complete "
+            "(EXE patches restored, local init deferred)");
+        RefreshRuntimeStatus(ioStatus);
+        return true;
+    }
+
     RestoreDllExitProcessPatches();
     RestoreTournamentExePatches();
     ForceLocalPlayInit();
     ClearRevivalText();
-    DisableRevivalTextRendering();
+    ResetRevivalTextRenderingAfterCleanup("tournament_return_to_title");
     g_localRoleFlag = kLocalRoleLocalPlay;
 
+    RefreshRuntimeStatus(ioStatus);
+    return true;
+}
+
+bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_tournamentReturnCleanupPending)
+    {
+        return false;
+    }
+
+    g_tournamentReturnCleanupPending = false;
+    mod::Log("Takeover: 1.02j tournament return cleanup stage 2 begin");
+
+    const bool initOk = ForceLocalPlayInit();
+    mod::Log(
+        "Takeover: 1.02j tournament return cleanup stage 2 ForceLocalPlayInit=%d",
+        initOk ? 1 : 0);
+
+    const bool dllPatchOk = RestoreDllExitProcessPatches();
+    mod::Log(
+        "Takeover: 1.02j tournament return cleanup stage 2 RestoreDllExitProcessPatches=%d",
+        dllPatchOk ? 1 : 0);
+
+    const bool clearOk = ClearRevivalText();
+    const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+        "102j_tournament_return_cleanup_stage2");
+    mod::Log(
+        "Takeover: 1.02j tournament return cleanup stage 2 text clear=%d reset=%d",
+        clearOk ? 1 : 0,
+        textOk ? 1 : 0);
+
+    g_localRoleFlag = kLocalRoleLocalPlay;
     RefreshRuntimeStatus(ioStatus);
     return true;
 }

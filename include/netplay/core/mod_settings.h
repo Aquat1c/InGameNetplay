@@ -12,6 +12,8 @@ struct Settings
     bool preserveRevivalLogsAcrossLaunches = false;
     bool enableConsole = false;
     bool enableDebugMenu = false;
+    bool verboseBridgePatchLogging = true;
+    bool verboseSyncDiagnostics = true;
     bool hideEmptySetsInBattleLog = true;
     // Keyboard binding (DIK_* form) for the async-hosting "return / rehost"
     // hotkey used while the hosting overlay is minimized in-game.
@@ -27,6 +29,8 @@ bool PreserveModLogAcrossLaunches();
 bool PreserveRevivalLogsAcrossLaunches();
 bool IsConsoleEnabled();
 bool IsDebugMenuEnabled();
+bool IsVerboseBridgePatchLoggingEnabled();
+bool IsVerboseSyncDiagnosticsEnabled();
 bool HideEmptySetsInBattleLogByDefault();
 // Async-hosting return/rehost hotkey as a DIK_* binding value (e.g. "DIK_F1").
 const std::string& AsyncHostReturnKeyBinding();

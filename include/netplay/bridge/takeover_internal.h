@@ -158,6 +158,7 @@ extern const RevivalAddressProfile* g_activeRevival;
 // Runtime version detection - reads PE TimeDateStamp, sets g_activeRevival.
 void DetectRevivalVersion();
 void EnsureActiveRevivalProfile();
+bool ActiveRevivalProfileSupportsSessionStart();
 
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
@@ -320,11 +321,15 @@ bool InvokeSessionVtableInit(const char* caller);
 bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
+bool SetRevivalTextRenderingEnabled(bool enable, const char* reason);
 bool DisableRevivalTextRendering();
+bool ResetRevivalTextRenderingAfterCleanup(const char* reason);
 bool RestoreRenderContextForGameplayExitCleanup();
 void MarkRenderContextConsumedForGameplayExitCleanup();
 bool ClearRevivalTextWithCurrentRenderContext();
+bool SetRevivalTextRenderingEnabledWithCurrentRenderContext(bool enable, const char* reason);
 bool DisableRevivalTextRenderingWithCurrentRenderContext();
+bool ResetRevivalTextRenderingAfterCleanupWithCurrentRenderContext(const char* reason);
 int GetRevivalGraphicsPatchState();
 bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason);
 
@@ -336,6 +341,8 @@ void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);
 void StabilizeOnlineSessionBindingAfterInit(int initMode);
 void RepairRollbackHistoryBindingsIfNeeded();
+bool InstallRevival102jSafeInputReadPatch(const char* caller);
+void MarkRevivalSyncDiagnosticsSessionStart(const char* context);
 bool InstallNetplayFrameHook();
 // Force the game mode index to 0 (title screen).
 // Safe to call from the crash handler VEH where minimal code should run.
@@ -352,6 +359,8 @@ void RestoreExeFrameHookBytes();
 // trampolines and changing the JMP target between sessions.
 void SaveExeDispatchHookBytes();
 void RestoreExeDispatchHookBytes();
+void RestoreExeDispatchHookBytesAfterSessionInit(int initMode);
+bool RestoreExeDispatchOriginalBytesForTitle(const char* caller);
 
 // Save / restore the 7 bytes at EXE addresses 0x763E50 and 0x763F04
 // before and after every g_localInitFn() call.  Prevents trampoline
@@ -488,6 +497,7 @@ void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error);
 void CloseProcessHandle(NetbridgeStatus* status);
 bool ProcessAlive(NetbridgeStatus* status);
 bool IsSyncReadyForVsHuman(const NetbridgeStatus* status);
+bool RequiresNativeVsHumanSyncForHandoff(const NetbridgeStatus* status);
 RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status);
 uint32_t BuildRuntimeReadyProbeMask(const RuntimeReadyProbe& probe);
 bool HasRuntimeReadySignal(const NetbridgeStatus* status);

@@ -94,16 +94,17 @@ const char* OriginToString(GameplayExitOrigin origin)
 void CleanupRevivalTextForGameplayExit(
     bool* outRestoreOk,
     bool* outClearOk,
-    bool* outDisableOk)
+    bool* outResetOk)
 {
     bool restoreOk = takeover::RestoreRenderContextForGameplayExitCleanup();
     bool clearOk = false;
-    bool disableOk = false;
+    bool resetOk = false;
 
     if (restoreOk)
     {
         clearOk = takeover::ClearRevivalTextWithCurrentRenderContext();
-        disableOk = takeover::DisableRevivalTextRenderingWithCurrentRenderContext();
+        resetOk = takeover::ResetRevivalTextRenderingAfterCleanupWithCurrentRenderContext(
+            "gameplay_exit_recovery");
         takeover::MarkRenderContextConsumedForGameplayExitCleanup();
     }
 
@@ -115,9 +116,9 @@ void CleanupRevivalTextForGameplayExit(
     {
         *outClearOk = clearOk;
     }
-    if (outDisableOk != nullptr)
+    if (outResetOk != nullptr)
     {
-        *outDisableOk = disableOk;
+        *outResetOk = resetOk;
     }
 }
 
@@ -139,8 +140,8 @@ bool RunGameplayExitContinuation(const char* origin)
 
     bool restoreOk = false;
     bool clearOk = false;
-    bool disableOk = false;
-    CleanupRevivalTextForGameplayExit(&restoreOk, &clearOk, &disableOk);
+    bool resetOk = false;
+    CleanupRevivalTextForGameplayExit(&restoreOk, &clearOk, &resetOk);
     mod::Log(
         "GAMEPLAY_EXIT_RECOVERY_STEP restore_render_context result=%d origin=%s",
         restoreOk ? 1 : 0,
@@ -150,8 +151,8 @@ bool RunGameplayExitContinuation(const char* origin)
         clearOk ? 1 : 0,
         originTag);
     mod::Log(
-        "GAMEPLAY_EXIT_RECOVERY_STEP disable_text result=%d origin=%s",
-        disableOk ? 1 : 0,
+        "GAMEPLAY_EXIT_RECOVERY_STEP reset_text_renderer result=%d origin=%s",
+        resetOk ? 1 : 0,
         originTag);
 
     const int countBefore = takeover::GetForceLocalPlayInitCount();

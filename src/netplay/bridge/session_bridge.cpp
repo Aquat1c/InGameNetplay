@@ -500,6 +500,17 @@ bool PrepareVsHumanHandoff()
     return prepared;
 }
 
+bool RequiresNativeVsHumanSyncForHandoff()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    return takeover::RequiresNativeVsHumanSyncForHandoff(&g_status);
+}
+
 void CancelSession(const char* reason)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -595,6 +606,24 @@ bool NotifyTitleScreenActive()
 
     JoinFinishedWorkerUnlocked();
     return takeover::NotifyTitleScreenActive(&g_status);
+}
+
+bool CompletePendingTournamentReturnCleanup()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized)
+    {
+        return false;
+    }
+
+    JoinFinishedWorkerUnlocked();
+    const bool completed =
+        takeover::CompletePendingTournamentReturnCleanup(&g_status);
+    if (completed)
+    {
+        state_export::Update(g_status);
+    }
+    return completed;
 }
 
 void OnTitleSelectionConfirmed(int selection)
@@ -751,6 +780,10 @@ bool ForceLocalPlayInit()
 bool ForceGameModeToTitle()
 {
     return takeover::ForceGameModeToTitle();
+}
+bool RestoreRevivalTitleDispatchForRecovery(const char* caller)
+{
+    return takeover::RestoreExeDispatchOriginalBytesForTitle(caller);
 }
 uintptr_t GetRevivalRenderContextOffset()
 {

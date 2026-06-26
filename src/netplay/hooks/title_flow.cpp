@@ -2789,8 +2789,10 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         PlayUiSound(screenContext, kSfxConfirm);
         const auto statusAfterApply = netplay::bridge::GetStatus();
         const auto phaseAfterApply = static_cast<NetbridgePhase>(statusAfterApply.phase);
+        const bool strictNativeSyncAfterApply =
+            netplay::bridge::RequiresNativeVsHumanSyncForHandoff();
         mod::Log(
-            "DelayOverlay: confirmed player=%d selected=%d recommended=%d min=%d max=%d ping=%d phase=%s syncReady=%d",
+            "DelayOverlay: confirmed player=%d selected=%d recommended=%d min=%d max=%d ping=%d phase=%s syncReady=%d strictNativeSync=%d",
             confirmPlayer,
             selectedDelay,
             g_delaySetupOverlay.recommendedDelay,
@@ -2798,10 +2800,12 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
             g_delaySetupOverlay.maxDelay,
             g_delaySetupOverlay.pingMs,
             netplay::bridge::PhaseToString(phaseAfterApply),
-            statusAfterApply.vsHumanSyncReady);
+            statusAfterApply.vsHumanSyncReady,
+            strictNativeSyncAfterApply ? 1 : 0);
 
         const bool readyForHandoff =
-            phaseAfterApply == NetbridgePhase::Connected || statusAfterApply.vsHumanSyncReady != 0;
+            statusAfterApply.vsHumanSyncReady != 0
+            || (phaseAfterApply == NetbridgePhase::Connected && !strictNativeSyncAfterApply);
         if (!readyForHandoff)
         {
             g_delaySetupOverlay.waitingForRuntimeReady = true;
@@ -3497,6 +3501,13 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
         static_cast<unsigned>(preExit),
         static_cast<unsigned>(preMode),
         static_cast<unsigned>(preSecondary));
+
+    if (!prepared)
+    {
+        mod::Log(
+            "HandoffConnectedSessionToVsHumanState: aborted because VS-human handoff is not ready");
+        return;
+    }
 
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareVsHumanGameState(screenContext);
@@ -5005,7 +5016,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         if (g_delaySetupOverlay.waitingForRuntimeReady
-            && (bridgePhase == NetbridgePhase::Connected || bridgeStatus.vsHumanSyncReady != 0))
+            && (bridgeStatus.vsHumanSyncReady != 0
+                || (bridgePhase == NetbridgePhase::Connected
+                    && !netplay::bridge::RequiresNativeVsHumanSyncForHandoff())))
         {
             if (bridgeStatus.vsHumanSyncReady == 0 && bridgePhase == NetbridgePhase::Connected)
             {

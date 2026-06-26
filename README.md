@@ -167,9 +167,9 @@ Async hosting lets you **start a host session and keep playing EFZ** while the l
 ```text
 NETPLAY → Host → start hosting
 → full HOSTING panel shows your IP / port
-→ D: minimize — listener stays open, small badge appears
+→ D: minimize - listener stays open, small badge appears
 → browse the netplay menu, leave to title, or play offline/practice
-→ opponent connects — badge changes to OPPONENT FOUND!
+→ opponent connects - badge changes to OPPONENT FOUND!
 → return to the full HOST overlay (select Host, or press F1 from outside the menu)
 → normal delay setup runs, then charselect / match as usual
 ```
@@ -178,7 +178,7 @@ NETPLAY → Host → start hosting
 
 - The full **HOSTING** panel shows your public IP and port (press **C** to copy).
 - **D** minimizes hosting: the overlay collapses to a small top-right badge (`HOSTING`) and you return to the main netplay menu. The listener **stays active**.
-- You can browse **Battle Log**, **Options**, and other netplay pages, or leave the netplay menu entirely — hosting is **not** cancelled when you exit the menu.
+- You can browse **Battle Log**, **Options**, and other netplay pages, or leave the netplay menu entirely - hosting is **not** cancelled when you exit the menu.
 - Select **Host** again (or re-enter NETPLAY) to restore the full hosting panel.
 
 ### When an opponent connects
@@ -201,7 +201,7 @@ Configure the return hotkey under **Options → Others → AsyncHostReturnKey** 
 
 ### Indicators
 
-- **Inside the netplay menu** (minimized): a small indexed badge in the top-right — `HOSTING`, `OPPONENT FOUND!`, or `TIMED OUT`.
+- **Inside the netplay menu** (minimized): a small indexed badge in the top-right - `HOSTING`, `OPPONENT FOUND!`, or `TIMED OUT`.
 - **Outside the netplay menu** (minimized): a top-center on-screen message with the same state (e.g. `Hosting... Press F1 to return to HOST menu`).
 
 ### Conflicts and cancellation

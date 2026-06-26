@@ -107,13 +107,14 @@ struct RevivalAddressProfile
     uintptr_t inputSwapPairRva;
 
     // RVA of the frame-hook dispatcher (sub_1006E590 in 1.02e).
-    // A void(void) __stdcall function whose first 6 bytes are overwritten
-    // with an absolute JMP trampoline into our per-frame hook.
+    // A void(void) __stdcall function whose first hookable prologue bytes are
+    // overwritten with a near-JMP into our frame hook.
     uintptr_t frameHookRva;
 
     // RVA of the per-frame tick dispatcher (sub_1006E570 in 1.02e).
-    // A __thiscall(void* this) function - first 6 bytes are overwritten
-    // with an absolute JMP trampoline into our per-frame tick handler.
+    // A __thiscall(void* this) function.  The overwritten span is profile-
+    // dependent because MinGW 1.02j starts with a different complete prologue
+    // sequence than the older MSVC builds.
     uintptr_t perFrameTickRva;
 
     // -----------------------------------------------------------------------
@@ -172,9 +173,12 @@ struct RevivalAddressProfile
     // -----------------------------------------------------------------------
 
     // Byte offset from the tournament session pointer to the auto-nav input
-    // deque (MSVC std::deque of 2-byte elements, 8 per block).  The
-    // tournament constructor populates this queue with 22 byte-pair entries
-    // that simulate controller presses to auto-navigate menus.
+    // deque.  Older MSVC Revival builds use the MSVC std::deque layout
+    // (2-byte elements, 8 per block).  1.02j is MinGW/libstdc++ and uses
+    // the map/start/finish iterator layout constructed at compact ctor
+    // RVA 0x479B0.  The tournament constructor populates this queue with
+    // byte-pair entries that simulate controller presses to auto-navigate
+    // menus.
     uintptr_t tournamentInputQueueOffset;
 
     // RVA of EFZ_Render_ClearText (sub_1006C070 in 1.02e).  A void(void)
@@ -684,6 +688,74 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
     7,                                                  // exitProcessNearJccCount
 };
 
+// EfzRevival.dll v1.02j - MinGW refactor build.
+// This build moved the DLL image to 0x70000000, consolidated several globals
+// into the patch context at +0x14E8C0, and removed the old rollback
+// initComplete DWORD.  Most ExitProcess call sites do not match the old
+// profile arrays.  The tournament return-to-title guard at RVA 0x4683F is
+// patched by a verified 1.02j-specific helper; the IAT hook remains the
+// fallback for online/spectate call sites covered by the frame/UI recovery
+// guards.
+constexpr RevivalAddressProfile kRevival_1_02j = {
+    "1.02j",                                            // versionTag
+    0x6A36A6AEu,                                        // peTimestamp
+    0x4386998Fu,                                        // efzFingerprint
+    0x70000000u,                                        // defaultImageBase
+    0x00790110u,                                        // addrGameModeStructTable
+    0x00790148u,                                        // addrGameModeCurrentIndex
+    {0x0014EC40u, 0u, 0u, 0u},                          // roleFlagOffsets
+    1,                                                  // roleFlagOffsetCount
+    {0x0014E980u, 0u, 0u, 0u},                          // sessionPtrOffsets
+    1,                                                  // sessionPtrOffsetCount
+    0x0014E924u,                                        // globalStatePtrOffset (patch ctx + 0x64)
+    0x0014EC44u,                                        // initFlagOffset / screen cache
+    0x0014ED64u,                                        // initByteOffset
+    0u,                                                 // initOnceGuardOffset (no old standalone guard)
+    0x0014E914u,                                        // timerPtrOffset (patch ctx + 0x54)
+    0x0014E8C0u,                                        // renderContextBaseOffset
+    0u,                                                 // errorCodeIsZeroRva (old MSVC helper absent)
+    0u,                                                 // errorCodeIsZeroPatchSize
+    0x000533B0u,                                        // startInitPlayerRva
+    0x000532A0u,                                        // inputSwapPairRva
+    0x00040200u,                                        // frameHookRva
+    0x00040AD0u,                                        // perFrameTickRva
+    0u,                                                 // sessionOffsetInitComplete (field removed)
+    0x310u,                                             // sessionOffsetInputDelay
+    0x448u,                                             // sessionOffsetPingMs
+    0x440u,                                             // sessionOffsetPingStructBase
+    0x31Cu,                                             // sessionOffsetHelperHandle
+    0x560u,                                             // sessionOffsetHelperPid
+    0x308u,                                             // sessionOffsetActivePlayer
+    0x30Cu,                                             // sessionOffsetQueuePlayer
+    0x398u,                                             // sessionOffsetHistoryPrimaryPtr
+    0x39Cu,                                             // sessionOffsetHistorySecondaryPtr
+    0x374u,                                             // sessionOffsetHistoryPrimaryVec
+    0x380u,                                             // sessionOffsetHistorySecondaryVec
+    0x324u,                                             // sessionOffsetCurrentFrame
+    0x32Cu,                                             // sessionOffsetGameModeSnapshot
+    0x328u,                                             // sessionOffsetMatchId
+    0x570u,                                             // sessionOffsetSentinel
+    0x45Eu,                                             // sessionOffsetP1Name
+    0x4DEu,                                             // sessionOffsetP2Name
+    0x564u,                                             // sessionOffsetP1Wins
+    0x568u,                                             // sessionOffsetP2Wins
+    4964u,                                              // globalStateOffsetFlag4964
+    4965u,                                              // globalStateOffsetFlag4965
+    82563u,                                             // globalStateOffsetSessionByte
+    0x340u,                                             // tournamentInputQueueOffset
+    0x00077DC0u,                                        // clearTextRva
+    0x00077B10u,                                        // setTextEnabledRva
+    0x0014E8D8u,                                        // renderContextGlobalOffset (patch ctx + 0x18)
+    {0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu},      // tournamentExePatchAddr
+    {7, 7, 1, 20},                                      // tournamentExePatchSize
+    4,                                                  // tournamentExePatchCount
+    {0u, 0u, 0u, 0u},                                   // exitProcessPatchRva
+    {0u, 0u, 0u, 0u},                                   // exitProcessPatchOriginal
+    0,                                                  // exitProcessPatchCount
+    {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
+    0,                                                  // exitProcessNearJccCount
+};
+
 // Table of all known profiles, for DetectRevivalVersion() iteration.
 constexpr const RevivalAddressProfile* kAllRevivalProfiles[] = {
     &kRevival_1_02e,
@@ -692,6 +764,7 @@ constexpr const RevivalAddressProfile* kAllRevivalProfiles[] = {
     &kRevival_1_02g,
     &kRevival_1_02h,
     &kRevival_1_02i,
+    &kRevival_1_02j,
 };
 constexpr size_t kRevivalProfileCount =
     sizeof(kAllRevivalProfiles) / sizeof(kAllRevivalProfiles[0]);
