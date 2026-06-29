@@ -645,14 +645,18 @@ void UpdateNow(const NetbridgeStatus& status)
     s.sessionPhase = status.phase;
     s.localSide = ResolveLocalSide(takeover::g_netplayRole, status.activePlayer);
 
-    // Detect session start: phase transitions from Idle to Connecting.
+    // Detect session start.  Retries normally begin from Failed or
+    // SessionEnded rather than returning through Idle, so restricting this
+    // to Idle -> Connecting re-used sessionId and stale score/name latches.
     {
         const auto curPhase = static_cast<NetbridgePhase>(status.phase);
         const auto prevPhase = static_cast<NetbridgePhase>(g_prevBridgePhase);
 
         // New session?
-        if (curPhase == NetbridgePhase::Connecting &&
-            prevPhase == NetbridgePhase::Idle)
+        if (curPhase == NetbridgePhase::Connecting
+            && (prevPhase == NetbridgePhase::Idle
+                || prevPhase == NetbridgePhase::Failed
+                || prevPhase == NetbridgePhase::SessionEnded))
         {
             ++g_sessionId;
             g_latchedEndReason = EFZ_END_NONE;
@@ -728,7 +732,7 @@ void UpdateNow(const NetbridgeStatus& status)
             s.p2Wins = liveP2;
         }
     }
-    if (s.p1Wins != 0 || s.p2Wins != 0 || s.matchCounter != 0)
+    if (status.sessionScoresValid != 0)
         caps |= EFZ_CAP_SCORES;
 
     // Detect set transition: scores reset to 0-0 from non-zero.
@@ -755,7 +759,7 @@ void UpdateNow(const NetbridgeStatus& status)
     std::memcpy(s.localNickname, status.nickname, sizeof(s.localNickname));
     std::memcpy(s.p1Name, status.p1Name, sizeof(s.p1Name));
     std::memcpy(s.p2Name, status.p2Name, sizeof(s.p2Name));
-    if (s.localNickname[0] != '\0' || s.p1Name[0] != '\0' || s.p2Name[0] != '\0')
+    if (status.sessionNamesValid != 0 || s.localNickname[0] != '\0')
         caps |= EFZ_CAP_NICKNAMES;
 
     // Log when any nickname changes.

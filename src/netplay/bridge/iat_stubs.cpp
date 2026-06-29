@@ -221,8 +221,24 @@ static int  __cdecl DummyVtableRet4()   { return 0; }
 static int  __cdecl DummyVtableRet8()   { return 0; }
 #endif
 
-static uintptr_t g_revivalDummyVtable[9] = { 0 };
+static uintptr_t g_revivalLegacyDummyVtable[9] = { 0 };
+static uintptr_t g_revival102jDummyVtable[10] = { 0 };
+static uintptr_t g_revival102jCompactDummyVtable[10] = { 0 };
 static bool g_dummyVtableInitialized = false;
+
+// The session and its original vtable must survive vtable neutralization.
+// DestroyCurrentSession consumes this identity before choosing a deleting
+// destructor.  Pointer exchanges are atomic on both supported Win32 and
+// diagnostic x64 builds.
+static PVOID volatile g_neutralizedSession = nullptr;
+static PVOID volatile g_neutralizedOriginalVtable = nullptr;
+
+static bool IsActiveRevival102jForVtable()
+{
+    return g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
+}
 
 static void EnsureDummyVtable()
 {
@@ -235,17 +251,55 @@ static void EnsureDummyVtable()
     const uintptr_t ret4 = reinterpret_cast<uintptr_t>(DummyVtableRet4);
     const uintptr_t ret8 = reinterpret_cast<uintptr_t>(DummyVtableRet8);
 
-    g_revivalDummyVtable[0] = ret4; // [0] destructor
-    g_revivalDummyVtable[1] = ret;  // [1] init
-    g_revivalDummyVtable[2] = ret;  // [2] tick
-    g_revivalDummyVtable[3] = ret4; // [3] hotkey
-    g_revivalDummyVtable[4] = ret8; // [4] input
-    g_revivalDummyVtable[5] = ret4; // [5] net data
-    g_revivalDummyVtable[6] = ret8; // [6] character
-    g_revivalDummyVtable[7] = ret8; // [7] action
-    g_revivalDummyVtable[8] = ret4; // [8] action
+    g_revivalLegacyDummyVtable[0] = ret4; // [0] deleting destructor
+    g_revivalLegacyDummyVtable[1] = ret;  // [1] init
+    g_revivalLegacyDummyVtable[2] = ret;  // [2] tick
+    g_revivalLegacyDummyVtable[3] = ret4; // [3] hotkey
+    g_revivalLegacyDummyVtable[4] = ret8; // [4] input
+    g_revivalLegacyDummyVtable[5] = ret4; // [5] net data
+    g_revivalLegacyDummyVtable[6] = ret8; // [6] character
+    g_revivalLegacyDummyVtable[7] = ret8; // [7] action
+    g_revivalLegacyDummyVtable[8] = ret4; // [8] action
+
+    // MinGW 1.02j inserted separate full/deleting destructor slots.  Its
+    // post-init and tick methods take no stack arguments; the remaining
+    // logical methods are the legacy slots shifted by one.
+    g_revival102jDummyVtable[0] = ret;  // [0] full destructor
+    g_revival102jDummyVtable[1] = ret;  // [1] deleting destructor
+    g_revival102jDummyVtable[2] = ret;  // [2] post-init
+    g_revival102jDummyVtable[3] = ret;  // [3] tick
+    g_revival102jDummyVtable[4] = ret4; // [4] hotkey
+    g_revival102jDummyVtable[5] = ret8; // [5] input
+    g_revival102jDummyVtable[6] = ret4; // [6] net data
+    g_revival102jDummyVtable[7] = ret8; // [7] character
+    g_revival102jDummyVtable[8] = ret8; // [8] action
+    g_revival102jDummyVtable[9] = ret4; // [9] action
+
+    std::memcpy(
+        g_revival102jCompactDummyVtable,
+        g_revival102jDummyVtable,
+        sizeof(g_revival102jCompactDummyVtable));
+    // Compact routes slots 7 and 8 through one-argument stdcall thunks at
+    // RVAs 0x64610/0x64630; the other J roles use two-argument methods.
+    g_revival102jCompactDummyVtable[7] = ret4;
+    g_revival102jCompactDummyVtable[8] = ret4;
 
     g_dummyVtableInitialized = true;
+}
+
+static uintptr_t* ActiveDummyVtable(
+    uintptr_t originalVtable,
+    uintptr_t revivalBase)
+{
+    if (!IsActiveRevival102jForVtable())
+    {
+        return &g_revivalLegacyDummyVtable[0];
+    }
+    if (originalVtable == revivalBase + 0x0016FEB0u)
+    {
+        return &g_revival102jCompactDummyVtable[0];
+    }
+    return &g_revival102jDummyVtable[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +312,10 @@ void NeutralizeRevivalSessionVtable()
     EnsureDummyVtable();
 
     HMODULE revival = g_localRevivalModule;
+    if (revival == nullptr)
+    {
+        revival = GetModuleHandleA("EfzRevival.dll");
+    }
     if (revival == nullptr)
     {
         return;
@@ -276,10 +334,103 @@ void NeutralizeRevivalSessionVtable()
         return;
     }
 
-    // The first DWORD of the session object is the vtable pointer.
-    // A single aligned 4-byte write is atomic on x86.
+    // The first DWORD of the session object is the vtable pointer.  Preserve
+    // the original before replacing it; otherwise cleanup sees only the mod
+    // table and cannot select the real deleting destructor.
     auto* vtableSlot = reinterpret_cast<uintptr_t*>(sessionPtr);
-    *vtableSlot = reinterpret_cast<uintptr_t>(&g_revivalDummyVtable[0]);
+    const uintptr_t originalVtable = *vtableSlot;
+    const uintptr_t dummyVtable =
+        reinterpret_cast<uintptr_t>(ActiveDummyVtable(originalVtable, base));
+    if (originalVtable == dummyVtable
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jCompactDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revivalLegacyDummyVtable[0]))
+    {
+        return;
+    }
+
+    const uintptr_t pendingSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (pendingSession != 0 && pendingSession != sessionPtr)
+    {
+        mod::Log(
+            "NeutralizeRevivalSessionVtable: replacing unconsumed identity "
+            "oldSession=0x%08lX newSession=0x%08lX",
+            static_cast<unsigned long>(pendingSession),
+            static_cast<unsigned long>(sessionPtr));
+    }
+
+    InterlockedExchangePointer(
+        &g_neutralizedOriginalVtable,
+        reinterpret_cast<PVOID>(originalVtable));
+    MemoryBarrier();
+    InterlockedExchangePointer(
+        &g_neutralizedSession,
+        reinterpret_cast<PVOID>(sessionPtr));
+    *vtableSlot = dummyVtable;
+
+    mod::Log(
+        "NeutralizeRevivalSessionVtable: captured session=0x%08lX "
+        "originalVtable=0x%08lX dummyVtable=0x%08lX abi=%s",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable),
+        static_cast<unsigned long>(dummyVtable),
+        IsActiveRevival102jForVtable() ? "mingw10" : "msvc9");
+}
+
+bool RestoreNeutralizedSessionVtableForCleanup(
+    uintptr_t sessionPtr,
+    uintptr_t* outOriginalVtable)
+{
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = 0;
+    }
+    if (sessionPtr == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t capturedSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (capturedSession != sessionPtr)
+    {
+        return false;
+    }
+
+    const uintptr_t originalVtable = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(
+            &g_neutralizedOriginalVtable,
+            nullptr,
+            nullptr));
+    if (originalVtable == 0
+        || !IsWritableRange(reinterpret_cast<void*>(sessionPtr), sizeof(uintptr_t)))
+    {
+        mod::Log(
+            "RestoreNeutralizedSessionVtableForCleanup: invalid capture "
+            "session=0x%08lX originalVtable=0x%08lX",
+            static_cast<unsigned long>(sessionPtr),
+            static_cast<unsigned long>(originalVtable));
+        return false;
+    }
+
+    *reinterpret_cast<uintptr_t*>(sessionPtr) = originalVtable;
+    MemoryBarrier();
+    InterlockedExchangePointer(&g_neutralizedSession, nullptr);
+    InterlockedExchangePointer(&g_neutralizedOriginalVtable, nullptr);
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = originalVtable;
+    }
+    mod::Log(
+        "RestoreNeutralizedSessionVtableForCleanup: restored "
+        "session=0x%08lX originalVtable=0x%08lX",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,14 +450,19 @@ static ExitProcessFn g_realExitProcess = nullptr;
 
 bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
 {
-    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Quit");
+    const char* const quitWireName = RevivalWireName("Quit");
+    HANDLE hMap = OpenFileMappingA(
+        FILE_MAP_ALL_ACCESS,
+        FALSE,
+        quitWireName);
     if (hMap == nullptr)
     {
         mod::Log(
             "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
-            "OpenFileMappingA('Quit') failed err=%lu",
+            "OpenFileMappingA('%s') failed err=%lu",
             contextTag != nullptr ? contextTag : "",
             static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
             static_cast<unsigned long>(GetLastError()));
         return false;
     }
@@ -319,9 +475,10 @@ bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
         CloseHandle(hMap);
         mod::Log(
             "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
-            "MapViewOfFile('Quit') failed err=%lu",
+            "MapViewOfFile('%s') failed err=%lu",
             contextTag != nullptr ? contextTag : "",
             static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
             static_cast<unsigned long>(mapErr));
         return false;
     }
@@ -545,7 +702,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         mod::Log(
             "NeutralizeExitProcess: TOCTOU step 6 ForceGameModeToTitle=%d",
             modeOk ? 1 : 0);
-        (void)RestoreExeDispatchOriginalBytesForTitle("NeutralizeExitProcess_TOCTOU");
+        (void)RestoreExeDispatchHookForTitle("NeutralizeExitProcess_TOCTOU");
 
         // ExitProcess is __noreturn.  The DLL code after `call ExitProcess`
         // is a compiler-emitted unreachable marker (HLT / privileged insn).
@@ -616,7 +773,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         mod::Log(
             "NeutralizeExitProcess: tournament step 6 ForceGameModeToTitle=%d",
             modeOk ? 1 : 0);
-        (void)RestoreExeDispatchOriginalBytesForTitle("NeutralizeExitProcess_tournament");
+        (void)RestoreExeDispatchHookForTitle("NeutralizeExitProcess_tournament");
 
         // Reset tournament role so the title-screen code doesn't think
         // we're still in tournament mode.
@@ -1549,6 +1706,13 @@ BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuf
                     {
                         SetEvent(temp.initEvent);
                     }
+                    LogRevival102jDeepStep(
+                        "Helper.WriteProcessMemory.fallback_init_event_signaled");
+                    LogRevival102jDeepBytes(
+                        "Helper.WriteProcessMemory.fallback",
+                        "init.params",
+                        reinterpret_cast<uintptr_t>(vals),
+                        sizeof(vals));
                     mod::Log(
                         "nb_stub_WriteProcessMemory: fallback captured init params mode=%d magic=%d",
                         vals[0],
@@ -1614,6 +1778,13 @@ BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuf
             g_injectedBlock->initParams[1] = vals[1];
             InterlockedIncrement(&g_injectedBlock->initSerial);
             SetEvent(g_injectedInitEvent);
+            LogRevival102jDeepStep(
+                "Helper.WriteProcessMemory.init_event_signaled");
+            LogRevival102jDeepBytes(
+                "Helper.WriteProcessMemory",
+                "init.params",
+                reinterpret_cast<uintptr_t>(vals),
+                sizeof(vals));
             g_initCapturedFromWrite = true;
             mod::Log(
                 "nb_stub_WriteProcessMemory: captured init params via write mode=%d magic=%d",
@@ -1677,6 +1848,18 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
                 temp.block->initParams[1] = paramMagic;
                 InterlockedIncrement(&temp.block->initSerial);
                 SetEvent(temp.initEvent);
+                LogRevival102jDeepStep(
+                    "Helper.CreateRemoteThread.fallback_init_event_signaled");
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.mode",
+                    reinterpret_cast<uintptr_t>(&paramMode),
+                    sizeof(paramMode));
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.magic",
+                    reinterpret_cast<uintptr_t>(&paramMagic),
+                    sizeof(paramMagic));
                 mod::Log(
                     "nb_stub_CreateRemoteThread: fallback captured init params mode=%d magic=%d start=0x%p call=%ld",
                     paramMode,
@@ -1717,6 +1900,13 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
         g_injectedBlock->initParams[1] = params[1];
         InterlockedIncrement(&g_injectedBlock->initSerial);
         SetEvent(g_injectedInitEvent);
+        LogRevival102jDeepStep(
+            "Helper.CreateRemoteThread.init_event_signaled");
+        LogRevival102jDeepBytes(
+            "Helper.CreateRemoteThread",
+            "init.params",
+            reinterpret_cast<uintptr_t>(params),
+            sizeof(params));
         fakeExitCode = 1;
         mod::Log(
             "nb_stub_CreateRemoteThread: captured init params mode=%d magic=%d start=0x%p call=%ld",

@@ -861,11 +861,13 @@ void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error)
             netplay::bridge::PhaseToString(oldPhase),
             netplay::bridge::PhaseToString(phase),
             status->errorMsg[0] != '\0' ? status->errorMsg : "");
+        LogRevival102jDeepStep("Phase.takeover_transition", status);
     }
 }
 
 void CloseProcessHandle(NetbridgeStatus* status)
 {
+    ResetInjectedPeerQuitBroadcastState();
     if (g_revivalProcess != nullptr)
     {
         CloseHandle(g_revivalProcess);
@@ -1155,11 +1157,13 @@ bool EnsureHostIpc()
         (g_hostRevivalBase != 0 && g_activeRevival != nullptr)
             ? g_activeRevival->peTimestamp
             : 0;
+    LogRevival102jDeepStep("HostIpc.ensure_complete");
     return true;
 }
 
 void CloseHostIpc()
 {
+    LogRevival102jDeepStep("HostIpc.close_begin");
     if (g_hostBlock != nullptr)
     {
         UnmapViewOfFile(g_hostBlock);
@@ -1280,7 +1284,7 @@ void ReinitLocalPlay()
         g_localRoleFlag);
     SetRoleFlagDirect(kLocalRoleLocalPlay, "reinit_local_play");
     const bool titleDispatchOk =
-        RestoreExeDispatchOriginalBytesForTitle("ReinitLocalPlay");
+        RestoreExeDispatchHookForTitle("ReinitLocalPlay");
     if (titleDispatchOk)
     {
         mod::Log("Takeover: local re-init restored 1.02j title dispatch");
@@ -1674,12 +1678,14 @@ void InitializeInjected()
         (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
             ? g_activeRevival->versionTag
             : "unknown");
+    LogRevival102jDeepStep("HelperIpc.initialize_complete");
     InterlockedExchange(&g_injectedLazyBootstrapState, g_injectedReady ? 2 : 0);
 }
 
 void ShutdownInjected()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("HelperIpc.shutdown_begin");
     ClearFakeThreads();
     ClearRedirectAllocations();
 

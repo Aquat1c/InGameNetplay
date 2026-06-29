@@ -330,6 +330,12 @@ private:
     std::thread m_pollThread;
     std::thread m_publicIpThread;
     std::atomic<bool> m_publicIpDiscoveryStarted{false};
+
+    // Poll-thread-only transport health/log throttling.  Concerto retries
+    // transient status failures instead of wedging on the first missed GET.
+    int m_consecutivePollFailures = 0;
+    std::string m_lastLoggedStatusBody;
+    DWORD m_lastStatusResponseLogTick = 0;
 };
 
 } // namespace netplay::lobby

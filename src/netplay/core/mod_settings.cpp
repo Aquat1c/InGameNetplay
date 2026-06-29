@@ -163,6 +163,12 @@ void Reload()
         loaded.verboseSyncDiagnostics =
             ReadBoolValue(L"Others", L"EnableSyncDiagnostics", true, iniPath);
     }
+    loaded.verboseRevival102jLifecycleLogging =
+        ReadBoolValue(
+            L"Others",
+            L"VerboseRevival102jLifecycleLogging",
+            true,
+            iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
     loaded.asyncHostReturnKey =
@@ -218,6 +224,11 @@ bool IsVerboseBridgePatchLoggingEnabled()
 bool IsVerboseSyncDiagnosticsEnabled()
 {
     return g_settings.verboseSyncDiagnostics;
+}
+
+bool IsVerboseRevival102jLifecycleLoggingEnabled()
+{
+    return g_settings.verboseRevival102jLifecycleLogging;
 }
 
 bool HideEmptySetsInBattleLogByDefault()

@@ -1990,7 +1990,13 @@ static bool TryFetchIpFromUrl(const char* url, const char* label)
     // verifyPeer=false: the embedded mbedTLS build has no CA root store,
     // so certificate verification always fails.  This request only fetches
     // a plain-text public IP address - no sensitive data.
-    if (!netplay::tls::HttpGet(url, false, kTimeoutMs, &body, &error))
+    if (!netplay::tls::HttpGet(
+            url,
+            false,
+            kTimeoutMs,
+            kTimeoutMs,
+            &body,
+            &error))
     {
         mod::Log("HostingOverlay: %s fetch failed: %s", label, error.c_str());
         return false;

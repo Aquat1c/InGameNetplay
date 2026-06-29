@@ -160,6 +160,11 @@ void DetectRevivalVersion();
 void EnsureActiveRevivalProfile();
 bool ActiveRevivalProfileSupportsSessionStart();
 
+// Resolve a legacy Revival shared-memory channel name to the name used by
+// the active binary.  The MinGW 1.02j build suffixes every native wire with
+// "_Spec"; older MSVC builds use the unsuffixed names.
+const char* RevivalWireName(const char* legacyName);
+
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
 extern HANDLE g_revivalProcess;
@@ -208,6 +213,11 @@ extern DWORD g_lastRuntimeReadyProbeLogTick;
 extern uint32_t g_lastRuntimeReadyProbeMask;
 extern bool g_lastRuntimeReadyProbeMaskValid;
 extern bool g_localInitAppliedForSession;
+extern bool g_spectatorPostInitAttemptedForSession;
+extern bool g_spectatorPostInitSucceededForSession;
+extern volatile LONG g_deferredLifecycleWorkRequested;
+extern volatile LONG g_deferredTitleSelection;
+extern bool g_tournamentReturnCleanupPending;
 extern uintptr_t g_remoteInjectedSelfBase;
 extern DWORD g_lastLatePatchRetryTick;
 extern DWORD g_lastLatePatchRetryLogTick;
@@ -318,12 +328,15 @@ bool AreDllExitPatchesSaved();
 bool DestroyCurrentSession(const char* caller);
 bool ForceLocalPlayInit();
 bool InvokeSessionVtableInit(const char* caller);
+bool IsRevival102jSpectatorPostInitReady(const char* caller);
+bool InvokeRevival102jSpectatorPostInit(const char* caller);
 bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
 bool SetRevivalTextRenderingEnabled(bool enable, const char* reason);
 bool DisableRevivalTextRendering();
 bool ResetRevivalTextRenderingAfterCleanup(const char* reason);
+bool ShouldRepeatPostExitTextCleanup();
 bool RestoreRenderContextForGameplayExitCleanup();
 void MarkRenderContextConsumedForGameplayExitCleanup();
 bool ClearRevivalTextWithCurrentRenderContext();
@@ -348,6 +361,13 @@ bool InstallNetplayFrameHook();
 // Safe to call from the crash handler VEH where minimal code should run.
 bool ForceGameModeToTitle();
 
+// ExitProcess recovery temporarily replaces the live session vtable.  Keep
+// and restore the original identity before destructor selection so cleanup
+// can still invoke the correct version-specific deleting destructor.
+bool RestoreNeutralizedSessionVtableForCleanup(
+    uintptr_t sessionPtr,
+    uintptr_t* outOriginalVtable);
+
 // Save / restore the 10 bytes at EXE address 0x401582 before and after
 // every g_localInitFn() call.  Prevents Revival's init() from chaining
 // trampolines whose unrelocated E9 displacement causes wild-EIP crashes.
@@ -360,7 +380,7 @@ void RestoreExeFrameHookBytes();
 void SaveExeDispatchHookBytes();
 void RestoreExeDispatchHookBytes();
 void RestoreExeDispatchHookBytesAfterSessionInit(int initMode);
-bool RestoreExeDispatchOriginalBytesForTitle(const char* caller);
+bool RestoreExeDispatchHookForTitle(const char* caller);
 
 // Save / restore the 7 bytes at EXE addresses 0x763E50 and 0x763F04
 // before and after every g_localInitFn() call.  Prevents trampoline
@@ -396,6 +416,23 @@ void LogSessionDiagnosticState(const char* context);
 // gameModeSnapshot, matchId, sentinel, helperHandle, historyPtrs),
 // and our module's patch/flag state.
 void LogInitWriteSnapshot(const char* context);
+
+// 1.02j-only diagnostic layer. Every function is a no-op unless the active
+// profile is 1.02j and [Others] VerboseRevival102jLifecycleLogging is enabled.
+// Step logging is intentionally compact; Snapshot logging includes raw IPC,
+// wire, hook, global, vtable, and complete role-specific session-object dumps.
+bool IsRevival102jDeepDiagnosticsEnabled();
+void LogRevival102jDeepStep(
+    const char* context,
+    const NetbridgeStatus* status = nullptr);
+void LogRevival102jDeepSnapshot(
+    const char* context,
+    const NetbridgeStatus* status = nullptr);
+void LogRevival102jDeepBytes(
+    const char* context,
+    const char* label,
+    uintptr_t address,
+    size_t size);
 
 // Track ForceLocalPlayInit call count for diagnostic purposes.
 void IncrementForceLocalPlayInitCount();
@@ -434,11 +471,17 @@ void RequestDeferredCancelCleanup(const char* reason = nullptr);
 void ArmOnlineMatchEscGracefulQuit();
 bool ConsumeOnlineMatchEscGracefulQuit();
 void ResetOnlineMatchEscGracefulQuit();
+// A fresh ESC from character select is a real session exit, not the held
+// battle-return ESC. Do not let the short battle Quit-ring suppression window
+// consume the new menu-exit signal.
+void ConfirmCharacterSelectEscToMenu();
 
 // Ask the injected EfzRevival.exe helper to broadcast its native MessageQuit
 // packet to connected peers before the host tears the helper down locally.
 // This is used for the "press ESC but don't actually exit EFZ.exe" path.
 bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs);
+// Clear the successful-send coalescing state when a helper session closes.
+void ResetInjectedPeerQuitBroadcastState();
 
 // Helper-process entry point invoked inside EfzRevival.exe. Resolves the live
 // peer manager object and calls the native "send quit to every peer" routine.

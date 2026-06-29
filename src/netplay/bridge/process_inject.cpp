@@ -402,6 +402,26 @@ bool PatchIatModule(
                     static_cast<unsigned long>(oldAddress),
                     static_cast<unsigned long>(newAddress));
             }
+            if (oldAddress != newAddress && IsRevival102jDeepDiagnosticsEnabled())
+            {
+                mod::Log(
+                    "J102_DIAG_REMOTE_IAT: module='%s' import='%s' slot=0x%08lX "
+                    "old=0x%08lX [%02X %02X %02X %02X] "
+                    "new=0x%08lX [%02X %02X %02X %02X]",
+                    moduleName,
+                    importName,
+                    static_cast<unsigned long>(ftAddress),
+                    static_cast<unsigned long>(oldAddress),
+                    static_cast<unsigned>(oldAddress & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 8u) & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 16u) & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 24u) & 0xFFu),
+                    static_cast<unsigned long>(newAddress),
+                    static_cast<unsigned>(newAddress & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 8u) & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 16u) & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 24u) & 0xFFu));
+            }
         }
     }
 
@@ -550,6 +570,25 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
             "Takeover: PatchIat refused - no target modules found (first='%s')",
             modules.front().moduleLower.c_str());
         return false;
+    }
+
+    if (IsRevival102jDeepDiagnosticsEnabled())
+    {
+        mod::Log(
+            "J102_DIAG_REMOTE_IAT: process=0x%p pid=%lu modules=%zu targets=%zu patchMap=%zu",
+            static_cast<void*>(process),
+            static_cast<unsigned long>(processId),
+            modules.size(),
+            targets.size(),
+            patchMap.size());
+        for (const RemoteModuleRecord& module : modules)
+        {
+            mod::Log(
+                "J102_DIAG_REMOTE_MODULE: pid=%lu name='%s' base=0x%08lX",
+                static_cast<unsigned long>(processId),
+                module.moduleLower.c_str(),
+                static_cast<unsigned long>(module.base));
+        }
     }
 
     int totalPatched = 0;

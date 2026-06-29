@@ -777,7 +777,7 @@ void TryForceTitleFallback(const char* reason)
 
     const bool forceOk = takeover::ForceGameModeToTitle();
     const bool dispatchOk =
-        takeover::RestoreExeDispatchOriginalBytesForTitle(
+        takeover::RestoreExeDispatchHookForTitle(
             "FrontendReturn_force_title_fallback");
     mod::Log(
         "FRONTEND_RETURN_FORCED_FALLBACK_USED reason=%s",

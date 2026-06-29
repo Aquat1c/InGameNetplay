@@ -101,6 +101,40 @@ bool IsActiveRevival102jProfile()
 }
 } // namespace
 
+const char* RevivalWireName(const char* legacyName)
+{
+    if (legacyName == nullptr || !IsActiveRevival102jProfile())
+    {
+        return legacyName;
+    }
+
+    struct WireNamePair
+    {
+        const char* legacy;
+        const char* revival102j;
+    };
+    static const WireNamePair kWireNames[] = {
+        {"Init",      "Init_Spec"},
+        {"Net",       "Net_Spec"},
+        {"Sync",      "Sync_Spec"},
+        {"Quit",      "Quit_Spec"},
+        {"LoadMatch", "LoadMatch_Spec"},
+        {"InputP1",   "InputP1_Spec"},
+        {"InputP2",   "InputP2_Spec"},
+        {"PaletteP1", "PaletteP1_Spec"},
+        {"PaletteP2", "PaletteP2_Spec"},
+    };
+
+    for (const auto& candidate : kWireNames)
+    {
+        if (std::strcmp(legacyName, candidate.legacy) == 0)
+        {
+            return candidate.revival102j;
+        }
+    }
+    return legacyName;
+}
+
 HMODULE g_localRevivalModule = nullptr;
 RevivalInitFn g_localInitFn = nullptr;
 HANDLE g_revivalProcess = nullptr;
@@ -139,6 +173,11 @@ bool g_injectedLazyBound = false;
 volatile LONG g_injectedLazyBootstrapState = 0;
 volatile LONG g_remoteThreadCallIndex = 0;
 volatile LONG g_startAbortRequested = 0;
+// Successful explicit Quit sends are coalesced per helper process. Character
+// select and Quit-ring recovery can observe the same local exit on adjacent
+// frames; the remote peer must receive one native MessageQuit, not a burst.
+static volatile LONG g_peerQuitBroadcastHelperPid = 0;
+static volatile LONG g_peerQuitBroadcastState = 0; // 0=idle, 1=in flight, 2=sent
 HANDLE g_fakeProcessThreadHandle = nullptr;
 bool g_initCapturedFromWrite = false;
 DWORD g_lastConnectingDiagnosticTick = 0;
@@ -150,6 +189,10 @@ uint32_t g_lastRuntimeReadyProbeMask = 0;
 bool g_lastRuntimeReadyProbeMaskValid = false;
 DWORD g_lastSpectateConsoleSnapshotTick = 0;
 bool g_localInitAppliedForSession = false;
+bool g_spectatorPostInitAttemptedForSession = false;
+bool g_spectatorPostInitSucceededForSession = false;
+volatile LONG g_deferredLifecycleWorkRequested = 0;
+volatile LONG g_deferredTitleSelection = -1;
 uintptr_t g_remoteInjectedSelfBase = 0;
 DWORD g_lastLatePatchRetryTick = 0;
 DWORD g_lastLatePatchRetryLogTick = 0;
@@ -679,6 +722,12 @@ static bool VerifyRevival102jBinary(HMODULE module)
         0x2200u,
         static_cast<uint32_t>(loadedBase + kRevival_1_02j.frameHookRva)),
         "init frame hook target");
+    require(!ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        0x00401642u),
+        "init must not claim persistent 0x401642 hook");
 
     static const uint8_t kFrameHookPrefix[] = {
         0x55, 0x89, 0xE5, 0x57, 0x56, 0x53, 0x31, 0xDB,
@@ -713,6 +762,9 @@ static bool VerifyRevival102jBinary(HMODULE module)
     static const uint8_t kTournamentExitGuardPatched[] = {
         0x90, 0x90,
     };
+    static const uint8_t kSpectatorStoreHelperHandle[] = {
+        0x89, 0x43, 0x64,
+    };
     static const uint8_t kCompactDequeInitPrefix[] = {
         0xC7, 0x83, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0xC7, 0x83, 0x48, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -738,6 +790,12 @@ static bool VerifyRevival102jBinary(HMODULE module)
         0x0005F790u, 0x0005D720u, 0x0005E380u,
         0x0005E3E0u, 0x0005C400u, 0x0005C4E0u,
         0x0005DE40u,
+    };
+    static const uintptr_t kReplayVtableSlots[] = {
+        0x00075CF0u, 0x00075CD0u, 0x000744A0u,
+        0x00074920u, 0x00073190u, 0x00074090u,
+        0x000741E0u, 0x00072F80u, 0x00073060u,
+        0x00073F40u,
     };
     static const uintptr_t kPracticeVtableSlots[] = {
         0x00080650u, 0x00080630u, 0x0007DE40u,
@@ -797,7 +855,26 @@ static bool VerifyRevival102jBinary(HMODULE module)
     require(ModuleVtableSlotsMatch(module, 0x0016FEB0u, kCompactVtableSlots, sizeof(kCompactVtableSlots) / sizeof(kCompactVtableSlots[0])), "compact vtable slots");
     require(ModuleVtableSlotsMatch(module, 0x0016FEF0u, kRollbackVtableSlots, sizeof(kRollbackVtableSlots) / sizeof(kRollbackVtableSlots[0])), "rollback vtable slots");
     require(ModuleVtableSlotsMatch(module, 0x0016FF20u, kSpectatorVtableSlots, sizeof(kSpectatorVtableSlots) / sizeof(kSpectatorVtableSlots[0])), "spectator vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF50u, kReplayVtableSlots, sizeof(kReplayVtableSlots) / sizeof(kReplayVtableSlots[0])), "replay vtable slots");
     require(ModuleVtableSlotsMatch(module, 0x0016FF80u, kPracticeVtableSlots, sizeof(kPracticeVtableSlots) / sizeof(kPracticeVtableSlots[0])), "practice vtable slots");
+    require(ModuleBytesMatch(
+        module,
+        0x0005E7A0u,
+        kSpectatorStoreHelperHandle,
+        sizeof(kSpectatorStoreHelperHandle)),
+        "spectator post-init helper handle offset");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0005E640u,
+        0x1000u,
+        0x000002E0u),
+        "spectator post-init helper pid offset");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0005E640u,
+        0x1000u,
+        0x00000588u),
+        "spectator post-init netplay control offset");
     require(ModuleBytesMatch(module, 0x00047BA8u, kCompactDequeInitPrefix, sizeof(kCompactDequeInitPrefix)), "compact deque init bytes");
     require(ModuleDirectCallCountEquals(module, 0x000479B0u, 0xA00u, 0x00102A20u, 22), "compact deque push count");
     require(kRevival_1_02j.tournamentInputQueueOffset == 0x340u, "compact deque profile offset");
@@ -3072,12 +3149,79 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
         g_localRoleFlag,
         g_netplayRole);
 
-    return RequestInjectedPeerQuitBroadcastImpl(
+    if (helperPid != 0)
+    {
+        const LONG trackedPid = InterlockedCompareExchange(
+            &g_peerQuitBroadcastHelperPid, 0, 0);
+        if (trackedPid != static_cast<LONG>(helperPid))
+        {
+            InterlockedExchange(&g_peerQuitBroadcastState, 0);
+            InterlockedExchange(
+                &g_peerQuitBroadcastHelperPid,
+                static_cast<LONG>(helperPid));
+        }
+
+        LONG state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
+        if (state == 2)
+        {
+            if (helperProcess != nullptr)
+            {
+                CloseHandle(helperProcess);
+            }
+            mod::Log(
+                "Takeover: peer-quit broadcast coalesced reason='%s' helperPid=%lu state=already_sent",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(helperPid));
+            return true;
+        }
+
+        if (InterlockedCompareExchange(&g_peerQuitBroadcastState, 1, 0) != 0)
+        {
+            if (helperProcess != nullptr)
+            {
+                CloseHandle(helperProcess);
+            }
+
+            const DWORD waitStart = GetTickCount();
+            do
+            {
+                state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
+                if (state != 1)
+                {
+                    break;
+                }
+                Sleep(1u);
+            }
+            while (GetTickCount() - waitStart < waitMs);
+
+            const bool priorSucceeded =
+                InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0) == 2;
+            mod::Log(
+                "Takeover: peer-quit broadcast coalesced reason='%s' helperPid=%lu state=%s",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(helperPid),
+                priorSucceeded ? "prior_success" : "prior_incomplete");
+            return priorSucceeded;
+        }
+    }
+
+    const bool sent = RequestInjectedPeerQuitBroadcastImpl(
         helperProcess,
         remoteSelfBase,
         helperPid,
         reason,
         waitMs);
+    if (helperPid != 0)
+    {
+        InterlockedExchange(&g_peerQuitBroadcastState, sent ? 2 : 0);
+    }
+    return sent;
+}
+
+void ResetInjectedPeerQuitBroadcastState()
+{
+    InterlockedExchange(&g_peerQuitBroadcastState, 0);
+    InterlockedExchange(&g_peerQuitBroadcastHelperPid, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3155,6 +3299,7 @@ void InitializeHost()
 void ShutdownHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
     if (g_revivalProcess != nullptr)
     {
         TerminateProcess(g_revivalProcess, 0);
@@ -3165,6 +3310,10 @@ void ShutdownHost()
     CleanupNativeHostShadowLogDirectory("host_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
     g_injectedDelayPromptWaitStartTick = 0;
@@ -3180,11 +3329,13 @@ void ShutdownHost()
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
     mod::Log("Takeover: host shutdown");
+    LogRevival102jDeepStep("ShutdownHost.99.complete");
 }
 
 void EmergencyShutdownHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepSnapshot("EmergencyShutdownHost.01.entry");
     InterlockedExchange(&g_startAbortRequested, 1);
     if (g_revivalProcess != nullptr)
     {
@@ -3196,6 +3347,10 @@ void EmergencyShutdownHost()
     CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
     g_injectedDelayPromptWaitStartTick = 0;
@@ -3219,6 +3374,19 @@ void RequestAbortStart()
 void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("TitleSelection.01.entry", ioStatus);
+
+    if (IsInsideFrameTick())
+    {
+        InterlockedExchange(&g_deferredTitleSelection, selection);
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        mod::Log(
+            "Takeover: deferred title selection=%d until the active Revival "
+            "frame tick returns",
+            selection);
+        LogRevival102jDeepSnapshot("TitleSelection.02.deferred", ioStatus);
+        return;
+    }
 
     if (!EnsureLocalRevivalLoaded())
     {
@@ -3243,6 +3411,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     // kLocalRoleLocalPlay lets SetLocalRoleFlag call init(3,102) again.
     if (g_localRoleFlag == kLocalRoleTournament)
     {
+        LogRevival102jDeepSnapshot("TitleSelection.10.tournament_cleanup_pre", ioStatus);
         if (g_tournamentReturnCleanupPending)
         {
             mod::Log(
@@ -3264,6 +3433,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
             textOk ? 1 : 0);
         g_localRoleFlag = kLocalRoleLocalPlay;
         mod::Log("Takeover: tournament cleanup before selection=%d", selection);
+        LogRevival102jDeepSnapshot("TitleSelection.11.tournament_cleanup_post", ioStatus);
     }
 
     if (selection == 2)
@@ -3283,6 +3453,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
             // on the very next frame and would call ExitProcess immediately
             // (mode is still 0 = title screen).
             const bool renderSavedBefore = SaveRenderContext();
+            LogRevival102jDeepSnapshot("TitleSelection.20.tournament_init_pre", ioStatus);
             mod::Log(
                 "Takeover: tournament pre-init SaveRenderContext=%d",
                 renderSavedBefore ? 1 : 0);
@@ -3306,6 +3477,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
                     textEnableOk ? 1 : 0);
             }
             (void)NeutralizeTournamentAutoNav();
+            LogRevival102jDeepSnapshot("TitleSelection.21.tournament_init_post", ioStatus);
         }
         else
         {
@@ -3320,6 +3492,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
         (void)SetRoleFlagDirect(kLocalRoleLocalPlay, "title_other");
     }
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TitleSelection.99.complete", ioStatus);
 }
 
 bool StartSession(
@@ -3340,6 +3513,7 @@ bool StartSession(
         (address != nullptr) ? address : "",
         (nickname != nullptr) ? nickname : "",
         writeNicknameToIni ? 1 : 0);
+    LogRevival102jDeepStep("StartSession.01.entry", ioStatus);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
@@ -3348,21 +3522,39 @@ bool StartSession(
     netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
     if (g_tournamentReturnCleanupPending)
     {
+        LogRevival102jDeepSnapshot("StartSession.02.stale_tournament_pre", ioStatus);
         mod::Log(
             "StartSession: completing stale 1.02j tournament return cleanup before new session");
         g_tournamentReturnCleanupPending = false;
-        const bool initOk = ForceLocalPlayInit();
+        const bool canReplaceSessionNow = !IsInsideFrameTick();
+        const bool exePatchOk = RestoreTournamentExePatches();
+        const bool initOk = canReplaceSessionNow
+            ? ForceLocalPlayInit()
+            : true;
         const bool patchOk = RestoreDllExitProcessPatches();
         const bool clearOk = ClearRevivalText();
         const bool textOk = ResetRevivalTextRenderingAfterCleanup(
             "stale_102j_tournament_cleanup_before_session");
-        g_localRoleFlag = kLocalRoleLocalPlay;
+        if (canReplaceSessionNow)
+        {
+            g_localRoleFlag = kLocalRoleLocalPlay;
+        }
+        else
+        {
+            mod::Log(
+                "StartSession: stale tournament object left alive for the "
+                "post-tick netplay init handshake to replace safely");
+        }
         mod::Log(
-            "StartSession: stale 1.02j tournament cleanup init=%d patch=%d clear=%d text=%d",
+            "StartSession: stale 1.02j tournament cleanup init=%d "
+            "replaceNow=%d exePatch=%d dllPatch=%d clear=%d text=%d",
             initOk ? 1 : 0,
+            canReplaceSessionNow ? 1 : 0,
+            exePatchOk ? 1 : 0,
             patchOk ? 1 : 0,
             clearOk ? 1 : 0,
             textOk ? 1 : 0);
+        LogRevival102jDeepSnapshot("StartSession.03.stale_tournament_post", ioStatus);
     }
 
     // --- Session boundary cleanup logging ---
@@ -3433,6 +3625,7 @@ bool StartSession(
         g_hostBlock->delayMaxPingMs = -1;
         g_hostBlock->delayRecommended = -1;
         g_hostBlock->delayRangeMax = 20;
+        LogRevival102jDeepStep("StartSession.05.shared_block_reset", ioStatus);
     }
 
     if (!EnsureLocalRevivalLoaded())
@@ -3469,6 +3662,8 @@ bool StartSession(
         return false;
     }
 
+    LogRevival102jDeepSnapshot("StartSession.06.profile_and_ipc_ready", ioStatus);
+
     // Save the EfzRender* pointer now so that ClearRevivalText /
     // DisableRevivalTextRendering can restore it during CancelSession.
     // Tournament mode already does this in OnTitleSelectionConfirmed,
@@ -3492,6 +3687,7 @@ bool StartSession(
         CopyString(ioStatus->nickname, sizeof(ioStatus->nickname), nickname);
     }
     SetPhase(ioStatus, NetbridgePhase::Connecting, nullptr);
+    LogRevival102jDeepStep("StartSession.07.phase_connecting", ioStatus);
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
     g_lastValidatedSessionPtr = 0;
@@ -3645,6 +3841,7 @@ bool StartSession(
 
         mod::Log("Takeover [Wine]: spawned EfzRevival suspended pid=%lu (DLL override active)",
                  static_cast<unsigned long>(pi.dwProcessId));
+        LogRevival102jDeepStep("StartSession.10.helper_spawned_suspended_wine", ioStatus);
     }
     else
     {
@@ -3670,6 +3867,7 @@ bool StartSession(
         }
 
         mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
+        LogRevival102jDeepStep("StartSession.10.helper_spawned_suspended", ioStatus);
     }
 
     // Assign to kill-on-close job so that if the host process terminates
@@ -3708,6 +3906,7 @@ bool StartSession(
         CloseHandle(pi.hProcess);
         return false;
     }
+    LogRevival102jDeepStep("StartSession.11.helper_injected", ioStatus);
 
     std::unordered_map<std::string, uint32_t> patches = BuildPatchMap(remoteBase);
 
@@ -3719,6 +3918,7 @@ bool StartSession(
         CloseHandle(pi.hProcess);
         return false;
     }
+    LogRevival102jDeepStep("StartSession.12.helper_iat_patched", ioStatus);
 
     int localRoleMode = kLocalRoleOnline;
     if (role == NetbridgeRole::Spectate || role == NetbridgeRole::JoinSpectate)
@@ -3730,6 +3930,8 @@ bool StartSession(
     g_hostBlock->initParams[1] = 102;
     ResetDebugCounters(g_hostBlock);
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
     g_sessionHistoryRepairHits = 0;
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
@@ -3758,6 +3960,7 @@ bool StartSession(
     }
     CloseMirrorLogFiles();
     InterlockedIncrement(&g_hostBlock->initSerial);
+    LogRevival102jDeepSnapshot("StartSession.13.ipc_payload_initialized", ioStatus);
 
     std::string primaryInput;
     std::string auxInput;
@@ -3902,6 +4105,7 @@ bool StartSession(
 
     ResetEvent(g_hostInitEvent);
     ResetEvent(g_hostConsoleEvent);
+    LogRevival102jDeepStep("StartSession.14.auto_reset_events_cleared", ioStatus);
 
     // --- Pre-launch ring buffer flush (spectate only) ----------------------
     // Revival's named shared-memory ring buffers ("InputP1", "InputP2", etc.)
@@ -3936,15 +4140,15 @@ bool StartSession(
             volatile DWORD* view;
         };
         RingMapping mappings[] = {
-            {"InputP1",   nullptr, nullptr},
-            {"InputP2",   nullptr, nullptr},
-            {"PaletteP1", nullptr, nullptr},
-            {"PaletteP2", nullptr, nullptr},
-            {"Sync",      nullptr, nullptr},
-            {"Quit",      nullptr, nullptr},
-            {"LoadMatch", nullptr, nullptr},
-            {"Init",      nullptr, nullptr},
-            {"Net",       nullptr, nullptr},
+            {RevivalWireName("InputP1"),   nullptr, nullptr},
+            {RevivalWireName("InputP2"),   nullptr, nullptr},
+            {RevivalWireName("PaletteP1"), nullptr, nullptr},
+            {RevivalWireName("PaletteP2"), nullptr, nullptr},
+            {RevivalWireName("Sync"),      nullptr, nullptr},
+            {RevivalWireName("Quit"),      nullptr, nullptr},
+            {RevivalWireName("LoadMatch"), nullptr, nullptr},
+            {RevivalWireName("Init"),      nullptr, nullptr},
+            {RevivalWireName("Net"),       nullptr, nullptr},
         };
         constexpr int kMappingCount = 9;
 
@@ -3987,6 +4191,7 @@ bool StartSession(
                 CloseHandle(mappings[mi].hMap);
         }
     }
+    LogRevival102jDeepSnapshot("StartSession.15.prelaunch_rings_flushed", ioStatus);
 
     // Both Wine and native: the process was created suspended, resume it
     // now that injection and IAT patching are complete.
@@ -3996,6 +4201,7 @@ bool StartSession(
                  static_cast<unsigned long>(resumeResult),
                  useWinePath ? " [Wine]" : "");
     }
+    LogRevival102jDeepStep("StartSession.16.helper_resumed", ioStatus);
 
     g_revivalProcess = pi.hProcess;
     g_revivalProcessId = pi.dwProcessId;
@@ -4023,6 +4229,7 @@ bool StartSession(
         static_cast<long>(auxSerialForSession));
     SetPhase(ioStatus, NetbridgePhase::Connecting, "awaiting handshake");
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("StartSession.99.armed", ioStatus);
     mod::Log("Takeover: start session armed (asynchronous handshake via Tick)");
     return true;
 }
@@ -4030,6 +4237,7 @@ bool StartSession(
 bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("ApplyInputDelay.01.entry", ioStatus);
 
     // Input delay is only applicable to online sessions (mode 0).
     // Spectator sessions have a different layout and the delay offset
@@ -4086,6 +4294,7 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
 
     if (promptPending && queuePromptInput(delayFrames))
     {
+        LogRevival102jDeepSnapshot("ApplyInputDelay.02.prompt_value_queued", ioStatus);
         return true;
     }
 
@@ -4132,12 +4341,14 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
     {
         ioStatus->rollbackFrames = delayFrames;
     }
+    LogRevival102jDeepSnapshot("ApplyInputDelay.99.direct_write_complete", ioStatus);
     return true;
 }
 
 bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("SpectatePrompt.01.answer_entry", ioStatus);
 
     LONG promptSerial = 0;
     LONG promptServedSerial = 0;
@@ -4191,12 +4402,14 @@ bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
         static_cast<long>(promptSerial),
         static_cast<long>(inputSerial));
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("SpectatePrompt.99.answer_queued", ioStatus);
     return true;
 }
 
 bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("Handoff.01.prepare_entry", ioStatus);
 
     if (!EnsureLocalRevivalLoaded())
     {
@@ -4275,8 +4488,14 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
             flag4964,
             flag4965,
             roleFlag);
+        LogRevival102jDeepStep("Handoff.02.readiness_changed_or_periodic", ioStatus);
     }
-    return syncReady || (roleSet && !strictNativeSync);
+    const bool ready = syncReady || (roleSet && !strictNativeSync);
+    if (ready)
+    {
+        LogRevival102jDeepSnapshot("Handoff.99.ready", ioStatus);
+    }
+    return ready;
 }
 
 void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
@@ -4298,12 +4517,37 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
     if (!ProcessAlive(ioStatus))
     {
+        LogRevival102jDeepSnapshot("Tick.10.helper_not_alive_pre_recovery", ioStatus);
         RefreshRuntimeStatus(ioStatus);
         const bool runtimeReady = HasRuntimeReadySignal(ioStatus);
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         {
             if (g_localInitAppliedForSession)
             {
+                const bool spectatorStarting =
+                    g_localRoleFlag == kLocalRoleSpectate
+                    || (g_hostBlock != nullptr
+                        && g_hostBlock->initParams[0] == kLocalRoleSpectate);
+                if (spectatorStarting)
+                {
+                    SetPhase(
+                        ioStatus,
+                        NetbridgePhase::Failed,
+                        "EfzRevival spectator process ended during initialization");
+                    g_localInitAppliedForSession = false;
+                    const bool localInitOk = ForceLocalPlayInit();
+                    mod::Log(
+                        "Takeover: spectator helper exited before handoff; "
+                        "local recovery result=%d postInitAttempted=%d postInitOk=%d",
+                        localInitOk ? 1 : 0,
+                        g_spectatorPostInitAttemptedForSession ? 1 : 0,
+                        g_spectatorPostInitSucceededForSession ? 1 : 0);
+                    LogRevival102jDeepSnapshot(
+                        "Tick.11.spectator_helper_exit_recovered",
+                        ioStatus);
+                    return;
+                }
+
                 if (runtimeReady)
                 {
                     SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
@@ -4343,6 +4587,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 mod::Log("Takeover: helper process exited during Connected phase - forcing SessionEnded (runtime was still ready)");
             }
         }
+        LogRevival102jDeepSnapshot("Tick.12.helper_exit_branch_complete", ioStatus);
         return;
     }
 
@@ -4360,6 +4605,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(cpHits),
                 static_cast<long>(wpmHits),
                 static_cast<long>(crtHits));
+            LogRevival102jDeepStep("Tick.20.takeover_create_path_observed", ioStatus);
         }
 
         if (!g_observedTakeoverCreatePath
@@ -4456,6 +4702,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(cpHits),
                 static_cast<long>(wpmHits),
                 static_cast<long>(crtHits));
+            LogRevival102jDeepStep("Tick.21.connecting_periodic", ioStatus);
         }
 
         const bool spectateRoleActive =
@@ -4469,15 +4716,45 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         }
     }
 
-    if ((phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
+    const bool initHandshakeEligible =
+        (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         && !g_localInitAppliedForSession
         && g_hostInitEvent != nullptr
         && g_hostBlock != nullptr
-        && g_localInitFn != nullptr)
+        && g_localInitFn != nullptr;
+
+    if (initHandshakeEligible
+        && IsInsideFrameTick()
+        && WaitForSingleObject(g_hostInitEvent, 0) == WAIT_OBJECT_0)
+    {
+        // g_hostInitEvent is an auto-reset event.  The zero-timeout wait above
+        // consumes its one signal, so put the signal back for the post-tick
+        // takeover::Tick() call that is allowed to run the destructor/init.
+        // Without this, every session remains stuck in Connecting because the
+        // deferred call can no longer observe the helper's init handshake.
+        if (!SetEvent(g_hostInitEvent))
+        {
+            mod::Log(
+                "Takeover: failed to preserve deferred init handshake event: %s",
+                ErrorString(GetLastError()).c_str());
+        }
+        LogRevival102jDeepStep("Tick.30.init_event_detected_and_rearmed", ioStatus);
+        const LONG wasPending =
+            InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        if (wasPending == 0)
+        {
+            mod::Log(
+                "Takeover: init handshake ready inside active Revival tick; "
+                "deferring destructor/init until post-tick");
+        }
+    }
+
+    if (initHandshakeEligible && !IsInsideFrameTick())
     {
         const DWORD initReady = WaitForSingleObject(g_hostInitEvent, 0);
         if (initReady == WAIT_OBJECT_0)
         {
+            LogRevival102jDeepSnapshot("Tick.31.init_event_post_tick_consumed", ioStatus);
             // --- Diagnostic dump before init handshake (2nd-session crash investigation) ---
             LogSessionDiagnosticState("Tick_init_handshake_pre");
 
@@ -4496,10 +4773,15 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // --- Full init write snapshot BEFORE ---
             LogInitWriteSnapshot("Tick_init_pre");
 
-            // Destroy the current session to prevent leaking the old object.
-            // This is the root cause fix for the 2nd-session crash (H1).
+            // 1.02j installs 0x401642 only once, outside exported init().
+            // Capture it before invoking the verified session destructor.
             const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+            if (IsActiveRevival102jProfile())
+            {
+                SaveExeDispatchHookBytes();
+            }
             DestroyCurrentSession("Tick_init_handshake");
+            LogRevival102jDeepStep("Tick.32.old_session_destroyed", ioStatus);
 
             // Prevent init() from chaining another trampoline at 0x401582.
             mod::Log(
@@ -4508,15 +4790,17 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[0],
                 static_cast<unsigned long>(oldSessionPtr));
             SaveExeFrameHookBytes();
-            // Save the 8 bytes at 0x401642 (per-frame dispatch replacement
-            // hook) so init()'s EFZ_BufferProcess_WithSize doesn't leak a
-            // new malloc'd trampoline on every session.
-            SaveExeDispatchHookBytes();
+            if (!IsActiveRevival102jProfile())
+            {
+                // Legacy builds may replace this hook from exported init().
+                SaveExeDispatchHookBytes();
+            }
             // Restore original (pre-hook) bytes at mode-ctor hook sites
             // BEFORE init() so the new trampoline copies clean EXE bytes
             // instead of stale hooks from a previous session's mode.
             RestoreModeCtorOriginalBytes();
             ResetModeConstructorTrampolineCache();
+            LogRevival102jDeepSnapshot("Tick.33.exported_init_pre", ioStatus);
 
             // Dump the 10 bytes at 0x401582 right before init().
             {
@@ -4533,6 +4817,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                      initParams[0], initParams[1]);
             CloseMirrorLogFiles();
             const int initResult = g_localInitFn(initParams);
+            LogRevival102jDeepSnapshot("Tick.34.exported_init_returned_unrestored", ioStatus);
 
             // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
             {
@@ -4563,13 +4848,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     verify[5], verify[6], verify[7], verify[8], verify[9]);
             }
 
-            // Restore saved 0x401642 bytes to undo init()'s new trampoline.
-            // For 1.02j, an online init can start from the clean EFZ bytes
-            // after exit recovery; in that case keep init()'s fresh hook.
+            // Restore the saved 0x401642 state. On 1.02j this must remain the
+            // one-time persistent dispatcher because init() never recreates it.
             RestoreExeDispatchHookBytesAfterSessionInit(initParams[0]);
 
             // Fix up relative instructions in mode-constructor trampolines.
             FixupModeConstructorTrampolines("Tick_init_handshake");
+            LogRevival102jDeepSnapshot("Tick.35.hooks_restored_and_fixed", ioStatus);
 
             // --- Dump bytes at 0x401642 (double-speed investigation) --------
             // After init(), check that the REPLACEMENT hook at 0x401642 is
@@ -4598,6 +4883,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // --- Full init write snapshot AFTER init() ---
             LogInitWriteSnapshot("Tick_init_post");
+            LogRevival102jDeepSnapshot("Tick.36.local_init_applied", ioStatus);
 
             mod::Log(
                 "Takeover: local init(mode=%d magic=%d) result=%d [deferred] oldSession=0x%08lX newSession=0x%08lX",
@@ -4687,6 +4973,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // --- Snapshot after StartInitPlayer (writes session fields) ---
             LogInitWriteSnapshot("Tick_startInitPlayer_post");
+            LogRevival102jDeepSnapshot("Tick.37.start_init_player_returned", ioStatus);
 
             if (initParams[0] == kLocalRoleOnline && IsActiveRevival102jProfile())
             {
@@ -4701,23 +4988,23 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
 
-            // For legacy spectator mode, init(1,102) creates the object
-            // before the frame hook runs the full post-init vtable path, so
-            // we force that path immediately.  1.02j is explicitly excluded:
-            // MinGW changed this vtable layout and slot 1 is a deleting
-            // destructor/free thunk for the spectator object.
+            // init(1,102) only constructs the spectator object. Legacy builds
+            // use vtable[1] for the required match init; 1.02j moved it to
+            // verified vtable[2] (RVA 0x5E640), while vtable[1] became its
+            // MinGW deleting destructor.
             if (initParams[0] == kLocalRoleSpectate)
             {
                 if (IsActiveRevival102jProfile())
                 {
                     mod::Log(
-                        "Takeover: spectator vtable init skipped for 1.02j "
-                        "(manual vtable[1] corrupts MinGW spectator object)");
-                    LogInitWriteSnapshot("Tick_spectateVtable1_skipped_102j");
+                        "Takeover: 1.02j spectator object constructed; "
+                        "waiting for native PID/wire readiness before vtable[2]");
                 }
                 else
                 {
                     const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
+                    g_spectatorPostInitAttemptedForSession = true;
+                    g_spectatorPostInitSucceededForSession = vtableInitOk;
                     mod::Log(
                         "Takeover: spectator vtable init result=%d [deferred]",
                         vtableInitOk ? 1 : 0);
@@ -4737,6 +5024,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 "for mode=%d (to be reversed by RestoreDllExitProcessPatches on exit)",
                 initParams[0]);
             (void)SaveAndApplyDllExitProcessPatches();
+            LogRevival102jDeepSnapshot("Tick.38.exit_guards_applied", ioStatus);
             mod::Log(
                 "Takeover: init snapshot complete for mode=%d",
                 initParams[0]);
@@ -4767,12 +5055,54 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             LogInitWriteSnapshot("Tick_initSequence_complete");
             MarkRevivalSyncDiagnosticsSessionStart("Tick_initSequence_complete");
             LogSessionDiagnosticState("Tick_init_handshake_post");
+            LogRevival102jDeepSnapshot("Tick.39.init_sequence_complete", ioStatus);
         }
     }
 
     if (g_localInitAppliedForSession)
     {
         RepairRollbackHistoryBindingsIfNeeded();
+    }
+
+    // 1.02j spectator post-init opens the peer process from the PID copied
+    // through Init_Spec.  The injected init event is emitted earlier, when
+    // the helper merely attempts the remote init call, so invoking vtable[2]
+    // in that event handler can race the native wire/PID publication.  Wait
+    // until those prerequisites are observable, invoke exactly once, and do
+    // not allow phase promotion unless all postconditions validate.
+    if (g_localInitAppliedForSession
+        && g_localRoleFlag == kLocalRoleSpectate
+        && IsActiveRevival102jProfile()
+        && !g_spectatorPostInitAttemptedForSession
+        && IsRevival102jSpectatorPostInitReady("Tick_spectate_ready"))
+    {
+        LogRevival102jDeepSnapshot("Tick.50.spectator_post_init_ready", ioStatus);
+        g_spectatorPostInitAttemptedForSession = true;
+        g_spectatorPostInitSucceededForSession =
+            InvokeRevival102jSpectatorPostInit("Tick_spectate");
+        mod::Log(
+            "Takeover: 1.02j spectator vtable[2] one-shot result=%d",
+            g_spectatorPostInitSucceededForSession ? 1 : 0);
+        LogInitWriteSnapshot(
+            g_spectatorPostInitSucceededForSession
+                ? "Tick_spectateVtable2_post_102j"
+                : "Tick_spectateVtable2_failed_102j");
+        LogRevival102jDeepSnapshot("Tick.51.spectator_post_init_returned", ioStatus);
+
+        if (!g_spectatorPostInitSucceededForSession)
+        {
+            SetPhase(
+                ioStatus,
+                NetbridgePhase::Failed,
+                "EfzRevival spectator initialization failed");
+            g_localInitAppliedForSession = false;
+            const bool localInitOk = ForceLocalPlayInit();
+            mod::Log(
+                "Takeover: spectator post-init failure local recovery result=%d",
+                localInitOk ? 1 : 0);
+            LogRevival102jDeepSnapshot("Tick.52.spectator_post_init_recovered", ioStatus);
+            return;
+        }
     }
 
     if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
@@ -4809,6 +5139,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 ioStatus->consoleErrorText,
                 static_cast<int>(phase));
             SetPhase(ioStatus, NetbridgePhase::Failed, ioStatus->consoleErrorText);
+            LogRevival102jDeepSnapshot("Tick.60.console_error_connecting", ioStatus);
             ReinitLocalPlay();
             return;
         }
@@ -4826,6 +5157,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 ioStatus->consoleErrorSerial,
                 ioStatus->consoleErrorText);
             SetPhase(ioStatus, NetbridgePhase::SessionEnded, ioStatus->consoleErrorText);
+            LogRevival102jDeepSnapshot("Tick.61.console_error_connected", ioStatus);
             return;
         }
     }
@@ -4855,6 +5187,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 runtimeProbe.helperHandleMatches ? 1 : 0,
                 runtimeProbe.nativeSyncReady ? 1 : 0,
                 ioStatus->roleFlag);
+            LogRevival102jDeepStep("Tick.70.runtime_probe_changed_or_periodic", ioStatus);
         }
     }
 
@@ -4872,6 +5205,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 ioStatus->delayPromptServedSerial,
                 ioStatus->pingMs,
                 ioStatus->rollbackFrames);
+            LogRevival102jDeepSnapshot("Tick.71.promoted_delay_setup", ioStatus);
         }
     }
 
@@ -4892,6 +5226,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             ioStatus->syncSessionByte,
             ioStatus->pingMs,
             ioStatus->rollbackFrames);
+        LogRevival102jDeepSnapshot("Tick.72.promoted_connected", ioStatus);
     }
 
     // Spectator sessions don't go through the rollback sync handshake, so
@@ -4902,6 +5237,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     if ((currentPhase == NetbridgePhase::Connecting || currentPhase == NetbridgePhase::DelaySetup)
         && g_localInitAppliedForSession
         && g_localRoleFlag == kLocalRoleSpectate
+        && g_spectatorPostInitSucceededForSession
         && AreDllExitPatchesSaved())
     {
         SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
@@ -4910,7 +5246,9 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             *ioConnectStartTick = GetTickCount();
         }
         mod::Log(
-            "Takeover: spectator promoted to connected (init applied, exit patches saved)");
+            "Takeover: spectator promoted to connected "
+            "(post-init/liveness validated, exit patches saved)");
+        LogRevival102jDeepSnapshot("Tick.73.spectator_promoted_connected", ioStatus);
     }
 }
 
@@ -4920,6 +5258,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    LogRevival102jDeepSnapshot("CancelSession.01.entry", ioStatus);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_entry");
     mod::Log(
@@ -5033,6 +5372,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     }
 
     const bool hadProcess = ProcessAlive(ioStatus);
+    LogRevival102jDeepStep("CancelSession.10.helper_teardown_begin", ioStatus);
     if (!suppressSharedRecoveryTeardown && hadProcess && g_revivalProcess != nullptr)
     {
         TerminateProcess(g_revivalProcess, 0);
@@ -5047,6 +5387,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         RestoreDllExitProcessPatches();
         ReinitLocalPlay();
     }
+    LogRevival102jDeepSnapshot("CancelSession.11.helper_teardown_complete", ioStatus);
 
     // ---- Additional cleanup (Issues 1, 4, 5 in CONNECTION_INTERRUPTION doc) ----
     // During normal operation (not process shutdown), reinitialise the DLL
@@ -5081,9 +5422,11 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
                 "Takeover: cancel cleanup - DEFERRED (inside frame tick, "
                 "ForceLocalPlayInit would destroy active session)");
             RequestDeferredCancelCleanup(reason);
+            LogRevival102jDeepSnapshot("CancelSession.20.local_reinit_deferred", ioStatus);
         }
         else
         {
+            LogRevival102jDeepSnapshot("CancelSession.21.local_reinit_pre", ioStatus);
             const bool initOk = ForceLocalPlayInit();
             mod::Log(
                 "Takeover: cancel cleanup - ForceLocalPlayInit result=%d",
@@ -5105,6 +5448,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
             ResetGameModeValidation();
             mod::Log("Takeover: cancel cleanup - game mode validation reset");
+            LogRevival102jDeepSnapshot("CancelSession.22.local_reinit_post", ioStatus);
         }
     }
     else
@@ -5141,6 +5485,10 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     ClearRedirectAllocations();
 
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
@@ -5176,6 +5524,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
         g_hostBlock->consoleErrorText[0] = '\0';
     }
+    LogRevival102jDeepStep("CancelSession.30.per_session_state_cleared", ioStatus);
     ResetNativeWorkflowFlags();
     g_lastConnectingDiagnosticTick = 0;
     g_lastSpectateConsoleSnapshotTick = 0;
@@ -5224,6 +5573,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     // --- Diagnostic dump after teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_exit");
+    LogRevival102jDeepSnapshot("CancelSession.99.exit", ioStatus);
 }
 
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus)
@@ -5255,6 +5605,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     }
 
     LogSessionDiagnosticState("ConsumeExitInterception_entry");
+    LogRevival102jDeepSnapshot("ExitInterception.01.entry", ioStatus);
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -5290,6 +5641,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
         "(step 1: cancel session / terminate peer / restore DLL patches)",
         mode);
     CancelSessionUnlocked("exit_intercepted", ioStatus);
+    LogRevival102jDeepSnapshot("ExitInterception.10.cancel_complete", ioStatus);
 
     // step 2: revert EXE patches applied by the session constructor.
     // Tournament: 4 inline EXE hooks (0x763F04, 0x763E50, 0x754C1A, 0x7599ED).
@@ -5299,6 +5651,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     {
         mod::Log("Takeover: exit interception step 2 - RestoreTournamentExePatches");
         RestoreTournamentExePatches();
+        LogRevival102jDeepSnapshot("ExitInterception.20.tournament_patches_restored", ioStatus);
     }
     else
     {
@@ -5332,6 +5685,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     {
         mod::Log("Takeover: exit interception step 3 - ForceLocalPlayInit (defence-in-depth)");
         ForceLocalPlayInit();
+        LogRevival102jDeepSnapshot("ExitInterception.30.defensive_local_init_complete", ioStatus);
     }
 
     // step 4: clear any DLL-side text overlay state left by the session.
@@ -5350,6 +5704,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
 
     mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
     LogSessionDiagnosticState("ConsumeExitInterception_exit");
+    LogRevival102jDeepSnapshot("ExitInterception.99.complete", ioStatus);
     return true;
 }
 
@@ -5400,6 +5755,7 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
     }
 
     mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
+    LogRevival102jDeepSnapshot("TournamentReturn.01.title_observed", ioStatus);
 
     if (IsActiveRevival102jProfile())
     {
@@ -5411,15 +5767,15 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
         }
 
         // 1.02j's MinGW practice/local session requires a post-init vtable[2]
-        // call before its shared input writer can run.  Arm the re-init for
-        // the next title-hook turn and leave the DLL ExitProcess guard patched
-        // until the new local session is fully initialized.
-        RestoreTournamentExePatches();
+        // call before its shared input writer can run.  Only arm the cleanup
+        // here: this callback still runs inside Compact's virtual tick, so
+        // patch restoration and object replacement both belong post-tick.
         g_tournamentReturnCleanupPending = true;
         mod::Log(
             "Takeover: 1.02j tournament return cleanup stage 1 complete "
-            "(EXE patches restored, local init deferred)");
+            "(all destructive work deferred post-tick)");
         RefreshRuntimeStatus(ioStatus);
+        LogRevival102jDeepSnapshot("TournamentReturn.02.stage1_armed", ioStatus);
         return true;
     }
 
@@ -5443,13 +5799,31 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
         return false;
     }
 
+    if (IsInsideFrameTick())
+    {
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        mod::Log(
+            "Takeover: 1.02j tournament return cleanup remains deferred "
+            "until the active Compact tick returns");
+        LogRevival102jDeepSnapshot("TournamentReturn.10.stage2_still_deferred", ioStatus);
+        return false;
+    }
+
     g_tournamentReturnCleanupPending = false;
     mod::Log("Takeover: 1.02j tournament return cleanup stage 2 begin");
+    LogRevival102jDeepSnapshot("TournamentReturn.11.stage2_pre", ioStatus);
+
+    const bool exePatchOk = RestoreTournamentExePatches();
+    mod::Log(
+        "Takeover: 1.02j tournament return cleanup stage 2 "
+        "RestoreTournamentExePatches=%d",
+        exePatchOk ? 1 : 0);
 
     const bool initOk = ForceLocalPlayInit();
     mod::Log(
         "Takeover: 1.02j tournament return cleanup stage 2 ForceLocalPlayInit=%d",
         initOk ? 1 : 0);
+    LogRevival102jDeepSnapshot("TournamentReturn.12.local_init_complete", ioStatus);
 
     const bool dllPatchOk = RestoreDllExitProcessPatches();
     mod::Log(
@@ -5466,6 +5840,7 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
 
     g_localRoleFlag = kLocalRoleLocalPlay;
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TournamentReturn.99.stage2_complete", ioStatus);
     return true;
 }
 

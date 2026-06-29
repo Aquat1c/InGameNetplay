@@ -1,8 +1,13 @@
 #include "netplay/core/tls_http_client.h"
 
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +25,177 @@ namespace netplay::tls
 {
 namespace
 {
+#if defined(EFZ_EMBEDDED_TLS)
+int ConnectTcpWithTimeout(
+    mbedtls_net_context* context,
+    const char* host,
+    const char* port,
+    uint32_t timeoutMs,
+    std::string* outError)
+{
+    if (context == nullptr || host == nullptr || port == nullptr)
+    {
+        return MBEDTLS_ERR_NET_BAD_INPUT_DATA;
+    }
+
+    WSADATA wsaData = {};
+    if (WSAStartup(MAKEWORD(2, 0), &wsaData) != 0)
+    {
+        if (outError != nullptr)
+        {
+            *outError = "WSAStartup failed";
+        }
+        return MBEDTLS_ERR_NET_SOCKET_FAILED;
+    }
+
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host, port, &hints, &addresses) != 0)
+    {
+        WSACleanup();
+        if (outError != nullptr)
+        {
+            *outError = "getaddrinfo failed";
+        }
+        return MBEDTLS_ERR_NET_UNKNOWN_HOST;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs != 0 ? timeoutMs : 1u);
+    int result = MBEDTLS_ERR_NET_CONNECT_FAILED;
+    int lastSocketError = 0;
+
+    for (const addrinfo* address = addresses;
+         address != nullptr;
+         address = address->ai_next)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            lastSocketError = WSAETIMEDOUT;
+            break;
+        }
+
+        SOCKET socketHandle = socket(
+            address->ai_family,
+            address->ai_socktype,
+            address->ai_protocol);
+        if (socketHandle == INVALID_SOCKET)
+        {
+            lastSocketError = WSAGetLastError();
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        u_long nonBlocking = 1;
+        if (ioctlsocket(socketHandle, FIONBIO, &nonBlocking) != 0)
+        {
+            lastSocketError = WSAGetLastError();
+            closesocket(socketHandle);
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        int connectResult = connect(
+            socketHandle,
+            address->ai_addr,
+            static_cast<int>(address->ai_addrlen));
+        if (connectResult == SOCKET_ERROR)
+        {
+            lastSocketError = WSAGetLastError();
+            if (lastSocketError != WSAEWOULDBLOCK
+                && lastSocketError != WSAEINPROGRESS
+                && lastSocketError != WSAEALREADY
+                && lastSocketError != WSAEINVAL)
+            {
+                closesocket(socketHandle);
+                continue;
+            }
+
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0)
+            {
+                lastSocketError = WSAETIMEDOUT;
+                closesocket(socketHandle);
+                break;
+            }
+
+            fd_set writeSet;
+            fd_set errorSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&errorSet);
+            FD_SET(socketHandle, &writeSet);
+            FD_SET(socketHandle, &errorSet);
+            timeval timeout = {};
+            timeout.tv_sec = static_cast<long>(remaining.count() / 1000);
+            timeout.tv_usec = static_cast<long>((remaining.count() % 1000) * 1000);
+            const int selected = select(0, nullptr, &writeSet, &errorSet, &timeout);
+            if (selected <= 0)
+            {
+                lastSocketError = selected == 0 ? WSAETIMEDOUT : WSAGetLastError();
+                closesocket(socketHandle);
+                if (selected == 0)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            int socketError = 0;
+            int socketErrorSize = sizeof(socketError);
+            if (getsockopt(
+                    socketHandle,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    reinterpret_cast<char*>(&socketError),
+                    &socketErrorSize) != 0
+                || socketError != 0)
+            {
+                lastSocketError = socketError != 0 ? socketError : WSAGetLastError();
+                closesocket(socketHandle);
+                continue;
+            }
+        }
+
+        u_long blocking = 0;
+        if (ioctlsocket(socketHandle, FIONBIO, &blocking) != 0)
+        {
+            lastSocketError = WSAGetLastError();
+            closesocket(socketHandle);
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        context->fd = static_cast<int>(socketHandle);
+        result = 0;
+        break;
+    }
+
+    freeaddrinfo(addresses);
+    if (result != 0)
+    {
+        WSACleanup();
+        if (outError != nullptr)
+        {
+            char errorText[96] = {};
+            std::snprintf(
+                errorText,
+                sizeof(errorText),
+                "TCP connect failed/timeout (WSA=%d timeoutMs=%lu)",
+                lastSocketError,
+                static_cast<unsigned long>(timeoutMs));
+            *outError = errorText;
+        }
+    }
+    // On success the matching WSACleanup occurs after mbedtls_net_free().
+    return result;
+}
+#endif
+
 constexpr const char kIsrgRootX1Pem[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
@@ -291,6 +467,7 @@ bool IsAvailable()
 bool HttpGet(
     const std::string& url,
     bool verifyPeer,
+    uint32_t connectTimeoutMs,
     uint32_t receiveTimeoutMs,
     std::string* outBody,
     std::string* outError)
@@ -328,6 +505,7 @@ bool HttpGet(
     mbedtls_x509_crt_init(&cacert);
 
     bool ok = false;
+    bool winsockConnected = false;
     std::string request;
     size_t writeOffset = 0;
     std::string rawResponse;
@@ -345,12 +523,21 @@ bool HttpGet(
         goto cleanup;
     }
 
-    ret = mbedtls_net_connect(&serverFd, parsed.host.c_str(), parsed.port.c_str(), MBEDTLS_NET_PROTO_TCP);
+    ret = ConnectTcpWithTimeout(
+        &serverFd,
+        parsed.host.c_str(),
+        parsed.port.c_str(),
+        connectTimeoutMs,
+        outError);
     if (ret != 0)
     {
-        *outError = "mbedtls_net_connect: " + MbedErrorToString(ret);
+        if (outError->empty())
+        {
+            *outError = "TCP connect: " + MbedErrorToString(ret);
+        }
         goto cleanup;
     }
+    winsockConnected = true;
 
     ret = mbedtls_ssl_config_defaults(
         &conf,
@@ -488,6 +675,10 @@ bool HttpGet(
 cleanup:
     mbedtls_ssl_close_notify(&ssl);
     mbedtls_net_free(&serverFd);
+    if (winsockConnected)
+    {
+        WSACleanup();
+    }
     mbedtls_x509_crt_free(&cacert);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);

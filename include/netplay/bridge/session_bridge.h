@@ -66,6 +66,8 @@ struct NetbridgeStatus
     int activePlayer = -1;      // 0 = P1 (host), 1 = P2 (client), -1 = unknown
     int sessionP1Wins = 0;      // P1 win count from Revival session object
     int sessionP2Wins = 0;      // P2 win count from Revival session object
+    int sessionScoresValid = 0; // both win counters were read from this role's verified layout
+    int sessionNamesValid = 0;  // both names were read and validated from this role's verified layout
 };
 
 struct DelayPromptMetrics
@@ -105,6 +107,10 @@ bool ApplyInputDelay(int delayFrames);
 bool AnswerSpectatePromptChoice(int choice);
 bool PrepareVsHumanHandoff();
 bool RequiresNativeVsHumanSyncForHandoff();
+// Send Revival's native MessageQuit before a local UI/process exit tears down
+// the helper. Returns true when the helper completed the native broadcast.
+// Safe to call from normal game/window callbacks; do not call under loader lock.
+bool RequestPeerQuitBeforeLocalExit(const char* reason);
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
 void CompleteGameplayExitRecovery(int mode, const char* origin);
@@ -129,8 +135,8 @@ bool ForceLocalPlayInit();
 // hook runs on the next main-loop iteration.  Returns true on success.
 // Safe to call from the VEH crash handler.
 bool ForceGameModeToTitle();
-// Restore the EFZ title dispatch site for Revival builds that need it during
-// recovery.  Returns false for builds where no restore is needed.
+// Restore the Revival-owned EFZ title dispatch hook when recovery disturbed
+// it. Returns false for builds where no restore is needed.
 bool RestoreRevivalTitleDispatchForRecovery(const char* caller);
 // Crash-handler diagnostic accessors - return active Revival profile offsets.
 // Returns 0 if no profile is active yet.

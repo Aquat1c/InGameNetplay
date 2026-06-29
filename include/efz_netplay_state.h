@@ -238,7 +238,7 @@ struct EFZNetplayState
                                  // incremented every Update() call.  Consumers
                                  // can use this to detect stale reads.
     uint32_t sessionId;          // Incremented each time a new session begins
-                                 // (phase transitions from Idle to Connecting).
+                                 // (Idle/Failed/SessionEnded -> Connecting).
                                  // Zero before the first session.
     uint32_t setId;              // Incremented each time a new set begins
                                  // (scores reset to 0-0).  Zero before first set.

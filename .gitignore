@@ -20,4 +20,4 @@ tools/
 /.claude
 /dumpbin
 /logs
-/cmake
+/cmake/

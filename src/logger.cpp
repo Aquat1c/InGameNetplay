@@ -37,7 +37,8 @@ std::deque<std::string> g_queue;
 std::atomic<bool> g_writerShouldStop{false};
 std::thread g_writerThread;
 std::atomic<uint64_t> g_droppedLines{0};
-constexpr std::size_t kMaxQueuedLines = 4096;
+constexpr std::size_t kNormalMaxQueuedLines = 4096;
+constexpr std::size_t kRevival102jDiagnosticMaxQueuedLines = 32768;
 
 // File/console side: guards the FILE* and console-attachment state.
 // The writer thread locks this to do fputs/fflush; SetFileLoggingEnabled /
@@ -260,7 +261,11 @@ void EnqueueLine(std::string line)
 {
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
-        if (g_queue.size() >= kMaxQueuedLines)
+        const std::size_t maxQueuedLines =
+            netplay::mod_settings::IsVerboseRevival102jLifecycleLoggingEnabled()
+                ? kRevival102jDiagnosticMaxQueuedLines
+                : kNormalMaxQueuedLines;
+        if (g_queue.size() >= maxQueuedLines)
         {
             g_queue.pop_front();
             g_droppedLines.fetch_add(1, std::memory_order_relaxed);

@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 
+#include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "logger.h"
 #include "netplay/core/player_rooms_menu.h"
@@ -8,6 +9,11 @@
 
 namespace netplay::hooks::internal
 {
+namespace
+{
+volatile LONG g_windowClosePeerQuitAttempted = 0;
+}
+
 using namespace netplay::constants;
 using NetplayMenuId = netplay::menu::NetplayMenuId;
 using NetplayMenuAction = netplay::menu::NetplayMenuAction;
@@ -351,6 +357,15 @@ LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         || message == WM_NCDESTROY;
     if (closeRequested)
     {
+        if (InterlockedExchange(&g_windowClosePeerQuitAttempted, 1) == 0)
+        {
+            const bool peerQuitSent =
+                netplay::bridge::RequestPeerQuitBeforeLocalExit("window_close");
+            mod::Log(
+                "NetplayWindowProc: pre-exit peer-quit message=0x%04X result=%d",
+                static_cast<unsigned>(message),
+                peerQuitSent ? 1 : 0);
+        }
         netplay::bridge::takeover::NotifyLocalProcessCloseForGameplayStall();
         (void)ShutdownLobbySessionForProcessExit(false, "window_close");
     }

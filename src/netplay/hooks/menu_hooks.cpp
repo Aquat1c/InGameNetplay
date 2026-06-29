@@ -63,10 +63,19 @@ JoiningOverlayState g_joiningOverlay = {};
 DebugOverlayState g_debugOverlay = {};
 std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 bool g_titleConfirmDown = false;
-// Number of frames to keep calling ClearRevivalText after an ExitProcess
-// interception.  Ensures stale tournament text is removed even if transient
-// state (e.g. init(2,102) resetting dword_100A0778) re-adds it briefly.
+// Legacy builds can need several cleanup frames. 1.02j repopulates text from
+// its persistent native frame driver, so repeated clears are disabled there.
 static int g_postExitTextClearFrames = 0;
+
+static void SchedulePostExitTextCleanup(const char* reason)
+{
+    g_postExitTextClearFrames =
+        netplay::bridge::takeover::ShouldRepeatPostExitTextCleanup() ? 5 : 0;
+    mod::Log(
+        "SchedulePostExitTextCleanup: reason=%s repeatFrames=%d",
+        reason != nullptr ? reason : "unknown",
+        g_postExitTextClearFrames);
+}
 static bool g_charSelectEntryHoldActive = false;
 static int g_charSelectEntryHoldFramesRemaining = 0;
 static uint32_t g_charSelectUpdateSlotAddress = 0;
@@ -588,16 +597,13 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
     if (!g_netplayMenuState.active
         && netplay::bridge::CompletePendingTournamentReturnCleanup())
     {
-        g_postExitTextClearFrames = 5;
+        SchedulePostExitTextCleanup("pending_tournament_return");
         mod::Log(
             "HookedTitleUpdateImpl: completed pending 1.02j tournament return cleanup");
         return 0;
     }
 
-    // Post-exit text clearing: keep issuing ClearRevivalText for a few
-    // frames after an ExitProcess interception to guarantee stale
-    // tournament text (nicknames, win counts) is removed even if
-    // init(2,102) or session tick re-adds it transiently.
+    // Legacy post-exit text clearing. 1.02j schedules zero repeat frames.
     if (g_postExitTextClearFrames > 0)
     {
         --g_postExitTextClearFrames;
@@ -623,7 +629,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         // game mode is 0, clean up immediately and schedule text clearing.
         if (netplay::bridge::NotifyTitleScreenActive())
         {
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("tournament_return_title");
             mod::Log("HookedTitleUpdateImpl: tournament return to title detected, clearing text");
             return 0;
         }
@@ -687,7 +693,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
                 // Online or spectate netplay - return to the netplay menu.
                 // Schedule multi-frame text clearing to ensure any DLL-side
                 // text overlays (nicknames, ping, delay) are fully purged.
-                g_postExitTextClearFrames = 5;
+                SchedulePostExitTextCleanup("exit_intercepted_netplay");
                 if (g_lobbySession)
                 {
                     if (exitMode == netplay::bridge::takeover::kLocalRoleSpectate)
@@ -709,7 +715,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             // Tournament or other - stay on the normal title screen.
             // Schedule a few frames of ClearRevivalText to ensure stale
             // tournament text overlays are fully cleared.
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("exit_intercepted_title");
             mod::Log(
                 "HookedTitleUpdateImpl: exit intercepted (mode=%d), staying on title screen",
                 exitMode);
@@ -751,7 +757,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             // Keep clearing DLL text rendering for several frames, just as
             // the tournament-mode exit path does.  init(3,102) or a transient
             // session tick can re-add text after the first clear.
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("post_match_return");
             EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
             return 0;
         }
@@ -959,6 +965,107 @@ extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
 // protection so NeutralizeExitProcess can safely escape.
 // ---------------------------------------------------------------------------
 static uint32_t g_charSelectUpdateCallCount = 0;
+static DWORD g_charSelectQuitHelperPid = 0;
+static DWORD g_lastCharSelectQuitProbeTick = 0;
+static DWORD g_charSelectEscCandidateTick = 0;
+static bool g_charSelectQuitAttempted = false;
+static bool g_charSelectEscWasDown = false;
+static constexpr DWORD kCharSelectContinuityWindowMs = 250u;
+static constexpr DWORD kCharSelectEscCandidateWindowMs = 500u;
+
+static void ObserveCharacterSelectEsc()
+{
+    const DWORD now = GetTickCount();
+    const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    const auto status = netplay::bridge::GetStatus();
+    const bool helperChanged = status.processId != g_charSelectQuitHelperPid;
+    const bool continuousCharSelect =
+        g_lastCharSelectQuitProbeTick != 0
+        && now - g_lastCharSelectQuitProbeTick <= kCharSelectContinuityWindowMs;
+
+    if (helperChanged)
+    {
+        g_charSelectQuitHelperPid = status.processId;
+        g_charSelectQuitAttempted = false;
+    }
+
+    // The first frame after entering charselect (including returning from a
+    // battle) establishes a key baseline.  A held battle ESC must not be
+    // mistaken for the separate ESC that exits charselect to the main menu.
+    if (!continuousCharSelect || helperChanged)
+    {
+        g_charSelectEscWasDown = escDown;
+        g_charSelectEscCandidateTick = 0;
+        g_lastCharSelectQuitProbeTick = now;
+        return;
+    }
+
+    const bool escRisingEdge = escDown && !g_charSelectEscWasDown;
+    g_charSelectEscWasDown = escDown;
+    g_lastCharSelectQuitProbeTick = now;
+    if (escRisingEdge)
+    {
+        g_charSelectEscCandidateTick = now;
+    }
+}
+
+static void MaybeSendCharacterSelectEscQuit(
+    uint32_t screenContext,
+    char updateResult)
+{
+    bool exitToMenuArmed = updateResult == 0;
+    __try
+    {
+        exitToMenuArmed =
+            exitToMenuArmed
+            || *reinterpret_cast<const volatile uint8_t*>(screenContext + 45) != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    const DWORD now = GetTickCount();
+    const bool freshEscCandidate =
+        g_charSelectEscCandidateTick != 0
+        && now - g_charSelectEscCandidateTick <= kCharSelectEscCandidateWindowMs;
+    if (!exitToMenuArmed || !freshEscCandidate || g_charSelectQuitAttempted)
+    {
+        return;
+    }
+
+    g_charSelectEscCandidateTick = 0;
+    const auto status = netplay::bridge::GetStatus();
+
+    const auto phase = static_cast<netplay::bridge::NetbridgePhase>(status.phase);
+    const bool activePhase =
+        phase == netplay::bridge::NetbridgePhase::Connecting
+        || phase == netplay::bridge::NetbridgePhase::DelaySetup
+        || phase == netplay::bridge::NetbridgePhase::Connected;
+    const bool activeRole =
+        status.roleFlag == netplay::bridge::takeover::kLocalRoleOnline
+        || status.roleFlag == netplay::bridge::takeover::kLocalRoleSpectate;
+    if (!activePhase || !activeRole || status.processId == 0)
+    {
+        mod::Log(
+            "CHARSELECT_QUIT: ESC-to-menu observed without active session "
+            "phase=%s roleFlag=%d helperPid=%lu",
+            netplay::bridge::PhaseToString(phase),
+            status.roleFlag,
+            static_cast<unsigned long>(status.processId));
+        return;
+    }
+
+    g_charSelectQuitAttempted = true;
+    netplay::bridge::takeover::ConfirmCharacterSelectEscToMenu();
+    const bool peerQuitSent = netplay::bridge::RequestPeerQuitBeforeLocalExit(
+        "character_select_esc_to_menu");
+    mod::Log(
+        "CHARSELECT_QUIT: ESC-to-menu peer-quit result=%d phase=%s "
+        "role=%d roleFlag=%d helperPid=%lu",
+        peerQuitSent ? 1 : 0,
+        netplay::bridge::PhaseToString(phase),
+        status.role,
+        status.roleFlag,
+        static_cast<unsigned long>(status.processId));
+}
 
 static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
 {
@@ -969,6 +1076,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
     // caused the exported state to freeze as soon as the hold ended.
     netplay::bridge::Tick();
     netplay::bridge::frontend_return::TickFrontendReturn();
+    ObserveCharacterSelectEsc();
 
     // Diagnostic: log charselect screen state on the first 5 frames
     // and then every 300 frames to track init/exit flags and game mode.
@@ -1016,6 +1124,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
     if (!g_charSelectEntryHoldActive)
     {
         const char csResult = g_originalCharSelectUpdate(screenContext);
+        MaybeSendCharacterSelectEscQuit(screenContext, csResult);
         if (csResult != 1)
         {
             mod::Log(
@@ -1037,6 +1146,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
             bridgeStatus.syncSessionByte);
         {
             const char csResult = g_originalCharSelectUpdate(screenContext);
+            MaybeSendCharacterSelectEscQuit(screenContext, csResult);
             if (csResult != 1)
                 mod::Log("CHARSELECT_UPDATE: hold-release originalUpdate returned %d frame=%u",
                     static_cast<int>(csResult), g_charSelectUpdateCallCount);
@@ -1056,6 +1166,7 @@ static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
             bridgeStatus.syncSessionByte);
         {
             const char csResult = g_originalCharSelectUpdate(screenContext);
+            MaybeSendCharacterSelectEscQuit(screenContext, csResult);
             if (csResult != 1)
                 mod::Log("CHARSELECT_UPDATE: hold-timeout originalUpdate returned %d frame=%u",
                     static_cast<int>(csResult), g_charSelectUpdateCallCount);
@@ -1114,6 +1225,11 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
         g_charSelectEntryHoldActive = false;
         g_charSelectEntryHoldArmed = false;
         g_charSelectEntryHoldFramesRemaining = 0;
+        g_charSelectQuitHelperPid = 0;
+        g_lastCharSelectQuitProbeTick = 0;
+        g_charSelectEscCandidateTick = 0;
+        g_charSelectQuitAttempted = false;
+        g_charSelectEscWasDown = false;
 
         // ExitProcess interception flag is already set; skip this frame and
         // let the title-screen update consume/cleanup in a clean state.

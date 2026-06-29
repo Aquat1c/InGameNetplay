@@ -1507,6 +1507,10 @@ void AppendSyntheticItems()
         false,
         "Log extra byte windows and vtable slots around Revival bridge patches.");
     upsertBoolIntItem(
+        "VerboseRevival102jLifecycleLogging",
+        true,
+        "Log full 1.02j lifecycle checkpoints, IPC state, hooks, mappings, vtables, and session-object byte dumps.");
+    upsertBoolIntItem(
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");

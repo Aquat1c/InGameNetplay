@@ -53,6 +53,7 @@ void SetPhase(NetbridgePhase phase, const char* error)
     {
         g_status.errorMsg[0] = '\0';
     }
+    takeover::LogRevival102jDeepStep("Phase.session_bridge_transition", &g_status);
 }
 
 void JoinFinishedWorkerUnlocked()
@@ -327,6 +328,7 @@ bool StartSession(
 
     SetPhase(NetbridgePhase::Connecting, nullptr);
     g_connectStartTick = GetTickCount();
+    takeover::LogRevival102jDeepStep("SessionBridge.StartSession.01.queued", &g_status);
 
     const uint32_t requestSerial = ++g_startRequestSerial;
     g_startWorkerRunning = true;
@@ -343,6 +345,10 @@ bool StartSession(
         std::snprintf(workerStatus.nickname, sizeof(workerStatus.nickname), "%s", nicknameCopy.c_str());
 #endif
 
+        takeover::LogRevival102jDeepStep(
+            "SessionBridge.StartSession.02.worker_begin",
+            &workerStatus);
+
         uint32_t workerConnectStartTick = GetTickCount();
         const bool started = takeover::StartSession(
             role,
@@ -352,6 +358,11 @@ bool StartSession(
             writeNicknameToIni,
             &workerStatus,
             &workerConnectStartTick);
+        takeover::LogRevival102jDeepStep(
+            started
+                ? "SessionBridge.StartSession.03.takeover_returned_success"
+                : "SessionBridge.StartSession.03.takeover_returned_failure",
+            &workerStatus);
 
         bool cancelStaleSession = false;
         {
@@ -360,6 +371,9 @@ bool StartSession(
             {
                 g_status = workerStatus;
                 g_connectStartTick = workerConnectStartTick;
+                takeover::LogRevival102jDeepStep(
+                    "SessionBridge.StartSession.04.worker_result_committed",
+                    &g_status);
                 if (!started)
                 {
                     mod::Log(
@@ -375,6 +389,9 @@ bool StartSession(
                     static_cast<unsigned>(requestSerial),
                     static_cast<unsigned>(g_startRequestSerial));
                 cancelStaleSession = started;
+                takeover::LogRevival102jDeepStep(
+                    "SessionBridge.StartSession.04.worker_result_stale",
+                    &workerStatus);
             }
 
             g_startWorkerRunning = false;
@@ -509,6 +526,69 @@ bool RequiresNativeVsHumanSyncForHandoff()
     }
 
     return takeover::RequiresNativeVsHumanSyncForHandoff(&g_status);
+}
+
+bool RequestPeerQuitBeforeLocalExit(const char* reason)
+{
+    // Older Revival builds already complete their native quit path correctly
+    // with the mod installed.  Keep those versions as the control and add the
+    // explicit pre-teardown broadcast only for the MinGW 1.02j wire layout.
+    takeover::EnsureActiveRevivalProfile();
+    const char* const quitWireName = takeover::RevivalWireName("Quit");
+    if (quitWireName == nullptr || std::strcmp(quitWireName, "Quit_Spec") != 0)
+    {
+        mod::Log(
+            "SessionBridge: pre-exit peer-quit left to legacy native path "
+            "reason='%s' wire='%s'",
+            reason != nullptr ? reason : "",
+            quitWireName != nullptr ? quitWireName : "");
+        return false;
+    }
+
+    NetbridgeStatus status = {};
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_initialized)
+        {
+            return false;
+        }
+        status = g_status;
+    }
+
+    const NetbridgePhase phase = static_cast<NetbridgePhase>(status.phase);
+    const bool activePhase =
+        phase == NetbridgePhase::Connecting
+        || phase == NetbridgePhase::DelaySetup
+        || phase == NetbridgePhase::Connected;
+    const bool activeRole =
+        status.roleFlag == takeover::kLocalRoleOnline
+        || status.roleFlag == takeover::kLocalRoleSpectate;
+    if (!activePhase || !activeRole || status.processId == 0)
+    {
+        mod::Log(
+            "SessionBridge: pre-exit peer-quit skipped reason='%s' phase=%s "
+            "role=%d roleFlag=%d helperPid=%lu",
+            reason != nullptr ? reason : "",
+            PhaseToString(phase),
+            status.role,
+            status.roleFlag,
+            static_cast<unsigned long>(status.processId));
+        return false;
+    }
+
+    const bool sent = takeover::RequestInjectedPeerQuitBroadcast(
+        reason != nullptr ? reason : "local_exit",
+        300u);
+    mod::Log(
+        "SessionBridge: pre-exit peer-quit reason='%s' result=%d phase=%s "
+        "role=%d roleFlag=%d helperPid=%lu",
+        reason != nullptr ? reason : "",
+        sent ? 1 : 0,
+        PhaseToString(phase),
+        status.role,
+        status.roleFlag,
+        static_cast<unsigned long>(status.processId));
+    return sent;
 }
 
 void CancelSession(const char* reason)
@@ -783,7 +863,7 @@ bool ForceGameModeToTitle()
 }
 bool RestoreRevivalTitleDispatchForRecovery(const char* caller)
 {
-    return takeover::RestoreExeDispatchOriginalBytesForTitle(caller);
+    return takeover::RestoreExeDispatchHookForTitle(caller);
 }
 uintptr_t GetRevivalRenderContextOffset()
 {

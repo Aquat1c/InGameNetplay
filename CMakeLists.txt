@@ -5,6 +5,11 @@ option(EFZ_STATIC_RUNTIME "Link MSVC runtime statically for single-DLL deploymen
 option(EFZ_XP_COMPAT "Enable Windows XP-oriented compile settings (requires compatible toolset)" OFF)
 option(EFZ_EMBEDDED_TLS "Enable embedded TLS HTTPS backend using bundled mbedTLS" ON)
 
+if(EFZ_XP_COMPAT AND NOT EFZ_EMBEDDED_TLS)
+    message(FATAL_ERROR
+        "EFZ_XP_COMPAT requires EFZ_EMBEDDED_TLS: XP's SChannel backends cannot reliably connect to the modern Concerto HTTPS endpoint.")
+endif()
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if(MSVC AND EFZ_STATIC_RUNTIME)
@@ -42,6 +47,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
     src/netplay/bridge/revival_memory.cpp
+    src/netplay/bridge/revival_j_diagnostics.cpp
     src/netplay/bridge/ipc_shared.cpp
     src/netplay/bridge/process_inject.cpp
     src/netplay/bridge/iat_stubs.cpp
@@ -104,6 +110,7 @@ if(WIN32)
         add_subdirectory("${EFZ_MINHOOK_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/minhook" EXCLUDE_FROM_ALL)
     endif()
     target_link_libraries(efz_netplay_mod PRIVATE winmm)
+    target_link_libraries(efz_netplay_mod PRIVATE ws2_32)
     target_link_libraries(efz_netplay_mod PRIVATE gdiplus)
     target_link_libraries(efz_netplay_mod PRIVATE d3d9)
     target_link_libraries(efz_netplay_mod PRIVATE minhook)
