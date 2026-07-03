@@ -609,6 +609,9 @@ void NoteConsolePromptLine(const std::string& text)
         const char* friendly;
     };
     static const ConsoleErrorMapping kConsoleErrorMap[] = {
+        {"desync detected", "Desync detected by Revival."},
+        {"header crc mismatch", "Desync detected by Revival (header CRC mismatch)."},
+        {"state not recoverable", "Desync detected by Revival (state not recoverable)."},
         {"Connection timed out", "Connection timed out."},
         {"Source quit or timed out", "Opponent quit or timed out."},
         {"Host timed out", "Host timed out - no one connected."},
@@ -972,6 +975,9 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
         static const char* kImmediateFlushKeywords[] = {
+            "desync detected",
+            "header crc mismatch",
+            "state not recoverable",
             "Recv quit from:",
             "Received quit from:",
             "Connection timed out",
@@ -988,7 +994,7 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
         };
         for (const char* kw : kImmediateFlushKeywords)
         {
-            if (line->find(kw) != std::string::npos)
+            if (ContainsCaseInsensitive(*line, kw))
             {
                 flushLine(true);
                 break;

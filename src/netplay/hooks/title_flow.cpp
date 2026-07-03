@@ -57,7 +57,10 @@ namespace
 {
 constexpr int kDelaySelectionMin = 0;
 constexpr int kDelaySelectionMax = 20;
-constexpr int kConnectedPreHandoffDelayFrames = 18;
+// FUCK IT WE BALL type fix - I didn't manage to find a case where title screen had more than 17 frames in it
+// Maybe some potato PC can produce this issue but at this point we can't do anything about it, got 17 frames even in 600 ping
+// Pretty sure it's tied to the clock and not internal frames so we don't really care
+constexpr int kVsHumanTitleWarmupFrames = 17;
 constexpr int kSpectateTitleWarmupFrames = 17;
 int g_pendingGlobalStateTransition = -1;
 bool g_charSelectResetPending = false;
@@ -115,6 +118,9 @@ constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
 bool g_spectateHandoffWarmupActive = false;
 int g_spectateHandoffWarmupFrames = 0;
 uint32_t g_spectateHandoffWarmupStartTick = 0;
+bool g_vsHumanHandoffWarmupActive = false;
+int g_vsHumanHandoffWarmupFrames = 0;
+uint32_t g_vsHumanHandoffWarmupStartTick = 0;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -1544,6 +1550,79 @@ void ResetSpectateHandoffWarmup(const char* reason)
     g_spectateHandoffWarmupStartTick = 0;
 }
 
+void ResetVsHumanHandoffWarmup(const char* reason)
+{
+    if (g_vsHumanHandoffWarmupActive && reason != nullptr)
+    {
+        mod::Log(
+            "VsHumanHandoffWarmup: reset reason=%s frames=%d target=%d",
+            reason,
+            g_vsHumanHandoffWarmupFrames,
+            kVsHumanTitleWarmupFrames);
+    }
+    g_vsHumanHandoffWarmupActive = false;
+    g_vsHumanHandoffWarmupFrames = 0;
+    g_vsHumanHandoffWarmupStartTick = 0;
+}
+
+bool AdvanceVsHumanHandoffWarmup(
+    uint32_t screenContext,
+    const netplay::bridge::NetbridgeStatus& bridgeStatus,
+    NetbridgePhase bridgePhase,
+    const char* source,
+    uint32_t* inactivityCounter)
+{
+    if (!g_vsHumanHandoffWarmupActive)
+    {
+        g_vsHumanHandoffWarmupActive = true;
+        g_vsHumanHandoffWarmupFrames = 0;
+        g_vsHumanHandoffWarmupStartTick = GetTickCount();
+        mod::Log(
+            "VsHumanHandoffWarmup: armed targetFrames=%d source=%s role=%d roleFlag=%d init=%d phase=%s "
+            "sync(mode=%d flag1084=%d session=%d flags=%d/%d) screen=%d menuSel=%d peerAlive=%d",
+            kVsHumanTitleWarmupFrames,
+            source != nullptr ? source : "unknown",
+            bridgeStatus.role,
+            bridgeStatus.roleFlag,
+            bridgeStatus.localInitApplied,
+            netplay::bridge::PhaseToString(bridgePhase),
+            bridgeStatus.syncGameMode,
+            bridgeStatus.syncMode0Flag1084,
+            bridgeStatus.syncSessionByte,
+            bridgeStatus.syncGlobalFlag4964,
+            bridgeStatus.syncGlobalFlag4965,
+            *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+            netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+    }
+
+    ++g_vsHumanHandoffWarmupFrames;
+    if (g_vsHumanHandoffWarmupFrames < kVsHumanTitleWarmupFrames)
+    {
+        ClearLocalMenuControlState(screenContext);
+        if (inactivityCounter != nullptr)
+        {
+            ++(*inactivityCounter);
+        }
+        return false;
+    }
+
+    const uint32_t elapsedMs =
+        g_vsHumanHandoffWarmupStartTick != 0
+            ? GetTickCount() - g_vsHumanHandoffWarmupStartTick
+            : 0;
+    mod::Log(
+        "VsHumanHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
+        "screen=%d menuSel=%d",
+        g_vsHumanHandoffWarmupFrames,
+        kVsHumanTitleWarmupFrames,
+        static_cast<unsigned long>(elapsedMs),
+        *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+    HandoffConnectedSessionToVsHumanState(screenContext);
+    return g_pendingGlobalStateTransition >= 0;
+}
+
 bool HasRecoveryMenuActionInput(const uint8_t* inputBytes)
 {
     if (inputBytes == nullptr)
@@ -1991,6 +2070,7 @@ void CopyBoundedText(char* dst, size_t dstSize, const char* src)
 
 void ResetDelaySetupOverlayState()
 {
+    ResetVsHumanHandoffWarmup(nullptr);
     g_delaySetupOverlay = {};
 }
 
@@ -2840,23 +2920,28 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         const bool readyForHandoff =
             statusAfterApply.vsHumanSyncReady != 0
             || (phaseAfterApply == NetbridgePhase::Connected && !strictNativeSyncAfterApply);
-        if (!readyForHandoff)
+        g_delaySetupOverlay.waitingForRuntimeReady = true;
+        g_delaySetupOverlay.vsHumanSyncArmed = false;
+        g_delaySetupOverlay.connectedHandoffDelayActive = false;
+        g_delaySetupOverlay.connectedHandoffDelayFramesRemaining = 0;
+        g_delaySetupOverlay.nextHandoffRetryTick = 0;
+        g_delaySetupOverlay.errorMessage[0] = '\0';
+        ResetVsHumanHandoffWarmup("delay_confirmed");
+        mod::Log(
+            "DelayOverlay: waiting for runtime sync/title warmup after delay selection phase=%s ready=%d prompt=%d/%d",
+            netplay::bridge::PhaseToString(phaseAfterApply),
+            readyForHandoff ? 1 : 0,
+            statusAfterApply.delayPromptSerial,
+            statusAfterApply.delayPromptServedSerial);
+        if (readyForHandoff)
         {
-            g_delaySetupOverlay.waitingForRuntimeReady = true;
-            g_delaySetupOverlay.vsHumanSyncArmed = false;
-            g_delaySetupOverlay.nextHandoffRetryTick = 0;
-            g_delaySetupOverlay.errorMessage[0] = '\0';
-            mod::Log(
-                "DelayOverlay: waiting for runtime sync after delay selection phase=%s prompt=%d/%d",
-                netplay::bridge::PhaseToString(phaseAfterApply),
-                statusAfterApply.delayPromptSerial,
-                statusAfterApply.delayPromptServedSerial);
-            return true;
+            (void)AdvanceVsHumanHandoffWarmup(
+                screenContext,
+                statusAfterApply,
+                phaseAfterApply,
+                "delay_confirm_ready",
+                inactivityCounter);
         }
-
-        ResetDelaySetupOverlayState();
-        ResetSpectateConfirmOverlayState();
-        HandoffConnectedSessionToVsHumanState(screenContext);
         return true;
     }
 
@@ -3299,6 +3384,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
+    ResetVsHumanHandoffWarmup("enter_netplay_menu");
     ResetSpectateHandoffWarmup("enter_netplay_menu");
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
@@ -3464,6 +3550,7 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
+    ResetVsHumanHandoffWarmup("leave_netplay_menu");
     ResetSpectateHandoffWarmup("leave_netplay_menu");
     DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
@@ -3574,6 +3661,8 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
+    ClearLocalMenuControlState(screenContext);
+    ResetVsHumanHandoffWarmup(nullptr);
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
@@ -4827,14 +4916,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
     // --- Fast handoff ---
     // If the Revival rollback engine is already in sync state (vsHumanSyncReady)
-    // and the delay overlay has been submitted (waitingForRuntimeReady) or delay
-    // setup was never shown, transition immediately.  This prevents a multi-frame
-    // window where the remote side is at State 1 (charselect) while we're still
-    // at State 0 (title), which causes a non-rollback desync freeze.
+    // and delay setup was never shown, transition immediately. Delay-confirmed
+    // sessions below use the 17-frame title warmup so we don't preempt their
+    // vanilla title-navigation tail.
     if (bridgeStatus.vsHumanSyncReady != 0
         && (bridgePhase == NetbridgePhase::Connected
             || bridgePhase == NetbridgePhase::DelaySetup)
-        && (!g_delaySetupOverlay.active || g_delaySetupOverlay.waitingForRuntimeReady))
+        && !g_delaySetupOverlay.active)
     {
         mod::Log(
             "FastHandoff: vsHumanSyncReady detected, immediate transition phase=%s sync(mode=%d flag1084=%d session=%d)",
@@ -5115,37 +5203,22 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 || (bridgePhase == NetbridgePhase::Connected
                     && !netplay::bridge::RequiresNativeVsHumanSyncForHandoff())))
         {
-            if (bridgeStatus.vsHumanSyncReady == 0 && bridgePhase == NetbridgePhase::Connected)
+            if (!g_vsHumanHandoffWarmupActive)
             {
-                if (!g_delaySetupOverlay.connectedHandoffDelayActive)
-                {
-                    g_delaySetupOverlay.connectedHandoffDelayActive = true;
-                    g_delaySetupOverlay.connectedHandoffDelayFramesRemaining = kConnectedPreHandoffDelayFrames;
-                    mod::Log(
-                        "DelayOverlay: connected pre-handoff delay started frames=%d sync(mode=%d flag1084=%d session=%d)",
-                        g_delaySetupOverlay.connectedHandoffDelayFramesRemaining,
-                        bridgeStatus.syncGameMode,
-                        bridgeStatus.syncMode0Flag1084,
-                        bridgeStatus.syncSessionByte);
-                }
-
-                if (g_delaySetupOverlay.connectedHandoffDelayFramesRemaining > 0)
-                {
-                    --g_delaySetupOverlay.connectedHandoffDelayFramesRemaining;
-                    return 0;
-                }
+                mod::Log(
+                    "DelayOverlay: runtime ready for VS-human title warmup phase=%s sync(mode=%d flag1084=%d session=%d)",
+                    netplay::bridge::PhaseToString(bridgePhase),
+                    bridgeStatus.syncGameMode,
+                    bridgeStatus.syncMode0Flag1084,
+                    bridgeStatus.syncSessionByte);
             }
-
-            mod::Log(
-                "DelayOverlay: runtime sync ready after delay selection phase=%s sync(mode=%d flag1084=%d session=%d)",
-                netplay::bridge::PhaseToString(bridgePhase),
-                bridgeStatus.syncGameMode,
-                bridgeStatus.syncMode0Flag1084,
-                bridgeStatus.syncSessionByte);
-            ResetDelaySetupOverlayState();
-            ResetSpectateConfirmOverlayState();
-            HandoffConnectedSessionToVsHumanState(screenContext);
-            if (g_pendingGlobalStateTransition >= 0)
+            const bool handoffQueued = AdvanceVsHumanHandoffWarmup(
+                screenContext,
+                bridgeStatus,
+                bridgePhase,
+                "delay_runtime_ready",
+                inactivityCounter);
+            if (handoffQueued && g_pendingGlobalStateTransition >= 0)
             {
                 const int nextState = g_pendingGlobalStateTransition;
                 g_pendingGlobalStateTransition = -1;
@@ -5157,6 +5230,10 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 return static_cast<char>(nextState);
             }
             return 0;
+        }
+        if (g_delaySetupOverlay.waitingForRuntimeReady)
+        {
+            ResetVsHumanHandoffWarmup("runtime_not_ready");
         }
 
         (void)HandleDelaySetupOverlayInput(screenContext, inputBytes, inactivityCounter);

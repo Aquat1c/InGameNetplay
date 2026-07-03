@@ -236,6 +236,11 @@ static bool SyncDiagnosticsEnabled()
     return netplay::mod_settings::IsVerboseSyncDiagnosticsEnabled();
 }
 
+static bool DetailedDiagnosticReportsEnabled()
+{
+    return netplay::mod_settings::AreAllVerboseLogsEnabled();
+}
+
 static void LogBytesIfVerbose(const char* context, uintptr_t address, size_t size)
 {
     if (!BridgePatchVerboseLoggingEnabled())
@@ -10237,8 +10242,13 @@ void ResetForceLocalPlayInitCount()
     g_forceLocalPlayInitCount = 0;
 }
 
-void LogSessionDiagnosticState(const char* context)
+static void LogSessionDiagnosticStateImpl(const char* context, bool force)
 {
+    if (!force && !DetailedDiagnosticReportsEnabled())
+    {
+        return;
+    }
+
     const char* ctx = (context != nullptr) ? context : "unknown";
 
     // --- DLL patch state ---
@@ -10502,6 +10512,16 @@ void LogSessionDiagnosticState(const char* context)
         static_cast<unsigned long>(g_lastSessionPtrOffset));
 }
 
+void LogSessionDiagnosticState(const char* context)
+{
+    LogSessionDiagnosticStateImpl(context, false);
+}
+
+void LogSessionDiagnosticStateForced(const char* context)
+{
+    LogSessionDiagnosticStateImpl(context, true);
+}
+
 // ---------------------------------------------------------------------------
 // LogInitWriteSnapshot - comprehensive snapshot of every value init() writes.
 //
@@ -10518,6 +10538,11 @@ void LogSessionDiagnosticState(const char* context)
 // ---------------------------------------------------------------------------
 void LogInitWriteSnapshot(const char* context)
 {
+    if (!DetailedDiagnosticReportsEnabled())
+    {
+        return;
+    }
+
     const char* ctx = (context != nullptr) ? context : "unknown";
 
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");

@@ -144,6 +144,9 @@ Options:
   - `WriteLogFile`
   - `EnableConsole`
   - `EnableDebugMenu`
+  - `VerboseBridgePatchLogging`
+  - `VerboseSyncDiagnostics`
+  - `VerboseRevival102jLifecycleLogging`
   - `HideEmptySetsInBattleLog`
   - `AsyncHostReturnKey` - hotkey to return to the HOST menu (or rehost) while async hosting is minimized (default: `F1`)
 - `About` modal with version/build information

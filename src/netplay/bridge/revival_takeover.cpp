@@ -13,6 +13,7 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -1580,6 +1581,22 @@ static const char* DecodeInjectedExceptionDetail(DWORD detail)
     default:
         return "unknown_exception";
     }
+}
+
+static bool ConsoleErrorIndicatesDesync(const char* text)
+{
+    if (text == nullptr || text[0] == '\0')
+    {
+        return false;
+    }
+
+    std::string lowered(text);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return lowered.find("desync") != std::string::npos
+        || lowered.find("header crc mismatch") != std::string::npos
+        || lowered.find("state not recoverable") != std::string::npos;
 }
 
 static void LogInjectedPeerQuitDiagnosticLine(const char* fmt, ...)
@@ -5131,6 +5148,21 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     // lines are no longer treated as fatal by themselves.
     if (ioStatus->consoleErrorSerial > 0)
     {
+        const bool desyncDetected =
+            (phase == NetbridgePhase::Connecting
+                || phase == NetbridgePhase::DelaySetup
+                || phase == NetbridgePhase::Connected)
+            && ConsoleErrorIndicatesDesync(ioStatus->consoleErrorText);
+        if (desyncDetected)
+        {
+            mod::Log(
+                "Takeover: desync console error detected serial=%d text='%s' phase=%d - emitting forced diagnostic report",
+                ioStatus->consoleErrorSerial,
+                ioStatus->consoleErrorText,
+                static_cast<int>(phase));
+            LogSessionDiagnosticStateForced("console_desync_detected");
+        }
+
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         {
             mod::Log(

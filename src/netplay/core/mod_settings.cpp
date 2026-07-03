@@ -152,7 +152,7 @@ void Reload()
             iniPath))
     {
         loaded.verboseBridgePatchLogging =
-            ReadBoolValue(L"Others", L"EnableBridgePatchDiagnostics", true, iniPath);
+            ReadBoolValue(L"Others", L"EnableBridgePatchDiagnostics", false, iniPath);
     }
     if (!TryReadBoolValue(
             L"Others",
@@ -161,13 +161,13 @@ void Reload()
             iniPath))
     {
         loaded.verboseSyncDiagnostics =
-            ReadBoolValue(L"Others", L"EnableSyncDiagnostics", true, iniPath);
+            ReadBoolValue(L"Others", L"EnableSyncDiagnostics", false, iniPath);
     }
     loaded.verboseRevival102jLifecycleLogging =
         ReadBoolValue(
             L"Others",
             L"VerboseRevival102jLifecycleLogging",
-            true,
+            false,
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
@@ -229,6 +229,13 @@ bool IsVerboseSyncDiagnosticsEnabled()
 bool IsVerboseRevival102jLifecycleLoggingEnabled()
 {
     return g_settings.verboseRevival102jLifecycleLogging;
+}
+
+bool AreAllVerboseLogsEnabled()
+{
+    return g_settings.verboseBridgePatchLogging
+        && g_settings.verboseSyncDiagnostics
+        && g_settings.verboseRevival102jLifecycleLogging;
 }
 
 bool HideEmptySetsInBattleLogByDefault()

@@ -405,6 +405,7 @@ void ResetModeConstructorTrampolineCache();
 // Diagnostic logging for second-session crash investigation.
 // Dumps all critical session lifecycle state to the log file.
 void LogSessionDiagnosticState(const char* context);
+void LogSessionDiagnosticStateForced(const char* context);
 
 // Comprehensive snapshot of ALL values that init() writes to.
 // Call before and after every init() invocation to capture a complete
