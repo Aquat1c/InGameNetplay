@@ -58,6 +58,7 @@ namespace
 constexpr int kDelaySelectionMin = 0;
 constexpr int kDelaySelectionMax = 20;
 constexpr int kConnectedPreHandoffDelayFrames = 18;
+constexpr int kSpectateTitleWarmupFrames = 17;
 int g_pendingGlobalStateTransition = -1;
 bool g_charSelectResetPending = false;
 constexpr uint32_t kGameSystemOffsetP1WinState = 4920;
@@ -111,6 +112,9 @@ bool g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
 bool g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
 int g_recoveryMenuInputQuarantineFramesRemaining = 0;
 constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
+bool g_spectateHandoffWarmupActive = false;
+int g_spectateHandoffWarmupFrames = 0;
+uint32_t g_spectateHandoffWarmupStartTick = 0;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -1514,6 +1518,30 @@ void ClearTitleInputLatches(uint32_t screenContext)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
+}
+
+void ClearLocalMenuControlState(uint32_t screenContext)
+{
+    ClearTitleInputLatches(screenContext);
+    g_filteredMenuInputs.fill(0);
+    g_unfocusedHeldMenuInputs.fill(0);
+    g_netplayHotkeyDown.fill(0);
+    g_joinWaitToSpectateButtonDown = {};
+}
+
+void ResetSpectateHandoffWarmup(const char* reason)
+{
+    if (g_spectateHandoffWarmupActive && reason != nullptr)
+    {
+        mod::Log(
+            "SpectateHandoffWarmup: reset reason=%s frames=%d target=%d",
+            reason,
+            g_spectateHandoffWarmupFrames,
+            kSpectateTitleWarmupFrames);
+    }
+    g_spectateHandoffWarmupActive = false;
+    g_spectateHandoffWarmupFrames = 0;
+    g_spectateHandoffWarmupStartTick = 0;
 }
 
 bool HasRecoveryMenuActionInput(const uint8_t* inputBytes)
@@ -3109,11 +3137,11 @@ void HandoffSpectateSession(uint32_t screenContext)
 
     // Transition directly to charselect (mode 1).  The DLL's client
     // session (type 1) survives mode transitions and drives the game via
-    // input replay from shared memory - the mode-8 replay screen detour
-    // is unnecessary because the DLL's watcher creation path only triggers
-    // for session type 2 (dword_100A05D0==2), not the mod's type 1.
-    // Going directly to charselect avoids wasting shared-memory input
-    // frames on the unused replay screen.
+    // input replay from shared memory.  Do not clear gameSystem input bytes
+    // here: spectator replay must preserve the exact recorded frame that
+    // Revival just applied before memorial_advance_screen reached this hook.
+    ClearLocalMenuControlState(screenContext);
+    ResetSpectateHandoffWarmup(nullptr);
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
     // Immediately publish the post-handoff state so inNetplayMenu=0 is visible
@@ -3271,6 +3299,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
+    ResetSpectateHandoffWarmup("enter_netplay_menu");
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
@@ -3435,6 +3464,7 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
     g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
+    ResetSpectateHandoffWarmup("leave_netplay_menu");
     DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
@@ -4926,45 +4956,71 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
 
     // --- Spectate handoff ---
-    // Spectating uses a fundamentally different path from online play:
-    // the DLL expects the game to transition to screen index 8 (Replay
-    // Screen), NOT screen 1 (Character Select).  The DLL's frame-hook
-    // (sub_1006D810) watches for a 0→8 mode transition, verifies role==2
-    // and title menu selection==4, then creates a lightweight spectator
-    // watcher session.
-    //
-    // Unlike online play, we cannot wait for vsHumanSyncReady (which
-    // requires syncGameMode==8) because the game mode will only BECOME 8
-    // after we perform this transition - waiting would deadlock.  Instead,
-    // we trigger the handoff as soon as DLL init is applied and any
-    // spectate-confirm prompt has been resolved.
-    if (bridgeStatus.roleFlag == kRoleFlagSpectate
+    // Revival's spectator replay consumes recorded title-navigation frames
+    // before character select.  Native 1.02h/1.02j traces spend frames 1-16
+    // in state 0 and reach state 1 on frame 17; switching immediately makes
+    // the local spectator one screen ahead of the recorded stream.
+    const bool spectateHandoffReady =
+        bridgeStatus.roleFlag == kRoleFlagSpectate
         && bridgeStatus.localInitApplied != 0
         && (bridgePhase == NetbridgePhase::Connecting
             || bridgePhase == NetbridgePhase::DelaySetup
             || bridgePhase == NetbridgePhase::Connected)
-        && !spectateConfirmPending)
+        && !spectateConfirmPending;
+    if (!spectateHandoffReady)
     {
+        ResetSpectateHandoffWarmup("conditions_lost");
+    }
+    if (spectateHandoffReady)
+    {
+        if (!g_spectateHandoffWarmupActive)
+        {
+            g_spectateHandoffWarmupActive = true;
+            g_spectateHandoffWarmupFrames = 0;
+            g_spectateHandoffWarmupStartTick = GetTickCount();
+            ClearPendingLobbySpectateWait("spectate_handoff_warmup");
+            ResetDelaySetupOverlayState();
+            ResetSpectateConfirmOverlayState();
+            mod::Log(
+                "SpectateHandoffWarmup: armed targetFrames=%d role=%d init=%d phase=%s "
+                "sync(mode=%d flag1084=%d session=%d flags=%d/%d) "
+                "confirmSerial=%d/%d screen=%d menuSel=%d peerAlive=%d",
+                kSpectateTitleWarmupFrames,
+                bridgeStatus.roleFlag,
+                bridgeStatus.localInitApplied,
+                netplay::bridge::PhaseToString(bridgePhase),
+                bridgeStatus.syncGameMode,
+                bridgeStatus.syncMode0Flag1084,
+                bridgeStatus.syncSessionByte,
+                bridgeStatus.syncGlobalFlag4964,
+                bridgeStatus.syncGlobalFlag4965,
+                bridgeStatus.spectateConfirmPromptSerial,
+                bridgeStatus.spectateConfirmPromptServedSerial,
+                *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+                static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+                netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
+        }
+
+        ++g_spectateHandoffWarmupFrames;
+        if (g_spectateHandoffWarmupFrames < kSpectateTitleWarmupFrames)
+        {
+            ClearLocalMenuControlState(screenContext);
+            ++(*inactivityCounter);
+            return 0;
+        }
+
+        const uint32_t elapsedMs =
+            g_spectateHandoffWarmupStartTick != 0
+                ? GetTickCount() - g_spectateHandoffWarmupStartTick
+                : 0;
         mod::Log(
-            "SpectateHandoff: triggered - role=%d init=%d phase=%s "
-            "sync(mode=%d flag1084=%d session=%d flags=%d/%d) "
-            "confirmSerial=%d/%d screen=%d menuSel=%d peerAlive=%d",
-            bridgeStatus.roleFlag,
-            bridgeStatus.localInitApplied,
-            netplay::bridge::PhaseToString(bridgePhase),
-            bridgeStatus.syncGameMode,
-            bridgeStatus.syncMode0Flag1084,
-            bridgeStatus.syncSessionByte,
-            bridgeStatus.syncGlobalFlag4964,
-            bridgeStatus.syncGlobalFlag4965,
-            bridgeStatus.spectateConfirmPromptSerial,
-            bridgeStatus.spectateConfirmPromptServedSerial,
+            "SpectateHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
+            "screen=%d menuSel=%d",
+            g_spectateHandoffWarmupFrames,
+            kSpectateTitleWarmupFrames,
+            static_cast<unsigned long>(elapsedMs),
             *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
-            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
-            netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
-        ClearPendingLobbySpectateWait("spectate_handoff");
-        ResetDelaySetupOverlayState();
-        ResetSpectateConfirmOverlayState();
+            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
         HandoffSpectateSession(screenContext);
         if (g_pendingGlobalStateTransition >= 0)
         {
