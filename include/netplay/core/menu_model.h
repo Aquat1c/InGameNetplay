@@ -113,6 +113,7 @@ enum class NetplayMenuAction : uint8_t
     BattleLogDetailPrevPage = 68,
     BattleLogDetailNextPage = 69,
     BattleLogBack = 70,
+    JoinSpectateIp = 71,
 };
 
 constexpr NetplayMenuAction PlayerRoomsSlotAction(int slot)

@@ -227,8 +227,8 @@ extern JoiningOverlayState g_joiningOverlay;
 extern DebugOverlayState g_debugOverlay;
 
 // "Stop hosting?" confirmation modal shown when the user selects a netplay-menu
-// option that conflicts with an active async-host listener (Join / Lobby /
-// Player Rooms). On confirm, the host session is cancelled and the deferred
+// option that conflicts with an active async-host listener (Join / Spectate IP /
+// Lobby / Player Rooms). On confirm, the host session is cancelled and the deferred
 // action runs; on cancel, hosting continues.
 struct StopHostingConfirmState
 {

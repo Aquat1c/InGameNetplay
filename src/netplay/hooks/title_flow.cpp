@@ -3724,6 +3724,27 @@ void ShowStubActionMessage(HWND owner, const std::string& message)
     SetNetplayStatusMessage(message.c_str());
 }
 
+bool StartJoinSpectateIpAction(uint32_t screenContext, bool playSuccessSound)
+{
+    std::string errorMessage;
+    if (TryStartWaitToSpectateFromJoinSettings(screenContext, &errorMessage))
+    {
+        if (playSuccessSound)
+        {
+            PlayUiSound(screenContext, kSfxConfirm);
+        }
+        return true;
+    }
+
+    const HWND owner = reinterpret_cast<HWND>(
+        *reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
+    ShowStubActionMessage(
+        owner,
+        "Spectate IP failed.\n\n"
+        + (errorMessage.empty() ? std::string("Unknown error") : errorMessage));
+    return false;
+}
+
 void SetNetplayStatusMessage(const char* text, DWORD durationMs)
 {
     g_netplayStatusMessage.clear();
@@ -3818,7 +3839,7 @@ NetplayMenuId ResolveCancelTargetMenu()
 
 // If an async-host listener is active, arm the "Stop hosting?" confirm modal for
 // |action| (deferred until the user confirms) and return true so the caller
-// skips the navigation. Returns false when not hosting (caller proceeds).
+// skips the navigation/action. Returns false when not hosting (caller proceeds).
 bool RequestStopHostingConfirmIfHosting(
     uint32_t screenContext,
     NetplayMenuAction action,
@@ -4017,6 +4038,9 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         }
         break;
     }
+    case NetplayMenuAction::JoinSpectateIp:
+        (void)StartJoinSpectateIpAction(screenContext, false);
+        break;
     case NetplayMenuAction::LobbyPlaying0:
     {
         if (!g_lobbySession)
@@ -4520,9 +4544,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
     // --- Join menu: C button = paste IP:port from clipboard ---
     if (windowFocused
         && g_netplayMenuState.menuId == NetplayMenuId::Join
-        && !g_inlineEditState.active)
+        && !g_inlineEditState.active
+        && !g_stopHostingConfirm.active)
     {
-        const bool debugMenuEnabled = netplay::mod_settings::IsDebugMenuEnabled();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
             if (inputBytes[playerIndex + 20] == 1)
@@ -4567,9 +4591,31 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 break;
             }
         }
+    }
 
-        if (!debugMenuEnabled && joinWaitToSpectatePressed)
+    if (windowFocused
+        && !g_inlineEditState.active
+        && !g_stopHostingConfirm.active
+        && joinWaitToSpectatePressed)
+    {
+        const int shortcutSelection =
+            ClampSelectionToCurrentMenu(static_cast<int>(*selectionPtr));
+        const NetplayMenuEntry* shortcutEntry = GetCurrentMenuEntry(shortcutSelection);
+        const bool canSpectateIp =
+            g_netplayMenuState.menuId == NetplayMenuId::Join
+            || (g_netplayMenuState.menuId == NetplayMenuId::Main
+                && shortcutEntry != nullptr
+                && shortcutEntry->action == NetplayMenuAction::OpenJoin);
+        if (canSpectateIp)
         {
+            if (RequestStopHostingConfirmIfHosting(
+                    screenContext,
+                    NetplayMenuAction::JoinSpectateIp,
+                    shortcutSelection))
+            {
+                *inactivityCounter = 0;
+                return 0;
+            }
             if (IsTransientNetplayOverlayActive())
             {
                 mod::Log(
@@ -4581,20 +4627,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
             else
             {
-                std::string errorMessage;
-                if (TryStartWaitToSpectateFromJoinSettings(screenContext, &errorMessage))
-                {
-                    PlayUiSound(screenContext, kSfxConfirm);
-                }
-                else
-                {
-                    const HWND owner = reinterpret_cast<HWND>(
-                        *reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
-                    ShowStubActionMessage(
-                        owner,
-                        "Wait to spectate failed.\n\n"
-                        + (errorMessage.empty() ? std::string("Unknown error") : errorMessage));
-                }
+                (void)StartJoinSpectateIpAction(screenContext, true);
                 *inactivityCounter = 0;
                 return 0;
             }

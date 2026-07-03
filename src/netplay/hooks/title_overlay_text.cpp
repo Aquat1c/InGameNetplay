@@ -256,15 +256,12 @@ std::string AppendPlayerRoomCodeFooter(std::string footer)
 
 std::string BuildActionTooltip(NetplayMenuAction action)
 {
-    const bool joinWaitShortcutAvailable = !netplay::mod_settings::IsDebugMenuEnabled();
     switch (action)
     {
     case NetplayMenuAction::OpenHost:
         return "Host a direct match.";
     case NetplayMenuAction::OpenJoin:
-        return joinWaitShortcutAvailable
-            ? "Configure a direct host connection.\nPress C to paste IP:PORT. Press D to wait to spectate."
-            : "Configure a direct host connection.\nPress C to paste IP:PORT.";
+        return "Configure a direct host connection.\nPress C to paste IP:PORT. Press D to Spectate IP.";
     case NetplayMenuAction::OpenPlayerRooms:
         return "Browse public and private player rooms.";
     case NetplayMenuAction::OpenLobby:
@@ -294,17 +291,11 @@ std::string BuildActionTooltip(NetplayMenuAction action)
     case NetplayMenuAction::HostEditPort:
         return "Set the port other players will use.";
     case NetplayMenuAction::JoinConnect:
-        return joinWaitShortcutAvailable
-            ? "Connect to the host using the settings below.\nPress C to paste IP:PORT. Press D to wait to spectate."
-            : "Connect to the host using the settings below.\nPress C to paste IP:PORT.";
+        return "Connect to the host using the settings below.\nPress C to paste IP:PORT. Press D to Spectate IP.";
     case NetplayMenuAction::JoinEditAddress:
-        return joinWaitShortcutAvailable
-            ? "Set the host address.\nPress C to paste IP:PORT. Press D to wait to spectate."
-            : "Set the host address.\nPress C to paste IP:PORT.";
+        return "Set the host address.\nPress C to paste IP:PORT. Press D to Spectate IP.";
     case NetplayMenuAction::JoinEditPort:
-        return joinWaitShortcutAvailable
-            ? "Set the host port.\nPress C to paste IP:PORT. Press D to wait to spectate."
-            : "Set the host port.\nPress C to paste IP:PORT.";
+        return "Set the host port.\nPress C to paste IP:PORT. Press D to Spectate IP.";
     case NetplayMenuAction::NicknameEdit:
         return "Update the nickname shown in lobbies and online matches.";
     case NetplayMenuAction::BackToMain:
