@@ -737,8 +737,8 @@ constexpr RevivalAddressProfile kRevival_1_02j = {
     0x570u,                                             // sessionOffsetSentinel
     0x45Eu,                                             // sessionOffsetP1Name
     0x4DEu,                                             // sessionOffsetP2Name
-    0x564u,                                             // sessionOffsetP1Wins
-    0x568u,                                             // sessionOffsetP2Wins
+    0x568u,                                             // sessionOffsetP1Wins (+0x564 is the current game number, not a win count)
+    0x56Cu,                                             // sessionOffsetP2Wins
     4964u,                                              // globalStateOffsetFlag4964
     4965u,                                              // globalStateOffsetFlag4965
     82563u,                                             // globalStateOffsetSessionByte

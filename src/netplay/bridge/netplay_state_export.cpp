@@ -280,6 +280,22 @@ static void ReadScores(int32_t& p1Wins, int32_t& p2Wins, int32_t& matchCtr)
     }
 }
 
+// Log label for g_netplayRole.  Printed as text because the value clashes
+// with Revival's native J role global (dll+0x14EC40), where 1 means
+// spectate rather than host, and bridge-layer logs use that convention.
+static const char* NetplayRoleName(int netplayRole)
+{
+    using namespace netplay::bridge::takeover;
+    switch (netplayRole)
+    {
+    case kNetplayRoleNone:      return "none";
+    case kNetplayRoleHost:      return "host";
+    case kNetplayRoleClient:    return "client";
+    case kNetplayRoleSpectator: return "spectator";
+    default:                    return "unknown";
+    }
+}
+
 // Map internal g_netplayRole → exported EFZNetplaySessionMode.
 // Falls back to status.role (NetbridgeRole intent) during the connecting
 // phase, before g_netplayRole is resolved by the init handshake.
@@ -1095,7 +1111,7 @@ void UpdateNow(const NetbridgeStatus& status)
         {
             mod::Log(
                 "StateExport: flow menu=%u->%u charsel=%u->%u match=%u->%u "
-                "screen=%u mode=%d phase=%d role=%d p1Wins=%d p2Wins=%d",
+                "screen=%u mode=%d phase=%d netRole=%s p1Wins=%d p2Wins=%d",
                 static_cast<unsigned>(g_prevInNetplayMenu),
                 static_cast<unsigned>(s.inNetplayMenu),
                 static_cast<unsigned>(g_prevInNetplayCharacterSelect),
@@ -1105,7 +1121,7 @@ void UpdateNow(const NetbridgeStatus& status)
                 static_cast<unsigned>(screenIdx),
                 s.sessionMode,
                 s.sessionPhase,
-                takeover::g_netplayRole,
+                NetplayRoleName(takeover::g_netplayRole),
                 s.p1Wins,
                 s.p2Wins);
             g_prevInNetplayMenu = s.inNetplayMenu;
@@ -1116,14 +1132,14 @@ void UpdateNow(const NetbridgeStatus& status)
         if (s.activityPhase != g_prevActivityPhase)
         {
             mod::Log(
-                "StateExport: activity %u->%u screen=%u mode=%d phase=%d role=%d side=%d "
+                "StateExport: activity %u->%u screen=%u mode=%d phase=%d netRole=%s side=%d "
                 "p1='%s' p2='%s' caps=0x%X sessionId=%u setId=%u seq=%u",
                 static_cast<unsigned>(g_prevActivityPhase),
                 static_cast<unsigned>(s.activityPhase),
                 static_cast<unsigned>(screenIdx),
                 s.sessionMode,
                 s.sessionPhase,
-                takeover::g_netplayRole,
+                NetplayRoleName(takeover::g_netplayRole),
                 s.localSide,
                 s.p1Name,
                 s.p2Name,
@@ -1165,7 +1181,7 @@ void UpdateNow(const NetbridgeStatus& status)
     {
         mod::Log(
             "StateExport: heartbeat seq=%u activity=%u menu=%u screen=%u "
-            "mode=%d phase=%d role=%d side=%d "
+            "mode=%d phase=%d netRole=%s side=%d "
             "p1Wins=%d p2Wins=%d ping=%d delay=%d "
             "local='%s' p1='%s' p2='%s' revival='%s' "
             "caps=0x%X sessionId=%u setId=%u endReason=%u",
@@ -1175,7 +1191,7 @@ void UpdateNow(const NetbridgeStatus& status)
             static_cast<unsigned>(screenIdx),
             s.sessionMode,
             s.sessionPhase,
-            takeover::g_netplayRole,
+            NetplayRoleName(takeover::g_netplayRole),
             s.localSide,
             s.p1Wins,
             s.p2Wins,
