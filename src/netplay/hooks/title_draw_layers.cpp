@@ -1,6 +1,8 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
+#include "netplay/hooks/debug_overlay.h"
 
 #include "logger.h"
 
@@ -23,6 +25,29 @@ namespace
 constexpr int kNetplayBackgroundWidth = 320;
 constexpr int kNetplayBackgroundHeight = 240;
 constexpr double kNetplayBackgroundScrollPixelsPerSecond = 12.5;
+
+// The netplay render pass owns the game-RT TTF text frame: one Begin at the
+// start of the pass, producers (battle log overlay, footer tooltip) submit
+// during their draws, one Commit right before present.  Committing every
+// frame - even with zero submits - is what expires stale text when a menu
+// stops submitting.
+bool BeginMenuRtTextFrame()
+{
+    if (!netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        return false;
+    }
+    netplay::debug_overlay::BeginRtTextFrame();
+    return true;
+}
+
+void CommitMenuRtTextFrame(bool began)
+{
+    if (began)
+    {
+        netplay::debug_overlay::CommitRtTextFrame();
+    }
+}
 
 bool UseScrollingNetplayBackground()
 {
@@ -496,6 +521,7 @@ void DrawNetplayBaseLayer(uint32_t screenContext)
 BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    const bool rtTextFrame = BeginMenuRtTextFrame();
     if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
     {
         DrawNetplayBackgroundOnly(screenContext);
@@ -509,6 +535,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawStopHostingConfirmGdi(screenContext);
         (void)DrawDebugOverlay(screenContext);
+        CommitMenuRtTextFrame(rtTextFrame);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
         LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime_battlelog");
         if (!drewBattleLogImages)
@@ -534,6 +561,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawStopHostingConfirmGdi(screenContext);
     (void)DrawDebugOverlay(screenContext);
+    CommitMenuRtTextFrame(rtTextFrame);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime");
     return presentResult;
@@ -542,6 +570,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
 BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
 {
     auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    const bool rtTextFrame = BeginMenuRtTextFrame();
     if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
     {
         DrawNetplayBackgroundOnly(screenContext);
@@ -555,6 +584,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
         (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
         (void)DrawStopHostingConfirmGdi(screenContext);
         (void)DrawDebugOverlay(screenContext);
+        CommitMenuRtTextFrame(rtTextFrame);
         const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
         LogRecoveryConfigFullFrameIfNeeded(presentResult, "config_battlelog");
         if (!drewBattleLogImages)
@@ -573,6 +603,7 @@ BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
     (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
     (void)DrawStopHostingConfirmGdi(screenContext);
     (void)DrawDebugOverlay(screenContext);
+    CommitMenuRtTextFrame(rtTextFrame);
     const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
     LogRecoveryConfigFullFrameIfNeeded(presentResult, "config");
     return presentResult;

@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/options_menu.h"
@@ -3315,6 +3316,7 @@ void InitializeHost()
 
 void ShutdownHost()
 {
+    netplay::bridge::desync_monitor::Shutdown();
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
     if (g_revivalProcess != nullptr)
@@ -3531,6 +3533,9 @@ bool StartSession(
         (nickname != nullptr) ? nickname : "",
         writeNicknameToIni ? 1 : 0);
     LogRevival102jDeepStep("StartSession.01.entry", ioStatus);
+
+    netplay::bridge::desync_monitor::NotifySessionStarted(
+        static_cast<int>(role), address, port, nickname);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
@@ -5290,6 +5295,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    netplay::bridge::desync_monitor::NotifySessionEnded(reason);
     LogRevival102jDeepSnapshot("CancelSession.01.entry", ioStatus);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_entry");

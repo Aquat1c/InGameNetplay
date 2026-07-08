@@ -1050,15 +1050,18 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
 // we capture the host process's intercepted disk writes and append them to a
 // single clean root logEfz.txt. Each init session writes a clear separator so
 // the file remains readable across reconnects/restarts.
+//
+// The file is append-only (FILE_APPEND_DATA): existing content is never
+// rewritten, so no in-memory history is kept and session boundaries cost one
+// header write instead of a full-file rebuild.  The only truncation is the
+// fresh-launch reset on the first open when the user keeps
+// PreserveRevivalLogsAcrossLaunches off.
 // ---------------------------------------------------------------------------
 static std::mutex g_ownedLogEfzMutex;
 static HANDLE g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
 static std::string g_ownedLogEfzCurrentPath;
-static std::string g_ownedLogEfzHistory;
-static std::string g_ownedLogEfzHistoryPath;
-static bool g_ownedLogEfzHistoryPrimed = false;
 static uint32_t g_ownedLogEfzSessionOrdinal = 0;
-static bool g_ownedLogEfzPrimedForProcess = false;
+static bool g_ownedLogEfzOpenedThisProcess = false;
 
 static unsigned long long QueryExistingOwnedLogEfzSize(const std::string& path, bool* outExists)
 {
@@ -1292,135 +1295,9 @@ static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
     return buffer;
 }
 
-static void PrimeOwnedLogEfzHistoryLocked(const std::string& path)
-{
-    if (path.empty())
-    {
-        return;
-    }
-
-    if (g_ownedLogEfzHistoryPrimed && _stricmp(g_ownedLogEfzHistoryPath.c_str(), path.c_str()) == 0)
-    {
-        return;
-    }
-
-    const bool preserveAcrossLaunches = netplay::mod_settings::PreserveRevivalLogsAcrossLaunches();
-    const bool firstPrimeThisProcess = !g_ownedLogEfzPrimedForProcess;
-    bool previousExists = false;
-    const unsigned long long previousBytes = QueryExistingOwnedLogEfzSize(path, &previousExists);
-
-    if (firstPrimeThisProcess && !preserveAcrossLaunches)
-    {
-        g_ownedLogEfzHistory.clear();
-        g_ownedLogEfzHistoryPath = path;
-        g_ownedLogEfzHistoryPrimed = true;
-        g_ownedLogEfzPrimedForProcess = true;
-
-        mod::Log(
-            "CAPTURE_LOG: starting fresh managed logEfz current='%s' preserveAcrossLaunches=0 previousExists=%d previousBytes=%llu",
-            path.c_str(),
-            previousExists ? 1 : 0,
-            previousBytes);
-        return;
-    }
-
-    g_ownedLogEfzHistory.clear();
-    FILE* file = _fsopen(path.c_str(), "rb", _SH_DENYNO);
-    if (file != nullptr)
-    {
-        if (std::fseek(file, 0, SEEK_END) == 0)
-        {
-            const long size = std::ftell(file);
-            if (size > 0 && std::fseek(file, 0, SEEK_SET) == 0)
-            {
-                g_ownedLogEfzHistory.resize(static_cast<size_t>(size));
-                const size_t read = std::fread(
-                    g_ownedLogEfzHistory.data(),
-                    1,
-                    g_ownedLogEfzHistory.size(),
-                    file);
-                if (read != g_ownedLogEfzHistory.size())
-                {
-                    char detail[256] = {};
-                    std::snprintf(
-                        detail,
-                        sizeof(detail),
-                        "requested=%lu read=%lu",
-                        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
-                        static_cast<unsigned long>(read));
-                    LogOwnedLogEfzIntegrityIssue("prime_short_read", path, detail);
-                }
-                g_ownedLogEfzHistory.resize(read);
-            }
-        }
-        std::fclose(file);
-    }
-
-    if (!g_ownedLogEfzHistory.empty())
-    {
-        const size_t bytesBefore = g_ownedLogEfzHistory.size();
-        const size_t firstNonNul = g_ownedLogEfzHistory.find_first_not_of('\0');
-        if (firstNonNul == std::string::npos)
-        {
-            mod::Log(
-                "CAPTURE_LOG: discarded all-zero managed logEfz history current='%s' bytes=%lu",
-                path.c_str(),
-                static_cast<unsigned long>(bytesBefore));
-            char detail[256] = {};
-            std::snprintf(
-                detail,
-                sizeof(detail),
-                "reason=all_zero_history bytesDiscarded=%lu",
-                static_cast<unsigned long>(bytesBefore));
-            LogOwnedLogEfzIntegrityIssue("discarded_history", path, detail);
-            g_ownedLogEfzHistory.clear();
-        }
-        else
-        {
-            size_t trimmedLeadingNuls = 0;
-            if (firstNonNul > 0)
-            {
-                trimmedLeadingNuls = firstNonNul;
-                g_ownedLogEfzHistory.erase(0, firstNonNul);
-            }
-
-            const auto newEnd = std::remove(g_ownedLogEfzHistory.begin(), g_ownedLogEfzHistory.end(), '\0');
-            const size_t removedEmbeddedNuls =
-                static_cast<size_t>(g_ownedLogEfzHistory.end() - newEnd);
-            g_ownedLogEfzHistory.erase(newEnd, g_ownedLogEfzHistory.end());
-
-            if (trimmedLeadingNuls > 0 || removedEmbeddedNuls > 0)
-            {
-                mod::Log(
-                    "CAPTURE_LOG: sanitized managed logEfz history current='%s' bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
-                    path.c_str(),
-                    static_cast<unsigned long>(bytesBefore),
-                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
-                    static_cast<unsigned long>(trimmedLeadingNuls),
-                    static_cast<unsigned long>(removedEmbeddedNuls));
-                char detail[320] = {};
-                std::snprintf(
-                    detail,
-                    sizeof(detail),
-                    "reason=nul_sanitized bytesBefore=%lu bytesAfter=%lu trimmedLeadingNuls=%lu removedEmbeddedNuls=%lu",
-                    static_cast<unsigned long>(bytesBefore),
-                    static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
-                    static_cast<unsigned long>(trimmedLeadingNuls),
-                    static_cast<unsigned long>(removedEmbeddedNuls));
-                LogOwnedLogEfzIntegrityIssue("history_sanitized", path, detail);
-            }
-        }
-    }
-
-    g_ownedLogEfzHistoryPath = path;
-    g_ownedLogEfzHistoryPrimed = true;
-    g_ownedLogEfzPrimedForProcess = true;
-
-    mod::Log(
-        "CAPTURE_LOG: primed managed logEfz history current='%s' bytes=%lu",
-        path.c_str(),
-        static_cast<unsigned long>(g_ownedLogEfzHistory.size()));
-}
+// (The old in-memory history priming/sanitizing lived here.  Append-only
+// writing made it unnecessary: prior file content is never re-read or
+// rewritten, so there is nothing to prime or sanitize.)
 
 static bool EnsureOwnedLogEfzFilesOpenLocked()
 {
@@ -1435,13 +1312,23 @@ static bool EnsureOwnedLogEfzFilesOpenLocked()
         return false;
     }
 
-    PrimeOwnedLogEfzHistoryLocked(g_ownedLogEfzCurrentPath);
+    const bool preserveAcrossLaunches =
+        netplay::mod_settings::PreserveRevivalLogsAcrossLaunches();
+    const bool firstOpenThisProcess = !g_ownedLogEfzOpenedThisProcess;
+    bool previousExists = false;
+    const unsigned long long previousBytes =
+        QueryExistingOwnedLogEfzSize(g_ownedLogEfzCurrentPath, &previousExists);
+
+    // Append-only: FILE_APPEND_DATA makes every WriteFile land at end of
+    // file, so session reopens never rewrite existing content.  The only
+    // truncation is the fresh-launch reset on the first open of a launch.
+    const bool truncateNow = firstOpenThisProcess && !preserveAcrossLaunches;
     g_ownedLogEfzCurrentHandle = CreateFileA(
         g_ownedLogEfzCurrentPath.c_str(),
-        GENERIC_WRITE,
+        FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
-        CREATE_ALWAYS,
+        truncateNow ? CREATE_ALWAYS : OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
 
@@ -1454,24 +1341,23 @@ static bool EnsureOwnedLogEfzFilesOpenLocked()
         std::snprintf(
             detail,
             sizeof(detail),
-            "reason=rebuild_open_failed winerr=%lu",
+            "reason=append_open_failed winerr=%lu",
             static_cast<unsigned long>(GetLastError()));
         LogOwnedLogEfzIntegrityIssue("open_failed", g_ownedLogEfzCurrentPath, detail);
         g_ownedLogEfzCurrentPath.clear();
         return false;
     }
 
-    if (!g_ownedLogEfzHistory.empty())
+    if (firstOpenThisProcess)
     {
-        if (!WriteOwnedLogEfzBytes(
-                g_ownedLogEfzCurrentPath,
-                "rebuild_history",
-                g_ownedLogEfzHistory.data(),
-                g_ownedLogEfzHistory.size()))
-        {
-            CloseOwnedLogEfzCurrentFileLocked("rebuild_history_failed");
-            return false;
-        }
+        g_ownedLogEfzOpenedThisProcess = true;
+        mod::Log(
+            "CAPTURE_LOG: %s managed logEfz current='%s' preserveAcrossLaunches=%d previousExists=%d previousBytes=%llu",
+            truncateNow ? "starting fresh" : "appending to preserved",
+            g_ownedLogEfzCurrentPath.c_str(),
+            preserveAcrossLaunches ? 1 : 0,
+            previousExists ? 1 : 0,
+            previousBytes);
     }
 
     const uint32_t sessionOrdinal = g_ownedLogEfzSessionOrdinal + 1;
@@ -1487,14 +1373,13 @@ static bool EnsureOwnedLogEfzFilesOpenLocked()
     }
 
     g_ownedLogEfzSessionOrdinal = sessionOrdinal;
-    g_ownedLogEfzHistory.append(header);
 
     mod::Log(
-        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=rebuild historyBytes=%lu preserveAcrossLaunches=%d",
+        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=append fileBytes=%llu preserveAcrossLaunches=%d",
         g_ownedLogEfzCurrentPath.c_str(),
         static_cast<unsigned long>(g_ownedLogEfzSessionOrdinal),
-        static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
-        netplay::mod_settings::PreserveRevivalLogsAcrossLaunches() ? 1 : 0);
+        previousBytes,
+        preserveAcrossLaunches ? 1 : 0);
     return true;
 }
 
@@ -1532,30 +1417,6 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
     std::string entry(prefix);
     entry.append(line);
     entry.append("\r\n");
-    g_ownedLogEfzHistory.append(entry);
-
-    // Cap the in-memory history to prevent unbounded growth over long
-    // sessions.  When the cap is exceeded, discard the oldest half of the
-    // buffer.  The disk file is **not** truncated - only the in-memory
-    // history used for session-rebuild is pruned.
-    static constexpr size_t kHistoryCapBytes = 2u * 1024u * 1024u; // 2 MB
-    if (g_ownedLogEfzHistory.size() > kHistoryCapBytes)
-    {
-        const size_t oldSize = g_ownedLogEfzHistory.size();
-        const size_t trimTo = kHistoryCapBytes / 2;
-        const size_t eraseBytes = oldSize - trimTo;
-        // Find the next newline after the erase point to keep lines intact.
-        size_t newlinePos = g_ownedLogEfzHistory.find('\n', eraseBytes);
-        if (newlinePos != std::string::npos && newlinePos + 1 < oldSize)
-            g_ownedLogEfzHistory.erase(0, newlinePos + 1);
-        else
-            g_ownedLogEfzHistory.erase(0, eraseBytes);
-        mod::Log(
-            "CAPTURE_LOG: pruned logEfz history %lu -> %lu bytes (cap=%lu)",
-            static_cast<unsigned long>(oldSize),
-            static_cast<unsigned long>(g_ownedLogEfzHistory.size()),
-            static_cast<unsigned long>(kHistoryCapBytes));
-    }
 
     if (!WriteOwnedLogEfzBytes(
             g_ownedLogEfzCurrentPath,
@@ -1609,8 +1470,11 @@ void CloseMirrorLogFiles()
 
 void PrimeManagedLogEfzHistory()
 {
+    // Append-only writing keeps no history; opening the file up front still
+    // matters so the fresh-launch truncation (and its log line) happens at
+    // startup rather than at the first captured write.
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-    PrimeOwnedLogEfzHistoryLocked(GetOwnedLogEfzPath());
+    (void)EnsureOwnedLogEfzFilesOpenLocked();
 }
 
 void BeginManagedLogEfzWrite()

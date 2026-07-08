@@ -1024,7 +1024,7 @@ size_t g_menuTextColorCount = 0;
 
 bool RtTextWanted()
 {
-    return netplay::mod_settings::IsBattleLogTtfTextEnabled();
+    return netplay::mod_settings::IsMenuTtfTextEnabled();
 }
 
 bool RtTextActive()
@@ -1070,7 +1070,7 @@ void SubmitMenuRtText(
     int x1,
     int y,
     netplay::debug_overlay::RtTextAlign align,
-    netplay::debug_overlay::RtTextSize size,
+    netplay::debug_overlay::RtTextProfile profile,
     uint8_t paletteColor)
 {
     netplay::debug_overlay::RtTextItem item;
@@ -1078,7 +1078,7 @@ void SubmitMenuRtText(
     item.x1 = static_cast<int16_t>(x1);
     item.y = static_cast<int16_t>(y);
     item.align = align;
-    item.size = size;
+    item.profile = profile;
     item.rgba = MenuTextRgbaFor(paletteColor);
     const size_t bytes = (std::min)(text.size(), sizeof(item.text) - 1);
     std::memcpy(item.text, text.data(), bytes);
@@ -1093,7 +1093,7 @@ void MenuTextLeft(const netplay::font::IndexedSurfaceView& surface, const std::s
 {
     if (RtTextWanted())
     {
-        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Left, netplay::debug_overlay::RtTextSize::Row, color);
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Left, netplay::debug_overlay::RtTextProfile::BattleLogRow, color);
         if (RtTextActive())
         {
             return;
@@ -1106,7 +1106,7 @@ void MenuTextCentered(const netplay::font::IndexedSurfaceView& surface, const st
 {
     if (RtTextWanted())
     {
-        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextSize::Row, color);
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextProfile::BattleLogRow, color);
         if (RtTextActive())
         {
             return;
@@ -1119,7 +1119,7 @@ void MenuTextRight(const netplay::font::IndexedSurfaceView& surface, const std::
 {
     if (RtTextWanted())
     {
-        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Right, netplay::debug_overlay::RtTextSize::Row, color);
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Right, netplay::debug_overlay::RtTextProfile::BattleLogRow, color);
         if (RtTextActive())
         {
             return;
@@ -1133,7 +1133,7 @@ void MenuTitleCentered(const netplay::font::IndexedSurfaceView& surface, const s
 {
     if (RtTextWanted())
     {
-        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextSize::Header, color);
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextProfile::BattleLogHeader, color);
         if (RtTextActive())
         {
             return;
@@ -1150,7 +1150,7 @@ int MeasureMenuTextWidth(const std::string& text)
     if (RtTextActive())
     {
         const int width = netplay::debug_overlay::MeasureRtTextWidth(
-            netplay::debug_overlay::RtTextSize::Row, text.c_str());
+            netplay::debug_overlay::RtTextProfile::BattleLogRow, text.c_str());
         if (width >= 0)
         {
             return width;
@@ -2378,10 +2378,11 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
 
     if (device != nullptr)
     {
-        // Drop committed game-RT text the moment the battle log menu is gone,
-        // so TTF text cannot linger over other screens.
-        if (!hooks::g_netplayMenuState.active
-            || hooks::g_netplayMenuState.menuId != NetplayMenuId::BattleLog)
+        // Drop committed game-RT text the moment the netplay menu is gone, so
+        // TTF text cannot linger over gameplay screens.  Per-menu ownership is
+        // handled by the render pass (it republishes the frame every tick), so
+        // only the menu-inactive case needs the hard clear.
+        if (!hooks::g_netplayMenuState.active)
         {
             netplay::debug_overlay::ClearRtText();
         }
@@ -6997,11 +6998,9 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         lockedSurface.pitch,
     };
 
-    const bool rtTextFrame = RtTextWanted();
-    if (rtTextFrame)
-    {
-        netplay::debug_overlay::BeginRtTextFrame();
-    }
+    // The render pass owns the RT text frame (Begin/Commit around the whole
+    // menu draw) so the footer can submit into the same frame; this overlay
+    // only submits items.
     ResetMenuTextColors();
 
     const uint8_t panelFill = netplay::draw::ResolveBestPaletteColor(screenContext, 0, 0, 0);
@@ -7044,11 +7043,6 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         DrawDetailPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, alertColor);
         DrawDetailRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor);
         break;
-    }
-
-    if (rtTextFrame)
-    {
-        netplay::debug_overlay::CommitRtTextFrame();
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);

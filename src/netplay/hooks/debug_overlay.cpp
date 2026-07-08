@@ -37,9 +37,39 @@ bool g_panelOpen = false;
 ImFont* g_badgeFont = nullptr;
 constexpr float kBadgeFontPx = 22.0f;
 
-// Smaller size of the same face for dense menu rows (game-RT text overlay).
-ImFont* g_rowFont = nullptr;
-constexpr float kRtRowFontPx = 15.0f;
+// Per-profile RT text styles.  fontPx is baked into the atlas (changing it
+// needs a font rebuild - the debug panel's Apply button); cellRtPx is the RT
+// height of the logical cell the text is centered on (a 5x7 row cell is
+// 14 RT px); yBiasRtPx nudges the line up/down after centering.  Dial values
+// in with the backslash panel, then hardcode them here.
+struct RtProfileStyle
+{
+    const char* name;
+    float fontPx;
+    float cellRtPx;
+    float yBiasRtPx;
+};
+// Defaults tuned in-game 2026-07-08 via the debug panel sliders.
+RtProfileStyle g_rtProfiles[static_cast<size_t>(RtTextProfile::Count)] = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         15.0f, 14.0f, 0.0f},
+    {"Footer",          22.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
+    {"BattleLogRow",    21.0f,  8.0f, 0.0f},
+};
+ImFont* g_rtProfileFonts[static_cast<size_t>(RtTextProfile::Count)] = {};
+char g_rtFontPath[MAX_PATH] = {};
+volatile LONG g_rtFontRebuildRequested = 0;
+
+const RtProfileStyle& RtStyleFor(RtTextProfile profile)
+{
+    size_t index = static_cast<size_t>(profile);
+    if (index >= static_cast<size_t>(RtTextProfile::Count))
+    {
+        index = static_cast<size_t>(RtTextProfile::MenuRow);
+    }
+    return g_rtProfiles[index];
+}
 
 // Game-RT text overlay items (see debug_overlay.h). Producers stage a full
 // frame from the menu render pass, then Commit publishes it for EndScene.
@@ -59,22 +89,20 @@ void EnsureRtTextLock()
     }
 }
 
-ImFont* RtFontFor(RtTextSize size)
+ImFont* RtFontFor(RtTextProfile profile)
 {
-    if (size == RtTextSize::Header)
+    size_t index = static_cast<size_t>(profile);
+    if (index >= static_cast<size_t>(RtTextProfile::Count))
     {
-        return g_badgeFont;
+        index = static_cast<size_t>(RtTextProfile::MenuRow);
     }
-    return (g_rowFont != nullptr) ? g_rowFont : g_badgeFont;
+    ImFont* font = g_rtProfileFonts[index];
+    return (font != nullptr) ? font : g_badgeFont;
 }
 
-float RtFontPxFor(RtTextSize size)
+float RtFontPxFor(RtTextProfile profile)
 {
-    if (size == RtTextSize::Header)
-    {
-        return kBadgeFontPx;
-    }
-    return kRtRowFontPx;
+    return RtStyleFor(profile).fontPx;
 }
 
 // EFZ renders its scene to a fixed 640x480 D3D9 render target; EFZ Revival then
@@ -98,10 +126,13 @@ float g_asyncPosY = 0.0f;     // fraction of screen height (0=top, 1=bottom)
 float g_asyncFontScale = 0.65f;
 float g_asyncBgAlpha = 0.48f; // tuned live via the backslash debug panel
 
-// Load a crisp UI font from the system fonts directory. Tries a few common
-// faces; returns nullptr (caller falls back to the default font) if none load.
-ImFont* LoadSystemBadgeFont()
+// Resolve a crisp system UI font face once (path cached for rebuilds).
+const char* ResolveSystemFontPath()
 {
+    if (g_rtFontPath[0] != '\0')
+    {
+        return g_rtFontPath;
+    }
     char winDir[MAX_PATH] = {};
     const UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
     if (n == 0 || n >= MAX_PATH)
@@ -109,29 +140,77 @@ ImFont* LoadSystemBadgeFont()
         return nullptr;
     }
     static const char* kFaces[] = { "segoeui.ttf", "tahoma.ttf", "arial.ttf", "verdana.ttf" };
-    ImGuiIO& io = ImGui::GetIO();
     for (const char* face : kFaces)
     {
         char path[MAX_PATH] = {};
         std::snprintf(path, sizeof(path), "%s\\Fonts\\%s", winDir, face);
-        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
         {
-            continue;
-        }
-        ImFont* f = io.Fonts->AddFontFromFileTTF(path, kBadgeFontPx);
-        if (f != nullptr)
-        {
-            // Bake the row size of the same face into the same atlas so the
-            // game-RT menu text is native-resolution rather than downscaled.
-            g_rowFont = io.Fonts->AddFontFromFileTTF(path, kRtRowFontPx);
-            mod::Log(
-                "DebugOverlay: loaded badge font %s @%.0fpx (rows @%.0fpx %s)",
-                path, kBadgeFontPx, kRtRowFontPx,
-                g_rowFont != nullptr ? "ok" : "failed");
-            return f;
+            std::snprintf(g_rtFontPath, sizeof(g_rtFontPath), "%s", path);
+            return g_rtFontPath;
         }
     }
     return nullptr;
+}
+
+// (Re)bake all fonts into the atlas: the async badge font plus one font per
+// distinct profile font size (profiles sharing a px share the ImFont).
+// Caller must ensure the DX9 backend recreates its device objects afterwards
+// (it does automatically on the next NewFrame after InvalidateDeviceObjects).
+void LoadRtFonts()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    g_badgeFont = nullptr;
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        g_rtProfileFonts[i] = nullptr;
+    }
+
+    const char* path = ResolveSystemFontPath();
+    if (path == nullptr)
+    {
+        io.Fonts->AddFontDefault();
+        mod::Log("DebugOverlay: no system TTF found, using default font");
+        return;
+    }
+
+    g_badgeFont = io.Fonts->AddFontFromFileTTF(path, kBadgeFontPx);
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        const float px = g_rtProfiles[i].fontPx;
+        // Reuse a font already baked at this size (including the badge font).
+        if (px == kBadgeFontPx && g_badgeFont != nullptr)
+        {
+            g_rtProfileFonts[i] = g_badgeFont;
+            continue;
+        }
+        ImFont* shared = nullptr;
+        for (size_t j = 0; j < i; ++j)
+        {
+            if (g_rtProfiles[j].fontPx == px && g_rtProfileFonts[j] != nullptr)
+            {
+                shared = g_rtProfileFonts[j];
+                break;
+            }
+        }
+        g_rtProfileFonts[i] = (shared != nullptr)
+            ? shared
+            : io.Fonts->AddFontFromFileTTF(path, px);
+    }
+    if (io.Fonts->Fonts.empty())
+    {
+        io.Fonts->AddFontDefault();
+    }
+    mod::Log(
+        "DebugOverlay: fonts baked from %s (badge @%.0fpx, profiles %.0f/%.0f/%.0f/%.0f/%.0f px)",
+        path,
+        kBadgeFontPx,
+        g_rtProfiles[0].fontPx,
+        g_rtProfiles[1].fontPx,
+        g_rtProfiles[2].fontPx,
+        g_rtProfiles[3].fontPx,
+        g_rtProfiles[4].fontPx);
 }
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -183,7 +262,11 @@ void ShutdownImGui()
     g_device = nullptr;
     g_hwnd = nullptr;
     g_badgeFont = nullptr;
-    g_rowFont = nullptr;
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        g_rtProfileFonts[i] = nullptr;
+    }
+    InterlockedExchange(&g_rtFontRebuildRequested, 0);
     g_lastBackBufferW = 0;
     g_lastBackBufferH = 0;
 }
@@ -260,8 +343,8 @@ bool EnsureInited(IDirect3DDevice9* device)
     ImGui::GetIO().IniFilename = nullptr; // do not write imgui.ini
     ImGui::StyleColorsDark();
 
-    // Load a crisp TTF before the backend builds the font atlas (on first frame).
-    g_badgeFont = LoadSystemBadgeFont();
+    // Load crisp TTFs before the backend builds the font atlas (on first frame).
+    LoadRtFonts();
 
     if (!ImGui_ImplWin32_Init(hwnd))
     {
@@ -342,12 +425,13 @@ void DrawRtTextItems()
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     for (const RtTextItem& item : g_rtTextActive)
     {
-        ImFont* font = RtFontFor(item.size);
+        ImFont* font = RtFontFor(item.profile);
         if (font == nullptr || !font->IsLoaded())
         {
             continue;
         }
-        const float fontPx = RtFontPxFor(item.size);
+        const RtProfileStyle& style = RtStyleFor(item.profile);
+        const float fontPx = style.fontPx;
         const ImVec2 textSize = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, item.text);
         const float rtX0 = static_cast<float>(item.x0) * 2.0f;
         const float rtX1 = static_cast<float>(item.x1) * 2.0f;
@@ -364,9 +448,11 @@ void DrawRtTextItems()
         {
             x = rtX0; // never spill left of the field when the text overflows
         }
-        // item.y is the top of the 7px-tall 5x7 cell (14 RT px); center the TTF
-        // line height on that cell so rows keep their vertical rhythm.
-        const float y = static_cast<float>(item.y) * 2.0f + (14.0f - textSize.y) * 0.5f;
+        // item.y is the top of the logical cell the text replaces; center the
+        // TTF line height on the profile's cell so rows keep their rhythm.
+        const float y = static_cast<float>(item.y) * 2.0f
+            + (style.cellRtPx - textSize.y) * 0.5f
+            + style.yBiasRtPx;
         dl->AddText(font, fontPx, ImVec2(x, y), item.rgba, item.text);
     }
     LeaveCriticalSection(&g_rtTextLock);
@@ -397,6 +483,27 @@ void DrawDebugPanel()
             ah::IsMinimized() ? 1 : 0,
             ah::IsPeerFoundHeld() ? 1 : 0,
             ah::IsTimedOut() ? 1 : 0);
+
+        ImGui::SeparatorText("RT text profiles");
+        bool fontPxChanged = false;
+        for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+        {
+            RtProfileStyle& style = g_rtProfiles[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Text("%s", style.name);
+            ImGui::SliderFloat("font px", &style.fontPx, 8.0f, 32.0f, "%.0f");
+            // Rebuild only on slider release - baking the atlas mid-drag
+            // would hitch every frame.
+            fontPxChanged |= ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::SliderFloat("cell px", &style.cellRtPx, 8.0f, 32.0f, "%.0f");
+            ImGui::SliderFloat("y bias", &style.yBiasRtPx, -8.0f, 8.0f, "%.1f");
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Apply font sizes (rebuild atlas)") || fontPxChanged)
+        {
+            InterlockedExchange(&g_rtFontRebuildRequested, 1);
+        }
+        ImGui::TextDisabled("cell/y-bias apply live; font px rebuilds the atlas.\nDial in, then hardcode in g_rtProfiles.");
     }
     ImGui::End();
 }
@@ -480,6 +587,14 @@ void Render(IDirect3DDevice9* device)
         return; // initialised, but nothing to draw this frame
     }
 
+    // Profile font-size change from the debug panel: rebake the atlas before
+    // the backend's NewFrame recreates the device objects.
+    if (InterlockedExchange(&g_rtFontRebuildRequested, 0) != 0)
+    {
+        ImGui_ImplDX9_InvalidateDeviceObjects();
+        LoadRtFonts();
+    }
+
     // One-shot diagnostics: confirm the ImGui/EndScene path actually renders
     // (the in-battle / outside-menu indicator depends on EndScene firing for the
     // game's device). If this never logs while hosting+minimized in a match, the
@@ -559,18 +674,18 @@ bool IsRtTextAvailable()
     return g_inited && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
 }
 
-int MeasureRtTextWidth(RtTextSize size, const char* text)
+int MeasureRtTextWidth(RtTextProfile profile, const char* text)
 {
     if (text == nullptr || !IsRtTextAvailable())
     {
         return -1;
     }
-    ImFont* font = RtFontFor(size);
+    ImFont* font = RtFontFor(profile);
     if (font == nullptr || !font->IsLoaded())
     {
         return -1;
     }
-    const ImVec2 textSize = font->CalcTextSizeA(RtFontPxFor(size), FLT_MAX, 0.0f, text);
+    const ImVec2 textSize = font->CalcTextSizeA(RtFontPxFor(profile), FLT_MAX, 0.0f, text);
     // RT pixels -> menu-logical pixels (x2 mapping), rounded up.
     return static_cast<int>((textSize.x + 1.9f) * 0.5f);
 }

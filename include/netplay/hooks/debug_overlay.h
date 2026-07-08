@@ -40,10 +40,19 @@ enum class RtTextAlign : uint8_t
     Right,       // anchor right edge at x1
 };
 
-enum class RtTextSize : uint8_t
+// Text style profiles - one per menu/usage context, so each menu can tune
+// its own font size, cell height, and vertical bias independently.  The
+// style table lives in debug_overlay.cpp; the backslash debug panel exposes
+// live sliders (font-size changes rebuild the atlas on Apply) so values can
+// be dialed in and then hardcoded as the profile defaults.
+enum class RtTextProfile : uint8_t
 {
-    Row = 0,     // dense list rows / body text
-    Header,      // panel titles (badge font size)
+    MenuHeader = 0,   // large page headers
+    MenuRow,          // generic menu rows
+    Footer,           // footer tooltip lines
+    BattleLogHeader,  // battle log panel titles
+    BattleLogRow,     // battle log dense rows
+    Count,
 };
 
 struct RtTextItem
@@ -52,7 +61,7 @@ struct RtTextItem
     int16_t x1 = 0;                    // logical right bound
     int16_t y = 0;                     // logical top of the 5x7 cell it replaces
     RtTextAlign align = RtTextAlign::Left;
-    RtTextSize size = RtTextSize::Row;
+    RtTextProfile profile = RtTextProfile::MenuRow;
     uint32_t rgba = 0xFFFFFFFFu;       // IM_COL32-style ABGR-packed color
     char text[112] = {};
 };
@@ -62,10 +71,11 @@ struct RtTextItem
 // whether to suppress their 5x7 fallback text.
 bool IsRtTextAvailable();
 
-// Width of `text` in menu-logical pixels (RT pixels / 2) for the given size,
-// so producers can run layout/fitting against the TTF metrics. Returns -1
-// when the overlay is unavailable (caller falls back to 5x7 metrics).
-int MeasureRtTextWidth(RtTextSize size, const char* text);
+// Width of `text` in menu-logical pixels (RT pixels / 2) for the given
+// profile, so producers can run layout/fitting against the TTF metrics.
+// Returns -1 when the overlay is unavailable (caller falls back to 5x7
+// metrics).
+int MeasureRtTextWidth(RtTextProfile profile, const char* text);
 
 // Frame protocol for producers: Begin clears the staging list, Submit appends,
 // Commit publishes staging as the active list consumed by Render(). Clear

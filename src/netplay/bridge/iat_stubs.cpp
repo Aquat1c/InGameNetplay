@@ -132,6 +132,100 @@ static bool HasLogEfzBaseNameW(LPCWSTR path)
     return _wcsicmp(baseName, L"logEfz.txt") == 0;
 }
 
+static bool HasLogNetBaseNameA(LPCSTR path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+
+    const char* baseName = path;
+    for (const char* p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "logNet.txt") == 0;
+}
+
+static bool HasLogNetBaseNameW(LPCWSTR path)
+{
+    if (path == nullptr || path[0] == L'\0')
+    {
+        return false;
+    }
+
+    const wchar_t* baseName = path;
+    for (const wchar_t* p = path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _wcsicmp(baseName, L"logNet.txt") == 0;
+}
+
+// The helper EXE opens logNet.txt with a truncating disposition at every
+// session start, so each session erases the previous one's network log.
+// Detect a truncating write open of logNet.txt and convert it to an
+// appending one: same path and access, OPEN_ALWAYS instead of truncate,
+// file pointer moved to end, plus a separator line so sessions stay
+// readable.  Only the disposition changes - the mod's WriteFile capture
+// keys on the handle/path and is unaffected.
+static bool IsTruncatingWriteOpen(DWORD desiredAccess, DWORD creationDisposition)
+{
+    const bool wantsWrite =
+        (desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    const bool truncates =
+        creationDisposition == CREATE_ALWAYS
+        || creationDisposition == TRUNCATE_EXISTING;
+    return wantsWrite && truncates;
+}
+
+static void SeekEndAndWriteLogNetSessionSeparator(HANDLE handle)
+{
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    const DWORD endPos = SetFilePointer(handle, 0, nullptr, FILE_END);
+    if (endPos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
+    {
+        return;
+    }
+    if (endPos == 0)
+    {
+        // Fresh file - no separator needed.
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    char separator[128] = {};
+    const int len = std::snprintf(
+        separator,
+        sizeof(separator),
+        "\r\n===== new session %04u-%02u-%02u %02u:%02u:%02u pid=%lu =====\r\n",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned long>(GetCurrentProcessId()));
+    if (len > 0)
+    {
+        DWORD written = 0;
+        (void)WriteFile(handle, separator, static_cast<DWORD>(len), &written, nullptr);
+    }
+}
+
 static std::string GetNativeShadowLogEfzPathA()
 {
     const std::string dir = GetTakeoverModuleDirectoryA();
@@ -141,7 +235,12 @@ static std::string GetNativeShadowLogEfzPathA()
     }
 
     const char* const subdir = IsCurrentProcessRevival() ? "native_revival" : "native_host";
-    const std::string shadowDir = dir + "\\" + subdir;
+    const std::string logsDir = dir + "\\logs";
+    if (!EnsureDirectoryExistsA(logsDir))
+    {
+        return {};
+    }
+    const std::string shadowDir = logsDir + "\\" + subdir;
     if (!EnsureDirectoryExistsA(shadowDir))
     {
         return {};
@@ -159,7 +258,12 @@ static std::wstring GetNativeShadowLogEfzPathW()
     }
 
     const wchar_t* const subdir = IsCurrentProcessRevival() ? L"native_revival" : L"native_host";
-    const std::wstring shadowDir = dir + L"\\" + subdir;
+    const std::wstring logsDir = dir + L"\\logs";
+    if (!EnsureDirectoryExistsW(logsDir))
+    {
+        return {};
+    }
+    const std::wstring shadowDir = logsDir + L"\\" + subdir;
     if (!EnsureDirectoryExistsW(shadowDir))
     {
         return {};
@@ -2672,6 +2776,27 @@ HANDLE StubCreateFileA(
         }
     }
 
+    if (HasLogNetBaseNameA(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                lpFileName);
+            return handle;
+        }
+    }
+
     return CreateFileA(
         lpFileName,
         dwDesiredAccess,
@@ -2713,6 +2838,29 @@ HANDLE StubCreateFileW(
                 dwCreationDisposition,
                 dwFlagsAndAttributes,
                 hTemplateFile);
+        }
+    }
+
+    if (HasLogNetBaseNameW(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            char originalUtf8[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                originalUtf8);
+            return handle;
         }
     }
 

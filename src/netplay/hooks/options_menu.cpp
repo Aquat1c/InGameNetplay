@@ -1518,6 +1518,14 @@ void AppendSyntheticItems()
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
+    upsertBoolIntItem(
+        "DesyncDetection",
+        true,
+        "Detect desyncs against a modded opponent and dump forensic logs to mods\\efz_netplay_mod\\logs. Also keeps Revival debug logs enabled and uncropped.");
+    upsertBoolIntItem(
+        "MenuTtfText",
+        true,
+        "Draw supported menu text (Battle Log, footer tooltips) with a crisp TTF font instead of the pixel font. Falls back automatically if unavailable.");
     upsertKeybindItem(
         "AsyncHostReturnKey",
         "DIK_F1",

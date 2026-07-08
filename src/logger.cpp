@@ -123,7 +123,7 @@ std::string BuildLogPathFromModule(HMODULE moduleHandle)
     }
 
     path.resize(slashPos + 1);
-    path += "efz_netplay_mod.log";
+    path += "logs\\efz_netplay_mod.log";
     return path;
 }
 
@@ -160,6 +160,14 @@ void OpenLogFileUnlocked()
     if (!g_fileLoggingEnabled || g_logFile != nullptr || g_logPath.empty())
     {
         return;
+    }
+
+    // The log lives in <mod>\logs\; create the folder lazily so it only
+    // exists when file logging is actually enabled.
+    const std::size_t dirEnd = g_logPath.find_last_of("\\/");
+    if (dirEnd != std::string::npos)
+    {
+        (void)CreateDirectoryA(g_logPath.substr(0, dirEnd).c_str(), nullptr);
     }
 
     const bool preserveAcrossLaunches = netplay::mod_settings::PreserveModLogAcrossLaunches();

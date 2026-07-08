@@ -1,6 +1,7 @@
 // Revival DLL memory introspection and session field manipulation.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/core/mod_settings.h"
@@ -8426,6 +8427,20 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         && g_activeRevival != nullptr
         && !preTickDisconnect)
     {
+        // Per-frame desync recorder: checksums + region copies of the
+        // post-tick confirmed state (no file I/O; see desync_monitor.cpp).
+        {
+            int dmFrame = -1;
+            int dmCommit = -1;
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(
+                    currentSession + g_activeRevival->sessionOffsetCurrentFrame),
+                &dmFrame);
+            (void)ReadGameplaySyncFrameForRecovery(currentSession, &dmCommit);
+            netplay::bridge::desync_monitor::RecordFrameTick(
+                currentSession, dmFrame, dmCommit);
+        }
+
         const bool isDesyncCheckFrame =
             (g_frameTick == 1)
             || (g_frameTick % 120 == 0)

@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/bridge/async_hosting.h"
+#include "netplay/hooks/debug_overlay.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/battle_log_menu.h"
@@ -372,6 +373,69 @@ std::string BuildEntryTooltip(const NetplayMenuEntry& entry)
     return BuildActionTooltip(entry.action);
 }
 
+// Submits one footer line to the game-RT TTF layer.  The submit happens even
+// while the layer is not live yet - a committed item is what makes the
+// EndScene hook initialise ImGui in the first place (same bootstrap the
+// battle log shims rely on).  Returns true only when the TTF layer will
+// actually draw this frame, i.e. the 5x7 fallback should be suppressed.
+bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
+{
+    namespace ov = netplay::debug_overlay;
+    if (!netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        return false;
+    }
+    for (unsigned char c : line)
+    {
+        if ((c & 0x80u) != 0)
+        {
+            return false; // TTF atlas is ASCII-only; keep 5x7 for this line
+        }
+    }
+
+    const int availableWidth = right - left;
+    std::string window = line;
+    // Width is unmeasurable until the fonts are loaded (-1); submit the whole
+    // line in that case - the marquee sizing corrects on the next frame.
+    const int textWidth = ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, line.c_str());
+    if (textWidth > availableWidth && !line.empty())
+    {
+        // Same marquee as the 5x7 path, sized with proportional metrics
+        // (average glyph width) instead of the fixed 6px cell.
+        constexpr DWORD kScrollStepMs = 180;
+        constexpr size_t kPadChars = 6;
+        const size_t visibleChars = (std::max)(
+            static_cast<size_t>(1),
+            line.size() * static_cast<size_t>(availableWidth)
+                / static_cast<size_t>(textWidth));
+        const std::string spacer(kPadChars, ' ');
+        const std::string marquee = line + spacer + line + spacer;
+        const size_t cycle = line.size() + spacer.size();
+        const size_t start = (GetTickCount() / kScrollStepMs) % cycle;
+        window = marquee.substr(start, (std::min)(visibleChars + 2, marquee.size() - start));
+        // The RT layer has no right-edge clipping (unlike the indexed
+        // surface), so trim the window until it actually fits the field.
+        while (!window.empty()
+            && ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, window.c_str()) > availableWidth)
+        {
+            window.pop_back();
+        }
+    }
+
+    ov::RtTextItem item;
+    item.x0 = static_cast<int16_t>(left);
+    item.x1 = static_cast<int16_t>(right);
+    item.y = static_cast<int16_t>(y);
+    item.align = ov::RtTextAlign::Left;
+    item.profile = ov::RtTextProfile::Footer;
+    item.rgba = 0xFFD0D0D0u; // footer grey (208,208,208), same as the 5x7 color
+    const size_t bytes = (std::min)(window.size(), sizeof(item.text) - 1);
+    std::memcpy(item.text, window.data(), bytes);
+    item.text[bytes] = '\0';
+    ov::SubmitRtText(item);
+    return ov::IsRtTextAvailable();
+}
+
 void DrawTooltipTextLines(
     const netplay::font::IndexedSurfaceView& surface,
     const std::string& text,
@@ -384,6 +448,13 @@ void DrawTooltipTextLines(
     {
         const int availableWidth = right - left;
         if (availableWidth <= 0)
+        {
+            return;
+        }
+
+        // Crisp TTF path via the game-RT overlay; the panel/frame stay on the
+        // indexed surface underneath.  Falls back to 5x7 per line.
+        if (SubmitFooterRtLine(line, left, right, y))
         {
             return;
         }
@@ -432,6 +503,14 @@ void DrawTooltipTextLines(
 
 std::string BuildFooterText()
 {
+    // The stop-hosting modal covers the footer area on the indexed surface,
+    // but RT text draws above everything - suppress the footer outright so
+    // it cannot float over the modal.
+    if (g_stopHostingConfirm.active)
+    {
+        return {};
+    }
+
     if (g_inlineEditState.active)
     {
         if (!g_inlineEditState.errorMessage.empty() && GetTickCount() < g_inlineEditState.errorExpireTick)

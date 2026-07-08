@@ -171,8 +171,10 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
-    loaded.battleLogTtfText =
-        ReadBoolValue(L"Others", L"BattleLogTtfText", true, iniPath);
+    loaded.desyncDetection =
+        ReadBoolValue(L"Others", L"DesyncDetection", true, iniPath);
+    loaded.menuTtfText =
+        ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
     loaded.asyncHostReturnKey =
         ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
     if (loaded.asyncHostReturnKey.empty())
@@ -218,6 +220,11 @@ bool IsDebugMenuEnabled()
     return g_settings.enableDebugMenu;
 }
 
+bool IsDesyncDetectionEnabled()
+{
+    return g_settings.desyncDetection;
+}
+
 bool IsVerboseBridgePatchLoggingEnabled()
 {
     return g_settings.verboseBridgePatchLogging;
@@ -245,9 +252,9 @@ bool HideEmptySetsInBattleLogByDefault()
     return g_settings.hideEmptySetsInBattleLog;
 }
 
-bool IsBattleLogTtfTextEnabled()
+bool IsMenuTtfTextEnabled()
 {
-    return g_settings.battleLogTtfText;
+    return g_settings.menuTtfText;
 }
 
 const std::string& AsyncHostReturnKeyBinding()

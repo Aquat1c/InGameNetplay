@@ -1,6 +1,7 @@
 // IPC shared memory, config loading, module resolution, and session status helpers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/mod_settings.h"
 
 #include <array>
 #include <cstdio>
@@ -649,7 +650,16 @@ void CleanupNativeHostShadowLogDirectory(const char* reason)
         return;
     }
 
-    const std::wstring shadowDir = moduleDir + L"\\native_host";
+    // Pre-logs-folder builds used <mod>\native_host; sweep the legacy
+    // location too so upgrades don't leave a stale copy behind.
+    const std::wstring legacyShadowDir = moduleDir + L"\\native_host";
+    if (GetFileAttributesW(legacyShadowDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        DWORD legacyErr = ERROR_SUCCESS;
+        (void)RemoveDirectoryTreeBestEffortW(legacyShadowDir, &legacyErr);
+    }
+
+    const std::wstring shadowDir = moduleDir + L"\\logs\\native_host";
     const DWORD attrs = GetFileAttributesW(shadowDir.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES)
     {
@@ -1553,6 +1563,25 @@ bool WriteIni(
         ok = wroteAddress && ok;
     }
     ok = writeIniKeyUtf8(L"Network", L"Port", "Network", "Port", portText) && ok;
+
+    // Desync forensics depend on Revival's native logs (logEfz.txt,
+    // logNet.txt, logDdraw.txt), which are only written with [Global]
+    // Debug=1. Enforce it at session start so every session is diagnosable;
+    // only touch the INI when the value actually differs.
+    if (netplay::mod_settings::IsDesyncDetectionEnabled())
+    {
+        const UINT debugValue =
+            GetPrivateProfileIntW(L"Global", L"Debug", 0, wideIniPath.c_str());
+        if (debugValue != 1)
+        {
+            const bool debugWriteOk =
+                writeIniKeyUtf8(L"Global", L"Debug", "Global", "Debug", "1");
+            mod::Log(
+                "Takeover: WriteIni enforced [Global] Debug=1 (was %u) result=%d",
+                debugValue,
+                debugWriteOk ? 1 : 0);
+        }
+    }
 
     mod::Log(
         "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",

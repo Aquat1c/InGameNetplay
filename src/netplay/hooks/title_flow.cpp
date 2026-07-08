@@ -3248,6 +3248,14 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
         return;
     }
 
+    // The game-RT TTF text layer (footer tooltips, battle log) renders from
+    // the shared D3D9 EndScene hook - install it up front so menu text is
+    // crisp from the first page, not only after the battle log installs it.
+    if (netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        (void)netplay::battle_log::EnsureGameplayOverlayHook();
+    }
+
     bool recoveryOwnedMenuEntry = false;
     if (skipFadeOut)
     {

@@ -140,6 +140,9 @@ std::string BuildArtifactPath(const char* extension)
         extension);
 
     std::string path = g_moduleDirectory[0] != '\0' ? g_moduleDirectory : ".";
+    path += "\\logs";
+    // Lazy: the folder only appears when a crash artifact is actually written.
+    (void)CreateDirectoryA(path.c_str(), nullptr);
     path += "\\";
     path += fileName;
     return path;
