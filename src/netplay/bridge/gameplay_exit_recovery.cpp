@@ -132,6 +132,28 @@ bool RunGameplayExitContinuation(const char* origin)
 
     takeover::LogSessionDiagnosticState("GameplayExitRecovery_entry");
 
+    // Recovery can fire while the connection is still alive (stall-detector
+    // exits, local bypass exits), and the helper is terminated below without
+    // any native goodbye - a healthy peer then hangs at "Pause, need more
+    // remote frames" until its own timeout and, on vanilla Revival, hard-exits
+    // through the Quit/ExitProcess path. Broadcast MessageQuit while the
+    // helper is still alive; if the peer/helper is already dead this fails
+    // fast and teardown continues unchanged.
+    bool peerQuitSent = false;
+    if ((recoveredRole == takeover::kLocalRoleOnline
+         || recoveredRole == takeover::kLocalRoleSpectate)
+        && takeover::g_revivalProcess != nullptr)
+    {
+        peerQuitSent = takeover::RequestInjectedPeerQuitBroadcast(
+            "gameplay_exit_recovery_pre_teardown", 300u);
+    }
+    mod::Log(
+        "GAMEPLAY_EXIT_RECOVERY_STEP peer_quit_broadcast result=%d role=%d helperPid=%lu origin=%s",
+        peerQuitSent ? 1 : 0,
+        recoveredRole,
+        static_cast<unsigned long>(recoveredPid),
+        originTag);
+
     takeover::NeutralizeRevivalSessionVtable();
     mod::Log(
         "GAMEPLAY_EXIT_RECOVERY_STEP neutralize_vtable result=1 origin=%s role=%d",

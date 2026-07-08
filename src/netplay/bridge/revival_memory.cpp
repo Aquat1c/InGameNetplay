@@ -5689,7 +5689,11 @@ struct GameplayStallTrackerState
 static GameplayStallTrackerState g_gameplayStall = {};
 static volatile LONG g_gameplayStallLocalProcessCloseActive = 0;
 static constexpr DWORD kGameplayStallConsoleErrorMs = 250u;
-static constexpr DWORD kGameplayStallSyncFrameMs = 5000u;
+// Tier B measures committed-frame progress (both players' inputs applied).
+// Revival reports genuine peer death through a console error well before
+// this (tier A), so tier B only exists for silent wedges - keep it above
+// any lag spike a live connection could still recover from.
+static constexpr DWORD kGameplayStallSyncFrameMs = 10000u;
 static constexpr DWORD kGameplayStallWallTimeoutMs = 30000u;
 static constexpr DWORD kGameplayStallProgressLogMs = 1000u;
 
@@ -5750,10 +5754,19 @@ static bool ReadGameplaySyncFrameForRecovery(uintptr_t sessionPtr, int* outSyncF
         return false;
     }
 
+    // gmBase+16 is the battle commit cursor (1.02e-i session+732, 1.02j
+    // session+828): it is re-anchored to currentFrame on every battle entry
+    // and advances only when a frame is committed with BOTH players' inputs,
+    // so it stalls exactly when the input exchange stalls.  Do NOT use
+    // gmBase+20 (the Sync-feed counter that fills the spectator queue): its
+    // currentFrame equality guard breaks permanently when a screen
+    // transition lands mid-prediction (e.g. battle ESC during rollback,
+    // routine on 1.02j delay=0), and Revival never repairs it - tier-B then
+    // tears down sessions whose battles are still advancing.
     const uintptr_t gmBase =
         sessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot;
     return SafeReadInt(
-        reinterpret_cast<const void*>(gmBase + 20),
+        reinterpret_cast<const void*>(gmBase + 16),
         outSyncFrame);
 }
 
@@ -5951,7 +5964,7 @@ static void ResetGameplayStallTracker(
     if (g_gameplayStall.active)
     {
         mod::Log(
-            "STALL_TRACK_RESET reason=%s previousStallMs=%lu previousBypassCount=%u previousSyncFrame=%d currentSyncFrame=%d screen=%u mode=%d",
+            "STALL_TRACK_RESET reason=%s previousStallMs=%lu previousBypassCount=%u previousCommitFrame=%d currentCommitFrame=%d screen=%u mode=%d",
             reason != nullptr ? reason : "unknown",
             static_cast<unsigned long>(GameplayStallElapsedMs(sample)),
             g_gameplayStall.bypassCount,
@@ -6039,7 +6052,7 @@ static void BeginGameplayStallTracker(
     }
 
     mod::Log(
-        "STALL_TRACK_BEGIN screen=%u mode=%d frameTick=%u syncFrame=%d consoleErrorSerial=%ld reason=%s",
+        "STALL_TRACK_BEGIN screen=%u mode=%d frameTick=%u commitFrame=%d consoleErrorSerial=%ld reason=%s",
         static_cast<unsigned>(sample.screen),
         sample.mode,
         sample.frameTick,
@@ -6059,7 +6072,7 @@ static void LogGameplayStallProgressIfDue(const GameplayStallSample& sample)
 
     g_gameplayStall.lastProgressLogMs = sample.nowMs;
     mod::Log(
-        "STALL_TRACK_PROGRESS screen=%u mode=%d stallMs=%lu syncFrame=%d syncFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld recoveryInProgress=%d phase=%d role=%d",
+        "STALL_TRACK_PROGRESS screen=%u mode=%d stallMs=%lu commitFrame=%d commitFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld recoveryInProgress=%d phase=%d role=%d",
         static_cast<unsigned>(sample.screen),
         sample.mode,
         static_cast<unsigned long>(stallMs),
@@ -6096,7 +6109,7 @@ static bool TriggerGameplayStallRecovery(
 {
     const char* originTag = GameplayStallOriginToString(origin);
     mod::Log(
-        "STALL_RECOVERY_TRIGGER origin=%s tier=%s screen=%u mode=%d stallMs=%lu syncFrame=%d syncFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld frameTick=%u phase=%d role=%d",
+        "STALL_RECOVERY_TRIGGER origin=%s tier=%s screen=%u mode=%d stallMs=%lu commitFrame=%d commitFrameStallMs=%lu bypassCount=%u consoleErrorSerial=%ld frameTick=%u phase=%d role=%d",
         originTag,
         tier != nullptr ? tier : "?",
         static_cast<unsigned>(sample.screen),
@@ -7366,6 +7379,33 @@ static void MonitorScreenIndexChange()
         static_cast<unsigned>(csExit),
         static_cast<unsigned long>(csObj));
 
+    // Session counter snapshot at every screen transition: transitions are
+    // where the Sync-feed counter (gmBase+20) permanently freezes when they
+    // land mid-prediction, so one line here captures the freeze moment
+    // without needing VerboseSyncDiagnostics.
+    if (g_localRoleFlag == kLocalRoleOnline
+        && g_localInitAppliedForSession
+        && g_lastValidatedSessionPtr != 0
+        && g_activeRevival != nullptr)
+    {
+        int monFrame = -1;
+        int monCommit = -1;
+        int monSyncFeed = -1;
+        const uintptr_t monGmBase =
+            g_lastValidatedSessionPtr + g_activeRevival->sessionOffsetGameModeSnapshot;
+        (void)SafeReadInt(
+            reinterpret_cast<const void*>(
+                g_lastValidatedSessionPtr + g_activeRevival->sessionOffsetCurrentFrame),
+            &monFrame);
+        (void)SafeReadInt(reinterpret_cast<const void*>(monGmBase + 16), &monCommit);
+        (void)SafeReadInt(reinterpret_cast<const void*>(monGmBase + 20), &monSyncFeed);
+        mod::Log(
+            "SCREEN_MONITOR: netplay counters frame=%d commit=%d syncFeed=%d",
+            monFrame,
+            monCommit,
+            monSyncFeed);
+    }
+
     g_lastMonitoredScreenIndex = currentIdx;
 }
 
@@ -8418,8 +8458,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 currentSession + g_activeRevival->sessionOffsetPingMs), &dsPingMs);
 
             // Game mode fields
+            int dsCommitFrame = -1;
             const uintptr_t dsGmBase = currentSession + g_activeRevival->sessionOffsetGameModeSnapshot;
             (void)SafeReadInt(reinterpret_cast<const void*>(dsGmBase + 12), &dsAdvanceCounter);
+            (void)SafeReadInt(reinterpret_cast<const void*>(dsGmBase + 16), &dsCommitFrame);
             (void)SafeReadInt(reinterpret_cast<const void*>(dsGmBase + 20), &dsSyncFrame);
 
             __try {
@@ -8440,13 +8482,13 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 const FpuControlSnapshot dsFpu = CaptureFpuControlSnapshot();
                 mod::Log(
                     "DESYNC_CHECK: S#%u tick=%u screen=%u frame=%d advCtr=%d "
-                    "syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
+                    "commit=%d syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
                     "sentinel=0x%08lX chk=0x%08lX "
                     "fpuCrt=%s0x%08lX x87=%s0x%04X mxcsr=%s0x%08lX",
                     g_sessionNumber, g_frameTick,
                     static_cast<unsigned>(dsScreen),
                     dsCurrentFrame, dsAdvanceCounter,
-                    dsSyncFrame, dsMatchId,
+                    dsCommitFrame, dsSyncFrame, dsMatchId,
                     dsInputDelay, dsPingMs, dsActivePlayer,
                     static_cast<unsigned long>(dsSentinel),
                     static_cast<unsigned long>(stateChecksum),
@@ -8461,12 +8503,12 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             {
                 mod::Log(
                     "DESYNC_CHECK: S#%u tick=%u screen=%u frame=%d advCtr=%d "
-                    "syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
+                    "commit=%d syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
                     "sentinel=0x%08lX chk=0x%08lX",
                     g_sessionNumber, g_frameTick,
                     static_cast<unsigned>(dsScreen),
                     dsCurrentFrame, dsAdvanceCounter,
-                    dsSyncFrame, dsMatchId,
+                    dsCommitFrame, dsSyncFrame, dsMatchId,
                     dsInputDelay, dsPingMs, dsActivePlayer,
                     static_cast<unsigned long>(dsSentinel),
                     static_cast<unsigned long>(stateChecksum));
@@ -9089,6 +9131,14 @@ static bool ConsumeLocalBattleEscQuitRingIgnore(
     if (elapsedMs > kLocalBattleEscQuitRingIgnoreWindowMs)
     {
         ResetLocalBattleEscQuitRingIgnore();
+        mod::Log(
+            "TICK_HOOK: Quit ring entry arrived after battle ESC ignore window expired "
+            "phase=%s frameTick=%u quitHead=%ld quitTail=%ld elapsedMs=%lu - treating as real session end",
+            phaseTag != nullptr ? phaseTag : "POST-TICK",
+            g_frameTick,
+            static_cast<long>(quitHeadBefore),
+            static_cast<long>(quitTailBefore),
+            static_cast<unsigned long>(elapsedMs));
         return false;
     }
 
