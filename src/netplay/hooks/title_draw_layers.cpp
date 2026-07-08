@@ -414,14 +414,20 @@ void DrawCompactMenuTitle(uint32_t screenContext)
 
 bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc)
 {
+    const int optionsSlideOffsetX =
+        (g_netplayMenuState.menuId == NetplayMenuId::Options)
+            ? netplay::options::GetOptionsSlideOffsetX()
+            : 0;
     const netplay::render::DynamicFieldOverlayState state = {
         g_netplayMenuState.active,
         g_useRuntimeTextOverlay,
         IsMenuSlideTransitionActive(),
+        netplay::options::IsSaveOverlayActive(), // modal covers the rows
         g_netplayMenuState.menuId,
         g_netplayMenuState.renderLayout.highlightHeight,
         g_netplayMenuState.paletteStart,
         g_netplayMenuState.paletteCount,
+        optionsSlideOffsetX,
     };
     return netplay::render::DrawDynamicFieldValuesGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);
 }

@@ -645,6 +645,26 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             &currentScreenIndex);
     }
 
+    // A user-initiated window close (flagged by NetplayWindowProc on
+    // WM_CLOSE/WM_DESTROY, cleared only at the next session start) means this
+    // ExitProcess is a legitimate quit - NOT a peer-death interception. Neutral-
+    // izing it here would suspend this thread forever, leaving a zombie EFZ.exe
+    // (window gone, process dangling, injected consoles never exiting) and
+    // skipping DLL_PROCESS_DETACH cleanup. Pass through to the real ExitProcess
+    // so the process terminates cleanly.
+    if (IsLocalProcessCloseForGameplayStallActive() && g_realExitProcess != nullptr)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: user-initiated close (code=%u role=%d screen=%d "
+            "caller=%s+0x%lX) - passing through to real ExitProcess for clean shutdown",
+            uExitCode, g_localRoleFlag, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva));
+        mod::FlushLoggerSync();
+        g_realExitProcess(uExitCode);
+        // g_realExitProcess is __noreturn; if it ever returns, fall through to
+        // the normal neutralization path below as a safety net.
+    }
+
     // First interception: neutralize the session vtable and capture the role.
     if (InterlockedExchange(&g_revivalExitIntercepted, 1) == 0)
     {

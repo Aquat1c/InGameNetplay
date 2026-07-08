@@ -6019,6 +6019,11 @@ void ClearLocalProcessCloseForGameplayStall()
     InterlockedExchange(&g_gameplayStallLocalProcessCloseActive, 0);
 }
 
+bool IsLocalProcessCloseForGameplayStallActive()
+{
+    return InterlockedCompareExchange(&g_gameplayStallLocalProcessCloseActive, 0, 0) != 0;
+}
+
 static void BeginGameplayStallTracker(
     const char* reason,
     const GameplayStallSample& sample)

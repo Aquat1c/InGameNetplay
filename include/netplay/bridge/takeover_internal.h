@@ -453,6 +453,10 @@ const char* CurrentDeferredCancelCleanupReason();
 uint8_t CurrentDeferredCancelCleanupSourceScreen();
 void NotifyLocalProcessCloseForGameplayStall();
 void ClearLocalProcessCloseForGameplayStall();
+// True once the user has initiated a window close (WM_CLOSE/DESTROY etc.) and
+// before the next session start. Used by the ExitProcess neutralizer to tell a
+// genuine quit apart from a peer-death interception.
+bool IsLocalProcessCloseForGameplayStallActive();
 
 // Returns true while the per-frame tick hook (OurPerFrameTickHook) is
 // executing the original sub_1006E570.  Used by CancelSessionUnlocked to

@@ -378,6 +378,20 @@ std::string BuildEntryTooltip(const NetplayMenuEntry& entry)
 // EndScene hook initialise ImGui in the first place (same bootstrap the
 // battle log shims rely on).  Returns true only when the TTF layer will
 // actually draw this frame, i.e. the 5x7 fallback should be suppressed.
+// Drop the last full UTF-8 code point (continuation bytes plus lead byte).
+void Utf8PopBack(std::string* text)
+{
+    while (!text->empty()
+        && (static_cast<unsigned char>(text->back()) & 0xC0u) == 0x80u)
+    {
+        text->pop_back();
+    }
+    if (!text->empty())
+    {
+        text->pop_back();
+    }
+}
+
 bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
 {
     namespace ov = netplay::debug_overlay;
@@ -385,12 +399,20 @@ bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
     {
         return false;
     }
+    bool hasNonAscii = false;
     for (unsigned char c : line)
     {
         if ((c & 0x80u) != 0)
         {
-            return false; // TTF atlas is ASCII-only; keep 5x7 for this line
+            hasNonAscii = true;
+            break;
         }
+    }
+    // Non-ASCII needs the Cyrillic ranges + merged Japanese font; without
+    // them the TTF would render '?' boxes, so keep 5x7 for those lines.
+    if (hasNonAscii && !ov::RtTextHasExtendedGlyphs())
+    {
+        return false;
     }
 
     const int availableWidth = right - left;
@@ -400,25 +422,30 @@ bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
     const int textWidth = ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, line.c_str());
     if (textWidth > availableWidth && !line.empty())
     {
-        // Same marquee as the 5x7 path, sized with proportional metrics
-        // (average glyph width) instead of the fixed 6px cell.
-        constexpr DWORD kScrollStepMs = 180;
-        constexpr size_t kPadChars = 6;
-        const size_t visibleChars = (std::max)(
-            static_cast<size_t>(1),
-            line.size() * static_cast<size_t>(availableWidth)
-                / static_cast<size_t>(textWidth));
-        const std::string spacer(kPadChars, ' ');
-        const std::string marquee = line + spacer + line + spacer;
-        const size_t cycle = line.size() + spacer.size();
-        const size_t start = (GetTickCount() / kScrollStepMs) % cycle;
-        window = marquee.substr(start, (std::min)(visibleChars + 2, marquee.size() - start));
+        if (!hasNonAscii)
+        {
+            // Same marquee as the 5x7 path, sized with proportional metrics
+            // (average glyph width) instead of the fixed 6px cell.
+            constexpr DWORD kScrollStepMs = 180;
+            constexpr size_t kPadChars = 6;
+            const size_t visibleChars = (std::max)(
+                static_cast<size_t>(1),
+                line.size() * static_cast<size_t>(availableWidth)
+                    / static_cast<size_t>(textWidth));
+            const std::string spacer(kPadChars, ' ');
+            const std::string marquee = line + spacer + line + spacer;
+            const size_t cycle = line.size() + spacer.size();
+            const size_t start = (GetTickCount() / kScrollStepMs) % cycle;
+            window = marquee.substr(start, (std::min)(visibleChars + 2, marquee.size() - start));
+        }
         // The RT layer has no right-edge clipping (unlike the indexed
-        // surface), so trim the window until it actually fits the field.
+        // surface), so trim until the text actually fits the field.  For
+        // multibyte text the sliding marquee is skipped (byte-offset slicing
+        // would split code points); it is trimmed to fit instead.
         while (!window.empty()
             && ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, window.c_str()) > availableWidth)
         {
-            window.pop_back();
+            Utf8PopBack(&window);
         }
     }
 
@@ -743,6 +770,13 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks()
             }
             return std::nullopt;
         },
+        // Section-header rows (small tinted labels, non-selectable). Only the
+        // options menu declares them today; other menus can opt in here.
+        [](const NetplayMenuEntry& entry) -> bool
+        {
+            return g_netplayMenuState.menuId == NetplayMenuId::Options
+                && netplay::options::IsHeaderRowAction(entry.action);
+        },
     };
     return callbacks;
 }
@@ -752,11 +786,17 @@ bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc)
     // The lobby always forces GDI rendering regardless of whether the sprite
     // font is loaded or the global runtime-text / GDI-fallback flags are set.
     const bool lobbyForced = (g_netplayMenuState.menuId == netplay::menu::NetplayMenuId::Lobby);
+    const int optionsSlideOffsetX =
+        (g_netplayMenuState.menuId == netplay::menu::NetplayMenuId::Options)
+            ? netplay::options::GetOptionsSlideOffsetX()
+            : 0;
     const netplay::render::RuntimeOverlayState state = {
         g_useRuntimeTextOverlay || lobbyForced, // lobby treated as always enabled
         g_netplayMenuState.active,
         g_enableGdiFallbackOverlay || lobbyForced,
+        netplay::options::IsSaveOverlayActive(), // modal covers the rows
         g_netplayMenuState.menuId,
+        optionsSlideOffsetX,
     };
     return netplay::render::DrawRuntimeTextOverlayGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);
 }

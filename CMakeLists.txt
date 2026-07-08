@@ -38,6 +38,7 @@ add_library(efz_netplay_mod SHARED
     src/crash_handler.cpp
     src/dllmain.cpp
     src/logger.cpp
+    src/netplay_mod.rc
     src/netplay/assets/assets.cpp
     src/netplay/bridge/async_hosting.cpp
     src/netplay/bridge/frontend_return.cpp

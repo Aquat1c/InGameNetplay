@@ -175,6 +175,12 @@ void Reload()
         ReadBoolValue(L"Others", L"DesyncDetection", true, iniPath);
     loaded.menuTtfText =
         ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
+    loaded.menuTtfFontFace =
+        ReadStringValue(L"Others", L"MenuTtfFont", L"Yu Gothic", iniPath);
+    if (loaded.menuTtfFontFace.empty())
+    {
+        loaded.menuTtfFontFace = "Yu Gothic";
+    }
     loaded.asyncHostReturnKey =
         ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
     if (loaded.asyncHostReturnKey.empty())
@@ -255,6 +261,11 @@ bool HideEmptySetsInBattleLogByDefault()
 bool IsMenuTtfTextEnabled()
 {
     return g_settings.menuTtfText;
+}
+
+const std::string& MenuTtfFontFace()
+{
+    return g_settings.menuTtfFontFace;
 }
 
 const std::string& AsyncHostReturnKeyBinding()

@@ -26,6 +26,14 @@ struct Settings
     // log menu, footer tooltip). Falls back to 5x7 automatically when the
     // D3D9/ImGui overlay is unavailable.
     bool menuTtfText = true;
+    // TTF face for the menu text overlay. Known values: Yu Gothic, Meiryo,
+    // MS Gothic, Noto Sans JP / Noto Sans Mono (bundled mod assets),
+    // Segoe UI, Arial, ITC Bolt (mod asset). Yu Gothic is the default: it
+    // natively covers Latin + Cyrillic + Japanese AND ships with every
+    // Windows 10/11 base install (Meiryo is an optional feature there); the
+    // bundled Noto faces guarantee coverage everywhere (incl. Wine) - the
+    // Microsoft faces cannot legally be redistributed with the mod.
+    std::string menuTtfFontFace = "Yu Gothic";
     // Keyboard binding (DIK_* form) for the async-hosting "return / rehost"
     // hotkey used while the hosting overlay is minimized in-game.
     std::string asyncHostReturnKey = "DIK_F1";
@@ -47,6 +55,7 @@ bool AreAllVerboseLogsEnabled();
 bool HideEmptySetsInBattleLogByDefault();
 bool IsDesyncDetectionEnabled();
 bool IsMenuTtfTextEnabled();
+const std::string& MenuTtfFontFace();
 // Async-hosting return/rehost hotkey as a DIK_* binding value (e.g. "DIK_F1").
 const std::string& AsyncHostReturnKeyBinding();
 } // namespace netplay::mod_settings

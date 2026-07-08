@@ -204,6 +204,77 @@ struct State
 
 State g_state = {};
 
+// ---------------------------------------------------------------------------
+// Page-transition slide animation. When the browser/detail list flips to a new
+// page, the fresh content slides in from the side (right for NEXT, left for
+// PREV) over a short window. Only the list content moves; the surrounding
+// panels and action buttons stay put. Idle (offset 0) rendering is byte-for-
+// byte the old path, so all animation risk is confined to the ~150ms window.
+// ---------------------------------------------------------------------------
+constexpr DWORD kPageSlideDurationMs = 185;
+int g_pageSlideDir = 0;                 // +1 = new page from right (NEXT), -1 = from left (PREV)
+DWORD g_pageSlideStartTick = 0;
+View g_pageSlideView = View::Browser;
+
+void StartPageSlide(int direction, View view)
+{
+    if (direction == 0)
+    {
+        return;
+    }
+    g_pageSlideDir = direction > 0 ? 1 : -1;
+    g_pageSlideStartTick = GetTickCount();
+    g_pageSlideView = view;
+}
+
+// Current horizontal content offset (logical 320-space px) for |view|; 0 when
+// idle or finished. Content eases from +/- kContentColumnW to 0.
+int GetPageSlideOffsetX(View view)
+{
+    if (g_pageSlideDir == 0 || g_pageSlideView != view)
+    {
+        return 0;
+    }
+    const DWORD elapsed = GetTickCount() - g_pageSlideStartTick;
+    if (elapsed >= kPageSlideDurationMs)
+    {
+        g_pageSlideDir = 0;
+        return 0;
+    }
+    // Remaining fraction eased out (fast start, gentle settle).
+    const float remaining = 1.0f - static_cast<float>(elapsed) / static_cast<float>(kPageSlideDurationMs);
+    const float eased = remaining * remaining;
+    return static_cast<int>(eased * static_cast<float>(kContentColumnW)) * g_pageSlideDir;
+}
+
+// Fill a rect clamped to [clipLeft, clipRight] on the X axis (Y unclamped);
+// used so sliding row boxes don't spill past the content panel edges.
+void FillRectClampedX(
+    const netplay::font::IndexedSurfaceView& surface,
+    int x,
+    int y,
+    int w,
+    int h,
+    uint8_t color,
+    int clipLeft,
+    int clipRight)
+{
+    int left = x;
+    int right = x + w;
+    if (left < clipLeft)
+    {
+        left = clipLeft;
+    }
+    if (right > clipRight)
+    {
+        right = clipRight;
+    }
+    if (right > left)
+    {
+        netplay::font::FillIndexedSurfaceRect(surface, left, y, right - left, h, color);
+    }
+}
+
 struct SpriteBitmap
 {
     std::string path;
@@ -2033,6 +2104,10 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     const int viewportX = (targetW - viewportW) / 2;
     const int viewportY = (targetH - viewportH) / 2;
 
+    // Page-slide: shift the icons with their rows and scissor-clip them to the
+    // content column so they don't spill past the panel while sliding in.
+    const int slidePageOffsetX = GetPageSlideOffsetX(g_state.view);
+
     struct TexturedVertex
     {
         float x;
@@ -2062,6 +2137,20 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
     device->SetFVF(kTexturedFvf);
+
+    if (slidePageOffsetX != 0)
+    {
+        const int scissorLeft = viewportX + (kContentColumnX * viewportW) / 320;
+        const int scissorRight = viewportX + ((kContentColumnX + kContentColumnW) * viewportW) / 320;
+        const RECT scissor = {
+            static_cast<LONG>(scissorLeft),
+            static_cast<LONG>(viewportY),
+            static_cast<LONG>(scissorRight),
+            static_cast<LONG>(viewportY + viewportH),
+        };
+        device->SetScissorRect(&scissor);
+        device->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    }
 
     struct IconDrawRequest
     {
@@ -2153,7 +2242,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int logicalX = icon.logicalX;
+                const int logicalX = icon.logicalX + slidePageOffsetX;
                 const int logicalY = icon.logicalY;
                 const int slotLeft = viewportX + (logicalX * viewportW) / 320;
                 const int slotTop = viewportY + (logicalY * viewportH) / 240;
@@ -2285,9 +2374,10 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int slotLeft = viewportX + (icon.logicalX * viewportW) / 320;
+                const int logicalX = icon.logicalX + slidePageOffsetX;
+                const int slotLeft = viewportX + (logicalX * viewportW) / 320;
                 const int slotTop = viewportY + (icon.logicalY * viewportH) / 240;
-                const int slotRight = viewportX + ((icon.logicalX + icon.logicalSize) * viewportW) / 320;
+                const int slotRight = viewportX + ((logicalX + icon.logicalSize) * viewportW) / 320;
                 const int slotBottom = viewportY + ((icon.logicalY + icon.logicalSize) * viewportH) / 240;
                 const int slotW = (std::max)(1, slotRight - slotLeft);
                 const int slotH = (std::max)(1, slotBottom - slotTop);
@@ -5849,19 +5939,54 @@ void DrawBrowserRows(
     (void)chipFrame;
     (void)chipText;
 
+    // Page-slide: the fresh page's rows slide in from the right (both PREV and
+    // NEXT enter from the right so the right-edge clip built into the text
+    // primitives suffices). 0 = idle -> identical to the pre-animation path.
+    const int slideOffsetX = GetPageSlideOffsetX(View::Browser);
+    const int slideClipLeft = kContentColumnX;
+    const int slideClipRight = kContentColumnX + kContentColumnW;
+    auto rowBox = [&](int y, bool sel)
+    {
+        if (slideOffsetX != 0)
+        {
+            FillRectClampedX(
+                surface, kContentColumnX + slideOffsetX, y, kContentColumnW, kBrowserRowH,
+                sel ? selectedFill : rowFill, slideClipLeft, slideClipRight);
+        }
+        else
+        {
+            DrawRowBoxAt(surface, kContentColumnX, y, kContentColumnW, kBrowserRowH, sel, rowFill, rowFrame, selectedFill);
+        }
+    };
+    auto textL = [&](const std::string& s, int l, int r, int y, uint8_t c)
+    {
+        if (slideOffsetX == 0) { MenuTextLeft(surface, s, l, r, y, c); return; }
+        int R = r + slideOffsetX;
+        if (R > slideClipRight) { R = slideClipRight; }
+        const int L = l + slideOffsetX;
+        if (L < R && L < slideClipRight) { MenuTextLeft(surface, s, L, R, y, c); }
+    };
+    auto textC = [&](const std::string& s, int l, int r, int y, uint8_t c)
+    {
+        if (slideOffsetX == 0) { MenuTextCentered(surface, s, l, r, y, c); return; }
+        int R = r + slideOffsetX;
+        if (R > slideClipRight) { R = slideClipRight; }
+        const int L = l + slideOffsetX;
+        if (L < R && L < slideClipRight) { MenuTextCentered(surface, s, L, R, y, c); }
+    };
+
     for (int slot = 0; slot < netplay::menu::kBattleLogVisibleSessionRows; ++slot)
     {
         const bool isSelected = slot == selection;
         const int rowY = kBrowserSessionRowY[static_cast<size_t>(slot)];
-        DrawRowBoxAt(surface, kContentColumnX, rowY, kContentColumnW, kBrowserRowH, isSelected, rowFill, rowFrame, selectedFill);
+        rowBox(rowY, isSelected);
 
         const BattleLogSession* session = GetSessionByIndex(GetSessionIndexForVisibleSlot(slot));
         if (session == nullptr)
         {
             if (slot == 0 && GetBrowserResultCount() == 0)
             {
-                MenuTextCentered(
-                    surface,
+                textC(
                     "<no matching sets>",
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
@@ -5877,34 +6002,10 @@ void DrawBrowserRows(
         const BrowserRowLayout layout =
             ComputeBrowserRowLayout(*session, p1Characters.size(), p2Characters.size());
 
-        MenuTextLeft(
-            surface,
-            layout.dateTimeText,
-            layout.dateLeft,
-            layout.dateRight,
-            rowY + 2,
-            dimText);
-        MenuTextLeft(
-            surface,
-            layout.leftNameText,
-            layout.p1NameLeft,
-            layout.p1NameRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
-        MenuTextCentered(
-            surface,
-            layout.scoreText,
-            layout.scoreLeft,
-            layout.scoreRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
-        MenuTextLeft(
-            surface,
-            layout.rightNameText,
-            layout.p2NameLeft,
-            layout.p2NameRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
+        textL(layout.dateTimeText, layout.dateLeft, layout.dateRight, rowY + 2, dimText);
+        textL(layout.leftNameText, layout.p1NameLeft, layout.p1NameRight, rowY + 2, isSelected ? selectedText : normalText);
+        textC(layout.scoreText, layout.scoreLeft, layout.scoreRight, rowY + 2, isSelected ? selectedText : normalText);
+        textL(layout.rightNameText, layout.p2NameLeft, layout.p2NameRight, rowY + 2, isSelected ? selectedText : normalText);
     }
 
     static const std::array<const char*, 4> kControls = {
@@ -6029,19 +6130,59 @@ void DrawDetailRows(
 
     const BattleLogSession* session = GetDetailSession();
 
+    // Page-slide (see DrawBrowserRows): fresh page enters from the right.
+    const int slideOffsetX = GetPageSlideOffsetX(View::SetDetail);
+    const int slideClipLeft = kContentColumnX;
+    const int slideClipRight = kContentColumnX + kContentColumnW;
+    auto rowBox = [&](int y, bool sel)
+    {
+        if (slideOffsetX != 0)
+        {
+            FillRectClampedX(
+                surface, kContentColumnX + slideOffsetX, y, kContentColumnW, kDetailRowH,
+                sel ? selectedFill : rowFill, slideClipLeft, slideClipRight);
+        }
+        else
+        {
+            DrawRowBoxAt(surface, kContentColumnX, y, kContentColumnW, kDetailRowH, sel, rowFill, rowFrame, selectedFill);
+        }
+    };
+    auto clampBounds = [&](int& L, int& R) -> bool
+    {
+        if (R > slideClipRight) { R = slideClipRight; }
+        return L < R && L < slideClipRight;
+    };
+    auto textL = [&](const std::string& s, int l, int r, int y, uint8_t c)
+    {
+        if (slideOffsetX == 0) { MenuTextLeft(surface, s, l, r, y, c); return; }
+        int L = l + slideOffsetX, R = r + slideOffsetX;
+        if (clampBounds(L, R)) { MenuTextLeft(surface, s, L, R, y, c); }
+    };
+    auto textC = [&](const std::string& s, int l, int r, int y, uint8_t c)
+    {
+        if (slideOffsetX == 0) { MenuTextCentered(surface, s, l, r, y, c); return; }
+        int L = l + slideOffsetX, R = r + slideOffsetX;
+        if (clampBounds(L, R)) { MenuTextCentered(surface, s, L, R, y, c); }
+    };
+    auto textR = [&](const std::string& s, int l, int r, int y, uint8_t c)
+    {
+        if (slideOffsetX == 0) { MenuTextRight(surface, s, l, r, y, c); return; }
+        int L = l + slideOffsetX, R = r + slideOffsetX;
+        if (clampBounds(L, R)) { MenuTextRight(surface, s, L, R, y, c); }
+    };
+
     for (int slot = 0; slot < netplay::menu::kBattleLogVisibleGameRows; ++slot)
     {
         const bool isSelected = slot == selection;
         const int rowY = kDetailGameRowY[static_cast<size_t>(slot)];
-        DrawRowBoxAt(surface, kContentColumnX, rowY, kContentColumnW, kDetailRowH, isSelected, rowFill, rowFrame, selectedFill);
+        rowBox(rowY, isSelected);
 
         const BattleLogMatch* match = GetMatchForVisibleDetailSlot(slot);
         if (match == nullptr)
         {
             if (slot == 0)
             {
-                MenuTextCentered(
-                    surface,
+                textC(
                     "<no games>",
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
@@ -6060,35 +6201,11 @@ void DrawDetailRows(
             FindCharacterSprite(match->p1CharacterDisplay) != nullptr,
             FindCharacterSprite(match->p2CharacterDisplay) != nullptr);
 
-        MenuTextLeft(surface, layout.labelText, layout.labelLeft, layout.labelRight, rowY + 2, dimText);
-        MenuTextLeft(
-            surface,
-            layout.leftNameText,
-            layout.p1NameLeft,
-            layout.p1NameRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
-        MenuTextCentered(
-            surface,
-            layout.roundsText,
-            layout.roundsLeft,
-            layout.roundsRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
-        MenuTextLeft(
-            surface,
-            layout.rightNameText,
-            layout.p2NameLeft,
-            layout.p2NameRight,
-            rowY + 2,
-            isSelected ? selectedText : normalText);
-        MenuTextRight(
-            surface,
-            layout.durationText,
-            layout.durationLeft,
-            layout.durationRight,
-            rowY + 2,
-            dimText);
+        textL(layout.labelText, layout.labelLeft, layout.labelRight, rowY + 2, dimText);
+        textL(layout.leftNameText, layout.p1NameLeft, layout.p1NameRight, rowY + 2, isSelected ? selectedText : normalText);
+        textC(layout.roundsText, layout.roundsLeft, layout.roundsRight, rowY + 2, isSelected ? selectedText : normalText);
+        textL(layout.rightNameText, layout.p2NameLeft, layout.p2NameRight, rowY + 2, isSelected ? selectedText : normalText);
+        textR(layout.durationText, layout.durationLeft, layout.durationRight, rowY + 2, dimText);
     }
 
     static const std::array<const char*, 3> kControls = {
@@ -6632,12 +6749,14 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
             {
                 --g_state.browserPage;
                 pageChanged = true;
+                StartPageSlide(-1, View::Browser);
                 SetStatusMessage("Previous page.");
             }
             else if (horizontalDir > 0 && g_state.browserPage + 1 < GetBrowserPageCount())
             {
                 ++g_state.browserPage;
                 pageChanged = true;
+                StartPageSlide(1, View::Browser);
                 SetStatusMessage("Next page.");
             }
 
@@ -6671,12 +6790,14 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
             {
                 --g_state.detailPage;
                 pageChanged = true;
+                StartPageSlide(-1, View::SetDetail);
                 SetStatusMessage("Previous page.");
             }
             else if (horizontalDir > 0 && g_state.detailPage + 1 < GetDetailPageCount())
             {
                 ++g_state.detailPage;
                 pageChanged = true;
+                StartPageSlide(1, View::SetDetail);
                 SetStatusMessage("Next page.");
             }
 
@@ -6906,6 +7027,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         if (g_state.browserPage > 0)
         {
             --g_state.browserPage;
+            StartPageSlide(-1, View::Browser);
             SetStatusMessage("Previous page.");
         }
         RebuildMenuEntries();
@@ -6916,6 +7038,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         if (g_state.browserPage + 1 < GetBrowserPageCount())
         {
             ++g_state.browserPage;
+            StartPageSlide(1, View::Browser);
             SetStatusMessage("Next page.");
         }
         RebuildMenuEntries();
@@ -6933,6 +7056,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         if (g_state.detailPage > 0)
         {
             --g_state.detailPage;
+            StartPageSlide(-1, View::SetDetail);
             SetStatusMessage("Previous page.");
         }
         RebuildMenuEntries();
@@ -6943,6 +7067,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         if (g_state.detailPage + 1 < GetDetailPageCount())
         {
             ++g_state.detailPage;
+            StartPageSlide(1, View::SetDetail);
             SetStatusMessage("Next page.");
         }
         RebuildMenuEntries();

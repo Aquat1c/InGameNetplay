@@ -52,6 +52,7 @@ enum class RtTextProfile : uint8_t
     Footer,           // footer tooltip lines
     BattleLogHeader,  // battle log panel titles
     BattleLogRow,     // battle log dense rows
+    MenuSection,      // small inline section headers between menu rows
     Count,
 };
 
@@ -63,6 +64,11 @@ struct RtTextItem
     RtTextAlign align = RtTextAlign::Left;
     RtTextProfile profile = RtTextProfile::MenuRow;
     uint32_t rgba = 0xFFFFFFFFu;       // IM_COL32-style ABGR-packed color
+    // Optional horizontal clip (logical 320-space). When clipX1 > clipX0 the
+    // glyphs are scissored to [clipX0, clipX1] - used by menu slide animations
+    // so text sliding past a panel edge is cut instead of spilling.
+    int16_t clipX0 = 0;
+    int16_t clipX1 = 0;
     char text[112] = {};
 };
 
@@ -70,6 +76,15 @@ struct RtTextItem
 // items will actually be drawn this frame. Producers use this to decide
 // whether to suppress their 5x7 fallback text.
 bool IsRtTextAvailable();
+
+// True when the baked fonts cover Cyrillic and a Japanese font was merged
+// into the name-carrying profiles (MenuRow/Footer/BattleLogRow) - i.e.
+// non-ASCII nicknames render properly instead of as '?' glyphs.
+bool RtTextHasExtendedGlyphs();
+
+// Re-resolve the configured font face ([Others] MenuTtfFont) and rebuild the
+// atlas on the next frame. Call after mod settings are saved/reloaded.
+void NotifyFontSettingsChanged();
 
 // Width of `text` in menu-logical pixels (RT pixels / 2) for the given
 // profile, so producers can run layout/fitting against the TTF metrics.

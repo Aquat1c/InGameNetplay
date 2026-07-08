@@ -3,6 +3,7 @@
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/hooks/menu_query.h"
+#include "netplay_resource_ids.h"
 #include "logger.h"
 
 #include "imgui.h"
@@ -16,6 +17,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // Declared by the Win32 backend; we call it from our chained wndproc.
@@ -41,7 +43,8 @@ constexpr float kBadgeFontPx = 22.0f;
 // needs a font rebuild - the debug panel's Apply button); cellRtPx is the RT
 // height of the logical cell the text is centered on (a 5x7 row cell is
 // 14 RT px); yBiasRtPx nudges the line up/down after centering.  Dial values
-// in with the backslash panel, then hardcode them here.
+// in with the backslash panel (Apply logs them in paste-ready form), then
+// hardcode them in the per-face defaults below.
 struct RtProfileStyle
 {
     const char* name;
@@ -49,17 +52,56 @@ struct RtProfileStyle
     float cellRtPx;
     float yBiasRtPx;
 };
-// Defaults tuned in-game 2026-07-08 via the debug panel sliders.
+
+// Every face renders at different metrics, so each gets its own tuned
+// defaults; faces without a tuned set use the base set until they get one.
+using RtProfileDefaults = RtProfileStyle[static_cast<size_t>(RtTextProfile::Count)];
+// Base set - tuned in-game 2026-07-08 with the original face (Segoe UI).
+constexpr RtProfileDefaults kRtProfileDefaultsBase = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         15.0f, 14.0f, 0.0f},
+    {"Footer",          22.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
+    {"BattleLogRow",    21.0f,  8.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
+};
+// Tuned in-game 2026-07-08 on Yu Gothic (MenuHeader/MenuRow still base
+// values); the bundled Noto Sans JP shares it as the closest approximation.
+constexpr RtProfileDefaults kRtProfileDefaultsJpGothic = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         17.0f, 17.0f, 0.0f},
+    {"Footer",          20.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 24.0f, 19.0f, 0.0f},
+    {"BattleLogRow",    18.0f, 13.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
+};
+// Tuned in-game 2026-07-08 on MS Gothic.
+constexpr RtProfileDefaults kRtProfileDefaultsMsGothic = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         15.0f, 14.0f, 0.0f},
+    {"Footer",          19.0f, 16.0f, 0.0f},
+    {"BattleLogHeader", 25.0f, 16.0f, 0.0f},
+    {"BattleLogRow",    18.0f, 12.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
+};
+
+// Active working set: seeded from the resolved face's defaults whenever the
+// face CHANGES (slider experiments survive same-face rebuilds).
 RtProfileStyle g_rtProfiles[static_cast<size_t>(RtTextProfile::Count)] = {
     {"MenuHeader",      22.0f, 14.0f, 0.0f},
     {"MenuRow",         15.0f, 14.0f, 0.0f},
     {"Footer",          22.0f, 17.0f, 0.0f},
     {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
     {"BattleLogRow",    21.0f,  8.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
 };
+char g_rtAppliedFaceLabel[64] = {};
 ImFont* g_rtProfileFonts[static_cast<size_t>(RtTextProfile::Count)] = {};
-char g_rtFontPath[MAX_PATH] = {};
+char g_rtJpFontPath[MAX_PATH] = {};
 volatile LONG g_rtFontRebuildRequested = 0;
+// True when the atlas covers Cyrillic (from the primary face) AND a Japanese
+// font was merged - i.e. non-ASCII nicknames will render instead of '?'.
+bool g_rtExtendedGlyphs = false;
 
 const RtProfileStyle& RtStyleFor(RtTextProfile profile)
 {
@@ -126,91 +168,457 @@ float g_asyncPosY = 0.0f;     // fraction of screen height (0=top, 1=bottom)
 float g_asyncFontScale = 0.65f;
 float g_asyncBgAlpha = 0.48f; // tuned live via the backslash debug panel
 
-// Resolve a crisp system UI font face once (path cached for rebuilds).
-const char* ResolveSystemFontPath()
+// stb_truetype (ImGui's built-in rasterizer) only understands TrueType
+// outlines: plain TTF (version 1.0 / 'true') and TTC collections.  CFF-based
+// OpenType files ('OTTO' magic, e.g. many .otf fonts) would make the whole
+// atlas build fail, taking every overlay down with it - reject them up front.
+bool IsStbLoadableFontFile(const char* path)
 {
-    if (g_rtFontPath[0] != '\0')
+    HANDLE file = CreateFileA(
+        path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
     {
-        return g_rtFontPath;
+        return false;
     }
-    char winDir[MAX_PATH] = {};
-    const UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
+    uint8_t magic[4] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, magic, sizeof(magic), &read, nullptr);
+    CloseHandle(file);
+    if (!ok || read != sizeof(magic))
     {
-        return nullptr;
+        return false;
     }
-    static const char* kFaces[] = { "segoeui.ttf", "tahoma.ttf", "arial.ttf", "verdana.ttf" };
-    for (const char* face : kFaces)
+    const bool ttf = magic[0] == 0x00 && magic[1] == 0x01 && magic[2] == 0x00 && magic[3] == 0x00;
+    const bool ttcf = std::memcmp(magic, "ttcf", 4) == 0;
+    const bool appleTrue = std::memcmp(magic, "true", 4) == 0;
+    if (std::memcmp(magic, "OTTO", 4) == 0)
     {
-        char path[MAX_PATH] = {};
-        std::snprintf(path, sizeof(path), "%s\\Fonts\\%s", winDir, face);
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        mod::Log(
+            "DebugOverlay: font '%s' uses CFF outlines (OTTO) - unsupported by the "
+            "built-in rasterizer, convert it to TTF outlines to use it",
+            path);
+        return false;
+    }
+    return ttf || ttcf || appleTrue;
+}
+
+std::string OverlayModuleDirectory()
+{
+    char modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&OverlayModuleDirectory),
+        &selfModule);
+    if (selfModule == nullptr || GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+    std::string dir(modulePath);
+    const size_t slash = dir.find_last_of("\\/");
+    if (slash == std::string::npos)
+    {
+        return {};
+    }
+    dir.resize(slash);
+    return dir;
+}
+
+// Selectable font faces.  jpCapable faces natively cover Latin + Cyrillic +
+// Japanese, so they need no fallback merging.  fallbackEligible faces may be
+// picked automatically when the configured face is unavailable; fonts a user
+// must opt into (display faces) keep it false.  Each face may resolve from
+// the system Fonts directory and/or a bundled mod asset (system preferred:
+// e.g. Meiryo uses the OS meiryo.ttc when installed, else the bundled TTF).
+// The DLL additionally embeds Noto Sans CJK JP as the last-resort fallback,
+// so full coverage exists even when the assets folder is missing entirely.
+struct RtFontFace
+{
+    const char* label;
+    const char* systemFile;  // in %WINDIR%\Fonts, nullptr if none
+    const char* assetFile;   // in <mod>\assets, nullptr if none
+    bool embeddedCopy;       // the DLL resource carries this face
+    bool jpCapable;
+    bool fallbackEligible;
+    const RtProfileStyle* profileDefaults;
+};
+constexpr RtFontFace kRtFontFaces[] = {
+    {"Yu Gothic",      "YuGothM.ttc",  "yugothib.ttf",                  false, true,  true,  kRtProfileDefaultsJpGothic},
+    {"Meiryo",         "meiryo.ttc",   "Meiryo.ttf",                    false, true,  true,  kRtProfileDefaultsBase},
+    {"MS Gothic",      "msgothic.ttc", nullptr,                         false, true,  true,  kRtProfileDefaultsMsGothic},
+    {"Noto Sans JP",   nullptr,        "NotoSansCJKjp-Regular.ttf",     true,  true,  true,  kRtProfileDefaultsJpGothic},
+    {"Noto Sans Mono", nullptr,        "NotoSansMonoCJKjp-Regular.ttf", false, true,  true,  kRtProfileDefaultsBase},
+    {"Segoe UI",       "segoeui.ttf",  nullptr,                         false, false, true,  kRtProfileDefaultsBase},
+    {"Arial",          "arial.ttf",    nullptr,                         false, false, true,  kRtProfileDefaultsBase},
+    {"ITC Bolt",       nullptr,        "ITC Bolt Bold Regular.otf",     false, false, false, kRtProfileDefaultsBase},
+};
+
+bool ResolveFacePath(const RtFontFace& face, char* outPath, size_t outSize)
+{
+    if (face.systemFile != nullptr)
+    {
+        char winDir[MAX_PATH] = {};
+        const UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
+        if (n != 0 && n < MAX_PATH)
         {
-            std::snprintf(g_rtFontPath, sizeof(g_rtFontPath), "%s", path);
-            return g_rtFontPath;
+            std::snprintf(outPath, outSize, "%s\\Fonts\\%s", winDir, face.systemFile);
+            if (GetFileAttributesA(outPath) != INVALID_FILE_ATTRIBUTES
+                && IsStbLoadableFontFile(outPath))
+            {
+                return true;
+            }
+        }
+    }
+    if (face.assetFile != nullptr)
+    {
+        const std::string dir = OverlayModuleDirectory();
+        if (!dir.empty())
+        {
+            std::snprintf(outPath, outSize, "%s\\assets\\%s", dir.c_str(), face.assetFile);
+            if (GetFileAttributesA(outPath) != INVALID_FILE_ATTRIBUTES
+                && IsStbLoadableFontFile(outPath))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The embedded last-resort font (see src/netplay_mod.rc).  Resource memory
+// stays mapped for the module's lifetime, so ImGui can reference it without
+// copying (FontDataOwnedByAtlas = false).
+bool GetEmbeddedFallbackFont(void** outData, int* outSize)
+{
+    *outData = nullptr;
+    *outSize = 0;
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&GetEmbeddedFallbackFont),
+        &selfModule);
+    if (selfModule == nullptr)
+    {
+        return false;
+    }
+    HRSRC resource = FindResourceA(
+        selfModule, MAKEINTRESOURCEA(IDR_FONT_FALLBACK), MAKEINTRESOURCEA(10) /*RT_RCDATA*/);
+    if (resource == nullptr)
+    {
+        return false;
+    }
+    HGLOBAL handle = LoadResource(selfModule, resource);
+    const DWORD size = SizeofResource(selfModule, resource);
+    if (handle == nullptr || size == 0)
+    {
+        return false;
+    }
+    void* data = LockResource(handle);
+    if (data == nullptr)
+    {
+        return false;
+    }
+    *outData = data;
+    *outSize = static_cast<int>(size);
+    return true;
+}
+
+// Resolve the primary face: the configured one if present and loadable,
+// otherwise walk the table in order.  An empty outPath with a non-null
+// return means "load this face from the embedded DLL resource".  Returns
+// nullptr only when nothing at all is loadable.
+const RtFontFace* ResolvePrimaryFont(char* outPath, size_t outSize, bool hasEmbedded)
+{
+    const std::string& configured = netplay::mod_settings::MenuTtfFontFace();
+    for (const RtFontFace& face : kRtFontFaces)
+    {
+        if (_stricmp(face.label, configured.c_str()) == 0)
+        {
+            if (ResolveFacePath(face, outPath, outSize))
+            {
+                return &face;
+            }
+            if (face.embeddedCopy && hasEmbedded)
+            {
+                outPath[0] = '\0';
+                return &face;
+            }
+            mod::Log(
+                "DebugOverlay: configured font '%s' unavailable, falling back",
+                configured.c_str());
+            break;
+        }
+    }
+    for (const RtFontFace& face : kRtFontFaces)
+    {
+        if (!face.fallbackEligible)
+        {
+            continue;
+        }
+        if (ResolveFacePath(face, outPath, outSize))
+        {
+            return &face;
+        }
+        if (face.embeddedCopy && hasEmbedded)
+        {
+            outPath[0] = '\0';
+            return &face;
         }
     }
     return nullptr;
 }
 
+// Japanese/Cyrillic fill-in source for primaries that lack those glyphs.
+// System fonts first, the bundled Noto TTF as the last resort (covers Wine,
+// where the Japanese system fonts usually do not exist).
+const char* ResolveJapaneseFontPath()
+{
+    if (g_rtJpFontPath[0] != '\0')
+    {
+        return g_rtJpFontPath;
+    }
+    char winDir[MAX_PATH] = {};
+    const UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
+    if (n != 0 && n < MAX_PATH)
+    {
+        static const char* kFaces[] = { "meiryo.ttc", "YuGothM.ttc", "yugothic.ttf", "msgothic.ttc" };
+        for (const char* face : kFaces)
+        {
+            char path[MAX_PATH] = {};
+            std::snprintf(path, sizeof(path), "%s\\Fonts\\%s", winDir, face);
+            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES
+                && IsStbLoadableFontFile(path))
+            {
+                std::snprintf(g_rtJpFontPath, sizeof(g_rtJpFontPath), "%s", path);
+                return g_rtJpFontPath;
+            }
+        }
+    }
+
+    const std::string modDir = OverlayModuleDirectory();
+    if (!modDir.empty())
+    {
+        static const char* kBundled[] = {
+            "NotoSansCJKjp-Regular.ttf",       // proportional - preferred
+            "NotoSansMonoCJKjp-Regular.ttf",
+        };
+        for (const char* file : kBundled)
+        {
+            char path[MAX_PATH] = {};
+            std::snprintf(path, sizeof(path), "%s\\assets\\%s", modDir.c_str(), file);
+            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES
+                && IsStbLoadableFontFile(path))
+            {
+                std::snprintf(g_rtJpFontPath, sizeof(g_rtJpFontPath), "%s", path);
+                return g_rtJpFontPath;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Only the profiles that carry player-provided text (nicknames, room names,
+// option values) get the ~3000-glyph Japanese ranges; header profiles show
+// static English labels and skipping them keeps the atlas within the texture
+// limits of older GPUs.
+bool ProfileWantsJapanese(size_t profileIndex)
+{
+    return profileIndex == static_cast<size_t>(RtTextProfile::MenuRow)
+        || profileIndex == static_cast<size_t>(RtTextProfile::Footer)
+        || profileIndex == static_cast<size_t>(RtTextProfile::BattleLogRow);
+}
+
 // (Re)bake all fonts into the atlas: the async badge font plus one font per
-// distinct profile font size (profiles sharing a px share the ImFont).
-// Caller must ensure the DX9 backend recreates its device objects afterwards
-// (it does automatically on the next NewFrame after InvalidateDeviceObjects).
+// distinct profile font size (profiles sharing a px share the ImFont).  The
+// primary face is baked with Latin+Cyrillic ranges; a Japanese font is merged
+// into the name-carrying sizes.  Caller must ensure the DX9 backend recreates
+// its device objects afterwards (it does automatically on the next NewFrame
+// after InvalidateDeviceObjects).
 void LoadRtFonts()
 {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     g_badgeFont = nullptr;
+    g_rtExtendedGlyphs = false;
     for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
     {
         g_rtProfileFonts[i] = nullptr;
     }
 
-    const char* path = ResolveSystemFontPath();
-    if (path == nullptr)
+    // Embedded last-resort font: also serves as the JP fill-in source when
+    // neither a Japanese system font nor the assets folder exists.
+    void* embeddedData = nullptr;
+    int embeddedSize = 0;
+    (void)GetEmbeddedFallbackFont(&embeddedData, &embeddedSize);
+
+    char primaryPath[MAX_PATH] = {};
+    const RtFontFace* face =
+        ResolvePrimaryFont(primaryPath, sizeof(primaryPath), embeddedData != nullptr);
+    if (face == nullptr)
     {
         io.Fonts->AddFontDefault();
-        mod::Log("DebugOverlay: no system TTF found, using default font");
+        mod::Log("DebugOverlay: no loadable TTF found (files or embedded), using default font");
         return;
     }
+    const bool primaryFromMemory = (primaryPath[0] == '\0');
+    const char* path = primaryFromMemory ? nullptr : primaryPath;
+    const char* faceLabel = face->label;
+    const bool jpCapablePrimary = face->jpCapable;
+    const RtProfileStyle* faceDefaults = face->profileDefaults;
 
-    g_badgeFont = io.Fonts->AddFontFromFileTTF(path, kBadgeFontPx);
-    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    // Seed the working profile set from the face's tuned defaults, but only
+    // when the face actually changed - same-face rebuilds keep the values
+    // the user is dialing in with the panel sliders.
+    if (_stricmp(g_rtAppliedFaceLabel, faceLabel) != 0)
     {
-        const float px = g_rtProfiles[i].fontPx;
-        // Reuse a font already baked at this size (including the badge font).
-        if (px == kBadgeFontPx && g_badgeFont != nullptr)
+        std::snprintf(g_rtAppliedFaceLabel, sizeof(g_rtAppliedFaceLabel), "%s", faceLabel);
+        for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
         {
-            g_rtProfileFonts[i] = g_badgeFont;
-            continue;
+            g_rtProfiles[i] = faceDefaults[i];
         }
-        ImFont* shared = nullptr;
-        for (size_t j = 0; j < i; ++j)
+        mod::Log("DebugOverlay: profile defaults applied for face '%s'", faceLabel);
+    }
+
+    // Fill-in source for primaries without native Cyrillic/Japanese glyphs:
+    // a Japanese font file if one exists, else the embedded font.
+    const char* jpPath = jpCapablePrimary ? nullptr : ResolveJapaneseFontPath();
+    const bool jpFromMemory =
+        !jpCapablePrimary && jpPath == nullptr && embeddedData != nullptr;
+    // Cyrillic ranges are a superset of the default Latin ranges.
+    const ImWchar* baseRanges = io.Fonts->GetGlyphRangesCyrillic();
+    bool jpMergedAnywhere = false;
+
+    // Merge |ranges| into the last-added font from either a file path or the
+    // embedded blob.  Resource memory must not be freed by the atlas.
+    auto mergeRanges = [&](float px, const ImWchar* ranges, const char* filePath, bool fromMemory) -> bool {
+        ImFontConfig mergeConfig;
+        mergeConfig.MergeMode = true;
+        // CJK at oversample 2 doubles an already large bake; 1 is the
+        // recommended setting and halves the atlas cost.
+        mergeConfig.OversampleH = 1;
+        mergeConfig.OversampleV = 1;
+        if (fromMemory)
         {
-            if (g_rtProfiles[j].fontPx == px && g_rtProfileFonts[j] != nullptr)
+            mergeConfig.FontDataOwnedByAtlas = false;
+            return io.Fonts->AddFontFromMemoryTTF(
+                       embeddedData, embeddedSize, px, &mergeConfig, ranges)
+                != nullptr;
+        }
+        if (filePath == nullptr)
+        {
+            return false;
+        }
+        return io.Fonts->AddFontFromFileTTF(filePath, px, &mergeConfig, ranges) != nullptr;
+    };
+
+    auto addSizedFont = [&](float px, bool wantJapanese) -> ImFont* {
+        ImFont* font = nullptr;
+        if (primaryFromMemory)
+        {
+            ImFontConfig memoryConfig;
+            memoryConfig.FontDataOwnedByAtlas = false;
+            font = io.Fonts->AddFontFromMemoryTTF(
+                embeddedData, embeddedSize, px, &memoryConfig, baseRanges);
+        }
+        else
+        {
+            font = io.Fonts->AddFontFromFileTTF(path, px, nullptr, baseRanges);
+        }
+        if (font == nullptr)
+        {
+            return nullptr;
+        }
+        if (!jpCapablePrimary && (jpPath != nullptr || jpFromMemory))
+        {
+            // Primary lacks Cyrillic/CJK: backfill Cyrillic everywhere so
+            // e.g. a Latin-only display face still renders Cyrillic names.
+            (void)mergeRanges(px, baseRanges, jpPath, jpFromMemory);
+        }
+        if (wantJapanese)
+        {
+            const ImWchar* jpRanges = io.Fonts->GetGlyphRangesJapanese();
+            bool merged = false;
+            if (jpCapablePrimary)
             {
-                shared = g_rtProfileFonts[j];
-                break;
+                merged = mergeRanges(px, jpRanges, path, primaryFromMemory);
+            }
+            else
+            {
+                merged = mergeRanges(px, jpRanges, jpPath, jpFromMemory);
+            }
+            jpMergedAnywhere |= merged;
+        }
+        return font;
+    };
+
+    // Unique sizes with whether any consumer of that size wants Japanese.
+    struct SizedFont
+    {
+        float px;
+        bool wantJapanese;
+        ImFont* font;
+    };
+    SizedFont sizes[static_cast<size_t>(RtTextProfile::Count) + 1] = {};
+    size_t sizeCount = 0;
+    auto noteSize = [&](float px, bool wantJapanese) {
+        for (size_t i = 0; i < sizeCount; ++i)
+        {
+            if (sizes[i].px == px)
+            {
+                sizes[i].wantJapanese |= wantJapanese;
+                return;
             }
         }
-        g_rtProfileFonts[i] = (shared != nullptr)
-            ? shared
-            : io.Fonts->AddFontFromFileTTF(path, px);
+        sizes[sizeCount].px = px;
+        sizes[sizeCount].wantJapanese = wantJapanese;
+        ++sizeCount;
+    };
+    noteSize(kBadgeFontPx, false);
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        noteSize(g_rtProfiles[i].fontPx, ProfileWantsJapanese(i));
     }
+
+    for (size_t i = 0; i < sizeCount; ++i)
+    {
+        sizes[i].font = addSizedFont(sizes[i].px, sizes[i].wantJapanese);
+    }
+
+    auto fontForPx = [&](float px) -> ImFont* {
+        for (size_t i = 0; i < sizeCount; ++i)
+        {
+            if (sizes[i].px == px)
+            {
+                return sizes[i].font;
+            }
+        }
+        return nullptr;
+    };
+    g_badgeFont = fontForPx(kBadgeFontPx);
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        g_rtProfileFonts[i] = fontForPx(g_rtProfiles[i].fontPx);
+    }
+
     if (io.Fonts->Fonts.empty())
     {
         io.Fonts->AddFontDefault();
     }
+    g_rtExtendedGlyphs = jpMergedAnywhere;
     mod::Log(
-        "DebugOverlay: fonts baked from %s (badge @%.0fpx, profiles %.0f/%.0f/%.0f/%.0f/%.0f px)",
-        path,
-        kBadgeFontPx,
+        "DebugOverlay: fonts baked from %s (face='%s' jpCapable=%d jpMerge=%s, %u sizes, profiles %.0f/%.0f/%.0f/%.0f/%.0f/%.0f px)",
+        path != nullptr ? path : "<embedded resource>",
+        faceLabel,
+        jpCapablePrimary ? 1 : 0,
+        jpPath != nullptr ? jpPath : (jpFromMemory ? "<embedded resource>" : "none"),
+        static_cast<unsigned>(sizeCount),
         g_rtProfiles[0].fontPx,
         g_rtProfiles[1].fontPx,
         g_rtProfiles[2].fontPx,
         g_rtProfiles[3].fontPx,
-        g_rtProfiles[4].fontPx);
+        g_rtProfiles[4].fontPx,
+        g_rtProfiles[5].fontPx);
 }
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -406,7 +814,8 @@ void DrawAsyncIndicator()
     const ImVec2 pos(cx - textSize.x * 0.5f, ty);
     const float pad = 5.0f;
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Background list keeps the badge above the game but below the panel.
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
     dl->AddRectFilled(
         ImVec2(pos.x - pad, pos.y - pad),
         ImVec2(pos.x + textSize.x + pad, pos.y + textSize.y + pad),
@@ -422,7 +831,9 @@ void DrawRtTextItems()
 {
     EnsureRtTextLock();
     EnterCriticalSection(&g_rtTextLock);
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Background list: renders above the game but BELOW ImGui windows, so
+    // the debug panel stays the top layer instead of being overdrawn.
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
     for (const RtTextItem& item : g_rtTextActive)
     {
         ImFont* font = RtFontFor(item.profile);
@@ -453,14 +864,46 @@ void DrawRtTextItems()
         const float y = static_cast<float>(item.y) * 2.0f
             + (style.cellRtPx - textSize.y) * 0.5f
             + style.yBiasRtPx;
+        const bool clip = item.clipX1 > item.clipX0;
+        if (clip)
+        {
+            dl->PushClipRect(
+                ImVec2(static_cast<float>(item.clipX0) * 2.0f, 0.0f),
+                ImVec2(static_cast<float>(item.clipX1) * 2.0f, static_cast<float>(kGameRtH)),
+                true);
+        }
         dl->AddText(font, fontPx, ImVec2(x, y), item.rgba, item.text);
+        if (clip)
+        {
+            dl->PopClipRect();
+        }
     }
     LeaveCriticalSection(&g_rtTextLock);
 }
 
+// Log the working profile set in the exact initializer form used by the
+// per-face default tables, so tuned values can be pasted straight back in.
+void LogRtProfileValues(const char* reason)
+{
+    mod::Log(
+        "DebugOverlay: RT profiles (%s) face='%s' - paste-ready:",
+        reason,
+        g_rtAppliedFaceLabel[0] != '\0' ? g_rtAppliedFaceLabel : "unknown");
+    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+    {
+        const RtProfileStyle& style = g_rtProfiles[i];
+        mod::Log(
+            "    {\"%s\", %.1ff, %.1ff, %.1ff},",
+            style.name,
+            style.fontPx,
+            style.cellRtPx,
+            style.yBiasRtPx);
+    }
+}
+
 void DrawDebugPanel()
 {
-    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::SetNextWindowBgAlpha(1.0f);
     ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("EFZ Netplay Debug ( \\ to toggle)", &g_panelOpen))
     {
@@ -499,11 +942,19 @@ void DrawDebugPanel()
             ImGui::SliderFloat("y bias", &style.yBiasRtPx, -8.0f, 8.0f, "%.1f");
             ImGui::PopID();
         }
-        if (ImGui::Button("Apply font sizes (rebuild atlas)") || fontPxChanged)
+        if (ImGui::Button("Apply font sizes (rebuild atlas + log values)"))
         {
+            LogRtProfileValues("apply_button");
             InterlockedExchange(&g_rtFontRebuildRequested, 1);
         }
-        ImGui::TextDisabled("cell/y-bias apply live; font px rebuilds the atlas.\nDial in, then hardcode in g_rtProfiles.");
+        else if (fontPxChanged)
+        {
+            LogRtProfileValues("slider_release");
+            InterlockedExchange(&g_rtFontRebuildRequested, 1);
+        }
+        ImGui::TextDisabled(
+            "cell/y-bias apply live; font px rebuilds the atlas.\n"
+            "Apply logs the values for hardcoding per-face defaults.");
     }
     ImGui::End();
 }
@@ -595,10 +1046,14 @@ void Render(IDirect3DDevice9* device)
         LoadRtFonts();
     }
 
+    ImGui_ImplDX9_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+
     // One-shot diagnostics: confirm the ImGui/EndScene path actually renders
     // (the in-battle / outside-menu indicator depends on EndScene firing for the
     // game's device). If this never logs while hosting+minimized in a match, the
-    // D3D9 EndScene hook is not reaching the game's present.
+    // D3D9 EndScene hook is not reaching the game's present.  Runs after the
+    // backend NewFrame so the atlas dimensions and display size are real.
     {
         static bool s_loggedFirstRender = false;
         if (!s_loggedFirstRender)
@@ -606,14 +1061,13 @@ void Render(IDirect3DDevice9* device)
             s_loggedFirstRender = true;
             const ImGuiIO& io = ImGui::GetIO();
             mod::Log(
-                "DebugOverlay: first ImGui render (wantIndicator=%d wantPanel=%d display=%.0fx%.0f)",
+                "DebugOverlay: first ImGui render (wantIndicator=%d wantPanel=%d display=%.0fx%.0f atlas=%dx%d extendedGlyphs=%d)",
                 wantIndicator ? 1 : 0, wantPanel ? 1 : 0,
-                io.DisplaySize.x, io.DisplaySize.y);
+                io.DisplaySize.x, io.DisplaySize.y,
+                io.Fonts->TexWidth, io.Fonts->TexHeight,
+                g_rtExtendedGlyphs ? 1 : 0);
         }
     }
-
-    ImGui_ImplDX9_NewFrame();
-    ImGui_ImplWin32_NewFrame();
 
     // We draw onto the 640x480 GAME render target, but ImGui_ImplWin32_NewFrame
     // just set io.DisplaySize to the WINDOW client size (e.g. 1920x1080 in
@@ -672,6 +1126,18 @@ bool IsDebugPanelActive()
 bool IsRtTextAvailable()
 {
     return g_inited && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
+}
+
+bool RtTextHasExtendedGlyphs()
+{
+    return IsRtTextAvailable() && g_rtExtendedGlyphs;
+}
+
+void NotifyFontSettingsChanged()
+{
+    // Rebuild lazily on the next Render; harmless when nothing changed and
+    // a no-op while ImGui is not initialised (init reads fresh settings).
+    InterlockedExchange(&g_rtFontRebuildRequested, 1);
 }
 
 int MeasureRtTextWidth(RtTextProfile profile, const char* text)
