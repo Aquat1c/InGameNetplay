@@ -15,6 +15,8 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 // Declared by the Win32 backend; we call it from our chained wndproc.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -34,6 +36,46 @@ bool g_panelOpen = false;
 // nullptr -> fall back to the default font.
 ImFont* g_badgeFont = nullptr;
 constexpr float kBadgeFontPx = 22.0f;
+
+// Smaller size of the same face for dense menu rows (game-RT text overlay).
+ImFont* g_rowFont = nullptr;
+constexpr float kRtRowFontPx = 15.0f;
+
+// Game-RT text overlay items (see debug_overlay.h). Producers stage a full
+// frame from the menu render pass, then Commit publishes it for EndScene.
+// Guarded by a critical section: the menu render and EndScene are expected on
+// the same thread, but the lock keeps the swap safe if that ever changes.
+CRITICAL_SECTION g_rtTextLock;
+bool g_rtTextLockInited = false;
+std::vector<RtTextItem> g_rtTextStaging;
+std::vector<RtTextItem> g_rtTextActive;
+
+void EnsureRtTextLock()
+{
+    if (!g_rtTextLockInited)
+    {
+        InitializeCriticalSection(&g_rtTextLock);
+        g_rtTextLockInited = true;
+    }
+}
+
+ImFont* RtFontFor(RtTextSize size)
+{
+    if (size == RtTextSize::Header)
+    {
+        return g_badgeFont;
+    }
+    return (g_rowFont != nullptr) ? g_rowFont : g_badgeFont;
+}
+
+float RtFontPxFor(RtTextSize size)
+{
+    if (size == RtTextSize::Header)
+    {
+        return kBadgeFontPx;
+    }
+    return kRtRowFontPx;
+}
 
 // EFZ renders its scene to a fixed 640x480 D3D9 render target; EFZ Revival then
 // composites/upscales that to the window backbuffer. Our overlay must draw on the
@@ -79,7 +121,13 @@ ImFont* LoadSystemBadgeFont()
         ImFont* f = io.Fonts->AddFontFromFileTTF(path, kBadgeFontPx);
         if (f != nullptr)
         {
-            mod::Log("DebugOverlay: loaded badge font %s @%.0fpx", path, kBadgeFontPx);
+            // Bake the row size of the same face into the same atlas so the
+            // game-RT menu text is native-resolution rather than downscaled.
+            g_rowFont = io.Fonts->AddFontFromFileTTF(path, kRtRowFontPx);
+            mod::Log(
+                "DebugOverlay: loaded badge font %s @%.0fpx (rows @%.0fpx %s)",
+                path, kBadgeFontPx, kRtRowFontPx,
+                g_rowFont != nullptr ? "ok" : "failed");
             return f;
         }
     }
@@ -135,6 +183,7 @@ void ShutdownImGui()
     g_device = nullptr;
     g_hwnd = nullptr;
     g_badgeFont = nullptr;
+    g_rowFont = nullptr;
     g_lastBackBufferW = 0;
     g_lastBackBufferH = 0;
 }
@@ -283,6 +332,46 @@ void DrawAsyncIndicator()
     dl->AddText(font, fontSize, pos, textColor, msg);
 }
 
+// Draw the committed game-RT text items. Coordinates are 320x240 menu-logical;
+// the RT is guaranteed 640x480 by the caller's render-target filter, so the
+// mapping is exactly x2 (same result as the icon renderer's letterbox math).
+void DrawRtTextItems()
+{
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    for (const RtTextItem& item : g_rtTextActive)
+    {
+        ImFont* font = RtFontFor(item.size);
+        if (font == nullptr || !font->IsLoaded())
+        {
+            continue;
+        }
+        const float fontPx = RtFontPxFor(item.size);
+        const ImVec2 textSize = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, item.text);
+        const float rtX0 = static_cast<float>(item.x0) * 2.0f;
+        const float rtX1 = static_cast<float>(item.x1) * 2.0f;
+        float x = rtX0;
+        if (item.align == RtTextAlign::Center)
+        {
+            x = rtX0 + ((rtX1 - rtX0) - textSize.x) * 0.5f;
+        }
+        else if (item.align == RtTextAlign::Right)
+        {
+            x = rtX1 - textSize.x;
+        }
+        if (x < rtX0)
+        {
+            x = rtX0; // never spill left of the field when the text overflows
+        }
+        // item.y is the top of the 7px-tall 5x7 cell (14 RT px); center the TTF
+        // line height on that cell so rows keep their vertical rhythm.
+        const float y = static_cast<float>(item.y) * 2.0f + (14.0f - textSize.y) * 0.5f;
+        dl->AddText(font, fontPx, ImVec2(x, y), item.rgba, item.text);
+    }
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
 void DrawDebugPanel()
 {
     ImGui::SetNextWindowBgAlpha(0.85f);
@@ -343,9 +432,18 @@ void Render(IDirect3DDevice9* device)
         ah::IsActive() && ah::IsMinimized() && !netplay::hooks::IsNetplayMenuActive();
     const bool wantPanel = debugAvailable && g_panelOpen;
 
-    // Initialise when the debug option is on (so DELETE works on any screen) or
-    // when the in-battle indicator needs drawing.
-    if (!debugAvailable && !wantIndicator && !g_inited)
+    // Game-RT text overlay items committed by a menu producer (battle log).
+    bool wantRtText = false;
+    if (g_rtTextLockInited)
+    {
+        EnterCriticalSection(&g_rtTextLock);
+        wantRtText = !g_rtTextActive.empty();
+        LeaveCriticalSection(&g_rtTextLock);
+    }
+
+    // Initialise when the debug option is on (so DELETE works on any screen),
+    // when the in-battle indicator needs drawing, or when menu text is queued.
+    if (!debugAvailable && !wantIndicator && !wantRtText && !g_inited)
     {
         return;
     }
@@ -377,7 +475,7 @@ void Render(IDirect3DDevice9* device)
         }
     }
 
-    if (!wantPanel && !wantIndicator)
+    if (!wantPanel && !wantIndicator && !wantRtText)
     {
         return; // initialised, but nothing to draw this frame
     }
@@ -425,6 +523,10 @@ void Render(IDirect3DDevice9* device)
 
     ImGui::NewFrame();
 
+    if (wantRtText)
+    {
+        DrawRtTextItems();
+    }
     if (wantIndicator)
     {
         DrawAsyncIndicator();
@@ -450,5 +552,70 @@ void ToggleDebugPanel()
 bool IsDebugPanelActive()
 {
     return g_panelOpen;
+}
+
+bool IsRtTextAvailable()
+{
+    return g_inited && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
+}
+
+int MeasureRtTextWidth(RtTextSize size, const char* text)
+{
+    if (text == nullptr || !IsRtTextAvailable())
+    {
+        return -1;
+    }
+    ImFont* font = RtFontFor(size);
+    if (font == nullptr || !font->IsLoaded())
+    {
+        return -1;
+    }
+    const ImVec2 textSize = font->CalcTextSizeA(RtFontPxFor(size), FLT_MAX, 0.0f, text);
+    // RT pixels -> menu-logical pixels (x2 mapping), rounded up.
+    return static_cast<int>((textSize.x + 1.9f) * 0.5f);
+}
+
+void BeginRtTextFrame()
+{
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    g_rtTextStaging.clear();
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
+void SubmitRtText(const RtTextItem& item)
+{
+    if (item.text[0] == '\0')
+    {
+        return;
+    }
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    if (g_rtTextStaging.size() < 256)
+    {
+        g_rtTextStaging.push_back(item);
+    }
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
+void CommitRtTextFrame()
+{
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    g_rtTextActive.swap(g_rtTextStaging);
+    g_rtTextStaging.clear();
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
+void ClearRtText()
+{
+    if (!g_rtTextLockInited)
+    {
+        return;
+    }
+    EnterCriticalSection(&g_rtTextLock);
+    g_rtTextActive.clear();
+    g_rtTextStaging.clear();
+    LeaveCriticalSection(&g_rtTextLock);
 }
 } // namespace netplay::debug_overlay

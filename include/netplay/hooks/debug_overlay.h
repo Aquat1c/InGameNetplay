@@ -25,4 +25,53 @@ void ToggleDebugPanel();
 
 // True while the debug panel is open (callers may suppress game input).
 bool IsDebugPanelActive();
+
+// ---------------------------------------------------------------------------
+// Game-RT text overlay: menu text drawn with the crisp TTF badge font on the
+// 640x480 game render target, replacing 5x7 indexed-surface text where a
+// producer (currently the battle log menu) submits items. Coordinates are in
+// the 320x240 menu-logical space; Render() maps them x2 onto the game RT.
+// ---------------------------------------------------------------------------
+
+enum class RtTextAlign : uint8_t
+{
+    Left = 0,    // anchor at x0
+    Center,      // centered between x0 and x1
+    Right,       // anchor right edge at x1
+};
+
+enum class RtTextSize : uint8_t
+{
+    Row = 0,     // dense list rows / body text
+    Header,      // panel titles (badge font size)
+};
+
+struct RtTextItem
+{
+    int16_t x0 = 0;                    // logical left bound (320-space)
+    int16_t x1 = 0;                    // logical right bound
+    int16_t y = 0;                     // logical top of the 5x7 cell it replaces
+    RtTextAlign align = RtTextAlign::Left;
+    RtTextSize size = RtTextSize::Row;
+    uint32_t rgba = 0xFFFFFFFFu;       // IM_COL32-style ABGR-packed color
+    char text[112] = {};
+};
+
+// True when the ImGui context and the TTF fonts are ready, i.e. submitted
+// items will actually be drawn this frame. Producers use this to decide
+// whether to suppress their 5x7 fallback text.
+bool IsRtTextAvailable();
+
+// Width of `text` in menu-logical pixels (RT pixels / 2) for the given size,
+// so producers can run layout/fitting against the TTF metrics. Returns -1
+// when the overlay is unavailable (caller falls back to 5x7 metrics).
+int MeasureRtTextWidth(RtTextSize size, const char* text);
+
+// Frame protocol for producers: Begin clears the staging list, Submit appends,
+// Commit publishes staging as the active list consumed by Render(). Clear
+// drops the active list immediately (menu closed).
+void BeginRtTextFrame();
+void SubmitRtText(const RtTextItem& item);
+void CommitRtTextFrame();
+void ClearRtText();
 }

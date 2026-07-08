@@ -171,6 +171,8 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
+    loaded.battleLogTtfText =
+        ReadBoolValue(L"Others", L"BattleLogTtfText", true, iniPath);
     loaded.asyncHostReturnKey =
         ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
     if (loaded.asyncHostReturnKey.empty())
@@ -241,6 +243,11 @@ bool AreAllVerboseLogsEnabled()
 bool HideEmptySetsInBattleLogByDefault()
 {
     return g_settings.hideEmptySetsInBattleLog;
+}
+
+bool IsBattleLogTtfTextEnabled()
+{
+    return g_settings.battleLogTtfText;
 }
 
 const std::string& AsyncHostReturnKeyBinding()

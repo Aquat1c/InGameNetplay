@@ -1003,8 +1003,159 @@ std::vector<std::string> BuildSessionIconCharacters(const BattleLogSession& sess
     return result;
 }
 
-int MeasureText5x7(const std::string& text)
+// --- Game-RT TTF text shims ------------------------------------------------
+// When [Others] BattleLogTtfText is enabled, menu text is submitted to the
+// debug-overlay game-RT text layer (the crisp badge TTF drawn in EndScene)
+// and the 5x7 indexed text is suppressed once that layer is live. Panels, row
+// boxes, selection fills, and icons stay on the indexed surface underneath.
+// If ImGui/D3D9 is unavailable the 5x7 path keeps drawing exactly as before.
+
+struct MenuTextColorEntry
 {
+    uint8_t palette;
+    uint32_t rgba;
+};
+
+// Palette byte -> RGBA mapping registered per frame while resolving colors in
+// DrawOverlayGdi, so the shims (which only see palette bytes) can recover the
+// intended RGB for the TTF layer.
+std::array<MenuTextColorEntry, 16> g_menuTextColors = {};
+size_t g_menuTextColorCount = 0;
+
+bool RtTextWanted()
+{
+    return netplay::mod_settings::IsBattleLogTtfTextEnabled();
+}
+
+bool RtTextActive()
+{
+    return RtTextWanted() && netplay::debug_overlay::IsRtTextAvailable();
+}
+
+void ResetMenuTextColors()
+{
+    g_menuTextColorCount = 0;
+}
+
+uint8_t RegisterMenuTextColor(uint32_t screenContext, int r, int g, int b)
+{
+    const uint8_t palette = netplay::draw::ResolveBestPaletteColor(screenContext, r, g, b);
+    if (g_menuTextColorCount < g_menuTextColors.size())
+    {
+        // IM_COL32 layout: A<<24 | B<<16 | G<<8 | R.
+        const uint32_t rgba = 0xFF000000u
+            | (static_cast<uint32_t>(b) << 16)
+            | (static_cast<uint32_t>(g) << 8)
+            | static_cast<uint32_t>(r);
+        g_menuTextColors[g_menuTextColorCount++] = {palette, rgba};
+    }
+    return palette;
+}
+
+uint32_t MenuTextRgbaFor(uint8_t palette)
+{
+    for (size_t index = 0; index < g_menuTextColorCount; ++index)
+    {
+        if (g_menuTextColors[index].palette == palette)
+        {
+            return g_menuTextColors[index].rgba;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+void SubmitMenuRtText(
+    const std::string& text,
+    int x0,
+    int x1,
+    int y,
+    netplay::debug_overlay::RtTextAlign align,
+    netplay::debug_overlay::RtTextSize size,
+    uint8_t paletteColor)
+{
+    netplay::debug_overlay::RtTextItem item;
+    item.x0 = static_cast<int16_t>(x0);
+    item.x1 = static_cast<int16_t>(x1);
+    item.y = static_cast<int16_t>(y);
+    item.align = align;
+    item.size = size;
+    item.rgba = MenuTextRgbaFor(paletteColor);
+    const size_t bytes = (std::min)(text.size(), sizeof(item.text) - 1);
+    std::memcpy(item.text, text.data(), bytes);
+    item.text[bytes] = '\0';
+    netplay::debug_overlay::SubmitRtText(item);
+}
+
+// Shims mirroring DrawText{Left,Centered,Right}5x7 at scale 1. While the TTF
+// layer is not yet live (first frame, or ImGui init failed) the 5x7 text still
+// draws, so the menu is never blank.
+void MenuTextLeft(const netplay::font::IndexedSurfaceView& surface, const std::string& text, int x0, int x1, int y, uint8_t color)
+{
+    if (RtTextWanted())
+    {
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Left, netplay::debug_overlay::RtTextSize::Row, color);
+        if (RtTextActive())
+        {
+            return;
+        }
+    }
+    netplay::font::DrawTextLeft5x7(surface, text, x0, x1, y, 1, 1, color);
+}
+
+void MenuTextCentered(const netplay::font::IndexedSurfaceView& surface, const std::string& text, int x0, int x1, int y, uint8_t color)
+{
+    if (RtTextWanted())
+    {
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextSize::Row, color);
+        if (RtTextActive())
+        {
+            return;
+        }
+    }
+    netplay::font::DrawTextCentered5x7(surface, text, x0, x1, y, 1, 1, color);
+}
+
+void MenuTextRight(const netplay::font::IndexedSurfaceView& surface, const std::string& text, int x0, int x1, int y, uint8_t color)
+{
+    if (RtTextWanted())
+    {
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Right, netplay::debug_overlay::RtTextSize::Row, color);
+        if (RtTextActive())
+        {
+            return;
+        }
+    }
+    netplay::font::DrawTextRight5x7(surface, text, x0, x1, y, 1, 1, color);
+}
+
+// Panel/view titles use the larger header (badge) font size.
+void MenuTitleCentered(const netplay::font::IndexedSurfaceView& surface, const std::string& text, int x0, int x1, int y, uint8_t color)
+{
+    if (RtTextWanted())
+    {
+        SubmitMenuRtText(text, x0, x1, y, netplay::debug_overlay::RtTextAlign::Center, netplay::debug_overlay::RtTextSize::Header, color);
+        if (RtTextActive())
+        {
+            return;
+        }
+    }
+    netplay::font::DrawTextCentered5x7(surface, text, x0, x1, y, 1, 1, color);
+}
+
+// Menu-text width in logical pixels: TTF row metrics when the overlay is
+// live, 5x7 metrics otherwise. All row layout/fitting flows through this so
+// text and icons share the same anchors in both modes.
+int MeasureMenuTextWidth(const std::string& text)
+{
+    if (RtTextActive())
+    {
+        const int width = netplay::debug_overlay::MeasureRtTextWidth(
+            netplay::debug_overlay::RtTextSize::Row, text.c_str());
+        if (width >= 0)
+        {
+            return width;
+        }
+    }
     return netplay::font::MeasureText5x7Width(text, 1);
 }
 
@@ -1021,7 +1172,7 @@ std::string FitTextToPixelWidth(const std::string& text, int maxWidth)
     {
         std::string trial = fitted;
         trial.push_back(c);
-        if (MeasureText5x7(trial) > maxWidth)
+        if (MeasureMenuTextWidth(trial) > maxWidth)
         {
             break;
         }
@@ -1049,15 +1200,15 @@ void FitTwoTextsToPixelWidth(
         return;
     }
 
-    const int leftFullWidth = MeasureText5x7(leftText);
-    const int rightFullWidth = MeasureText5x7(rightText);
+    const int leftFullWidth = MeasureMenuTextWidth(leftText);
+    const int rightFullWidth = MeasureMenuTextWidth(rightText);
     int leftBudget = totalWidth / 2;
     int rightBudget = totalWidth - leftBudget;
 
     std::string fittedLeft = FitTextToPixelWidth(leftText, leftBudget);
     std::string fittedRight = FitTextToPixelWidth(rightText, rightBudget);
-    int leftUsed = MeasureText5x7(fittedLeft);
-    int rightUsed = MeasureText5x7(fittedRight);
+    int leftUsed = MeasureMenuTextWidth(fittedLeft);
+    int rightUsed = MeasureMenuTextWidth(fittedRight);
     int remaining = totalWidth - leftUsed - rightUsed;
 
     while (remaining > 0)
@@ -1072,12 +1223,12 @@ void FitTwoTextsToPixelWidth(
         if (leftDeficit >= rightDeficit && leftDeficit > 0)
         {
             fittedLeft = FitTextToPixelWidth(leftText, leftUsed + remaining);
-            leftUsed = MeasureText5x7(fittedLeft);
+            leftUsed = MeasureMenuTextWidth(fittedLeft);
         }
         else if (rightDeficit > 0)
         {
             fittedRight = FitTextToPixelWidth(rightText, rightUsed + remaining);
-            rightUsed = MeasureText5x7(fittedRight);
+            rightUsed = MeasureMenuTextWidth(fittedRight);
         }
 
         const int updatedRemaining = totalWidth - leftUsed - rightUsed;
@@ -1156,7 +1307,7 @@ BrowserRowLayout ComputeBrowserRowLayout(
 
     const int rowLeft = kContentColumnX + 4;
     const int rowRight = kContentColumnX + kContentColumnW - 4;
-    const int labelWidth = MeasureText5x7(layout.dateTimeText);
+    const int labelWidth = MeasureMenuTextWidth(layout.dateTimeText);
     layout.dateLeft = rowLeft;
     layout.dateRight = rowLeft + labelWidth;
 
@@ -1170,7 +1321,7 @@ BrowserRowLayout ComputeBrowserRowLayout(
             ? static_cast<int>(p2IconCount) * kBrowserIconSlotSize
                 + (static_cast<int>(p2IconCount) - 1) * kBrowserIconGap
             : 0;
-    const int scoreWidth = MeasureText5x7(layout.scoreText);
+    const int scoreWidth = MeasureMenuTextWidth(layout.scoreText);
     const int availableLeft = layout.dateRight + kBrowserDateGap;
     const int availableWidth = (std::max)(0, rowRight - availableLeft + 1);
     const int fixedWidth =
@@ -1185,8 +1336,8 @@ BrowserRowLayout ComputeBrowserRowLayout(
 
     FitTwoTextsToPixelWidth(session.p1Name, session.p2Name, maxNamesWidth, &layout.leftNameText, &layout.rightNameText);
 
-    const int leftNameWidth = MeasureText5x7(layout.leftNameText);
-    const int rightNameWidth = MeasureText5x7(layout.rightNameText);
+    const int leftNameWidth = MeasureMenuTextWidth(layout.leftNameText);
+    const int rightNameWidth = MeasureMenuTextWidth(layout.rightNameText);
     const int blockWidth =
         p1IconsWidth
         + (p1IconsWidth > 0 ? kBrowserIconNameGap : 0)
@@ -1247,9 +1398,9 @@ DetailRowLayout ComputeDetailRowLayout(
 
     const int rowLeft = kContentColumnX + 4;
     const int rowRight = kContentColumnX + kContentColumnW - 6;
-    const int labelWidth = MeasureText5x7(layout.labelText);
-    const int durationWidth = MeasureText5x7(layout.durationText);
-    const int roundsWidth = MeasureText5x7(layout.roundsText);
+    const int labelWidth = MeasureMenuTextWidth(layout.labelText);
+    const int durationWidth = MeasureMenuTextWidth(layout.durationText);
+    const int roundsWidth = MeasureMenuTextWidth(layout.roundsText);
     layout.labelLeft = rowLeft;
     layout.labelRight = rowLeft + labelWidth;
     layout.durationRight = rowRight;
@@ -1274,8 +1425,8 @@ DetailRowLayout ComputeDetailRowLayout(
 
     FitTwoTextsToPixelWidth(p1Name, p2Name, maxNamesWidth, &layout.leftNameText, &layout.rightNameText);
 
-    const int leftNameWidth = MeasureText5x7(layout.leftNameText);
-    const int rightNameWidth = MeasureText5x7(layout.rightNameText);
+    const int leftNameWidth = MeasureMenuTextWidth(layout.leftNameText);
+    const int rightNameWidth = MeasureMenuTextWidth(layout.rightNameText);
     const int blockWidth =
         p1IconWidth
         + (p1IconWidth > 0 ? kDetailIconNameGap : 0)
@@ -2227,6 +2378,13 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
 
     if (device != nullptr)
     {
+        // Drop committed game-RT text the moment the battle log menu is gone,
+        // so TTF text cannot linger over other screens.
+        if (!hooks::g_netplayMenuState.active
+            || hooks::g_netplayMenuState.menuId != NetplayMenuId::BattleLog)
+        {
+            netplay::debug_overlay::ClearRtText();
+        }
         (void)RenderBrowserIconsD3d9(device);
         // ImGui debug overlay + async-host in-gameplay indicator (renders on any
         // screen; no-op unless something is active).
@@ -5453,18 +5611,16 @@ void DrawSummaryPanel(
         panelFill,
         panelFrame);
     DrawPanelBox(surface, kSummaryCardX, kSummaryCardY, kSummaryCardW, kSummaryCardH, panelFill, panelFrame);
-    netplay::font::DrawTextCentered5x7(surface, BuildSummaryTitleText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 4, 1, 1, titleColor);
-    netplay::font::DrawTextCentered5x7(
+    MenuTitleCentered(surface, BuildSummaryTitleText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 4, titleColor);
+    MenuTextCentered(
         surface,
         "ACTIONS",
         kSummaryActionPanelX + 2,
         kSummaryActionPanelX + kSummaryActionPanelW - 2,
         kSummaryActionPanelY + 3,
-        1,
-        1,
         titleColor);
-    netplay::font::DrawTextCentered5x7(surface, BuildSummaryIdentityText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 18, 1, 1, textColor);
-    netplay::font::DrawTextCentered5x7(surface, BuildSummaryLoadText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 30, 1, 1, dimColor);
+    MenuTextCentered(surface, BuildSummaryIdentityText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 18, textColor);
+    MenuTextCentered(surface, BuildSummaryLoadText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 30, dimColor);
 
     const BattleLogSummary& summary = GetDisplayedSummary();
     const int halfSplitLeft = kSummaryCardX + (kSummaryCardW / 2) - 4;
@@ -5476,26 +5632,22 @@ void DrawSummaryPanel(
     const std::string gamesText = summary.hasPerspective
         ? ("Games " + std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses))
         : ("Games " + std::to_string(summary.totalGames));
-    netplay::font::DrawTextLeft5x7(surface, setsText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 42, 1, 1, textColor);
-    netplay::font::DrawTextRight5x7(surface, gamesText, halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 42, 1, 1, textColor);
+    MenuTextLeft(surface, setsText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 42, textColor);
+    MenuTextRight(surface, gamesText, halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 42, textColor);
 
-    netplay::font::DrawTextLeft5x7(
+    MenuTextLeft(
         surface,
         BuildSummarySetRateText(),
         kSummaryCardX + 8,
         halfSplitLeft,
         kSummaryCardY + 53,
-        1,
-        1,
         dimColor);
-    netplay::font::DrawTextRight5x7(
+    MenuTextRight(
         surface,
         BuildSummaryGameRateText(),
         halfSplitRight,
         kSummaryCardX + kSummaryCardW - 8,
         kSummaryCardY + 53,
-        1,
-        1,
         dimColor);
 
     const std::string playTimeText = "Playtime: " + FormatDurationShort(summary.totalDurationSeconds);
@@ -5509,29 +5661,27 @@ void DrawSummaryPanel(
                 + AbbreviateForDisplay(
                     summary.mostUsedCharacter.empty() ? std::string("N/A") : summary.mostUsedCharacter,
                     18));
-    netplay::font::DrawTextLeft5x7(surface, BuildSummaryAverageGamesText(), kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 64, 1, 1, dimColor);
+    MenuTextLeft(surface, BuildSummaryAverageGamesText(), kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 64, dimColor);
     if (summary.hasPerspective)
     {
-        netplay::font::DrawTextRight5x7(surface, BuildSummaryAverageSetDurationText(), halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, 1, 1, dimColor);
+        MenuTextRight(surface, BuildSummaryAverageSetDurationText(), halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, dimColor);
     }
     else
     {
-        netplay::font::DrawTextRight5x7(surface, BuildSummaryLongestSetText(), wideRightLeft, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, 1, 1, dimColor);
+        MenuTextRight(surface, BuildSummaryLongestSetText(), wideRightLeft, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, dimColor);
     }
-    netplay::font::DrawTextLeft5x7(surface, playTimeText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 75, 1, 1, textColor);
-    netplay::font::DrawTextRight5x7(
+    MenuTextLeft(surface, playTimeText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 75, textColor);
+    MenuTextRight(
         surface,
         summary.hasPerspective ? BuildSummaryLongestSetText() : BuildSummaryCompletionRatioText(),
         wideRightLeft,
         kSummaryCardX + kSummaryCardW - 8,
         kSummaryCardY + 75,
-        1,
-        1,
         dimColor);
 
     const uint8_t recentColor = summary.hasSessions ? textColor : alertColor;
-    netplay::font::DrawTextLeft5x7(surface, mostPlayedText, kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 86, 1, 1, textColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildSummaryRecentText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 97, 1, 1, recentColor);
+    MenuTextLeft(surface, mostPlayedText, kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 86, textColor);
+    MenuTextLeft(surface, BuildSummaryRecentText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 97, recentColor);
 }
 
 void DrawBrowserPanel(
@@ -5546,22 +5696,20 @@ void DrawBrowserPanel(
     DrawPanelBox(surface, kBrowserHeaderPanelX, kBrowserHeaderPanelY, kBrowserHeaderPanelW, kBrowserHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kBrowserContentPanelY, kContentColumnW + 4, 84, panelFill, panelFrame);
     DrawPanelBox(surface, kBrowserActionPanelX, kBrowserActionPanelY, kBrowserActionPanelW, kBrowserActionPanelH, panelFill, panelFrame);
-    netplay::font::DrawTextCentered5x7(surface, "SET BROWSER", kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, 1, 1, titleColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildFilterSummary(g_state.activeFilter), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 18, 1, 1, textColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildBrowserPageText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, 1, 1, dimColor);
-    netplay::font::DrawTextRight5x7(surface, BuildBrowserLongestSetText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, 1, 1, dimColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildBrowserRecordLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 44, 1, 1, textColor);
-    netplay::font::DrawTextRight5x7(surface, BuildBrowserRecordRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 44, 1, 1, textColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildBrowserUsageLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 57, 1, 1, dimColor);
-    netplay::font::DrawTextRight5x7(surface, BuildBrowserUsageRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 57, 1, 1, dimColor);
-    netplay::font::DrawTextCentered5x7(
+    MenuTitleCentered(surface, "SET BROWSER", kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, titleColor);
+    MenuTextLeft(surface, BuildFilterSummary(g_state.activeFilter), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 18, textColor);
+    MenuTextLeft(surface, BuildBrowserPageText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
+    MenuTextRight(surface, BuildBrowserLongestSetText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
+    MenuTextLeft(surface, BuildBrowserRecordLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 44, textColor);
+    MenuTextRight(surface, BuildBrowserRecordRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 44, textColor);
+    MenuTextLeft(surface, BuildBrowserUsageLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 57, dimColor);
+    MenuTextRight(surface, BuildBrowserUsageRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 57, dimColor);
+    MenuTextCentered(
         surface,
         "ACTIONS",
         kBrowserActionPanelX + 2,
         kBrowserActionPanelX + kBrowserActionPanelW - 2,
         kBrowserActionPanelY + 3,
-        1,
-        1,
         titleColor);
 }
 
@@ -5576,10 +5724,10 @@ void DrawFiltersPanel(
     DrawPanelBox(surface, kPanelX, kPanelY, kPanelW, 46, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, 72, kContentColumnW + 4, 96, panelFill, panelFrame);
     DrawPanelBox(surface, kActionStackX, 164, kActionStackW, 44, panelFill, panelFrame);
-    netplay::font::DrawTextCentered5x7(surface, "SEARCH", kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, 1, 1, titleColor);
-    netplay::font::DrawTextLeft5x7(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 18, 1, 1, textColor);
-    netplay::font::DrawTextLeft5x7(surface, "Exact names. Character, set type, and game count filters.", kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, 1, 1, dimColor);
-    netplay::font::DrawTextCentered5x7(surface, "ACTIONS", kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, 1, 1, titleColor);
+    MenuTitleCentered(surface, "SEARCH", kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, titleColor);
+    MenuTextLeft(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 18, textColor);
+    MenuTextLeft(surface, "Exact names. Character, set type, and game count filters.", kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, dimColor);
+    MenuTextCentered(surface, "ACTIONS", kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, titleColor);
 }
 
 void DrawDetailPanel(
@@ -5594,13 +5742,13 @@ void DrawDetailPanel(
     DrawPanelBox(surface, kDetailHeaderPanelX, kDetailHeaderPanelY, kDetailHeaderPanelW, kDetailHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kDetailContentPanelY, kContentColumnW + 4, kDetailContentPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kDetailActionPanelX, kDetailActionPanelY, kDetailActionPanelW, kDetailActionPanelH, panelFill, panelFrame);
-    netplay::font::DrawTextCentered5x7(surface, "SET DETAILS", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 4, 1, 1, titleColor);
-    netplay::font::DrawTextCentered5x7(surface, "ACTIONS", kDetailActionPanelX + 2, kDetailActionPanelX + kDetailActionPanelW - 2, kDetailActionPanelY + 3, 1, 1, titleColor);
+    MenuTitleCentered(surface, "SET DETAILS", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 4, titleColor);
+    MenuTextCentered(surface, "ACTIONS", kDetailActionPanelX + 2, kDetailActionPanelX + kDetailActionPanelW - 2, kDetailActionPanelY + 3, titleColor);
 
     const BattleLogSession* session = GetDetailSession();
     if (session == nullptr)
     {
-        netplay::font::DrawTextCentered5x7(surface, "No set selected.", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, 1, 1, alertColor);
+        MenuTextCentered(surface, "No set selected.", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, alertColor);
         return;
     }
 
@@ -5619,17 +5767,15 @@ void DrawDetailPanel(
         + "  Playtime: "
         + FormatDurationShort(session->totalDurationSeconds);
 
-    netplay::font::DrawTextCentered5x7(
+    MenuTextCentered(
         surface,
         matchup,
         kDetailHeaderPanelX + 8,
         kDetailHeaderPanelX + kDetailHeaderPanelW - 8,
         kDetailHeaderPanelY + 21,
-        1,
-        1,
         textColor);
-    netplay::font::DrawTextLeft5x7(surface, dateTimeText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, 1, 1, dimColor);
-    netplay::font::DrawTextRight5x7(surface, durationText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, 1, 1, dimColor);
+    MenuTextLeft(surface, dateTimeText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, dimColor);
+    MenuTextRight(surface, durationText, kDetailHeaderPanelX + 8, kDetailHeaderPanelX + kDetailHeaderPanelW - 8, kDetailHeaderPanelY + 37, dimColor);
 }
 
 void DrawScreenTitleBar(
@@ -5641,7 +5787,7 @@ void DrawScreenTitleBar(
 {
     constexpr int kLogicalWidth = 320;
     DrawPanelBox(surface, 0, 0, kLogicalWidth, 14, fillColor, frameColor);
-    netplay::font::DrawTextCentered5x7(surface, "BATTLE LOG", 2, kLogicalWidth - 2, 3, 1, 1, titleColor);
+    MenuTitleCentered(surface, "BATTLE LOG", 2, kLogicalWidth - 2, 3, titleColor);
 }
 
 void DrawSummaryRows(
@@ -5672,14 +5818,12 @@ void DrawSummaryRows(
         const bool isSelected = static_cast<int>(index) == selection;
         const int rowX = buttonsX + static_cast<int>(index) * (kSummaryActionButtonW + kSummaryActionButtonGap);
         DrawRowBoxAt(surface, rowX, rowY, kSummaryActionButtonW, kSummaryActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
-        netplay::font::DrawTextCentered5x7(
+        MenuTextCentered(
             surface,
             labels[index],
             rowX + 2,
             rowX + kSummaryActionButtonW - 2,
             rowY + 3,
-            1,
-            1,
             isSelected ? selectedText : normalText);
     }
 }
@@ -5715,14 +5859,12 @@ void DrawBrowserRows(
         {
             if (slot == 0 && GetBrowserResultCount() == 0)
             {
-                netplay::font::DrawTextCentered5x7(
+                MenuTextCentered(
                     surface,
                     "<no matching sets>",
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
                     rowY + 2,
-                    1,
-                    1,
                     isSelected ? selectedText : alertColor);
             }
             continue;
@@ -5734,41 +5876,33 @@ void DrawBrowserRows(
         const BrowserRowLayout layout =
             ComputeBrowserRowLayout(*session, p1Characters.size(), p2Characters.size());
 
-        netplay::font::DrawTextLeft5x7(
+        MenuTextLeft(
             surface,
             layout.dateTimeText,
             layout.dateLeft,
             layout.dateRight,
             rowY + 2,
-            1,
-            1,
             dimText);
-        netplay::font::DrawTextLeft5x7(
+        MenuTextLeft(
             surface,
             layout.leftNameText,
             layout.p1NameLeft,
             layout.p1NameRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
-        netplay::font::DrawTextCentered5x7(
+        MenuTextCentered(
             surface,
             layout.scoreText,
             layout.scoreLeft,
             layout.scoreRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
-        netplay::font::DrawTextLeft5x7(
+        MenuTextLeft(
             surface,
             layout.rightNameText,
             layout.p2NameLeft,
             layout.p2NameRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
     }
 
@@ -5791,14 +5925,12 @@ void DrawBrowserRows(
         const bool isSelected = selectionIndex == selection;
         const int rowX = buttonsX + control * (kBrowserActionButtonW + kBrowserActionButtonGap);
         DrawRowBoxAt(surface, rowX, rowY, kBrowserActionButtonW, kBrowserActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
-        netplay::font::DrawTextCentered5x7(
+        MenuTextCentered(
             surface,
             kControls[static_cast<size_t>(control)],
             rowX + 2,
             rowX + kBrowserActionButtonW - 2,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
     }
 }
@@ -5844,38 +5976,32 @@ void DrawFilterRows(
         DrawRowBoxAt(surface, rowX, rowY, rowW, kFilterRowH, isSelected, rowFill, rowFrame, selectedFill);
         if (isActionRow)
         {
-            netplay::font::DrawTextCentered5x7(
+            MenuTextCentered(
                 surface,
                 rows[index].label,
                 rowX + 4,
                 rowX + rowW - 4,
                 rowY + 2,
-                1,
-                1,
                 isSelected ? selectedText : normalText);
         }
         else
         {
-            netplay::font::DrawTextLeft5x7(
+            MenuTextLeft(
                 surface,
                 rows[index].label,
                 rowX + 6,
                 rowX + 118,
                 rowY + 2,
-                1,
-                1,
                 isSelected ? selectedText : normalText);
         }
         if (!rows[index].value.empty() && !isActionRow)
         {
-            netplay::font::DrawTextRight5x7(
+            MenuTextRight(
                 surface,
                 rows[index].value,
                 rowX + 122,
                 rowX + rowW - 6,
                 rowY + 2,
-                1,
-                1,
                 isSelected ? selectedText : dimText);
         }
     }
@@ -5913,14 +6039,12 @@ void DrawDetailRows(
         {
             if (slot == 0)
             {
-                netplay::font::DrawTextCentered5x7(
+                MenuTextCentered(
                     surface,
                     "<no games>",
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
                     rowY + 2,
-                    1,
-                    1,
                     isSelected ? selectedText : dimText);
             }
             continue;
@@ -5935,42 +6059,34 @@ void DrawDetailRows(
             FindCharacterSprite(match->p1CharacterDisplay) != nullptr,
             FindCharacterSprite(match->p2CharacterDisplay) != nullptr);
 
-        netplay::font::DrawTextLeft5x7(surface, layout.labelText, layout.labelLeft, layout.labelRight, rowY + 2, 1, 1, dimText);
-        netplay::font::DrawTextLeft5x7(
+        MenuTextLeft(surface, layout.labelText, layout.labelLeft, layout.labelRight, rowY + 2, dimText);
+        MenuTextLeft(
             surface,
             layout.leftNameText,
             layout.p1NameLeft,
             layout.p1NameRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
-        netplay::font::DrawTextCentered5x7(
+        MenuTextCentered(
             surface,
             layout.roundsText,
             layout.roundsLeft,
             layout.roundsRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
-        netplay::font::DrawTextLeft5x7(
+        MenuTextLeft(
             surface,
             layout.rightNameText,
             layout.p2NameLeft,
             layout.p2NameRight,
             rowY + 2,
-            1,
-            1,
             isSelected ? selectedText : normalText);
-        netplay::font::DrawTextRight5x7(
+        MenuTextRight(
             surface,
             layout.durationText,
             layout.durationLeft,
             layout.durationRight,
             rowY + 2,
-            1,
-            1,
             dimText);
     }
 
@@ -5991,14 +6107,12 @@ void DrawDetailRows(
         const bool isSelected = selectionIndex == selection;
         const int rowX = buttonsX + control * (kDetailActionButtonW + kDetailActionButtonGap);
         DrawRowBoxAt(surface, rowX, rowY, kDetailActionButtonW, kDetailActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
-        netplay::font::DrawTextCentered5x7(
+        MenuTextCentered(
             surface,
             kControls[static_cast<size_t>(control)],
             rowX + 2,
             rowX + kDetailActionButtonW - 2,
             rowY + 3,
-            1,
-            1,
             isSelected ? selectedText : normalText);
     }
 }
@@ -6883,19 +6997,27 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         lockedSurface.pitch,
     };
 
+    const bool rtTextFrame = RtTextWanted();
+    if (rtTextFrame)
+    {
+        netplay::debug_overlay::BeginRtTextFrame();
+    }
+    ResetMenuTextColors();
+
     const uint8_t panelFill = netplay::draw::ResolveBestPaletteColor(screenContext, 0, 0, 0);
     const uint8_t panelFrame = netplay::draw::ResolveBestPaletteColor(screenContext, 120, 170, 210);
     const uint8_t rowFill = netplay::draw::ResolveBestPaletteColor(screenContext, 0, 0, 0);
     const uint8_t rowFrame = netplay::draw::ResolveBestPaletteColor(screenContext, 72, 100, 140);
     const uint8_t selectedFill = netplay::draw::ResolveBestPaletteColor(screenContext, 18, 22, 30);
-    const uint8_t titleColor = netplay::draw::ResolveBestPaletteColor(screenContext, 240, 242, 255);
-    const uint8_t textColor = netplay::draw::ResolveBestPaletteColor(screenContext, 212, 220, 230);
-    const uint8_t selectedText = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 255, 255);
-    const uint8_t dimColor = netplay::draw::ResolveBestPaletteColor(screenContext, 150, 168, 190);
-    const uint8_t alertColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 176, 110);
+    // Text colors go through the registry so the TTF layer can recover the RGB.
+    const uint8_t titleColor = RegisterMenuTextColor(screenContext, 240, 242, 255);
+    const uint8_t textColor = RegisterMenuTextColor(screenContext, 212, 220, 230);
+    const uint8_t selectedText = RegisterMenuTextColor(screenContext, 255, 255, 255);
+    const uint8_t dimColor = RegisterMenuTextColor(screenContext, 150, 168, 190);
+    const uint8_t alertColor = RegisterMenuTextColor(screenContext, 255, 176, 110);
     const uint8_t chipFill = netplay::draw::ResolveBestPaletteColor(screenContext, 28, 40, 62);
     const uint8_t chipFrame = netplay::draw::ResolveBestPaletteColor(screenContext, 135, 180, 220);
-    const uint8_t chipText = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 230, 160);
+    const uint8_t chipText = RegisterMenuTextColor(screenContext, 255, 230, 160);
     const uint8_t titleFill = netplay::draw::ResolveBestPaletteColor(screenContext, 0, 0, 0);
 
     const int selection = ClampSelectionForCurrentView(
@@ -6922,6 +7044,11 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         DrawDetailPanel(surface, panelFill, panelFrame, titleColor, textColor, dimColor, alertColor);
         DrawDetailRows(surface, screenContext, selection, rowFill, rowFrame, selectedFill, textColor, selectedText, chipFill, chipFrame, chipText, dimColor);
         break;
+    }
+
+    if (rtTextFrame)
+    {
+        netplay::debug_overlay::CommitRtTextFrame();
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
