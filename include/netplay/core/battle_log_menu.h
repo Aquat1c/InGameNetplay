@@ -118,4 +118,16 @@ bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction acti
 bool DrawOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 uint8_t GetMenuDetailForStateExport();
+
+// Live-tunable positional nudge for the character icons (browser + detail
+// views), exposed so the ImGui debug panel can dial in a layout offset for
+// future adjustments. offsetX/offsetY are in 320x240 logical pixels; scale
+// multiplies the icon size. Applied on top of the computed per-slot layout.
+struct IconAdjust
+{
+    int offsetX = 0;
+    int offsetY = 0;
+    float scale = 1.0f;
+};
+IconAdjust& GetIconAdjust();
 }

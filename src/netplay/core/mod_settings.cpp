@@ -181,6 +181,12 @@ void Reload()
     {
         loaded.menuTtfFontFace = "Yu Gothic";
     }
+    loaded.hostingTipFontFace =
+        ReadStringValue(L"Others", L"HostingTipFont", L"Yu Gothic", iniPath);
+    if (loaded.hostingTipFontFace.empty())
+    {
+        loaded.hostingTipFontFace = "Yu Gothic";
+    }
     loaded.asyncHostReturnKey =
         ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
     if (loaded.asyncHostReturnKey.empty())
@@ -266,6 +272,11 @@ bool IsMenuTtfTextEnabled()
 const std::string& MenuTtfFontFace()
 {
     return g_settings.menuTtfFontFace;
+}
+
+const std::string& HostingTipFontFace()
+{
+    return g_settings.hostingTipFontFace;
 }
 
 const std::string& AsyncHostReturnKeyBinding()

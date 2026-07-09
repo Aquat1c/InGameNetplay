@@ -268,7 +268,8 @@ bool DrawRuntimeTextOverlayGdi(
 
     const bool wideDynamicMenu =
         state.menuId == netplay::menu::NetplayMenuId::Options
-        || state.menuId == netplay::menu::NetplayMenuId::PlayerRooms;
+        || state.menuId == netplay::menu::NetplayMenuId::PlayerRooms
+        || state.menuId == netplay::menu::NetplayMenuId::Lobby;
     const int panelLeft = wideDynamicMenu ? kOptionsTextLeft : 150;
     const int panelRight = wideDynamicMenu ? kOptionsTextRight : 314;
     constexpr int rowHeight = netplay::constants::kNetplayDefaultHighlightHeight;
@@ -328,9 +329,11 @@ bool DrawRuntimeTextOverlayGdi(
             const uint8_t color = isSelected ? selectedTextColor : normalTextColor;
             if (wideDynamicMenu)
             {
+                // Options, Player Rooms and the Lobby all draw crisp TTF rows
+                // (MenuRow profile) with the 5x7 fallback.
                 DrawSplitRowText(
                     callbacks, sv, entries[i], panelLeft + 2, panelRight - 2, textY, 1, 1, color,
-                    state.menuId == netplay::menu::NetplayMenuId::Options && !state.suppressRtText,
+                    !state.suppressRtText,
                     isSelected);
             }
             else
@@ -474,8 +477,11 @@ bool DrawDynamicFieldValuesGdi(
                     lockedSurface.pitch,
                 };
 
-                if (isOptions || isPlayerRooms)
+                if (isOptions || isPlayerRooms || isLobby)
                 {
+                    // Options, Player Rooms and the Lobby all render their rows
+                    // through the crisp TTF layer (MenuRow profile) with the 5x7
+                    // fallback - lobby rows are single labels (empty secondary).
                     DrawSplitRowText(
                         callbacks,
                         surfaceView,
@@ -486,7 +492,7 @@ bool DrawDynamicFieldValuesGdi(
                         fontScaleX,
                         fontScaleY,
                         color,
-                        isOptions && !state.suppressRtText,
+                        !state.suppressRtText,
                         i == selected);
                 }
                 else if (drawLeftAligned)

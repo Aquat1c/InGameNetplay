@@ -216,6 +216,10 @@ int g_pageSlideDir = 0;                 // +1 = new page from right (NEXT), -1 =
 DWORD g_pageSlideStartTick = 0;
 View g_pageSlideView = View::Browser;
 
+// Live-tunable icon layout nudge (see GetIconAdjust); dialed in via the ImGui
+// debug panel. Zeroed by default = the original computed layout.
+IconAdjust g_iconAdjust;
+
 void StartPageSlide(int direction, View view)
 {
     if (direction == 0)
@@ -2242,12 +2246,14 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int logicalX = icon.logicalX + slidePageOffsetX;
-                const int logicalY = icon.logicalY;
+                const int logicalX = icon.logicalX + slidePageOffsetX + g_iconAdjust.offsetX;
+                const int logicalY = icon.logicalY + g_iconAdjust.offsetY;
+                const int logicalSize =
+                    (std::max)(1, static_cast<int>(icon.logicalSize * g_iconAdjust.scale + 0.5f));
                 const int slotLeft = viewportX + (logicalX * viewportW) / 320;
                 const int slotTop = viewportY + (logicalY * viewportH) / 240;
-                const int slotRight = viewportX + ((logicalX + icon.logicalSize) * viewportW) / 320;
-                const int slotBottom = viewportY + ((logicalY + icon.logicalSize) * viewportH) / 240;
+                const int slotRight = viewportX + ((logicalX + logicalSize) * viewportW) / 320;
+                const int slotBottom = viewportY + ((logicalY + logicalSize) * viewportH) / 240;
                 const int slotW = (std::max)(1, slotRight - slotLeft);
                 const int slotH = (std::max)(1, slotBottom - slotTop);
                 int drawX = 0;
@@ -2374,11 +2380,14 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int logicalX = icon.logicalX + slidePageOffsetX;
+                const int logicalX = icon.logicalX + slidePageOffsetX + g_iconAdjust.offsetX;
+                const int logicalY = icon.logicalY + g_iconAdjust.offsetY;
+                const int logicalSize =
+                    (std::max)(1, static_cast<int>(icon.logicalSize * g_iconAdjust.scale + 0.5f));
                 const int slotLeft = viewportX + (logicalX * viewportW) / 320;
-                const int slotTop = viewportY + (icon.logicalY * viewportH) / 240;
-                const int slotRight = viewportX + ((logicalX + icon.logicalSize) * viewportW) / 320;
-                const int slotBottom = viewportY + ((icon.logicalY + icon.logicalSize) * viewportH) / 240;
+                const int slotTop = viewportY + (logicalY * viewportH) / 240;
+                const int slotRight = viewportX + ((logicalX + logicalSize) * viewportW) / 320;
+                const int slotBottom = viewportY + ((logicalY + logicalSize) * viewportH) / 240;
                 const int slotW = (std::max)(1, slotRight - slotLeft);
                 const int slotH = (std::max)(1, slotBottom - slotTop);
                 int drawX = 0;
@@ -6244,6 +6253,11 @@ void ShutdownRenderOverlay()
 bool EnsureGameplayOverlayHook()
 {
     return EnsureD3d9OverlayHookInstalled();
+}
+
+IconAdjust& GetIconAdjust()
+{
+    return g_iconAdjust;
 }
 
 const NetplayMenuSpec* GetMenuSpec()

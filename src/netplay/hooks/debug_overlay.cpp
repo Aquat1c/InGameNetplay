@@ -1,6 +1,7 @@
 #include "netplay/hooks/debug_overlay.h"
 
 #include "netplay/bridge/async_hosting.h"
+#include "netplay/core/battle_log_menu.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/hooks/menu_query.h"
 #include "netplay_resource_ids.h"
@@ -83,6 +84,24 @@ constexpr RtProfileDefaults kRtProfileDefaultsMsGothic = {
     {"BattleLogHeader", 25.0f, 16.0f, 0.0f},
     {"BattleLogRow",    18.0f, 12.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+};
+// Tuned in-game 2026-07-09 on Meiryo (its own set now, was sharing base).
+constexpr RtProfileDefaults kRtProfileDefaultsMeiryo = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         20.0f, 13.0f, 0.0f},
+    {"Footer",          22.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
+    {"BattleLogRow",    20.0f, 12.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
+};
+// Tuned in-game 2026-07-09 on ITC Bolt (Latin display face; smaller body px).
+constexpr RtProfileDefaults kRtProfileDefaultsItcBolt = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         13.0f, 16.0f, 0.0f},
+    {"Footer",          13.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 24.0f, 18.0f, 0.0f},
+    {"BattleLogRow",    16.0f, 11.0f, 0.0f},
+    {"MenuSection",     15.0f, 16.0f, 0.0f},
 };
 
 // Active working set: seeded from the resolved face's defaults whenever the
@@ -237,7 +256,7 @@ struct RtFontFace
 {
     const char* label;
     const char* systemFile;  // in %WINDIR%\Fonts, nullptr if none
-    const char* assetFile;   // in <mod>\assets, nullptr if none
+    const char* assetFile;   // in <mod>\assets\fonts, nullptr if none
     bool embeddedCopy;       // the DLL resource carries this face
     bool jpCapable;
     bool fallbackEligible;
@@ -245,13 +264,13 @@ struct RtFontFace
 };
 constexpr RtFontFace kRtFontFaces[] = {
     {"Yu Gothic",      "YuGothM.ttc",  "yugothib.ttf",                  false, true,  true,  kRtProfileDefaultsJpGothic},
-    {"Meiryo",         "meiryo.ttc",   "Meiryo.ttf",                    false, true,  true,  kRtProfileDefaultsBase},
+    {"Meiryo",         "meiryo.ttc",   "Meiryo.ttf",                    false, true,  true,  kRtProfileDefaultsMeiryo},
     {"MS Gothic",      "msgothic.ttc", nullptr,                         false, true,  true,  kRtProfileDefaultsMsGothic},
     {"Noto Sans JP",   nullptr,        "NotoSansCJKjp-Regular.ttf",     true,  true,  true,  kRtProfileDefaultsJpGothic},
     {"Noto Sans Mono", nullptr,        "NotoSansMonoCJKjp-Regular.ttf", false, true,  true,  kRtProfileDefaultsBase},
     {"Segoe UI",       "segoeui.ttf",  nullptr,                         false, false, true,  kRtProfileDefaultsBase},
     {"Arial",          "arial.ttf",    nullptr,                         false, false, true,  kRtProfileDefaultsBase},
-    {"ITC Bolt",       nullptr,        "ITC Bolt Bold Regular.otf",     false, false, false, kRtProfileDefaultsBase},
+    {"ITC Bolt",       nullptr,        "ITC Bolt\\ITC Bolt.ttf",        false, false, false, kRtProfileDefaultsItcBolt},
 };
 
 bool ResolveFacePath(const RtFontFace& face, char* outPath, size_t outSize)
@@ -275,7 +294,7 @@ bool ResolveFacePath(const RtFontFace& face, char* outPath, size_t outSize)
         const std::string dir = OverlayModuleDirectory();
         if (!dir.empty())
         {
-            std::snprintf(outPath, outSize, "%s\\assets\\%s", dir.c_str(), face.assetFile);
+            std::snprintf(outPath, outSize, "%s\\assets\\fonts\\%s", dir.c_str(), face.assetFile);
             if (GetFileAttributesA(outPath) != INVALID_FILE_ATTRIBUTES
                 && IsStbLoadableFontFile(outPath))
             {
@@ -328,12 +347,12 @@ bool GetEmbeddedFallbackFont(void** outData, int* outSize)
 // otherwise walk the table in order.  An empty outPath with a non-null
 // return means "load this face from the embedded DLL resource".  Returns
 // nullptr only when nothing at all is loadable.
-const RtFontFace* ResolvePrimaryFont(char* outPath, size_t outSize, bool hasEmbedded)
+const RtFontFace* ResolveFontByLabel(
+    const char* configured, char* outPath, size_t outSize, bool hasEmbedded)
 {
-    const std::string& configured = netplay::mod_settings::MenuTtfFontFace();
     for (const RtFontFace& face : kRtFontFaces)
     {
-        if (_stricmp(face.label, configured.c_str()) == 0)
+        if (_stricmp(face.label, configured) == 0)
         {
             if (ResolveFacePath(face, outPath, outSize))
             {
@@ -346,7 +365,7 @@ const RtFontFace* ResolvePrimaryFont(char* outPath, size_t outSize, bool hasEmbe
             }
             mod::Log(
                 "DebugOverlay: configured font '%s' unavailable, falling back",
-                configured.c_str());
+                configured);
             break;
         }
     }
@@ -367,6 +386,12 @@ const RtFontFace* ResolvePrimaryFont(char* outPath, size_t outSize, bool hasEmbe
         }
     }
     return nullptr;
+}
+
+const RtFontFace* ResolvePrimaryFont(char* outPath, size_t outSize, bool hasEmbedded)
+{
+    return ResolveFontByLabel(
+        netplay::mod_settings::MenuTtfFontFace().c_str(), outPath, outSize, hasEmbedded);
 }
 
 // Japanese/Cyrillic fill-in source for primaries that lack those glyphs.
@@ -406,7 +431,7 @@ const char* ResolveJapaneseFontPath()
         for (const char* file : kBundled)
         {
             char path[MAX_PATH] = {};
-            std::snprintf(path, sizeof(path), "%s\\assets\\%s", modDir.c_str(), file);
+            std::snprintf(path, sizeof(path), "%s\\assets\\fonts\\%s", modDir.c_str(), file);
             if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES
                 && IsStbLoadableFontFile(path))
             {
@@ -599,6 +624,42 @@ void LoadRtFonts()
     for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
     {
         g_rtProfileFonts[i] = fontForPx(g_rtProfiles[i].fontPx);
+    }
+
+    // The hosting-overlay badge ("Hosting... Press F1...") may use a different
+    // face than the menu. Its text is always ASCII, so no JP/CJK merge is
+    // needed - a plain bake at the badge px from the configured hosting-tip
+    // face. When that face matches the menu face we just keep the primary bake.
+    {
+        const std::string& badgeConfigured = netplay::mod_settings::HostingTipFontFace();
+        if (!badgeConfigured.empty() && _stricmp(badgeConfigured.c_str(), faceLabel) != 0)
+        {
+            char badgePath[MAX_PATH] = {};
+            const RtFontFace* badgeFace = ResolveFontByLabel(
+                badgeConfigured.c_str(), badgePath, sizeof(badgePath), embeddedData != nullptr);
+            if (badgeFace != nullptr)
+            {
+                ImFont* badgeFont = nullptr;
+                if (badgePath[0] != '\0')
+                {
+                    badgeFont = io.Fonts->AddFontFromFileTTF(badgePath, kBadgeFontPx, nullptr, baseRanges);
+                }
+                else if (embeddedData != nullptr)
+                {
+                    ImFontConfig memoryConfig;
+                    memoryConfig.FontDataOwnedByAtlas = false;
+                    badgeFont = io.Fonts->AddFontFromMemoryTTF(
+                        embeddedData, embeddedSize, kBadgeFontPx, &memoryConfig, baseRanges);
+                }
+                if (badgeFont != nullptr)
+                {
+                    g_badgeFont = badgeFont;
+                    mod::Log(
+                        "DebugOverlay: hosting-tip badge baked from separate face '%s' (menu face '%s')",
+                        badgeFace->label, faceLabel);
+                }
+            }
+        }
     }
 
     if (io.Fonts->Fonts.empty())
@@ -917,6 +978,25 @@ void DrawDebugPanel()
         ImGui::SliderFloat("Font scale", &g_asyncFontScale, 0.5f, 4.0f, "%.2f");
         ImGui::SliderFloat("BG alpha", &g_asyncBgAlpha, 0.0f, 1.0f, "%.2f");
         ImGui::TextDisabled("Dial these in, then hardcode the defaults\nin debug_overlay.cpp.");
+
+        ImGui::SeparatorText("Battle Log character icons");
+        {
+            netplay::battle_log::IconAdjust& icon = netplay::battle_log::GetIconAdjust();
+            ImGui::SliderInt("icon offX (logical)", &icon.offsetX, -40, 40);
+            ImGui::SliderInt("icon offY (logical)", &icon.offsetY, -40, 40);
+            ImGui::SliderFloat("icon scale", &icon.scale, 0.5f, 2.0f, "%.2f");
+            if (ImGui::Button("Log icon adjust"))
+            {
+                mod::Log(
+                    "DebugOverlay: battle-log icon adjust - offsetX=%d offsetY=%d scale=%.2ff",
+                    icon.offsetX, icon.offsetY, icon.scale);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset icons"))
+            {
+                icon = netplay::battle_log::IconAdjust{};
+            }
+        }
 
         namespace ah = netplay::bridge::async_host;
         ImGui::SeparatorText("Async-host state");

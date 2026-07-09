@@ -34,6 +34,9 @@ struct Settings
     // bundled Noto faces guarantee coverage everywhere (incl. Wine) - the
     // Microsoft faces cannot legally be redistributed with the mod.
     std::string menuTtfFontFace = "Yu Gothic";
+    // Font face for the in-game hosting-overlay badge ("Hosting... Press F1...").
+    // Independent of the menu face so the tip can stand out; ASCII-only text.
+    std::string hostingTipFontFace = "Yu Gothic";
     // Keyboard binding (DIK_* form) for the async-hosting "return / rehost"
     // hotkey used while the hosting overlay is minimized in-game.
     std::string asyncHostReturnKey = "DIK_F1";
@@ -56,6 +59,7 @@ bool HideEmptySetsInBattleLogByDefault();
 bool IsDesyncDetectionEnabled();
 bool IsMenuTtfTextEnabled();
 const std::string& MenuTtfFontFace();
+const std::string& HostingTipFontFace();
 // Async-hosting return/rehost hotkey as a DIK_* binding value (e.g. "DIK_F1").
 const std::string& AsyncHostReturnKeyBinding();
 } // namespace netplay::mod_settings

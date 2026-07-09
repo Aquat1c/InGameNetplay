@@ -1383,7 +1383,7 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         {"Global", "AUDIO", {"ToggleBGM", "MuteBGM", "BGMFolder"}},
         {"Global", "SYSTEM", {"SoftwareRendering", "Debug"}},
         // [Others] (mod-owned settings)
-        {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
+        {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
         {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey"}},
         {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "DesyncDetection"}},
     };
@@ -1776,6 +1776,11 @@ void AppendSyntheticItems()
         "Yu Gothic",
         {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
         "TTF face for menu text. The Noto faces ship with the mod and always cover Japanese and Cyrillic; system faces fall back to them when missing glyphs.");
+    upsertChoiceItem(
+        "HostingTipFont",
+        "Yu Gothic",
+        {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
+        "TTF face for the in-game hosting-overlay tip ('Hosting... Press F1...'). Independent of the menu font so the tip can stand out.");
     upsertKeybindItem(
         "AsyncHostReturnKey",
         "DIK_F1",
