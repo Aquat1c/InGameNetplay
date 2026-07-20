@@ -1,6 +1,7 @@
 // Revival DLL memory introspection and session field manipulation.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/batch_stabilizer.h"
 #include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
@@ -11,9 +12,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <float.h>
 #include <intrin.h>
+#include <mutex>
+#include <string>
 #include <xmmintrin.h>
+
+#include <MinHook.h>
 
 #include <windows.h>
 #include <psapi.h>  // For PROCESS_MEMORY_COUNTERS type only; psapi.dll loaded at runtime
@@ -3790,8 +3796,19 @@ bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason)
                         char(__thiscall*)(void* context, char enable);
                     auto togglePatchSet =
                         reinterpret_cast<TogglePatchSetFn>(fnAddr);
-                    const char result = togglePatchSet(nullptr, 1);
-                    applyOk = result != 0;
+                    const char rawResult = togglePatchSet(nullptr, 1);
+                    // The legacy toggle helper returns its patch-map
+                    // iteration predicate, which is 0 after a COMPLETED
+                    // full restore - the raw byte is not a success flag.
+                    // Success is judged by the verified postcondition
+                    // (stateAfter/sitesOk) below; keep the raw byte as
+                    // diagnostics only.
+                    applyOk = true;
+                    mod::Log(
+                        "REVIVAL_GRAPHICS_PATCH_RESTORE_APPLY_LEGACY reason=%s "
+                        "rawResult=%d (diagnostic only)",
+                        reasonTag,
+                        static_cast<int>(rawResult));
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER)
                 {
@@ -5590,25 +5607,12 @@ static void RunFrameDispatch()
 // it patches EXE address 0x401642 to JMP into sub_1006E570.  From that point
 // the EXE's main loop calls sub_1006E570 on EVERY frame.
 //
-// sub_1006E570 is __thiscall - ECX comes from the EXE.  It reads the session
-// pointer from dword_100A02CC, looks up vtable[2], and calls it PASSING ECX
-// (the EXE-supplied this) as the first argument:
-//
-//   return (vtable[2])(this);    // this = ECX from EXE
-//
-// vtable[2] (typically EFZ_Main_RollbackLoopTick) treats that argument as
-// the session's `self` pointer.  During a normal match this is correct:
-// InvokeStartInitPlayer writes the session pointer into an EXE global that
-// feeds ECX.  But ForceLocalPlayInit replaces the DLL-side session pointer
-// without updating the EXE global, so ECX carries the OLD (freed) session
-// address → crash.
-//
-// FIX
-// ---
-// We hook sub_1006E570 and replace ECX with the current value of
-// dword_100A02CC before calling the original.  This guarantees the
-// correct session pointer reaches vtable[2] regardless of what the EXE
-// passes.
+// sub_1006E570 is __thiscall, so the detour must preserve the incoming ECX.
+// Verified 1.02h saves it, reloads dword_100A02EC into ECX, and dispatches
+// through that session's vtable; 1.02j likewise reloads its global session
+// before the tail call. The incoming value does not select or double-run the
+// rollback session, but forwarding EFZ's original value exactly preserves the
+// native ABI for every supported build.
 // ---------------------------------------------------------------------------
 
 // Per-frame tick RVA is now profile-driven: g_activeRevival->perFrameTickRva.
@@ -7443,11 +7447,12 @@ static int RunPerFrameTickDispatch(void* fixedThis)
 #pragma warning(pop)
 #endif
 
-// Our per-frame tick hook.  Uses __fastcall to capture ECX (first arg) and
-// EDX (second, unused).  Replaces ECX with the current session pointer
-// before calling the original sub_1006E570.
+// Our per-frame tick hook. Uses __fastcall to capture ECX (first arg) and EDX
+// (second, unused), then forwards EFZ's original ECX to Revival unchanged.
 static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 {
+    netplay::bridge::batch_stabilizer::EnsurePerTick();
+
     // NOTE: A "double-tick skip" heuristic used to live here. It compared
     // gameSys+4968 across consecutive calls and, when it saw the same value
     // twice, skipped ALL mod-side per-frame processing for that call (still
@@ -7521,21 +7526,17 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     const uintptr_t exeThisAddr = reinterpret_cast<uintptr_t>(exeThis);
     const uintptr_t currentSession = ReadSessionPtrRaw();
 
-    // Use the current DLL session if available; fall back to EXE's value.
-    void* fixedThis = (currentSession != 0)
-        ? reinterpret_cast<void*>(currentSession)
-        : exeThis;
-
     EnsureRevivalFpuBaselineForSession("tick_entry", currentSession);
 
-    // Detect and log the first ECX mismatch (stale session pointer).
+    // Record the first ECX difference. In verified 1.02h this is diagnostic:
+    // the native wrapper reloads the global session before virtual dispatch.
     if (exeThisAddr != currentSession && !g_perFrameMismatchLogged)
     {
         g_perFrameMismatchLogged = true;
         mod::Log(
             "TICK_HOOK: *** ECX MISMATCH *** frameTick=%u "
             "exeECX=0x%08lX dllSession=0x%08lX - "
-            "overriding ECX with current session",
+            "forwarding native EFZ ECX unchanged",
             g_frameTick,
             static_cast<unsigned long>(exeThisAddr),
             static_cast<unsigned long>(currentSession));
@@ -7644,6 +7645,175 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
+    // ---- Provisional desync warning watcher ------------------------------
+    // Revival's "Desync detected" console line arrives on its own IPC
+    // channel and is deliberately NON-fatal: stock Revival keeps the match
+    // running after the one-shot warning. RNG-only Sync inequality is a real
+    // deterministic fault, but duration or later phase compensation cannot
+    // classify its gameplay impact
+    // (docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md). Log a rich snapshot when
+    // the warning first appears, then a once-per-second trail of the Revival
+    // RNG engine state and EFZ effect-ring cursors so host/client logs can
+    // be correlated. The type-47/RNG monitor records causal evidence without
+    // promoting any duration threshold into session control; transport and
+    // protocol failures still use the fatal consoleErrorSerial path below.
+    {
+        static uint32_t s_desyncWarnSeenSession = 0;
+        static LONG s_desyncWarnSeenSerial = 0;
+        static int s_desyncWarnTrailSamples = 0;
+        static DWORD s_desyncWarnNextSampleTick = 0;
+
+        // Teardown clears the shared serial. Reset the consumer on the local
+        // session generation as well: two consecutive sessions can each have
+        // their first warning published as serial 1.
+        if (s_desyncWarnSeenSession != g_sessionNumber)
+        {
+            s_desyncWarnSeenSession = g_sessionNumber;
+            s_desyncWarnSeenSerial = 0;
+            s_desyncWarnTrailSamples = 0;
+            s_desyncWarnNextSampleTick = 0;
+        }
+
+        const LONG desyncWarnSerial =
+            g_hostBlock != nullptr
+                ? InterlockedCompareExchange(&g_hostBlock->consoleDesyncWarnSerial, 0, 0)
+                : 0;
+        if (desyncWarnSerial < s_desyncWarnSeenSerial)
+        {
+            // Serial was externally cleared (session teardown/restart).
+            s_desyncWarnSeenSerial = desyncWarnSerial;
+            s_desyncWarnTrailSamples = 0;
+        }
+
+        const DWORD desyncWarnNowTick = GetTickCount();
+        const bool newDesyncWarning = desyncWarnSerial > s_desyncWarnSeenSerial;
+        const bool trailSampleDue =
+            s_desyncWarnTrailSamples > 0
+            && static_cast<int>(desyncWarnNowTick - s_desyncWarnNextSampleTick) >= 0;
+
+        if (newDesyncWarning || trailSampleDue)
+        {
+            // EFZ gameSystem offsets (fixed across supported EFZ builds; the
+            // same struct Revival's global-state pointer targets - offsets
+            // 4964/4965/82563 in the profile address the same block).
+            constexpr uintptr_t kEfzEffectAllocCursorOffset = 4992;
+            constexpr uintptr_t kEfzEffectProcCursorOffset = 4994;
+            constexpr uintptr_t kEfzEffectsSettingOffset = 4966;
+
+            int rngEngineState = -1;
+            int sessionFrame = -1;
+            uint16_t effectAllocCursor = 0xFFFF;
+            uint16_t effectProcCursor = 0xFFFF;
+            uint8_t effectsSetting = 0xFF;
+            uint8_t replayModeByte = 0xFF;
+            uint8_t gameModeIndex = 0xFF;
+
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            if (revival != nullptr && g_activeRevival != nullptr)
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+                if (g_activeRevival->rngEngineStateOffset != 0)
+                {
+                    (void)SafeReadInt(
+                        reinterpret_cast<const void*>(
+                            base + g_activeRevival->rngEngineStateOffset),
+                        &rngEngineState);
+                }
+                if (g_activeRevival->sessionPtrOffsetCount > 0)
+                {
+                    uintptr_t sessionPtr = 0;
+                    if (SafeReadPtr(
+                            reinterpret_cast<const void*>(
+                                base + g_activeRevival->sessionPtrOffsets[0]),
+                            &sessionPtr)
+                        && sessionPtr != 0
+                        && g_activeRevival->sessionOffsetCurrentFrame != 0)
+                    {
+                        (void)SafeReadInt(
+                            reinterpret_cast<const void*>(
+                                sessionPtr + g_activeRevival->sessionOffsetCurrentFrame),
+                            &sessionFrame);
+                    }
+                }
+                uintptr_t globalStatePtr = 0;
+                if (g_activeRevival->globalStatePtrOffset != 0
+                    && SafeReadPtr(
+                        reinterpret_cast<const void*>(
+                            base + g_activeRevival->globalStatePtrOffset),
+                        &globalStatePtr)
+                    && globalStatePtr != 0)
+                {
+                    (void)SafeReadWord(
+                        reinterpret_cast<const void*>(
+                            globalStatePtr + kEfzEffectAllocCursorOffset),
+                        &effectAllocCursor);
+                    (void)SafeReadWord(
+                        reinterpret_cast<const void*>(
+                            globalStatePtr + kEfzEffectProcCursorOffset),
+                        &effectProcCursor);
+                    (void)SafeReadByte(
+                        reinterpret_cast<const void*>(
+                            globalStatePtr + kEfzEffectsSettingOffset),
+                        &effectsSetting);
+                    (void)SafeReadByte(
+                        reinterpret_cast<const void*>(
+                            globalStatePtr + g_activeRevival->globalStateOffsetSessionByte),
+                        &replayModeByte);
+                }
+                if (g_activeRevival->addrGameModeCurrentIndex != 0)
+                {
+                    (void)SafeReadByte(
+                        reinterpret_cast<const void*>(
+                            g_activeRevival->addrGameModeCurrentIndex),
+                        &gameModeIndex);
+                }
+            }
+
+            if (newDesyncWarning)
+            {
+                char warnText[128] = {};
+                ReadConsoleDesyncWarning(nullptr, warnText, sizeof(warnText));
+                s_desyncWarnSeenSerial = desyncWarnSerial;
+                s_desyncWarnTrailSamples = 10;
+                s_desyncWarnNextSampleTick = desyncWarnNowTick + 1000;
+                mod::Log(
+                    "DESYNC_WARN_PROVISIONAL serial=%ld frameTick=%u sessionFrame=%d "
+                    "gameMode=%u rngState=%d effectAlloc=%u effectProc=%u "
+                    "effectsSetting=%u replayModeByte=%u text='%s' - session kept "
+                    "alive (stock-parity); causal tracer remains observational",
+                    static_cast<long>(desyncWarnSerial),
+                    g_frameTick,
+                    sessionFrame,
+                    gameModeIndex,
+                    rngEngineState,
+                    effectAllocCursor,
+                    effectProcCursor,
+                    effectsSetting,
+                    replayModeByte,
+                    warnText);
+            }
+            else
+            {
+                --s_desyncWarnTrailSamples;
+                // Do not catch up a stale wall-clock deadline on consecutive
+                // game ticks after a stall; that burst is itself observable.
+                s_desyncWarnNextSampleTick = desyncWarnNowTick + 1000;
+                mod::Log(
+                    "DESYNC_WARN_TRAIL serial=%ld remaining=%d frameTick=%u "
+                    "sessionFrame=%d gameMode=%u rngState=%d effectAlloc=%u "
+                    "effectProc=%u",
+                    static_cast<long>(s_desyncWarnSeenSerial),
+                    s_desyncWarnTrailSamples,
+                    g_frameTick,
+                    sessionFrame,
+                    gameModeIndex,
+                    rngEngineState,
+                    effectAllocCursor,
+                    effectProcCursor);
+            }
+        }
+    }
+
     // ---- Pre-tick graceful-end / disconnect detection --------------------
     // Replace Revival's patched-out quitMem -> ExitProcess path on the host
     // side, and keep the existing console-error short-circuit as well.
@@ -7731,7 +7901,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         }
     }
 
-    // Call the original sub_1006E570 with the corrected ECX unless a
+    // Call the original sub_1006E570 with EFZ's native ECX unless a
     // pre-tick disconnect was detected.
     int result = 0;
     LARGE_INTEGER tickQpcBefore = {}, tickQpcAfter = {};
@@ -7739,6 +7909,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     RevivalRemoteInputDiagSnapshot revivalTickAfter = {};
     bool revivalRemoteDiagActive = false;
     bool revivalBatchZeroFrameDiag = false;
+    const bool eagerZeroFrameExperiment =
+        netplay::mod_settings::IsEagerZeroFrameGraphicsRestoreEnabled();
     static int s_lastZeroFrameLeftAloneFrame = -1;
     static uint32_t s_lastZeroFrameLeftAloneTick = 0;
 
@@ -7747,7 +7919,8 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         // The remote-input snapshot describes RollbackSession.  In
         // SpectatorSession the same offsets are different MinGW objects and
         // wire queues, so reading them only creates misleading diagnostics.
-        if (g_localRoleFlag == kLocalRoleOnline)
+        if (g_localRoleFlag == kLocalRoleOnline
+            && (kLogRevivalTickDiag || eagerZeroFrameExperiment))
         {
             CaptureRevivalRemoteInputDiag(currentSession, &revivalTickBefore);
             revivalRemoteDiagActive =
@@ -7771,18 +7944,20 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
         if (revivalTickBefore.pauseRemoteInput)
         {
-            mod::Log(
-                "REVIVAL_PAUSE_REMOTE_INPUT ping=%u delay=%d localLen=%d "
-                "remoteLen=%d returnIterations=0",
-                static_cast<unsigned>(revivalTickBefore.pingStruct[3]),
-                revivalTickBefore.waitDelay,
-                revivalTickBefore.localLen,
-                revivalTickBefore.remoteLen);
-
             revivalBatchZeroFrameDiag = true;
-            mod::Log(
-                "REVIVAL_BATCH_RENDER_ENTER frameCount=0 patchStateBefore=%d",
-                revivalTickBefore.patchState);
+            if (kLogRevivalTickDiag || eagerZeroFrameExperiment)
+            {
+                mod::Log(
+                    "REVIVAL_PAUSE_REMOTE_INPUT ping=%u delay=%d localLen=%d "
+                    "remoteLen=%d returnIterations=0",
+                    static_cast<unsigned>(revivalTickBefore.pingStruct[3]),
+                    revivalTickBefore.waitDelay,
+                    revivalTickBefore.localLen,
+                    revivalTickBefore.remoteLen);
+                mod::Log(
+                    "REVIVAL_BATCH_RENDER_ENTER frameCount=0 patchStateBefore=%d",
+                    revivalTickBefore.patchState);
+            }
         }
 
         // Wrapped in RunPerFrameTickDispatch which sets up a setjmp recovery
@@ -7790,7 +7965,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         // during the DLL's session tick (vtable[2] → RollbackLoopTick).
         NormalizeRevivalFpuState("pre_orig_tick", currentSession);
         QueryPerformanceCounter(&tickQpcBefore);
-        result = RunPerFrameTickDispatch(fixedThis);
+        result = RunPerFrameTickDispatch(exeThis);
         QueryPerformanceCounter(&tickQpcAfter);
         NormalizeRevivalFpuState("post_orig_tick", currentSession);
         TrackRevivalSyncDiagnosticsAfterTick("post_orig_tick", currentSession);
@@ -7805,36 +7980,58 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 iterations =
                     revivalTickAfter.currentFrame - revivalTickBefore.currentFrame;
             }
-            mod::Log(
-                "REVIVAL_TICK_EXIT iterations=%d state=%d "
-                "currentFrameBefore=%d currentFrameAfter=%d rawResult=%d "
-                "patchState=%d",
-                iterations,
-                revivalTickAfter.state,
-                revivalTickBefore.currentFrame,
-                revivalTickAfter.currentFrame,
-                result,
-                revivalTickAfter.patchState);
+            if (revivalRemoteDiagActive || kLogRevivalTickDiag)
+            {
+                mod::Log(
+                    "REVIVAL_TICK_EXIT iterations=%d state=%d "
+                    "currentFrameBefore=%d currentFrameAfter=%d rawResult=%d "
+                    "patchState=%d",
+                    iterations,
+                    revivalTickAfter.state,
+                    revivalTickBefore.currentFrame,
+                    revivalTickAfter.currentFrame,
+                    result,
+                    revivalTickAfter.patchState);
+            }
         }
 
         if (revivalBatchZeroFrameDiag)
         {
-            mod::Log(
-                "REVIVAL_BATCH_RENDER_EXIT frameCount=0 patchStateAfter=%d",
-                revivalTickAfter.patchState);
+            if (kLogRevivalTickDiag)
+            {
+                mod::Log(
+                    "REVIVAL_BATCH_RENDER_EXIT frameCount=0 patchStateAfter=%d",
+                    revivalTickAfter.patchState);
+            }
             if (revivalTickBefore.state == 3
                 && revivalTickBefore.patchState == 1
                 && revivalTickAfter.patchState == 0)
             {
                 mod::Log(
-                    "REVIVAL_ZERO_FRAME_PATCH_LEAK_DETECTED state=3 frameCount=0 before=1 after=0 currentFrame=%d",
+                    "REVIVAL_ZERO_FRAME_RENDER_SUPPRESSION_OBSERVED state=3 frameCount=0 before=1 after=0 currentFrame=%d",
                     revivalTickBefore.currentFrame);
-                const bool restoreOk =
-                    EnsureRevivalGraphicsPatchSetEnabled(
-                        "zero_frame_patch_leak");
-                mod::Log(
-                    "REVIVAL_ZERO_FRAME_PATCH_LEAK_RESTORED result=%d",
-                    restoreOk ? 1 : 0);
+                // Stock Revival leaves the patch set disabled across
+                // zero-iteration batches (final-frame-only rendering); the
+                // eager re-enable is a mod-specific difference and a desync
+                // A/B axis. The production default preserves stock behavior;
+                // terminal/frontend recovery restores remain separate and
+                // still repair the real integrated-process unfreeze case.
+                if (eagerZeroFrameExperiment)
+                {
+                    const bool restoreOk =
+                        EnsureRevivalGraphicsPatchSetEnabled(
+                            "zero_frame_render_override_experiment");
+                    mod::Log(
+                        "REVIVAL_ZERO_FRAME_RENDER_OVERRIDE_APPLIED result=%d",
+                        restoreOk ? 1 : 0);
+                }
+                else
+                {
+                    mod::Log(
+                        "REVIVAL_ZERO_FRAME_RENDER_SUPPRESSION_PRESERVED reason=stock_parity_default "
+                        "currentFrame=%d",
+                        revivalTickBefore.currentFrame);
+                }
             }
             else if (revivalTickAfter.patchState == 0)
             {
@@ -7846,7 +8043,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     s_lastZeroFrameLeftAloneFrame = revivalTickBefore.currentFrame;
                     s_lastZeroFrameLeftAloneTick = g_frameTick;
                     mod::Log(
-                        "REVIVAL_ZERO_FRAME_PATCH_LEAK_LEFT_ALONE reason=not_in_recovery state=%d frameCount=0 before=%d after=%d currentFrame=%d",
+                        "REVIVAL_ZERO_FRAME_RENDER_REMAINS_SUPPRESSED reason=native_zero_frame_batch state=%d frameCount=0 before=%d after=%d currentFrame=%d",
                         revivalTickBefore.state,
                         revivalTickBefore.patchState,
                         revivalTickAfter.patchState,
@@ -8432,18 +8629,24 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         && g_activeRevival != nullptr
         && !preTickDisconnect)
     {
-        // Per-frame desync recorder: checksums + region copies of the
-        // post-tick confirmed state (no file I/O; see desync_monitor.cpp).
+        // Experimental tracer: observe only the native frame during the
+        // handshake. Full state capture starts after both peers agree on the
+        // same future frame, keeping the normal hot path inert.
+        if (netplay::bridge::desync_monitor::IsSessionTracing())
         {
             int dmFrame = -1;
-            int dmCommit = -1;
             (void)SafeReadInt(
                 reinterpret_cast<const void*>(
                     currentSession + g_activeRevival->sessionOffsetCurrentFrame),
                 &dmFrame);
-            (void)ReadGameplaySyncFrameForRecovery(currentSession, &dmCommit);
-            netplay::bridge::desync_monitor::RecordFrameTick(
-                currentSession, dmFrame, dmCommit);
+            netplay::bridge::desync_monitor::ObserveFrame(dmFrame);
+            if (netplay::bridge::desync_monitor::IsCaptureArmed())
+            {
+                int dmCommit = -1;
+                (void)ReadGameplaySyncFrameForRecovery(currentSession, &dmCommit);
+                netplay::bridge::desync_monitor::RecordFrameTick(
+                    currentSession, dmFrame, dmCommit);
+            }
         }
 
         const bool isDesyncCheckFrame =
@@ -8521,17 +8724,21 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             }
             else
             {
+                // fpuRewrites: unconditional (audit finding) - a peer that
+                // had to CORRECT drifted FPU control on the divergence
+                // frame must be visible without VerboseSyncDiagnostics.
                 mod::Log(
                     "DESYNC_CHECK: S#%u tick=%u screen=%u frame=%d advCtr=%d "
                     "commit=%d syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
-                    "sentinel=0x%08lX chk=0x%08lX",
+                    "sentinel=0x%08lX chk=0x%08lX fpuRewrites=%u",
                     g_sessionNumber, g_frameTick,
                     static_cast<unsigned>(dsScreen),
                     dsCurrentFrame, dsAdvanceCounter,
                     dsCommitFrame, dsSyncFrame, dsMatchId,
                     dsInputDelay, dsPingMs, dsActivePlayer,
                     static_cast<unsigned long>(dsSentinel),
-                    static_cast<unsigned long>(stateChecksum));
+                    static_cast<unsigned long>(stateChecksum),
+                    g_revivalFpuNormalizeCount);
             }
         }
     }
@@ -9802,9 +10009,8 @@ bool InstallNetplayFrameHook()
     //
     // sub_1006E570 is the ACTUAL per-frame entry point.  sub_1006E590 (hooked
     // above) runs once during init and installs an EXE patch at 0x401642 that
-    // calls sub_1006E570 every frame.  We hook sub_1006E570 to:
-    //   (a) Fix the stale ECX that the EXE passes after session replacement.
-    //   (b) Run per-frame diagnostic heartbeats.
+    // calls sub_1006E570 every frame. We hook it to install the recovery
+    // boundary and diagnostics while forwarding the native ECX unchanged.
     //
     // sub_1006E570 prologue - may start with:
     //   55                 push ebp       (MSVC frame-pointer prologue)

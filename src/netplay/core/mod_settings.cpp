@@ -171,8 +171,44 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
+    // Do not inherit the obsolete experimental key names. The corrected wire-
+    // v4 monitor is temporarily default-on for the current RNG investigation;
+    // an explicit ExperimentalDesyncMonitor=0 remains authoritative. The
+    // active-battle zero-frame graphics override stays opt-in/default-off.
     loaded.desyncDetection =
-        ReadBoolValue(L"Others", L"DesyncDetection", true, iniPath);
+        ReadBoolValue(L"Others", L"ExperimentalDesyncMonitor", true, iniPath);
+    loaded.eagerZeroFrameGraphicsRestore =
+        ReadBoolValue(
+            L"Others",
+            L"ExperimentalEagerZeroFrameGraphicsRestore",
+            false,
+            iniPath);
+    loaded.deferredConsoleParse =
+        ReadBoolValue(L"Others", L"DeferredConsoleParse", true, iniPath);
+    loaded.experimentalEmergencyEvidenceFlush =
+        ReadBoolValue(
+            L"Others",
+            L"ExperimentalEmergencyEvidenceFlush",
+            true,
+            iniPath);
+    loaded.experimentalSnapshotBoundaryMarkers =
+        ReadBoolValue(
+            L"Others",
+            L"ExperimentalSnapshotBoundaryMarkers",
+            true,
+            iniPath);
+    loaded.experimentalCaptureVerboseDump =
+        ReadBoolValue(
+            L"Others",
+            L"ExperimentalCaptureVerboseDump",
+            true,
+            iniPath);
+    loaded.experimentalRngCallTrace =
+        ReadBoolValue(
+            L"Others",
+            L"ExperimentalRngCallTrace",
+            true,
+            iniPath);
     loaded.menuTtfText =
         ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
     loaded.menuTtfFontFace =
@@ -237,6 +273,31 @@ bool IsDesyncDetectionEnabled()
     return g_settings.desyncDetection;
 }
 
+bool IsDeferredConsoleParseEnabled()
+{
+    return g_settings.deferredConsoleParse;
+}
+
+bool IsEmergencyEvidenceFlushEnabled()
+{
+    return g_settings.experimentalEmergencyEvidenceFlush;
+}
+
+bool IsSnapshotBoundaryMarkersEnabled()
+{
+    return g_settings.experimentalSnapshotBoundaryMarkers;
+}
+
+bool IsCaptureVerboseDumpEnabled()
+{
+    return g_settings.experimentalCaptureVerboseDump;
+}
+
+bool IsRngCallTraceEnabled()
+{
+    return g_settings.experimentalRngCallTrace;
+}
+
 bool IsVerboseBridgePatchLoggingEnabled()
 {
     return g_settings.verboseBridgePatchLogging;
@@ -262,6 +323,11 @@ bool AreAllVerboseLogsEnabled()
 bool HideEmptySetsInBattleLogByDefault()
 {
     return g_settings.hideEmptySetsInBattleLog;
+}
+
+bool IsEagerZeroFrameGraphicsRestoreEnabled()
+{
+    return g_settings.eagerZeroFrameGraphicsRestore;
 }
 
 bool IsMenuTtfTextEnabled()

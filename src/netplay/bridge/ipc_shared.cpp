@@ -1,8 +1,6 @@
 // IPC shared memory, config loading, module resolution, and session status helpers.
 
 #include "netplay/bridge/takeover_internal.h"
-#include "netplay/core/mod_settings.h"
-
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -509,6 +507,61 @@ void PublishConsoleError(const char* errorText)
         writeError(temp.block);
     }
     CloseTempIpcContext(&temp);
+}
+
+void PublishConsoleDesyncWarning(const char* warnText)
+{
+    if (warnText == nullptr || warnText[0] == '\0')
+    {
+        return;
+    }
+
+    auto writeWarning = [&](SharedBlock* block)
+    {
+        CopyString(
+            block->consoleDesyncWarnText,
+            sizeof(block->consoleDesyncWarnText),
+            warnText);
+        InterlockedIncrement(&block->consoleDesyncWarnSerial);
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        writeWarning(g_injectedBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        writeWarning(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize)
+{
+    LONG serial = 0;
+    const char* text = nullptr;
+
+    if (g_hostBlock != nullptr)
+    {
+        serial = InterlockedCompareExchange(&g_hostBlock->consoleDesyncWarnSerial, 0, 0);
+        text = g_hostBlock->consoleDesyncWarnText;
+    }
+
+    if (outSerial != nullptr)
+    {
+        *outSerial = serial;
+    }
+    if (outText != nullptr && outTextSize > 0 && text != nullptr && serial > 0)
+    {
+        CopyString(outText, outTextSize, text);
+    }
+    else if (outText != nullptr && outTextSize > 0)
+    {
+        outText[0] = '\0';
+    }
 }
 
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize)
@@ -1563,25 +1616,6 @@ bool WriteIni(
         ok = wroteAddress && ok;
     }
     ok = writeIniKeyUtf8(L"Network", L"Port", "Network", "Port", portText) && ok;
-
-    // Desync forensics depend on Revival's native logs (logEfz.txt,
-    // logNet.txt, logDdraw.txt), which are only written with [Global]
-    // Debug=1. Enforce it at session start so every session is diagnosable;
-    // only touch the INI when the value actually differs.
-    if (netplay::mod_settings::IsDesyncDetectionEnabled())
-    {
-        const UINT debugValue =
-            GetPrivateProfileIntW(L"Global", L"Debug", 0, wideIniPath.c_str());
-        if (debugValue != 1)
-        {
-            const bool debugWriteOk =
-                writeIniKeyUtf8(L"Global", L"Debug", "Global", "Debug", "1");
-            mod::Log(
-                "Takeover: WriteIni enforced [Global] Debug=1 (was %u) result=%d",
-                debugValue,
-                debugWriteOk ? 1 : 0);
-        }
-    }
 
     mod::Log(
         "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",

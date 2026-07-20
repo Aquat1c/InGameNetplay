@@ -3317,6 +3317,8 @@ void InitializeHost()
 void ShutdownHost()
 {
     netplay::bridge::desync_monitor::Shutdown();
+    CloseMirrorLogFiles();
+    StopManagedLogEfzWorker(true);
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
     if (g_revivalProcess != nullptr)
@@ -3353,6 +3355,7 @@ void ShutdownHost()
 
 void EmergencyShutdownHost()
 {
+    StopManagedLogEfzWorker(false);
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepSnapshot("EmergencyShutdownHost.01.entry");
     InterlockedExchange(&g_startAbortRequested, 1);
@@ -5561,6 +5564,8 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_hostBlock->spectateConfirmInputValue = 0;
         InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
         g_hostBlock->consoleErrorText[0] = '\0';
+        InterlockedExchange(&g_hostBlock->consoleDesyncWarnSerial, 0);
+        g_hostBlock->consoleDesyncWarnText[0] = '\0';
     }
     LogRevival102jDeepStep("CancelSession.30.per_session_state_cleared", ioStatus);
     ResetNativeWorkflowFlags();

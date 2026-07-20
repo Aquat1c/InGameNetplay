@@ -2579,11 +2579,18 @@ bool EnsureD3d9OverlayHookInstalled()
     presentParameters.hDeviceWindow = dummyWindow;
 
     LPDIRECT3DDEVICE9 tempDevice = nullptr;
+    // D3DCREATE_FPU_PRESERVE: without it D3D9 drops the creating thread's
+    // x87 precision to single (24-bit) at device creation.  This dummy
+    // device is created lazily on the game thread, i.e. at peer-asymmetric
+    // times, and EFZ's collision/particle math is x87 doubles - exactly the
+    // Wine-vs-Windows FP asymmetry class.  The per-tick FPU normalization
+    // brackets simulation anyway; this removes the perturbation at the
+    // source.
     const HRESULT createDeviceHr = d3d9->CreateDevice(
         D3DADAPTER_DEFAULT,
         D3DDEVTYPE_HAL,
         dummyWindow,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING,
+        D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE,
         &presentParameters,
         &tempDevice);
     if (FAILED(createDeviceHr) || tempDevice == nullptr)

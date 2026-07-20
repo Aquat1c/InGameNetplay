@@ -1385,7 +1385,7 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         // [Others] (mod-owned settings)
         {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
         {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey"}},
-        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "DesyncDetection"}},
+        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "ExperimentalDesyncMonitor", "ExperimentalEagerZeroFrameGraphicsRestore"}},
     };
     return kGroups;
 }
@@ -1537,6 +1537,18 @@ bool LoadItemsFromIni()
         const std::wstring valueWide = TrimWide(std::wstring_view(trimmed).substr(equals + 1));
         const std::string key = WideToUtf8(keyWide);
         const std::string value = WideToUtf8(valueWide);
+
+        // These formerly default-on experimental keys are intentionally
+        // ignored by settings reload. Hide stale lines that no longer control
+        // anything; their explicit replacements are synthesized below with
+        // the current independently chosen defaults.
+        if (currentSection == "Others"
+            && (key == "DesyncDetection"
+                || key == "EagerZeroFrameGraphicsRestore"))
+        {
+            commentLines.clear();
+            continue;
+        }
 
         Item item;
         item.kind = InferItemKind(key, value);
@@ -1764,9 +1776,13 @@ void AppendSyntheticItems()
         true,
         "Hide empty 0-0 Battle Log sets by default.");
     upsertBoolIntItem(
-        "DesyncDetection",
+        "ExperimentalDesyncMonitor",
         true,
-        "Detect desyncs against a modded opponent and dump forensic logs to mods\\efz_netplay_mod\\logs. Also keeps Revival debug logs enabled and uncropped.");
+        "Experimental rollback tracer, enabled by default during the current RNG investigation. Both peers need the same mod build; recording begins only after a compatible two-peer handshake. Set this to OFF to disable capture explicitly.");
+    upsertBoolIntItem(
+        "ExperimentalEagerZeroFrameGraphicsRestore",
+        false,
+        "Experimental A/B only: re-enable Revival's graphics patch set after an ordinary zero-frame battle tick. Normal play keeps stock render-patch policy; terminal recovery restores remain active.");
     upsertBoolIntItem(
         "MenuTtfText",
         true,

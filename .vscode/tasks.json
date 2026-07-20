@@ -38,6 +38,34 @@
 				"kind": "build",
 				"isDefault": true
 			}
+		},
+		{
+			"label": "Debug DLL Configure",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"-S",
+				"stock_debug_probe",
+				"-B",
+				"build_probe",
+				"-A",
+				"Win32",
+				"-T",
+				"v141_xp"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Debug DLL Build",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"build_probe",
+				"--config",
+				"Release"
+			],
+			"group": "build"
 		}
 	]
 }

@@ -2762,7 +2762,23 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
-    MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
+    const DWORD nativeError = GetLastError();
+    DWORD capturedBytes = 0;
+    if (result && lpOverlapped == nullptr)
+    {
+        capturedBytes =
+            lpNumberOfBytesWritten != nullptr
+                ? *lpNumberOfBytesWritten
+                : nNumberOfBytesToWrite;
+    }
+    // A failed, pending, or overlapped write has no reliable completed-byte
+    // count at this interception point. Capturing it here would invent output
+    // (and may touch a rejected buffer); Revival's log handles are synchronous.
+    if (capturedBytes != 0)
+    {
+        MaybeLogConsoleOutputChunk(hFile, lpBuffer, capturedBytes);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
@@ -2897,28 +2913,64 @@ HANDLE StubCreateFileW(
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
     const BOOL result = WriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
-    MaybeLogConsoleWriteAChunk(lpBuffer, nNumberOfCharsToWrite);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteAChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
     const BOOL result = WriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
-    MaybeLogConsoleWriteWChunk(lpBuffer, nNumberOfCharsToWrite);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteWChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
     const BOOL result = WriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterAChunk(lpCharacter, nLength, dwWriteCoord);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterAChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
     const BOOL result = WriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterWChunk(lpCharacter, nLength, dwWriteCoord);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterWChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
     return result;
 }
 

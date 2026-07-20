@@ -22,7 +22,7 @@ namespace netplay::bridge::takeover
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kIpcMagic = 0x4E425247;
-constexpr uint32_t kIpcVersion = 1;
+constexpr uint32_t kIpcVersion = 2;
 constexpr char kSharedBlockName[] = "EFZNetbridge_Shared";
 constexpr char kInitReadyEventName[] = "EFZNetbridge_InitReady";
 constexpr char kConsoleReadyEventName[] = "EFZNetbridge_ConsoleReady";
@@ -98,6 +98,16 @@ struct SharedBlock
     char consoleErrorText[128] = {};
     volatile LONG peerQuitDiagnosticSerial = 0;
     char peerQuitDiagnosticText[8192] = {};
+    // Provisional desync warning channel.  Revival's "Desync detected"
+    // console line is a one-shot Sync-record inequality warning that stock
+    // Revival treats as non-fatal (it keeps comparing and the match keeps
+    // running).  It must NOT flow through consoleErrorSerial, which the
+    // tick hook treats as an immediate disconnect. RNG-only inequality is a
+    // real deterministic fault, but duration/reconvergence cannot classify
+    // it and stock Revival keeps comparing after this warning. See
+    // docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md.
+    volatile LONG consoleDesyncWarnSerial = 0;
+    char consoleDesyncWarnText[128] = {};
 };
 #pragma pack(pop)
 
@@ -290,6 +300,7 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
 void FlushPendingConsoleOutput(const char* reason);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
 void CloseMirrorLogFiles();
+void StopManagedLogEfzWorker(bool waitForDrain);
 void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord);
@@ -530,6 +541,8 @@ void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
+void PublishConsoleDesyncWarning(const char* warnText);
+void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize);
 void ClearPeerQuitDiagnostic();
 void AppendPeerQuitDiagnostic(const char* text);
 void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize);
