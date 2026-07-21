@@ -1573,7 +1573,7 @@ BOOL StubCreateProcessA(
             {
                 PublishConsoleError(
                     looksLikePause
-                        ? "Revival entered a native pause prompt"
+                        ? "Revival entered a lasolasse prompt"
                         : "Revival attempted an unexpected child process");
             }
             errorSerialAfter = PeekPublishedConsoleErrorSerial();

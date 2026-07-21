@@ -1,5 +1,7 @@
 #include "netplay/core/mod_settings.h"
 
+#include "logger.h"
+
 #include <windows.h>
 
 #include <cwchar>
@@ -171,12 +173,21 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
-    // Do not inherit the obsolete experimental key names. The corrected wire-
-    // v4 monitor is temporarily default-on for the current RNG investigation;
-    // an explicit ExperimentalDesyncMonitor=0 remains authoritative. The
-    // active-battle zero-frame graphics override stays opt-in/default-off.
+    // Investigation forensics (desync monitor, per-call RNG trace, snapshot
+    // boundary markers, verbose capture dump) DEFAULT to build-gated: ON in
+    // EFZ_LIFECYCLE_TRACE (xp-trace) builds, OFF in shipping (xp-release)
+    // builds.  Rationale: (1) end-user quietness - release must not emit
+    // memory dumps / pointers / per-frame diagnostics or write forensic CSVs;
+    // (2) these tracers perform heavy per-tick work on the rollback thread
+    // (per-rand() detour, ~110KB region hashing per snapshot save/load) that is
+    // itself asymmetric-timing perturbation between peers with different
+    // settings - a candidate contributor to the very desync under study.  An
+    // explicit INI key still overrides in either build (e.g. force a capture in
+    // a release binary, or silence a trace binary).
+    constexpr bool kInvestigationDefault = (MOD_LIFECYCLE_TRACE_COMPILED != 0);
     loaded.desyncDetection =
-        ReadBoolValue(L"Others", L"ExperimentalDesyncMonitor", true, iniPath);
+        ReadBoolValue(L"Others", L"ExperimentalDesyncMonitor",
+            kInvestigationDefault, iniPath);
     loaded.eagerZeroFrameGraphicsRestore =
         ReadBoolValue(
             L"Others",
@@ -185,6 +196,11 @@ void Reload()
             iniPath);
     loaded.deferredConsoleParse =
         ReadBoolValue(L"Others", L"DeferredConsoleParse", true, iniPath);
+    {
+        const int workKb = static_cast<int>(GetPrivateProfileIntW(
+            L"Others", L"BatchStabilizerWorkKB", 64, iniPath.c_str()));
+        loaded.batchStabilizerWorkKb = (workKb < 0) ? 0 : (workKb > 1024 ? 1024 : workKb);
+    }
     loaded.experimentalEmergencyEvidenceFlush =
         ReadBoolValue(
             L"Others",
@@ -195,19 +211,19 @@ void Reload()
         ReadBoolValue(
             L"Others",
             L"ExperimentalSnapshotBoundaryMarkers",
-            true,
+            kInvestigationDefault,
             iniPath);
     loaded.experimentalCaptureVerboseDump =
         ReadBoolValue(
             L"Others",
             L"ExperimentalCaptureVerboseDump",
-            true,
+            kInvestigationDefault,
             iniPath);
     loaded.experimentalRngCallTrace =
         ReadBoolValue(
             L"Others",
             L"ExperimentalRngCallTrace",
-            true,
+            kInvestigationDefault,
             iniPath);
     loaded.menuTtfText =
         ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
@@ -231,6 +247,15 @@ void Reload()
     }
 
     g_settings = loaded;
+
+#if defined(EFZ_LIFECYCLE_TRACE)
+    // Investigation trace runtime toggle. Compiled in only for trace builds
+    // (xp-trace preset); defaults OFF so even a trace binary is quiet until an
+    // investigation explicitly opts in. Ignored entirely in end-user builds -
+    // the key has no effect there and the trace call sites are absent.
+    mod::SetLifecycleTraceEnabled(
+        ReadBoolValue(L"Others", L"LifecycleTrace", false, iniPath));
+#endif
 }
 
 const Settings& Get()
@@ -271,6 +296,11 @@ bool IsDebugMenuEnabled()
 bool IsDesyncDetectionEnabled()
 {
     return g_settings.desyncDetection;
+}
+
+int BatchStabilizerWorkKb()
+{
+    return g_settings.batchStabilizerWorkKb;
 }
 
 bool IsDeferredConsoleParseEnabled()

@@ -360,6 +360,13 @@ bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason);
 // Reverse the P1/P2 input-config swap that Revival applied when we joined
 // as client (P2).  No-op unless g_netplayRole == kNetplayRoleClient.
 bool ReverseInputSwapIfClient();
+// Durable "a client (P2) input swap is currently applied" flag, independent of
+// g_netplayRole.  Set true when a client init applies Revival's P1/P2 swap;
+// ReverseInputSwapIfClient() clears it on a successful reversal.  Lets a swap
+// stranded by a role-clearing exit path be normalized at the next session
+// boundary.  See ReverseInputSwapIfClient in revival_memory.cpp.
+void SetClientInputSwapApplied(bool applied);
+bool IsClientInputSwapApplied();
 
 void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);

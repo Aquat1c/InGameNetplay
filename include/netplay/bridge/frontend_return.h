@@ -105,4 +105,8 @@ bool ConsumeTitleContinuation(ReturnOwner* ownerOut, ReturnTarget* targetOut);
 const char* CurrentStateName();
 bool HasNetplayMenuContinuationPending();
 bool HasConsumedNetplayMenuContinuation();
+// Clears the consumed-continuation suppression latch. Called by the centralized
+// session-boundary reset so a new session never inherits the previous session's
+// legacy-cleanup suppression. Idempotent; safe to call when already clear.
+void ResetConsumedContinuationLatch();
 }

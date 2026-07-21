@@ -1336,6 +1336,20 @@ bool HasConsumedNetplayMenuContinuation()
     return InterlockedCompareExchange(&g_netplayMenuContinuationConsumed, 0, 0) != 0;
 }
 
+void ResetConsumedContinuationLatch()
+{
+    // The consumed-continuation latch is armed when a return-to-netplay-menu
+    // handoff completes (routine post-session return AND the F1 async-host
+    // return).  While set, ShouldSuppressLegacyGameplayExitCleanup() returns
+    // true, suppressing the legacy gameplay-exit teardown.  BeginReturnToFrontend
+    // is its only other reset site, so without this it stays armed for the whole
+    // of the next session on whichever peer returned - an asymmetric suppression
+    // that lets stale state survive into match N+1.  The centralized session
+    // boundary reset calls this so every new session starts with the latch
+    // clear on both peers at the same logical point.  Idempotent.
+    InterlockedExchange(&g_netplayMenuContinuationConsumed, 0);
+}
+
 extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)
 {
     if (HasPendingReturn()

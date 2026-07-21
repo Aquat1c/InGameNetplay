@@ -208,15 +208,21 @@ void WriterThreadEntry()
     while (true)
     {
         {
-            std::unique_lock<std::mutex> lock(g_queueMutex);
-            g_queueCv.wait(lock, []() {
-                return !g_queue.empty() || g_writerShouldStop.load();
-            });
-
-            while (!g_queue.empty())
+            // Swap the whole deque out under the lock (O(1)) instead of an
+            // element-wise move+pop (O(queue length)) - producers, including
+            // the game thread's Log(), must never block behind a long drain
+            // (2026-07-20 desync-surface audit hygiene finding).
+            std::deque<std::string> pending;
             {
-                batch.push_back(std::move(g_queue.front()));
-                g_queue.pop_front();
+                std::unique_lock<std::mutex> lock(g_queueMutex);
+                g_queueCv.wait(lock, []() {
+                    return !g_queue.empty() || g_writerShouldStop.load();
+                });
+                pending.swap(g_queue);
+            }
+            for (std::string& line : pending)
+            {
+                batch.push_back(std::move(line));
             }
         }
 
@@ -232,11 +238,14 @@ void WriterThreadEntry()
             // Drain one final time in case producers enqueued after our
             // last wake-up but before they observed the stop flag.
             {
-                std::lock_guard<std::mutex> lock(g_queueMutex);
-                while (!g_queue.empty())
+                std::deque<std::string> pending;
                 {
-                    batch.push_back(std::move(g_queue.front()));
-                    g_queue.pop_front();
+                    std::lock_guard<std::mutex> lock(g_queueMutex);
+                    pending.swap(g_queue);
+                }
+                for (std::string& line : pending)
+                {
+                    batch.push_back(std::move(line));
                 }
             }
             if (!batch.empty())
@@ -496,4 +505,21 @@ void Log(const char* fmt, ...)
 
     EnqueueLine(std::string(line, static_cast<std::size_t>(lineLen)));
 }
+
+#if defined(EFZ_LIFECYCLE_TRACE)
+namespace
+{
+std::atomic<bool> g_lifecycleTraceEnabled{false};
+}
+
+bool IsLifecycleTraceEnabled()
+{
+    return g_lifecycleTraceEnabled.load(std::memory_order_relaxed);
+}
+
+void SetLifecycleTraceEnabled(bool enabled)
+{
+    g_lifecycleTraceEnabled.store(enabled, std::memory_order_relaxed);
+}
+#endif
 }

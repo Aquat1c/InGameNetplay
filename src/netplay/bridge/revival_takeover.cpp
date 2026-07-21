@@ -7,6 +7,7 @@
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
+#include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/options_menu.h"
 
@@ -3513,6 +3514,21 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     {
         (void)SetRoleFlagDirect(kLocalRoleLocalPlay, "title_other");
     }
+    // Normalize a stranded client input swap before entering any offline/local
+    // mode.  A prior client (P2) netplay session that returned via the
+    // frontend_return path leaves the persistent P1/P2 input blocks swapped;
+    // these local-play title paths run neither StartSession nor (for regular VS
+    // Human) ForceLocalPlayInit, so without this the offline match would start
+    // with P1/P2 inputs swapped.  No-op when nothing is stranded; the tournament
+    // branch already cleared the flag via ForceLocalPlayInit.  Safe here because
+    // title selection implies no live netplay session.
+    if (IsClientInputSwapApplied())
+    {
+        mod::Log(
+            "TitleSelection: normalizing stranded client input swap before "
+            "offline/local play");
+        ReverseInputSwapIfClient();
+    }
     RefreshRuntimeStatus(ioStatus);
     LogRevival102jDeepSnapshot("TitleSelection.99.complete", ioStatus);
 }
@@ -3545,6 +3561,29 @@ bool StartSession(
     ResetGameModeValidation();
     ClearLocalProcessCloseForGameplayStall();
     netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
+    // Centralized, idempotent reset of the mod's cross-session latches at the
+    // single unconditional session-start choke point.  Bumps the session epoch
+    // (stable id for two-peer lifecycle-trace alignment) and clears latches
+    // that would otherwise let match N's state survive into match N+1 on one
+    // peer only (frontend continuation-suppression latch; crash-artifact latch).
+    const uint32_t sessionEpoch =
+        netplay::bridge::session_lifecycle::BeginSessionBoundary("StartSession");
+    (void)sessionEpoch;
+    // Normalize a stranded client input swap before the new session inits.  If
+    // the previous session was a client (P2) whose swap was never reversed
+    // (e.g. it returned to the netplay menu via frontend_return, which clears
+    // the role without running ForceLocalPlayInit), the persistent P1/P2 input
+    // blocks are still swapped and would corrupt this session's input ownership
+    // (immediate desync).  This reverses+clears it iff the flag is still set;
+    // a no-op otherwise.  Runs before the helper spawns and long before this
+    // session's own StartInitPlayer applies its swap, so it cannot race.
+    if (IsClientInputSwapApplied())
+    {
+        mod::Log(
+            "StartSession: normalizing stranded client input swap from a prior "
+            "session before new init");
+        ReverseInputSwapIfClient();
+    }
     if (g_tournamentReturnCleanupPending)
     {
         LogRevival102jDeepSnapshot("StartSession.02.stale_tournament_pre", ioStatus);
@@ -4986,6 +5025,11 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 if (activePlayer == 1)
                 {
                     g_netplayRole = kNetplayRoleClient;
+                    // Revival's StartInitPlayer just swapped the P1/P2 input
+                    // blocks for the P2/client side.  Record it durably so the
+                    // swap is reversed even if this session ends via a path
+                    // that clears the role without running ForceLocalPlayInit.
+                    SetClientInputSwapApplied(true);
                     mod::Log("Takeover: netplay role = Client (P2, inputs swapped)");
                 }
                 else
@@ -5298,6 +5342,31 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    // Idempotency guard for the normal match-end double-cancel: the flow fires
+    // CancelSession twice per boundary - "match_ended" (heavy teardown, parks
+    // phase at SessionEnded) then "no_overlay_session_ended" (drives phase to
+    // Idle).  Every operation in the body is individually idempotent EXCEPT
+    // ForceLocalPlayInit, which unconditionally destroys+rebuilds the session
+    // and re-runs Revival's init() - running it a second time per boundary is a
+    // prime suspect for the 2nd/3rd-session desync.  The session epoch (bumped
+    // once per session at StartSession) lets a repeat teardown within one
+    // boundary be recognized and skip that non-idempotent step.  The peer-death
+    // path (where "no_overlay_session_ended" is the FIRST cancel) has no prior
+    // teardown for this epoch, so it runs the full teardown normally.
+    const uint32_t boundaryEpoch =
+        netplay::bridge::session_lifecycle::CurrentSessionEpoch();
+    const uint32_t cleanupInvocation =
+        netplay::bridge::session_lifecycle::NextCleanupInvocation();
+    (void)cleanupInvocation;  // read only by the (release-compiled-out) trace
+    const bool repeatTeardown =
+        boundaryEpoch != 0
+        && netplay::bridge::session_lifecycle::LastTornDownEpoch() == boundaryEpoch;
+    MOD_LIFECYCLE_TRACE(
+        "LIFECYCLE ep=%u cleanup=%u stage=cancel_session action=%s reason=%s role=%d",
+        boundaryEpoch, cleanupInvocation,
+        repeatTeardown ? "repeat" : "begin",
+        (reason != nullptr) ? reason : "", g_localRoleFlag);
+
     netplay::bridge::desync_monitor::NotifySessionEnded(reason);
     LogRevival102jDeepSnapshot("CancelSession.01.entry", ioStatus);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
@@ -5361,31 +5430,60 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
             netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
     }
 
-    const bool gameplayEscPeerQuitPending =
-        g_localRoleFlag == kLocalRoleOnline
-        && ConsumeOnlineMatchEscGracefulQuit();
-    if (gameplayEscPeerQuitPending)
+    // Pre-teardown peer-quit broadcast (rank 4).  The natural match-end cancel
+    // ("match_ended") and most other cancel reasons historically said nothing
+    // to the peer - the old ConsumeOnlineMatchEscGracefulQuit gate here was
+    // never armed (dead code), so a fast peer that reached title first would
+    // TerminateProcess its helper and leave the slow peer stalled waiting for
+    // frames until a network timeout.  Broadcast a native MessageQuit to the
+    // peer BEFORE tearing down, unconditionally for online/spectate cancels
+    // while the helper is still alive.  This is the same proven mechanism the
+    // disconnect-recovery path already uses (gameplay_exit_recovery.cpp:142).
+    // It is idempotent on both ends: the receiver re-entering its terminal quit
+    // state is a no-op, and the sender's peer-manager lookup no-ops if the
+    // session already tore down.  MUST use the ...Impl variant - the public
+    // wrapper re-locks the takeover mutex we already hold (self-deadlock).
+    // Skip on shutdown/emergency (loader lock) and on repeat teardown.
+    const bool broadcastReasonOk =
+        reason == nullptr
+        || (std::strcmp(reason, "shutdown") != 0
+            && std::strcmp(reason, "emergency") != 0);
+    const bool shouldBroadcastPeerQuit =
+        !repeatTeardown
+        && broadcastReasonOk
+        // The shared gameplay-exit recovery path broadcasts its own MessageQuit
+        // (gameplay_exit_recovery.cpp) before it tears down; don't double-fire.
+        && !suppressSharedRecoveryTeardown
+        // The broadcast blocks up to 300ms on WaitForSingleObject.  Never run
+        // that on the rollback/per-frame tick thread (an in-tick cancel would
+        // stall the simulation and itself risk a desync); the normal match-end
+        // cancel that needs the broadcast fires from the title hook, not in-tick.
+        && !IsInsideFrameTick()
+        // Online only.  Spectator MessageQuit via sendQuitAll on the spectator's
+        // peer manager is unverified against the players' match and could end a
+        // real 2-player game, so keep the historical Online-only scope.
+        && g_localRoleFlag == kLocalRoleOnline
+        && g_revivalProcess != nullptr;
+    if (shouldBroadcastPeerQuit)
     {
         HANDLE helperProcess = nullptr;
         HANDLE sourceHelperProcess = g_revivalProcess;
         DWORD duplicateErr = 0;
-        if (g_revivalProcess != nullptr)
+        if (!DuplicateHandle(
+                GetCurrentProcess(),
+                g_revivalProcess,
+                GetCurrentProcess(),
+                &helperProcess,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS))
         {
-            if (!DuplicateHandle(
-                    GetCurrentProcess(),
-                    g_revivalProcess,
-                    GetCurrentProcess(),
-                    &helperProcess,
-                    0,
-                    FALSE,
-                    DUPLICATE_SAME_ACCESS))
-            {
-                duplicateErr = GetLastError();
-            }
+            duplicateErr = GetLastError();
         }
 
         mod::Log(
-            "Takeover: cancel session gameplay-ESC peer-quit prepare sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
+            "Takeover: cancel session peer-quit prepare reason='%s' sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
+            reason != nullptr ? reason : "",
             sourceHelperProcess,
             helperProcess,
             static_cast<unsigned long>(g_revivalProcessId),
@@ -5396,10 +5494,10 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
             helperProcess,
             g_remoteInjectedSelfBase,
             g_revivalProcessId,
-            "cancel_session_gameplay_esc",
+            "cancel_session_peer_quit",
             300u);
         mod::Log(
-            "Takeover: cancel session gameplay-ESC peer-quit broadcast=%d "
+            "Takeover: cancel session peer-quit broadcast=%d "
             "reason='%s' helperPid=%lu",
             peerQuitSent ? 1 : 0,
             reason != nullptr ? reason : "",
@@ -5407,7 +5505,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (!peerQuitSent)
         {
             mod::Log(
-                "Takeover: cancel session gameplay-ESC broadcast failed; "
+                "Takeover: cancel session peer-quit broadcast failed; "
                 "continuing with local teardown");
         }
     }
@@ -5449,8 +5547,17 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         && GetForceLocalPlayInitCount() > 0
         && ReadSessionPointerFromRevival() != 0;
 
-    if (!isShutdown && !suppressSharedRecoveryTeardown && !alreadyRecoveredLocal102j)
+    // True only when this call actually ran (or deferred) the non-idempotent
+    // ForceLocalPlayInit teardown.  Used to gate NoteTeardownComplete so that a
+    // cancel SKIPPED for a transient reason (recovery-suppressed, shutdown,
+    // already-recovered) does NOT mark the epoch torn down - otherwise a later
+    // cancel of the same boundary would falsely see a repeat and skip the real
+    // teardown that never happened.
+    bool ranTeardown = false;
+    if (!isShutdown && !suppressSharedRecoveryTeardown && !alreadyRecoveredLocal102j
+        && !repeatTeardown)
     {
+        ranTeardown = true;
         // If we're inside the per-frame tick (sub_1006E570 -> vtable[2] ->
         // RollbackLoopTick), ForceLocalPlayInit MUST NOT run now because it
         // would destroy the session that RollbackLoopTick is actively using
@@ -5496,16 +5603,34 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     {
         mod::Log(
             "Takeover: cancel cleanup - skipped DLL re-init "
-            "(reason='%s' shutdown=%d suppressShared=%d alreadyRecoveredLocal102j=%d)",
+            "(reason='%s' shutdown=%d suppressShared=%d alreadyRecoveredLocal102j=%d repeat=%d)",
             reason != nullptr ? reason : "",
             isShutdown ? 1 : 0,
             suppressSharedRecoveryTeardown ? 1 : 0,
-            alreadyRecoveredLocal102j ? 1 : 0);
+            alreadyRecoveredLocal102j ? 1 : 0,
+            repeatTeardown ? 1 : 0);
         // Still reset the netplay role even on shutdown so stale state
         // doesn't leak to a future session (belt-and-suspenders).
         g_netplayRole = kNetplayRoleNone;
     }
     // ---- End additional cleanup ------------------------------------------------
+
+    // Mark this session boundary's teardown as run so a repeat cancel within
+    // the same boundary (the normal match_ended -> no_overlay_session_ended
+    // double-cancel) is recognized above and skips the non-idempotent
+    // ForceLocalPlayInit.  Only mark when this call actually ran/deferred the
+    // teardown (ranTeardown) - a transiently-skipped cancel must not claim the
+    // boundary.  Idempotent; the terminal phase block below still runs on every
+    // call so the SessionEnded -> Idle transition is unaffected.
+    if (boundaryEpoch != 0 && ranTeardown)
+    {
+        netplay::bridge::session_lifecycle::NoteTeardownComplete(boundaryEpoch);
+    }
+    MOD_LIFECYCLE_TRACE(
+        "LIFECYCLE ep=%u cleanup=%u stage=cancel_session action=%s reason=%s",
+        boundaryEpoch, cleanupInvocation,
+        repeatTeardown ? "repeat_complete" : "complete",
+        (reason != nullptr) ? reason : "");
 
     // Clear per-session IAT hook tracking vectors to prevent unbounded
     // growth across sessions (GAP 4 in cleanup audit).

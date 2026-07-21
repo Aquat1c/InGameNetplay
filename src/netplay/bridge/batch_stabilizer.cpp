@@ -27,6 +27,7 @@
 #include "netplay/bridge/batch_stabilizer.h"
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/mod_settings.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -260,6 +261,17 @@ uintptr_t g_hookedBase = 0;
 bool g_installLogged = false;
 volatile LONG g_installBusy = 0;
 
+// Tunable extra constant-cost workload (see BatchStabilizerWorkKb): a scratch
+// buffer scanned a fixed number of bytes each batch. Deterministic, touches no
+// game state, adds only FIXED cost - the dial for the wrap's suppression
+// strength ("costlier is safe", full-dump load suppressed hardest). Read once
+// at install. 1 MB buffer covers the clamp ceiling while exceeding L2 so the
+// scan actually costs cycles at larger settings.
+constexpr size_t kExtraWorkBufBytes = 1u << 20; // 1 MB
+static uint8_t g_extraWorkBuf[kExtraWorkBufBytes];
+size_t g_extraWorkBytes = 0;         // bytes to scan per batch (from setting)
+volatile uint32_t g_extraWorkSink = 0; // volatile so the scan is not elided
+
 // Health counters for the periodic heartbeat: a long session must be able to
 // prove from the log alone that the wrap is still firing at full cost.
 volatile LONG g_wrapCalls = 0;     // dispatcher wraps executed (lifetime)
@@ -290,13 +302,14 @@ bool g_sinkWorkerStarted = false;
 
 void SinkWorkerMain()
 {
-    // Heartbeat cadence: every 600 drain cycles = ~5 minutes. The delta of
-    // g_wrapCalls between heartbeats is the liveness proof - during an active
-    // battle it must be nonzero; wraps=+0 across a heartbeat while a session
-    // runs means the wrap stopped firing (the failure mode the postfix rehost
-    // capture exposed, now impossible to miss in the log).
+    // Heartbeat cadence: every 60 drain cycles = ~30 s (was 300 s, far too
+    // coarse - the session-3 capture ran ~5 min across 8 session generations
+    // and produced ZERO heartbeats, so wrap liveness could not be confirmed).
+    // The delta of g_wrapCalls between heartbeats is the liveness proof - during
+    // an active battle it must be nonzero.
     LONG lastWraps = 0;
     unsigned cycle = 0;
+    (void)lastWraps;  // only read by the (release-compiled-out) heartbeat trace
     for (;;)
     {
         Sleep(500);
@@ -308,11 +321,12 @@ void SinkWorkerMain()
         // Discarded: the wrap's value is its timing profile, not the data.
         InterlockedExchangeAdd(&g_sinkDrained, static_cast<LONG>(drained.size()));
 
-        if (++cycle >= 600)
+        if (++cycle >= 60)
         {
             cycle = 0;
             const LONG wraps = InterlockedCompareExchange(&g_wrapCalls, 0, 0);
-            mod::Log(
+            // Diagnostic status line - trace builds only (release stays quiet).
+            MOD_LIFECYCLE_TRACE(
                 "BATCH_STABILIZER: heartbeat wraps=%ld (+%ld) drained=%ld "
                 "dropped=%ld repairs=%ld reinstalls=%ld hooked=%d",
                 static_cast<long>(wraps), static_cast<long>(wraps - lastWraps),
@@ -456,6 +470,38 @@ char __fastcall DispatcherWrap(void* thisPtr, void* /*edx*/, int a2)
     LARGE_INTEGER qpcAfter = {};
     QueryPerformanceCounter(&qpcAfter);
 
+    // Firing proof (session 3 capture had zero stabilizer heartbeats, so we
+    // could not confirm the wrap was even active during the desync). Log the
+    // first wrap of each burst - i.e., the first call after any >=2 s idle gap,
+    // which brackets each battle / rollback burst - with the measured per-batch
+    // cost.  TRACE BUILDS ONLY: this QueryPerformanceFrequency + Log at burst
+    // start is variable-cost work that violates the wrap's constant-cost
+    // contract, so it is compiled out of release entirely (release keeps only
+    // the constant-cost sampling below).
+#if MOD_LIFECYCLE_TRACE_COMPILED
+    if (mod::IsLifecycleTraceEnabled())
+    {
+        static volatile LONG s_lastWrapMs = 0;
+        const LONG nowMs = static_cast<LONG>(GetTickCount());
+        const LONG last = InterlockedExchange(&s_lastWrapMs, nowMs);
+        if (last == 0 || (nowMs - last) > 2000)
+        {
+            LARGE_INTEGER freq = {};
+            QueryPerformanceFrequency(&freq);
+            const long long durUs = freq.QuadPart != 0
+                ? (qpcAfter.QuadPart - qpcBefore.QuadPart) * 1000000
+                      / freq.QuadPart
+                : -1;
+            mod::Log(
+                "BATCH_STABILIZER: wrap ACTIVE call#%ld gapMs=%ld durUs=%lld "
+                "frame=%d->%d (firing proof)",
+                static_cast<long>(InterlockedCompareExchange(&g_wrapCalls, 0, 0)),
+                static_cast<long>(last == 0 ? 0 : nowMs - last),
+                durUs, frameEnter, frameExit);
+        }
+    }
+#endif
+
     char line[512];
     const int n = std::snprintf(
         line, sizeof(line),
@@ -489,6 +535,21 @@ char __fastcall DispatcherWrap(void* thisPtr, void* /*edx*/, int a2)
         {
             InterlockedIncrement(&g_sinkDropped);
         }
+    }
+
+    // Tunable extra constant-cost workload - the suppression-strength dial.
+    // Fixed byte count, deterministic sequential read, result forced live via
+    // a volatile sink. No branch on game state, no allocation, no lock: pure
+    // constant cost, exactly the property the wrap relies on.
+    if (g_extraWorkBytes != 0)
+    {
+        uint32_t acc = g_extraWorkSink;
+        const size_t count = g_extraWorkBytes;
+        for (size_t i = 0; i < count; ++i)
+        {
+            acc += g_extraWorkBuf[i];
+        }
+        g_extraWorkSink = acc;
     }
     return result;
 }
@@ -540,6 +601,13 @@ bool InstallAt(uintptr_t base)
     }
     g_hookedAddr = addr;
     g_hookedBase = base;
+    {
+        const int workKb = netplay::mod_settings::BatchStabilizerWorkKb();
+        size_t bytes = (workKb <= 0) ? 0
+            : static_cast<size_t>(workKb) * 1024u;
+        if (bytes > kExtraWorkBufBytes) bytes = kExtraWorkBufBytes;
+        g_extraWorkBytes = bytes;
+    }
     if (!g_sinkWorkerStarted)
     {
         try
@@ -559,8 +627,9 @@ bool InstallAt(uintptr_t base)
         g_installLogged = true;
         mod::Log(
             "BATCH_STABILIZER: installed @0x%08lX (dispatcher wrap; "
-            "bisection-verified desync suppressor)",
-            static_cast<unsigned long>(addr));
+            "probabilistic desync suppressor; extraWork=%zuKB)",
+            static_cast<unsigned long>(addr),
+            g_extraWorkBytes / 1024u);
     }
     else
     {

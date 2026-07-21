@@ -52,6 +52,16 @@ struct Settings
     // rollback re-execution.  Hot path; disable with
     // [Others] ExperimentalRngCallTrace=0.
     bool experimentalRngCallTrace = true;
+    // Batch timing stabilizer extra constant-cost workload, in KB scanned per
+    // batch dispatch. The stabilizer wrap is a probabilistic desync suppressor
+    // whose strength scales with the constant per-tick cost it adds (the
+    // heavy full-dump capture suppressed hardest). This is the tunable dial:
+    // 0 = wrap does its normal sampling only; N = also deterministically scan
+    // N KB of a scratch buffer each batch (fixed cost, no game state, cannot
+    // add variable timing). Raise it if the desync still reproduces; lower it
+    // if it costs FPS. Clamped to [0, 1024] - the scratch buffer is 1 MB.
+    // [Others] BatchStabilizerWorkKB (default 64).
+    int batchStabilizerWorkKb = 64;
     // Defer console-capture PARSING off the writing thread. Revival writes
     // console/log text from its simulation (rollback) thread; the capture
     // parse (line assembly + keyword scans + prompt/error detection) used to
@@ -107,6 +117,7 @@ bool AreAllVerboseLogsEnabled();
 bool HideEmptySetsInBattleLogByDefault();
 bool IsDesyncDetectionEnabled();
 bool IsEagerZeroFrameGraphicsRestoreEnabled();
+int BatchStabilizerWorkKb();
 bool IsDeferredConsoleParseEnabled();
 bool IsEmergencyEvidenceFlushEnabled();
 bool IsSnapshotBoundaryMarkersEnabled();

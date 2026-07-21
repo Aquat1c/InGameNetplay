@@ -1176,10 +1176,12 @@ void UpdateNow(const NetbridgeStatus& status)
 
     // Periodic heartbeat - every 600 ticks (~10s at 60fps) and on the very
     // first tick - dump all key fields so we can verify the export without
-    // needing a phase transition to trigger the transition logs.
+    // needing a phase transition to trigger the transition logs.  Trace builds
+    // only: this dumps player nicknames and internal state every ~10s, which a
+    // release build must not emit.
     if (g_stateSeq == 1 || (g_stateSeq % 600) == 0)
     {
-        mod::Log(
+        MOD_LIFECYCLE_TRACE(
             "StateExport: heartbeat seq=%u activity=%u menu=%u screen=%u "
             "mode=%d phase=%d netRole=%s side=%d "
             "p1Wins=%d p2Wins=%d ping=%d delay=%d "

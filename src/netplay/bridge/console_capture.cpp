@@ -1237,6 +1237,10 @@ static volatile LONG g_ownedLogEfzEmergencyStop = 0;
 static unsigned long long g_ownedLogEfzEnqueuedSequence = 0;
 static unsigned long long g_ownedLogEfzProcessedSequence = 0;
 static unsigned long g_ownedLogEfzDroppedLines = 0;
+// Times a parse chunk could not be deferred (queue full) and fell back to a
+// synchronous parse on the writing thread. Should stay 0; nonzero = the
+// deferred-parse protection was briefly lost (see EnqueueConsoleParseChunk).
+static volatile LONG g_ownedLogEfzParseOverflowCount = 0;
 // Worker thread id: lets AppendOwnedLogEfzLine mirror-write DIRECTLY when the
 // parse itself is running on the worker (deferred path), preserving strict
 // FIFO order with session close boundaries instead of re-enqueueing behind
@@ -1834,6 +1838,22 @@ static bool EnqueueConsoleParseChunk(
         }
         if (g_ownedLogEfzQueue.size() >= kOwnedLogEfzQueueLimit)
         {
+            // Queue full: caller falls back to a SYNCHRONOUS parse on the
+            // writing (during battle, rollback) thread - the exact per-tick
+            // perturbation DeferredConsoleParse exists to remove. This should
+            // never happen in practice (the worker drains far faster than
+            // Revival writes), so make it loud rather than silent: the
+            // 2026-07-20 desync-surface audit flagged this reversion as the
+            // one path that could reintroduce the timing cost mid-battle.
+            const unsigned long n = ++g_ownedLogEfzParseOverflowCount;
+            if (n == 1 || (n % 256) == 0)
+            {
+                mod::Log(
+                    "CAPTURE_LOG: deferred parse queue full (limit=%zu, "
+                    "overflow #%lu) - parsing SYNCHRONOUSLY on the writing "
+                    "thread; deferred-parse protection temporarily lost",
+                    kOwnedLogEfzQueueLimit, n);
+            }
             return false;
         }
         entry.sequence = ++g_ownedLogEfzEnqueuedSequence;

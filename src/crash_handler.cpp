@@ -685,4 +685,28 @@ void ResetCrashRecoveryState()
     g_toctouRecoveryFired.store(false);
     mod::Log("CrashHandler: TOCTOU recovery guard reset");
 }
+
+void RearmCrashArtifacts()
+{
+    // Re-arm the once-per-process artifact latch at each session boundary so a
+    // crash in a later session (the 2nd/3rd-session desync being hunted) still
+    // produces a minidump + text log.  The latch exists to avoid re-entrant
+    // double-dumps within a single crash, not to permanently silence later
+    // sessions.
+    //
+    // Flip the latch under g_crashMutex, then release BEFORE logging: mod::Log
+    // takes the logger queue mutex, so logging under g_crashMutex would create
+    // a g_crashMutex -> g_queueMutex order, the inverse of the crash path
+    // (a fault while holding g_queueMutex runs the handler, which takes
+    // g_crashMutex).  Keeping g_crashMutex a pure leaf lock avoids that edge.
+    bool rearmed;
+    {
+        std::lock_guard<std::mutex> lock(g_crashMutex);
+        rearmed = g_dumpWritten.exchange(false);
+    }
+    if (rearmed)
+    {
+        mod::Log("CrashHandler: artifact latch re-armed for new session");
+    }
+}
 } // namespace mod

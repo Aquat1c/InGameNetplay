@@ -2128,6 +2128,11 @@ bool DestroyCurrentSession(const char* caller)
                      &sessionPtr)
         || sessionPtr == 0)
     {
+        // Global already NULL (Revival's own destructor or a prior teardown
+        // freed it).  Still invalidate the mod's write-fallback cache so it
+        // can never outlive the object it points at.  Idempotent.
+        g_lastValidatedSessionPtr = 0;
+        g_lastSessionPtrOffset = 0;
         mod::Log("%s: DestroyCurrentSession skipped (session NULL)", caller);
         return false;
     }
@@ -2349,6 +2354,18 @@ zero_globals:
             }
         }
     }
+
+    // Invalidate the mod's own last-validated session-pointer cache at the
+    // same choke point that frees the object.  ReadSessionPointerForMutation
+    // falls back to g_lastValidatedSessionPtr when the strict scan fails
+    // (revival_memory.cpp:588); leaving it set here would let a WRITE go
+    // through a freed/re-derived pointer during the next session's init
+    // handshake (Tick_init_handshake strict-reads then frees the pre-existing
+    // object).  Every object-freeing path (SetLocalRoleFlag, ForceLocalPlayInit,
+    // Tick_init_handshake) passes through this label, so clearing here makes
+    // the cache lifetime exactly bracket the object lifetime.  Idempotent.
+    g_lastValidatedSessionPtr = 0;
+    g_lastSessionPtrOffset = 0;
 
     // Reset the mode-constructor trampoline fixup cache.  The destructor
     // unhooks 0x763E50/0x763F04 and frees the old trampolines.  If a
@@ -2841,14 +2858,13 @@ bool ForceLocalPlayInit()
     // --- Full snapshot BEFORE init() ---
     LogInitWriteSnapshot("ForceLocalPlayInit_pre");
 
-    // If we were the client (P2 / joiner), Revival swapped the P1/P2
-    // input-config blocks during StartInitPlayer.  Reverse that swap now
-    // BEFORE destroying the session so controls return to their default
-    // layout for local play.
-    if (g_netplayRole == kNetplayRoleClient)
-    {
-        ReverseInputSwapIfClient();
-    }
+    // If a client (P2 / joiner) swap is currently applied, Revival swapped the
+    // P1/P2 input-config blocks during StartInitPlayer.  Reverse that swap now
+    // BEFORE destroying the session so controls return to their default layout
+    // for local play.  Keyed off the durable swap-applied flag (not the role,
+    // which some exit paths clear without reversing), so it is correct even
+    // when g_netplayRole was already reset by an earlier partial teardown.
+    ReverseInputSwapIfClient();
     g_netplayRole = kNetplayRoleNone;
 
     // 1.02j installs 0x401642 once, outside exported init(). Capture that
@@ -2983,25 +2999,48 @@ bool ForceLocalPlayInit()
 }
 
 // ---------------------------------------------------------------------------
+// Explicit "a client (P2) input swap is currently applied" flag.  Revival's
+// StartInitPlayer swaps the two P1/P2 controller-config blocks when the local
+// side is P2; the swap is a pure TOGGLE on a PERSISTENT global (dword_100A0760
+// [20]+448) that survives session teardown.  Reversal was historically keyed
+// off g_netplayRole == kNetplayRoleClient, but several client exit paths -
+// notably the frontend_return "return to netplay menu" flow - clear the role
+// (or never run ForceLocalPlayInit) WITHOUT reversing, stranding the swap into
+// the next session and corrupting P1/P2 input ownership (asymmetric, immediate
+// desync).  This flag is the durable source of truth: set when a client swap
+// is applied, cleared only by an actual reversal, so a stranded swap can be
+// detected and normalized at the next session boundary regardless of role.
+static volatile LONG g_clientInputSwapApplied = 0;
+
+void SetClientInputSwapApplied(bool applied)
+{
+    InterlockedExchange(&g_clientInputSwapApplied, applied ? 1 : 0);
+}
+
+bool IsClientInputSwapApplied()
+{
+    return InterlockedCompareExchange(&g_clientInputSwapApplied, 0, 0) != 0;
+}
+
 // ReverseInputSwapIfClient - calls Revival's input-swap helper to toggle the
 // P1/P2 input-config swap back to its original state.  Older MSVC builds call
 // this as a __thiscall helper on dword_100A0760.  1.02j decompiles as a
 // MinGW __fastcall helper, but its only argument is still passed in ECX, so
 // the same one-argument call shape is intentional and verifier-covered.
-// Only fires when g_netplayRole == kNetplayRoleClient, meaning we joined as
-// P2 and Revival swapped the two controller blocks during StartInitPlayer.
-// The swap is a toggle, so calling it a second time restores the layout.
+// Fires when g_clientInputSwapApplied is set (a P2/client swap is live) and
+// clears the flag on success, so it is idempotent against the ACTUAL swap
+// state rather than the role - callable from teardown AND from the session
+// boundary to normalize a stranded swap, and a no-op when nothing is swapped.
+// The swap is a toggle, so calling it exactly once restores the layout.
 //
-// Must be called during session teardown (ForceLocalPlayInit) BEFORE the
-// session object is destroyed, though the swap targets a persistent global
-// structure (dword_100A0760[20]+448) that survives session changes.
+// The swap targets a persistent global structure (dword_100A0760[20]+448)
+// that survives session changes, so normalization must happen before the next
+// session's StartInitPlayer applies its own swap.
 // ---------------------------------------------------------------------------
 bool ReverseInputSwapIfClient()
 {
-    if (g_netplayRole != kNetplayRoleClient)
+    if (!IsClientInputSwapApplied())
     {
-        mod::Log("ReverseInputSwapIfClient: skipped (role=%d, not client)",
-                 g_netplayRole);
         return false;
     }
 
@@ -3032,6 +3071,9 @@ bool ReverseInputSwapIfClient()
     __try
     {
         const int result = swapFn(reinterpret_cast<void*>(contextBaseAddr));
+        // Clear the flag only AFTER the toggle succeeds, so an exception leaves
+        // the swap marked applied and a later boundary retry can normalize it.
+        SetClientInputSwapApplied(false);
         mod::Log(
             "ReverseInputSwapIfClient: swap reversed OK (fn=0x%08lX this=0x%08lX result=%d)",
             static_cast<unsigned long>(dllBase + g_activeRevival->inputSwapPairRva),
@@ -7580,7 +7622,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         g_lastHeartbeatTimeMs = nowMs;
         g_lastHeartbeatFrameTick = g_frameTick;
 
-        mod::Log(
+        // Periodic liveness heartbeat with raw session/ECX pointers - trace
+        // builds only (release must not emit internal pointers / per-tick
+        // diagnostics).
+        MOD_LIFECYCLE_TRACE(
             "TICK_HOOK: heartbeat S#%u frameTick=%u session=0x%08lX exeECX=0x%08lX match=%d "
             "elapsed=%lums fps=%.1f toggleSame=%u",
             g_sessionNumber,
@@ -7591,15 +7636,20 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             static_cast<unsigned long>(elapsedMs),
             measuredFps,
             g_toggleSameCount);
+        (void)elapsedMs;    // read only by the (release-compiled-out) heartbeat
+        (void)measuredFps;
 
         // --- Resource leak tracking (every heartbeat = ~10s) ----------------
         // Log the process's handle count and memory usage so we can spot
         // leaks over time.  A steadily growing handle count or working set
-        // indicates the mod (or Revival) is leaking resources.
+        // indicates the mod (or Revival) is leaking resources.  Trace builds
+        // only - a release build must not emit this periodic diagnostic.
         //
         // GetProcessHandleCount requires XP SP1+; GetProcessMemoryInfo lives
         // in psapi.dll which may not be loaded on minimal Wine prefixes.
         // Resolve both at runtime to keep the DLL loadable everywhere.
+#if MOD_LIFECYCLE_TRACE_COMPILED
+        if (mod::IsLifecycleTraceEnabled())
         {
             typedef BOOL (WINAPI *PFN_GetProcessHandleCount)(HANDLE, PDWORD);
             typedef BOOL (WINAPI *PFN_GetProcessMemoryInfo)(
@@ -7643,6 +7693,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                 g_fpsDropCount,
                 g_tickBudgetExceededCount);
         }
+#endif  // MOD_LIFECYCLE_TRACE_COMPILED
     }
 
     // ---- Provisional desync warning watcher ------------------------------
@@ -8724,10 +8775,10 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             }
             else
             {
-                // fpuRewrites: unconditional (audit finding) - a peer that
-                // had to CORRECT drifted FPU control on the divergence
-                // frame must be visible without VerboseSyncDiagnostics.
-                mod::Log(
+                // Routine periodic state dump: trace builds only - this is a
+                // per-120-frame sync-counter/pointer diagnostic that a release
+                // build must not emit.
+                MOD_LIFECYCLE_TRACE(
                     "DESYNC_CHECK: S#%u tick=%u screen=%u frame=%d advCtr=%d "
                     "commit=%d syncFrame=%d matchId=%d delay=%d ping=%d active=%d "
                     "sentinel=0x%08lX chk=0x%08lX fpuRewrites=%u",
@@ -8739,6 +8790,21 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     static_cast<unsigned long>(dsSentinel),
                     static_cast<unsigned long>(stateChecksum),
                     g_revivalFpuNormalizeCount);
+                // Essential signal preserved for release (the "audit finding"):
+                // a peer that had to CORRECT drifted FPU control is a desync-risk
+                // event.  Surface it once per rise in the correction count -
+                // event-driven, not every 120 frames - so release stays quiet
+                // until something actually happens.
+                static volatile LONG s_lastReportedFpuRewrites = 0;
+                const LONG fpuNow = static_cast<LONG>(g_revivalFpuNormalizeCount);
+                if (fpuNow != InterlockedExchange(&s_lastReportedFpuRewrites, fpuNow))
+                {
+                    mod::Log(
+                        "DESYNC_CHECK: FPU control drift corrected S#%u frame=%d "
+                        "fpuRewrites=%u",
+                        g_sessionNumber, dsCurrentFrame,
+                        g_revivalFpuNormalizeCount);
+                }
             }
         }
     }
@@ -9369,10 +9435,38 @@ static bool ConsumeLocalBattleEscQuitRingIgnore(
         return false;
     }
 
+    // Decide-before-discard: the caller already advanced head to tail (drained
+    // the whole ring), so attribute entries here.  A local battle ESC is
+    // expected to place at most ONE entry; if MORE than one entry was pending,
+    // a genuine peer session-quit landed inside the 500ms ignore window
+    // alongside the local ESC (the confirmed swallow bug).  Swallowing that
+    // would leave this peer simulating a session the other player has left.
+    // Only swallow a single-entry ring; route any multi-entry ring to the real
+    // teardown path (the safe direction: a session with a genuine peer quit
+    // must end).  Deltas that are not exactly 1 (multi-entry, or a wrapped
+    // cursor we cannot interpret from the 8-byte header) fail closed to
+    // teardown rather than risk swallowing a real quit.
+    const LONG pendingEntries = quitTailBefore - quitHeadBefore;
+    if (pendingEntries != 1)
+    {
+        ResetLocalBattleEscQuitRingIgnore();
+        mod::Log(
+            "TICK_HOOK: Quit ring had %ld pending entries during battle ESC ignore "
+            "window (expected 1) phase=%s frameTick=%u quitHead=%ld quitTail=%ld "
+            "elapsedMs=%lu - a real peer quit is present, routing to session teardown",
+            static_cast<long>(pendingEntries),
+            phaseTag != nullptr ? phaseTag : "POST-TICK",
+            g_frameTick,
+            static_cast<long>(quitHeadBefore),
+            static_cast<long>(quitTailBefore),
+            static_cast<unsigned long>(elapsedMs));
+        return false;
+    }
+
     ResetLocalBattleEscQuitRingIgnore();
     mod::Log(
         "TICK_HOOK: local battle ESC consumed Quit ring without session teardown "
-        "phase=%s frameTick=%u quitHead=%ld quitTail=%ld elapsedMs=%lu",
+        "phase=%s frameTick=%u quitHead=%ld quitTail=%ld elapsedMs=%lu pendingEntries=1",
         phaseTag != nullptr ? phaseTag : "POST-TICK",
         g_frameTick,
         static_cast<long>(quitHeadBefore),

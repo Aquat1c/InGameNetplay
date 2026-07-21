@@ -614,6 +614,13 @@ volatile LONG g_type47SessionEndSequence = 0;
 volatile LONG g_type47PassSerial = 0;
 volatile LONG g_type47DetoursActive = 0;
 volatile LONG g_charContextLastPass = -1;
+// Per-session re-armable one-shot diagnostic latches.  Hoisted from function
+// scope so the session-start reset can re-arm them; otherwise their one-liner
+// diagnostics (char-context pointer identity, save-object presence) only ever
+// print for the FIRST session of the process and go dark for exactly the
+// 2nd/3rd-session desync being investigated.
+volatile LONG g_charContextDiagOnce = 0;
+volatile LONG g_saveObjectDiagOnce = 0;
 // Highest event frame seen this session (resim discriminator) and the
 // session frame captured just before a snapshot restore (load_from column).
 volatile LONG g_maxEventFrame = -1;
@@ -967,9 +974,8 @@ void FillSnapshotMarkerCharContext(Type47TraceEvent* event)
         const uintptr_t p2 =
             *reinterpret_cast<const volatile uintptr_t*>(
                 battleScreen + kOffsetBattleP2Char);
-        static LONG s_charContextDiagOnce = 0;
         if (p1 != 0
-            && InterlockedExchange(&s_charContextDiagOnce, 1) == 0)
+            && InterlockedExchange(&g_charContextDiagOnce, 1) == 0)
         {
             // One-shot: raw pointers (incl. the SECOND char-pointer pair at
             // +20/+24 that Revival's savestate copies - identity vs the sim
@@ -1778,8 +1784,7 @@ uintptr_t ReadTraceGameSys()
 // share a frame with the hook's C++ RAII object.
 void LogSaveObjectDiagOnce()
 {
-    static LONG s_saveObjectDiagOnce = 0;
-    if (InterlockedExchange(&s_saveObjectDiagOnce, 1) != 0)
+    if (InterlockedExchange(&g_saveObjectDiagOnce, 1) != 0)
     {
         return;
     }
@@ -2940,6 +2945,13 @@ void ResetType47TraceForSession(bool hooksReady)
     InvalidateType47TraceProducers();
     InterlockedExchange(&g_type47EvidenceTriggerSequence, 0);
     InterlockedExchange(&g_type47PassSerial, 0);
+    // Re-arm per-session diagnostic one-shots so the 2nd/3rd-session desync
+    // dumps carry the char-context/save-object identity lines (they otherwise
+    // print only for the process's first session), and reset the pass-serial
+    // dedup companion that the serial reset above would otherwise leave stale.
+    InterlockedExchange(&g_charContextLastPass, -1);
+    InterlockedExchange(&g_charContextDiagOnce, 0);
+    InterlockedExchange(&g_saveObjectDiagOnce, 0);
     ConfigureType47TraceContext();
     const LONG start =
         InterlockedCompareExchange(&g_type47TraceWriteSequence, 0, 0) + 1;
