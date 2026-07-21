@@ -273,6 +273,16 @@ volatile LONG g_reinstalls = 0;    // module-rebase reinstalls
 // worker); the worker drains-and-discards every 500 ms so the cap is never
 // reached in practice and the per-batch cost stays constant forever. This
 // constancy IS the fix - see the file header.
+//
+// DO-NOT-REDUCE CONTRACT (hardening plan Phase 2, amended on evidence): the
+// postfix rehost capture proved that when the alloc+push portion silently
+// stopped (v1's undrained cap filled) the suppression FADED - even though the
+// snprintf and mutex kept running every batch. The heap allocation and queue
+// push are therefore treated as load-bearing parts of the verified timing
+// profile. Do not "optimize" this into a lock-free/preallocated ring or a
+// try_lock; making the wrap CHEAPER is the one direction known to break it.
+// (Making it costlier is safe - the full-dump build added far more and also
+// suppressed.)
 std::mutex g_sinkMutex;
 std::deque<std::string> g_sinkLines;
 constexpr size_t kSinkCap = 1u << 18;

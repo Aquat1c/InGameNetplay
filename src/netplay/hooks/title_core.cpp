@@ -347,34 +347,114 @@ bool HandleInlineEditInput(uint32_t screenContext, const uint8_t* inputBytes)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Close-teardown offload (hardening plan Phase 1, finding A1).
+//
+// The pre-exit sequence (peer-quit broadcast <=300 ms, emergency evidence
+// flush <=~2 s incl. disk I/O, lobby shutdown) used to run synchronously
+// INSIDE message retrieval, freezing the window ("not responding") during
+// close. Now: the first WM_CLOSE/SC_CLOSE is swallowed, the sequence runs on
+// a detached teardown thread, and WM_CLOSE is re-posted when it finishes -
+// the pump stays live the whole time and total close latency is unchanged.
+// OS-driven terminal messages (QUERYENDSESSION/ENDSESSION/DESTROY) cannot be
+// deferred and keep the bounded synchronous path, skipping whatever the
+// async teardown already completed.
+// ---------------------------------------------------------------------------
+static volatile LONG g_closeTeardownState = 0; // 0 idle, 1 running, 2 done
+
+static void RunCloseTeardownSequence(const char* context)
+{
+    if (InterlockedExchange(&g_windowClosePeerQuitAttempted, 1) == 0)
+    {
+        const bool peerQuitSent =
+            netplay::bridge::RequestPeerQuitBeforeLocalExit("window_close");
+        mod::Log(
+            "CloseTeardown[%s]: pre-exit peer-quit result=%d",
+            context,
+            peerQuitSent ? 1 : 0);
+    }
+    netplay::bridge::takeover::NotifyLocalProcessCloseForGameplayStall();
+    // Window close skips normal session teardown, which is where the desync
+    // monitor's deferred forensic I/O runs - desync3 lost a peer-acknowledged
+    // onset this way. Bounded best-effort flush; cheap no-op when no
+    // capture/evidence exists. Gated by ExperimentalEmergencyEvidenceFlush.
+    netplay::bridge::desync_monitor::EmergencyEvidenceFlush("window_close");
+    (void)ShutdownLobbySessionForProcessExit(false, "window_close");
+}
+
+static DWORD WINAPI CloseTeardownThreadProc(LPVOID param)
+{
+    const HWND hwnd = static_cast<HWND>(param);
+    RunCloseTeardownSequence("async");
+    InterlockedExchange(&g_closeTeardownState, 2);
+    if (hwnd != nullptr && IsWindow(hwnd))
+    {
+        PostMessageA(hwnd, WM_CLOSE, 0, 0);
+    }
+    mod::Log("CloseTeardown[async]: complete; close re-posted");
+    return 0;
+}
+
 LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    const bool closeRequested =
+    const bool deferrableClose =
         message == WM_CLOSE
-        || (message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE)
-        || message == WM_QUERYENDSESSION
+        || (message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE);
+    const bool terminalClose =
+        message == WM_QUERYENDSESSION
         || (message == WM_ENDSESSION && wParam != 0)
         || message == WM_DESTROY
         || message == WM_NCDESTROY;
-    if (closeRequested)
+    if (deferrableClose)
     {
-        if (InterlockedExchange(&g_windowClosePeerQuitAttempted, 1) == 0)
+        const LONG prior =
+            InterlockedCompareExchange(&g_closeTeardownState, 1, 0);
+        if (prior == 0)
         {
-            const bool peerQuitSent =
-                netplay::bridge::RequestPeerQuitBeforeLocalExit("window_close");
-            mod::Log(
-                "NetplayWindowProc: pre-exit peer-quit message=0x%04X result=%d",
-                static_cast<unsigned>(message),
-                peerQuitSent ? 1 : 0);
+            HANDLE thread = CreateThread(
+                nullptr, 0, &CloseTeardownThreadProc, hwnd, 0, nullptr);
+            if (thread != nullptr)
+            {
+                CloseHandle(thread);
+                mod::Log(
+                    "NetplayWindowProc: close deferred, teardown running "
+                    "async (message=0x%04X)",
+                    static_cast<unsigned>(message));
+                return 0; // swallow; WM_CLOSE re-posted when teardown ends
+            }
+            // Thread creation failed: fall back to the old synchronous path.
+            RunCloseTeardownSequence("sync_fallback");
+            InterlockedExchange(&g_closeTeardownState, 2);
         }
-        netplay::bridge::takeover::NotifyLocalProcessCloseForGameplayStall();
-        // Window close skips normal session teardown, which is where the
-        // desync monitor's deferred forensic I/O runs - desync3 lost a
-        // peer-acknowledged onset this way.  Bounded best-effort flush;
-        // cheap no-op when no capture/evidence exists.  Gated by
-        // [Others] ExperimentalEmergencyEvidenceFlush.
-        netplay::bridge::desync_monitor::EmergencyEvidenceFlush("window_close");
-        (void)ShutdownLobbySessionForProcessExit(false, "window_close");
+        else if (prior == 1)
+        {
+            return 0; // teardown in flight; keep swallowing close requests
+        }
+        // prior == 2: teardown finished - fall through, let the close proceed.
+    }
+    else if (terminalClose)
+    {
+        // OS-driven or already-destroying: cannot defer. If the async
+        // teardown is mid-flight, wait for it (bounded - the old code blocked
+        // here anyway); if it never ran, run it inline once.
+        const LONG prior =
+            InterlockedCompareExchange(&g_closeTeardownState, 1, 0);
+        if (prior == 1)
+        {
+            for (int i = 0;
+                 i < 60
+                 && InterlockedCompareExchange(&g_closeTeardownState, 0, 0) != 2;
+                 ++i)
+            {
+                Sleep(50);
+            }
+        }
+        else if (prior == 0)
+        {
+            RunCloseTeardownSequence("terminal");
+            InterlockedExchange(&g_closeTeardownState, 2);
+        }
+        // prior == 2: already done.
     }
 
     if (g_netplayMenuState.active)

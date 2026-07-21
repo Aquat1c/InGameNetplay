@@ -1061,6 +1061,40 @@ void Render(IDirect3DDevice9* device)
         }
     }
 
+    // Double-EndScene detection (hardening plan P3.1, measure-first): the
+    // custom DDRAW.dll's Flip can issue TWO EndScene calls in one presented
+    // frame (its text-overlay pass + the main pass). Two game-RT EndScenes
+    // within 4 ms = one such pair. Detection only - render behavior is
+    // unchanged until measurements say the double work matters (skipping one
+    // pass blindly risks drawing on the occluded one).
+    {
+        static LARGE_INTEGER s_lastEndScene = {};
+        static LONG s_pairCount = 0;
+        static LONG s_pairLogged = 0;
+        LARGE_INTEGER now = {}, freq = {};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        if (s_lastEndScene.QuadPart != 0 && freq.QuadPart != 0)
+        {
+            const double deltaMs =
+                static_cast<double>(now.QuadPart - s_lastEndScene.QuadPart)
+                * 1000.0 / static_cast<double>(freq.QuadPart);
+            if (deltaMs < 4.0)
+            {
+                const LONG pairs = InterlockedIncrement(&s_pairCount);
+                if ((pairs == 1 || pairs % 3600 == 0)
+                    && InterlockedExchange(&s_pairLogged, 1) >= 0)
+                {
+                    mod::Log(
+                        "OVERLAY: double-EndScene pair detected (count=%ld, "
+                        "delta=%.2fms) - P3.1 measurement",
+                        static_cast<long>(pairs), deltaMs);
+                }
+            }
+        }
+        s_lastEndScene = now;
+    }
+
     namespace ah = netplay::bridge::async_host;
     const bool debugAvailable = netplay::mod_settings::IsDebugMenuEnabled();
     // Suppress the top-middle ImGui badge while the netplay menu is open - the
