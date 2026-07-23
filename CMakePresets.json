@@ -43,6 +43,16 @@
         "EFZ_XP_COMPAT": "ON",
         "EFZ_LIFECYCLE_TRACE": "ON"
       }
+    },
+    {
+      "name": "xp-native-tick",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build_xp_native_tick_win32",
+      "toolset": "v141_xp",
+      "cacheVariables": {
+        "EFZ_XP_COMPAT": "ON",
+        "EFZ_NATIVE_TICK_PASSTHROUGH": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -59,6 +69,11 @@
     {
       "name": "build-xp-trace",
       "configurePreset": "xp-trace",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-xp-native-tick",
+      "configurePreset": "xp-native-tick",
       "configuration": "Release"
     }
   ]

@@ -498,10 +498,12 @@ void Log(const char* fmt, ...)
         return;
     }
 
-    // OutputDebugStringA on the caller - lock-free and very fast when no
-    // debugger is attached; callers that attach a debugger get immediate
-    // output without waiting on the writer thread.
+    // Debugger delivery is intentionally absent from shipping builds.
+    // OutputDebugString can synchronously rendezvous with a debugger/DBWIN
+    // consumer, so it does not belong on a rollback-thread call path.
+#if defined(EFZ_LIFECYCLE_TRACE)
     OutputDebugStringA(line);
+#endif
 
     EnqueueLine(std::string(line, static_cast<std::size_t>(lineLen)));
 }

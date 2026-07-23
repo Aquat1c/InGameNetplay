@@ -474,9 +474,10 @@ inline std::vector<ProbeModule>& Registry()
 // the first bisection attempt). Section [probes]; keys are module names
 // (stock_rng_probe, stock_rollback_probe, stock_batch_probe, stock_seed_probe,
 // stock_session_probe) plus "full_dump" for the raw dump inside the rollback
-// probe. Everything defaults ON; a missing ini changes nothing. Falls back to
-// the CWD ini if none exists beside the DLL. ProbeConfigIniPath() lets the
-// host print exactly which file was consulted.
+// probe. The host defaults only the decisive stock_rng_probe ON; heavier
+// rollback/batch/session probes and full_dump default OFF. Falls back to the
+// CWD ini if none exists beside the DLL. ProbeConfigIniPath() lets the host
+// print exactly which file was consulted.
 inline const char* ProbeConfigIniPath()
 {
     static char s_path[MAX_PATH] = {};

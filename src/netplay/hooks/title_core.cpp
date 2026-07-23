@@ -1,6 +1,5 @@
 #include "netplay/hooks/internal/shared.h"
 
-#include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "logger.h"
@@ -374,11 +373,6 @@ static void RunCloseTeardownSequence(const char* context)
             peerQuitSent ? 1 : 0);
     }
     netplay::bridge::takeover::NotifyLocalProcessCloseForGameplayStall();
-    // Window close skips normal session teardown, which is where the desync
-    // monitor's deferred forensic I/O runs - desync3 lost a peer-acknowledged
-    // onset this way. Bounded best-effort flush; cheap no-op when no
-    // capture/evidence exists. Gated by ExperimentalEmergencyEvidenceFlush.
-    netplay::bridge::desync_monitor::EmergencyEvidenceFlush("window_close");
     (void)ShutdownLobbySessionForProcessExit(false, "window_close");
 }
 

@@ -83,6 +83,7 @@ ProcessEffectFn g_origProcessEffect = nullptr;
 volatile LONG g_curGameSys = 0;
 volatile LONG g_curSlot = 0xFFFF;
 volatile LONG g_lastT47Tick = -600000; // last type47 console event (rate limit)
+bool g_verboseContext = false;
 
 HANDLE g_csv = INVALID_HANDLE_VALUE;
 HANDLE g_flushThread = nullptr;
@@ -132,12 +133,14 @@ char* __cdecl HookRng()
         }
     }
 
-    // Both chars' vintage at the draw - the exact fields throw contact and the
-    // spawn midpoint resolve on.
+    // Both chars' vintage is useful for a broad spawn investigation, but it
+    // requires battle discovery and eight additional guarded reads per draw.
+    // The minimal raw-peer discriminator needs only slot/behavior/y/vy and the
+    // RNG transition, so this context is opt-in.
     uint16_t p1m = 0xFFFF, p1a = 0xFFFF, p1t = 0xFFFF, p1c = 0xFFFF;
     uint16_t p2m = 0xFFFF, p2a = 0xFFFF, p2t = 0xFFFF, p2c = 0xFFFF;
     uintptr_t p1 = 0, p2 = 0;
-    if (ResolveBattle(nullptr, nullptr, &p1, &p2))
+    if (g_verboseContext && ResolveBattle(nullptr, nullptr, &p1, &p2))
     {
         if (p1 != 0)
         {
@@ -299,6 +302,8 @@ void OpenCsv()
 // --- module interface (driven by probe_host.cpp) -----------------------------
 bool Install(uintptr_t revivalBase)
 {
+    g_verboseContext =
+        ProbeConfigEnabled("stock_rng_verbose", false);
     g_revivalBase = revivalBase;
     g_rngAddr = revivalBase + kRngReplacementRva;
     g_rngEngineAddr = revivalBase + kRngEngineStateRva;
@@ -329,10 +334,12 @@ bool Install(uintptr_t revivalBase)
     OpenCsv();
     g_flushThread = CreateThread(nullptr, 0, &FlushThreadProc, nullptr, 0, nullptr);
     char msg[128];
-    std::snprintf(msg, sizeof(msg), "installed. base=0x%08lX rand=0x%08lX engine=0x%08lX",
+    std::snprintf(msg, sizeof(msg),
+                  "installed. base=0x%08lX rand=0x%08lX engine=0x%08lX verbose=%d",
                   static_cast<unsigned long>(g_revivalBase),
                   static_cast<unsigned long>(g_rngAddr),
-                  static_cast<unsigned long>(g_rngEngineAddr));
+                  static_cast<unsigned long>(g_rngEngineAddr),
+                  g_verboseContext ? 1 : 0);
     Breadcrumb("stock_rng_probe", msg);
     return true;
 }

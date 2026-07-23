@@ -5,7 +5,6 @@
 #include <ws2tcpip.h>
 
 #include "netplay/bridge/revival_takeover.h"
-#include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
@@ -3317,7 +3316,6 @@ void InitializeHost()
 
 void ShutdownHost()
 {
-    netplay::bridge::desync_monitor::Shutdown();
     CloseMirrorLogFiles();
     StopManagedLogEfzWorker(true);
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -3552,9 +3550,6 @@ bool StartSession(
         (nickname != nullptr) ? nickname : "",
         writeNicknameToIni ? 1 : 0);
     LogRevival102jDeepStep("StartSession.01.entry", ioStatus);
-
-    netplay::bridge::desync_monitor::NotifySessionStarted(
-        static_cast<int>(role), address, port, nickname);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
@@ -5367,7 +5362,6 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         repeatTeardown ? "repeat" : "begin",
         (reason != nullptr) ? reason : "", g_localRoleFlag);
 
-    netplay::bridge::desync_monitor::NotifySessionEnded(reason);
     LogRevival102jDeepSnapshot("CancelSession.01.entry", ioStatus);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_entry");

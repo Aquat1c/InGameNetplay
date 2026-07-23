@@ -329,6 +329,7 @@ struct D3dOverlayState
     bool firstGetViewportFailureLogged = false;
     bool firstGetSwapChainFailureLogged = false;
     bool firstGetPresentParametersFailureLogged = false;
+    bool netplayMenuObserved = false;
     uint32_t targetTraceLogsRemaining = 24;
     void* endSceneTarget = nullptr;
     EndSceneFn originalEndScene = nullptr;
@@ -2477,12 +2478,18 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
 
     if (device != nullptr)
     {
-        // Drop committed game-RT text the moment the netplay menu is gone, so
-        // TTF text cannot linger over gameplay screens.  Per-menu ownership is
-        // handled by the render pass (it republishes the frame every tick), so
-        // only the menu-inactive case needs the hard clear.
-        if (!hooks::g_netplayMenuState.active)
+        // Drop committed game-RT text once when leaving the netplay menu. The
+        // previous implementation took the RT-text critical section and
+        // cleared an already-empty vector on every gameplay EndScene. That is
+        // invisible steady-state work absent from the known-clean control
+        // build and serves no rendering purpose.
+        if (hooks::g_netplayMenuState.active)
         {
+            g_d3dOverlay.netplayMenuObserved = true;
+        }
+        else if (g_d3dOverlay.netplayMenuObserved)
+        {
+            g_d3dOverlay.netplayMenuObserved = false;
             netplay::debug_overlay::ClearRtText();
         }
         (void)RenderBrowserIconsD3d9(device);

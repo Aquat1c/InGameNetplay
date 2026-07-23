@@ -1,0 +1,15 @@
+[probes]
+# Minimal decisive raw-peer capture. This records logical RNG transitions and
+# the current effect slot/behavior/position without game-thread disk I/O.
+stock_rng_probe=1
+stock_rng_verbose=0
+
+# Broader probes are opt-in because enabling them changes the timing profile.
+stock_rollback_probe=0
+stock_batch_probe=0
+stock_seed_probe=0
+stock_session_probe=0
+
+# Extremely heavy (~110 KB per record, potentially GB-scale). Never enable for
+# the first causal capture.
+full_dump=0

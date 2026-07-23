@@ -1,6 +1,7 @@
 // IPC shared memory, config loading, module resolution, and session status helpers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/batch_stabilizer.h"
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -1287,6 +1288,11 @@ bool EnsureLocalRevivalLoaded()
     DetectRevivalVersion();
 
     PublishHostRevivalBase();
+    // Install the empirically useful batch stabilizer once Revival is known
+    // and profiled. The per-frame hook continues to self-repair it in normal
+    // builds; the native-tick A/B build deliberately has no such hook, so this
+    // startup installation preserves the same mitigation in both arms.
+    netplay::bridge::batch_stabilizer::EnsurePerTick();
     if (!PatchRevivalErrorCodeNullGuard())
     {
         mod::Log("Takeover: warning failed to patch EfzRevival null-guard");

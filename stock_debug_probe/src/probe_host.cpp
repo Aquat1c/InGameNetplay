@@ -40,6 +40,16 @@ bool g_consoleAllocated = false;
 // Which registered modules actually armed, for the heartbeat composition.
 std::vector<const ProbeModule*> g_armed;
 
+bool ProbeEnabledForRun(const char* name)
+{
+    // The RNG+effect-slot observer alone distinguishes the two four-call raw
+    // paths. Keep every broader/heavier probe opt-in so an absent INI cannot
+    // accidentally turn a minimal causal capture into a timing stress test.
+    const bool defaultOn =
+        name != nullptr && std::strcmp(name, "stock_rng_probe") == 0;
+    return ProbeConfigEnabled(name, defaultOn);
+}
+
 uintptr_t WaitForRevival()
 {
     HMODULE revival = nullptr;
@@ -153,11 +163,14 @@ void HostRun()
         for (const ProbeModule& m : Registry())
         {
             n += std::snprintf(cfg + n, sizeof(cfg) - static_cast<size_t>(n),
-                               " %s=%d", m.name, ProbeConfigEnabled(m.name) ? 1 : 0);
+                               " %s=%d", m.name,
+                               ProbeEnabledForRun(m.name) ? 1 : 0);
             if (n >= static_cast<int>(sizeof(cfg)) - 24) break;
         }
         std::snprintf(cfg + n, sizeof(cfg) - static_cast<size_t>(n),
-                      " full_dump=%d", ProbeConfigEnabled("full_dump") ? 1 : 0);
+                      " full_dump=%d rng_verbose=%d",
+                      ProbeConfigEnabled("full_dump", false) ? 1 : 0,
+                      ProbeConfigEnabled("stock_rng_verbose", false) ? 1 : 0);
         Breadcrumb("host", cfg);
     }
 
@@ -165,7 +178,7 @@ void HostRun()
     const int total = static_cast<int>(Registry().size());
     for (const ProbeModule& m : Registry())
     {
-        if (!ProbeConfigEnabled(m.name))
+        if (!ProbeEnabledForRun(m.name))
         {
             char msg[96];
             std::snprintf(msg, sizeof(msg),

@@ -1385,9 +1385,29 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         // [Others] (mod-owned settings)
         {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
         {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey"}},
-        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "ExperimentalDesyncMonitor", "ExperimentalEagerZeroFrameGraphicsRestore"}},
+        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "ExperimentalEagerZeroFrameGraphicsRestore"}},
+        {"Others", "TIMING", {"DeferredConsoleParse", "BatchStabilizerWorkKB"}},
     };
     return kGroups;
+}
+
+bool IsCurrentOthersSetting(const std::string& key)
+{
+    for (const PageGroupDef& group : GetPageGroupDefs())
+    {
+        if (std::strcmp(group.section, "Others") != 0)
+        {
+            continue;
+        }
+        for (const char* currentKey : group.keys)
+        {
+            if (currentKey != nullptr && key == currentKey)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void BuildCategoryPageRows(Category& category)
@@ -1538,13 +1558,9 @@ bool LoadItemsFromIni()
         const std::string key = WideToUtf8(keyWide);
         const std::string value = WideToUtf8(valueWide);
 
-        // These formerly default-on experimental keys are intentionally
-        // ignored by settings reload. Hide stale lines that no longer control
-        // anything; their explicit replacements are synthesized below with
-        // the current independently chosen defaults.
-        if (currentSection == "Others"
-            && (key == "DesyncDetection"
-                || key == "EagerZeroFrameGraphicsRestore"))
+        // [Others] is mod-owned. Admit only current settings so retired
+        // investigation keys in an old INI cannot reappear as dead controls.
+        if (currentSection == "Others" && !IsCurrentOthersSetting(key))
         {
             commentLines.clear();
             continue;
@@ -1775,10 +1791,6 @@ void AppendSyntheticItems()
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
-    upsertBoolIntItem(
-        "ExperimentalDesyncMonitor",
-        true,
-        "Experimental rollback tracer, enabled by default during the current RNG investigation. Both peers need the same mod build; recording begins only after a compatible two-peer handshake. Set this to OFF to disable capture explicitly.");
     upsertBoolIntItem(
         "ExperimentalEagerZeroFrameGraphicsRestore",
         false,

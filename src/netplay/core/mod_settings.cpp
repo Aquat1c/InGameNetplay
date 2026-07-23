@@ -173,58 +173,33 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
-    // Investigation forensics (desync monitor, per-call RNG trace, snapshot
-    // boundary markers, verbose capture dump) DEFAULT to build-gated: ON in
-    // EFZ_LIFECYCLE_TRACE (xp-trace) builds, OFF in shipping (xp-release)
-    // builds.  Rationale: (1) end-user quietness - release must not emit
-    // memory dumps / pointers / per-frame diagnostics or write forensic CSVs;
-    // (2) these tracers perform heavy per-tick work on the rollback thread
-    // (per-rand() detour, ~110KB region hashing per snapshot save/load) that is
-    // itself asymmetric-timing perturbation between peers with different
-    // settings - a candidate contributor to the very desync under study.  An
-    // explicit INI key still overrides in either build (e.g. force a capture in
-    // a release binary, or silence a trace binary).
-    constexpr bool kInvestigationDefault = (MOD_LIFECYCLE_TRACE_COMPILED != 0);
-    loaded.desyncDetection =
-        ReadBoolValue(L"Others", L"ExperimentalDesyncMonitor",
-            kInvestigationDefault, iniPath);
+    // Production-safe timing mitigation and console parsing remain ordinary
+    // runtime settings in both build flavors.
+    loaded.deferredConsoleParse =
+        ReadBoolValue(L"Others", L"DeferredConsoleParse", true, iniPath);
+    {
+        const int workKb = static_cast<int>(GetPrivateProfileIntW(
+            L"Others", L"BatchStabilizerWorkKB", 64, iniPath.c_str()));
+        loaded.batchStabilizerWorkKb =
+            (workKb < 0) ? 0 : (workKb > 1024 ? 1024 : workKb);
+    }
+
+    // The zero-frame behavior experiment remains trace-build-only. The former
+    // invasive observer and all of its hook settings were removed entirely
+    // after the 1.02j on/off A/B implicated the observer itself.
+#if MOD_LIFECYCLE_TRACE_COMPILED
     loaded.eagerZeroFrameGraphicsRestore =
         ReadBoolValue(
             L"Others",
             L"ExperimentalEagerZeroFrameGraphicsRestore",
             false,
             iniPath);
-    loaded.deferredConsoleParse =
-        ReadBoolValue(L"Others", L"DeferredConsoleParse", true, iniPath);
-    {
-        const int workKb = static_cast<int>(GetPrivateProfileIntW(
-            L"Others", L"BatchStabilizerWorkKB", 64, iniPath.c_str()));
-        loaded.batchStabilizerWorkKb = (workKb < 0) ? 0 : (workKb > 1024 ? 1024 : workKb);
-    }
-    loaded.experimentalEmergencyEvidenceFlush =
-        ReadBoolValue(
-            L"Others",
-            L"ExperimentalEmergencyEvidenceFlush",
-            true,
-            iniPath);
-    loaded.experimentalSnapshotBoundaryMarkers =
-        ReadBoolValue(
-            L"Others",
-            L"ExperimentalSnapshotBoundaryMarkers",
-            kInvestigationDefault,
-            iniPath);
-    loaded.experimentalCaptureVerboseDump =
-        ReadBoolValue(
-            L"Others",
-            L"ExperimentalCaptureVerboseDump",
-            kInvestigationDefault,
-            iniPath);
-    loaded.experimentalRngCallTrace =
-        ReadBoolValue(
-            L"Others",
-            L"ExperimentalRngCallTrace",
-            kInvestigationDefault,
-            iniPath);
+#else
+    loaded.verboseBridgePatchLogging = false;
+    loaded.verboseSyncDiagnostics = false;
+    loaded.verboseRevival102jLifecycleLogging = false;
+    loaded.eagerZeroFrameGraphicsRestore = false;
+#endif
     loaded.menuTtfText =
         ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
     loaded.menuTtfFontFace =
@@ -293,11 +268,6 @@ bool IsDebugMenuEnabled()
     return g_settings.enableDebugMenu;
 }
 
-bool IsDesyncDetectionEnabled()
-{
-    return g_settings.desyncDetection;
-}
-
 int BatchStabilizerWorkKb()
 {
     return g_settings.batchStabilizerWorkKb;
@@ -306,26 +276,6 @@ int BatchStabilizerWorkKb()
 bool IsDeferredConsoleParseEnabled()
 {
     return g_settings.deferredConsoleParse;
-}
-
-bool IsEmergencyEvidenceFlushEnabled()
-{
-    return g_settings.experimentalEmergencyEvidenceFlush;
-}
-
-bool IsSnapshotBoundaryMarkersEnabled()
-{
-    return g_settings.experimentalSnapshotBoundaryMarkers;
-}
-
-bool IsCaptureVerboseDumpEnabled()
-{
-    return g_settings.experimentalCaptureVerboseDump;
-}
-
-bool IsRngCallTraceEnabled()
-{
-    return g_settings.experimentalRngCallTrace;
 }
 
 bool IsVerboseBridgePatchLoggingEnabled()

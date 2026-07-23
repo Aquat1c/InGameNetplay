@@ -250,35 +250,6 @@ struct RevivalAddressProfile
     // shared_documentation/RNG_SEEDING_ALL_VERSIONS.md.
     uintptr_t rngEngineStateOffset;
 
-    // Rollback savestate SAVE/LOAD entry RVAs (diagnostic snapshot-boundary
-    // markers for the desync monitor's type-47 trace).  1.02h byte-verified:
-    // save = sub_1006F390 (__thiscall(void**, char); copies the 0x142F0 EFZ
-    // battle block then serializes the RNG engine via sub_10013140), load =
-    // sub_1006F270 (__thiscall(void*); parses via sub_10012EE0 and reapplies
-    // with sub_10013150).  Zero disables the markers fail-closed for that
-    // build; the desync4 restore-divergence evidence is 1.02h-only, so other
-    // profiles stay unset until their entries are byte-verified.
-    uintptr_t snapshotSaveRva;
-    uintptr_t snapshotLoadRva;
-
-    // RVA of Revival's rand() replacement installed at efz.exe 0x777D61 (the
-    // per-logical-call entry to the minstd distribution adapter).  1.02h
-    // byte-verified: sub_1006E1A0, prologue 55 8B EC 83 EC 08.  The desync
-    // monitor detours this to record every logical game rand() call with its
-    // efz.exe return address and the engine-state delta (rngEngineStateOffset
-    // before/after) - the per-call attribution the state columns cannot give.
-    // Zero disables the RNG-call tracer fail-closed for that build.
-    uintptr_t rngReplacementRva;
-
-    // RVA of the minstd engine's seed() normalize body (state = seed %
-    // 0x7FFFFFFF, 0->1, stored to rngEngineStateOffset).  Called for EVERY
-    // engine (re)seed: the DLL-load default, the synced StartInitPlayer
-    // seed, spectator init, AND the savestate-restore reapply.  The desync
-    // monitor detours it to trace the seed lifecycle at the APPLY boundary -
-    // the exact seed value each peer writes into the engine, deduped by
-    // value.  MSVC builds e-i share prologue 55 8B EC 8B 4D 08 (e/f/f-fs/g
-    // RVA 0x011060, h/i 0x0111D0).  Zero disables the seed trace fail-closed.
-    uintptr_t rngSeedApplyRva;
 };
 
 // ---------------------------------------------------------------------------
@@ -346,10 +317,6 @@ constexpr RevivalAddressProfile kRevival_Unsupported = {
     {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
     0u,                                                 // exitProcessNearJccCount
     0u,                                                 // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0u,                                             // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02e - original release, baseline for all addresses.
@@ -412,10 +379,6 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     {0x0007251Bu, 0x0007252Eu, 0x000742E1u, 0x000742F4u, 0x00074301u, 0u, 0u, 0u},
     5,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0x00011060u,                                    // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02f - minor revision, same .data layout as 1.02e.
@@ -479,10 +442,6 @@ constexpr RevivalAddressProfile kRevival_1_02f = {
     {0x0007254Bu, 0x0007255Eu, 0x00074311u, 0x00074324u, 0x00074331u, 0u, 0u, 0u},
     5,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0x00011060u,                                    // rngSeedApplyRva
 };
 
 // Custom framestepping 1.02f build: same data layout as stock 1.02f/1.02g,
@@ -549,10 +508,6 @@ constexpr RevivalAddressProfile kRevival_1_02f_framestepping = {
      0x00074544u, 0x00074551u, 0u, 0u},               // exitProcessNearJccRva
     6,                                                 // exitProcessNearJccCount
     0x000A06ECu,                                       // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0x00011060u,                                    // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02g - session objects enlarged (host 0x5D0→0x690),
@@ -621,10 +576,6 @@ constexpr RevivalAddressProfile kRevival_1_02g = {
      0x00074561u, 0x00074574u, 0x00074581u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0x00011060u,                                    // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02h - .data shifted +0x20 from e/f/g.
@@ -689,10 +640,6 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
      0x00074CA1u, 0x00074CB4u, 0x00074CC1u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A070Cu,                                        // rngEngineStateOffset
-    0x0006F390u,                                    // snapshotSaveRva
-    0x0006F270u,                                    // snapshotLoadRva
-    0x0006E1A0u,                                    // rngReplacementRva
-    0x000111D0u,                                    // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02i - largest version (SizeOfImage 0xB3000 vs 0xB2000).
@@ -758,10 +705,6 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
      0x00075231u, 0x00075244u, 0x00075251u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A1788u,                                        // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0x000111D0u,                                    // rngSeedApplyRva
 };
 
 // EfzRevival.dll v1.02j - MinGW refactor build.
@@ -831,10 +774,6 @@ constexpr RevivalAddressProfile kRevival_1_02j = {
     {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
     0,                                                  // exitProcessNearJccCount
     0x0014E984u,                                        // rngEngineStateOffset
-    0u,                                             // snapshotSaveRva
-    0u,                                             // snapshotLoadRva
-    0u,                                             // rngReplacementRva
-    0u,                                             // rngSeedApplyRva
 };
 
 // Table of all known profiles, for DetectRevivalVersion() iteration.

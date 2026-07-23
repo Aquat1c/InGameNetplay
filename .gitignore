@@ -22,3 +22,5 @@ tools/
 /logs
 /cmake/
 /docs
+*.md
+!README.md

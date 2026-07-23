@@ -3231,7 +3231,7 @@ void HandoffSpectateSession(uint32_t screenContext)
 
     // Immediately publish the post-handoff state so inNetplayMenu=0 is visible
     // to export consumers before the next frame hook fires.
-    netplay::bridge::TickExportOnly();
+    netplay::bridge::TickExportOnly(true);
 
     mod::Log(
         "HandoffSpectateSession: queued global transition nextState=%d returnToNetplay=%d",
@@ -3677,7 +3677,7 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     // Immediately publish the post-handoff state so that inNetplayMenu=0 and
     // activityPhase=InMatch are visible to export consumers before the next
     // frame hook fires (avoids a stale "menu=1" window during the fade-out).
-    netplay::bridge::TickExportOnly();
+    netplay::bridge::TickExportOnly(true);
 
     // Post-handoff diagnostic: read charselect screen object state AFTER
     // PrepareVsHumanGameState to verify flags were set correctly.

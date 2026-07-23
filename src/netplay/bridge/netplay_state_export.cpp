@@ -177,7 +177,7 @@ void QueueUpdate(const NetbridgeStatus& status)
         const LONG dropCount = InterlockedIncrement(&g_updatePublishDropped);
         if (dropCount <= 10 || (dropCount % 300) == 0)
         {
-            mod::Log(
+            MOD_LIFECYCLE_TRACE(
                 "StateExport: async queue skipped due contention dropCount=%ld",
                 static_cast<long>(dropCount));
         }

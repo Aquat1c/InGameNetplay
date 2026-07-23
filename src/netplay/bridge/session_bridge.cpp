@@ -237,10 +237,40 @@ void Tick()
     }
 }
 
-void TickExportOnly()
+void TickExportOnly(bool force)
 {
-    // Lightweight per-frame export pulse.  Called every game frame from
-    // OurPerFrameTickHook (revival_memory.cpp) so that activityPhase,
+    // Lightweight export pulse. Called every game frame from
+    // OurPerFrameTickHook (revival_memory.cpp), but rate-limited here so
+    // shared-state consumers remain current without performing session-memory
+    // reads and queue publication on every rollback tick.
+    //
+    // 125 ms is fast enough for UI/status consumers while moving this work
+    // from ~60 Hz to at most 8 Hz. Transition sites pass force=true.
+    static volatile LONG s_lastPublishTick = 0;
+    const DWORD nowTick = GetTickCount();
+    if (!force)
+    {
+        const LONG previous = InterlockedCompareExchange(
+            &s_lastPublishTick, 0, 0);
+        if (previous != 0
+            && static_cast<DWORD>(nowTick - static_cast<DWORD>(previous)) < 125u)
+        {
+            return;
+        }
+        if (InterlockedCompareExchange(
+                &s_lastPublishTick,
+                static_cast<LONG>(nowTick),
+                previous) != previous)
+        {
+            return;
+        }
+    }
+    else
+    {
+        InterlockedExchange(&s_lastPublishTick, static_cast<LONG>(nowTick));
+    }
+
+    // Keep activityPhase,
     // inNetplayMenu, stateSeq, scores, ping, delay, and all other exported
     // fields remain current during loading screen and battle - screens that
     // have no title/charselect hook calling the full Tick().
@@ -264,7 +294,7 @@ void TickExportOnly()
             ++s_teoSkippedCount;
             if (s_teoSkippedCount <= 10 || (s_teoSkippedCount % 300) == 0)
             {
-                mod::Log(
+                MOD_LIFECYCLE_TRACE(
                     "PERF_WARN: TickExportOnly skipped due to bridge lock contention "
                     "(skipCount=%u)",
                     s_teoSkippedCount);

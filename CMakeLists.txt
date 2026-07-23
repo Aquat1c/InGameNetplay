@@ -4,11 +4,18 @@ project(EFZInGameNetplayMod VERSION 0.1.0 LANGUAGES C CXX)
 option(EFZ_STATIC_RUNTIME "Link MSVC runtime statically for single-DLL deployment" ON)
 option(EFZ_XP_COMPAT "Enable Windows XP-oriented compile settings (requires compatible toolset)" OFF)
 option(EFZ_EMBEDDED_TLS "Enable embedded TLS HTTPS backend using bundled mbedTLS" ON)
-# Investigation builds only: compiles the lifecycle/desync diagnostic layer
-# (MOD_LIFECYCLE_TRACE call sites, verbose per-frame dumps, forensic tracers
-# defaulting ON) into the binary.  OFF for end-user builds: the trace calls
-# compile to nothing and the forensic INI keys default OFF.
-option(EFZ_LIFECYCLE_TRACE "Compile in lifecycle/desync investigation tracing (debug builds only)" OFF)
+# Investigation builds only: compiles verbose lifecycle/per-frame logging.
+# The invasive rollback/RNG observer was removed and is no longer part of any
+# build flavor. OFF for end-user builds: trace call sites compile to nothing.
+option(EFZ_LIFECYCLE_TRACE "Compile verbose lifecycle investigation logging (debug builds only)" OFF)
+# Controlled A/B build: retain the init-time frame dispatcher hook but leave
+# Revival's actual per-frame tick target untouched. This isolates the large
+# OurPerFrameTickHook wrapper as a desync variable. It is intentionally not the
+# shipping default because normal gameplay-exit recovery currently uses that
+# wrapper; use the dedicated preset only for parity captures.
+option(EFZ_NATIVE_TICK_PASSTHROUGH
+    "Do not detour Revival's active-battle per-frame tick (diagnostic A/B)"
+    OFF)
 
 if(EFZ_XP_COMPAT AND NOT EFZ_EMBEDDED_TLS)
     message(FATAL_ERROR
@@ -53,7 +60,6 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/revival_takeover.cpp
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
-    src/netplay/bridge/desync_monitor.cpp
     src/netplay/bridge/batch_stabilizer.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/revival_j_diagnostics.cpp
@@ -102,6 +108,10 @@ target_compile_features(efz_netplay_mod PRIVATE cxx_std_17)
 target_compile_definitions(efz_netplay_mod PRIVATE NOMINMAX)
 if(EFZ_LIFECYCLE_TRACE)
     target_compile_definitions(efz_netplay_mod PRIVATE EFZ_LIFECYCLE_TRACE=1)
+endif()
+if(EFZ_NATIVE_TICK_PASSTHROUGH)
+    target_compile_definitions(
+        efz_netplay_mod PRIVATE EFZ_NATIVE_TICK_PASSTHROUGH=1)
 endif()
 
 if(EFZ_EMBEDDED_TLS)
@@ -159,9 +169,11 @@ set_target_properties(efz_netplay_mod PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-if(Python3_Interpreter_FOUND)
+set(EFZ_REVIVAL_102J_VERIFY_SCRIPT
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_revival_102j.py")
+if(Python3_Interpreter_FOUND AND EXISTS "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}")
     add_custom_target(verify_revival_102j
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_revival_102j.py"
+        COMMAND "${Python3_EXECUTABLE}" "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Verifying EfzRevival 1.02j profile and hook contracts against raw binaries")
 endif()

@@ -2,7 +2,6 @@
 
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/bridge/batch_stabilizer.h"
-#include "netplay/bridge/desync_monitor.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/core/mod_settings.h"
@@ -7705,9 +7704,9 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // (docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md). Log a rich snapshot when
     // the warning first appears, then a once-per-second trail of the Revival
     // RNG engine state and EFZ effect-ring cursors so host/client logs can
-    // be correlated. The type-47/RNG monitor records causal evidence without
-    // promoting any duration threshold into session control; transport and
-    // protocol failures still use the fatal consoleErrorSerial path below.
+    // be correlated. This event-driven warning path installs no game-state
+    // hooks; transport and protocol failures still use the fatal
+    // consoleErrorSerial path below.
     {
         static uint32_t s_desyncWarnSeenSession = 0;
         static LONG s_desyncWarnSeenSerial = 0;
@@ -7831,7 +7830,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     "DESYNC_WARN_PROVISIONAL serial=%ld frameTick=%u sessionFrame=%d "
                     "gameMode=%u rngState=%d effectAlloc=%u effectProc=%u "
                     "effectsSetting=%u replayModeByte=%u text='%s' - session kept "
-                    "alive (stock-parity); causal tracer remains observational",
+                    "alive (stock-parity)",
                     static_cast<long>(desyncWarnSerial),
                     g_frameTick,
                     sessionFrame,
@@ -8680,26 +8679,6 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         && g_activeRevival != nullptr
         && !preTickDisconnect)
     {
-        // Experimental tracer: observe only the native frame during the
-        // handshake. Full state capture starts after both peers agree on the
-        // same future frame, keeping the normal hot path inert.
-        if (netplay::bridge::desync_monitor::IsSessionTracing())
-        {
-            int dmFrame = -1;
-            (void)SafeReadInt(
-                reinterpret_cast<const void*>(
-                    currentSession + g_activeRevival->sessionOffsetCurrentFrame),
-                &dmFrame);
-            netplay::bridge::desync_monitor::ObserveFrame(dmFrame);
-            if (netplay::bridge::desync_monitor::IsCaptureArmed())
-            {
-                int dmCommit = -1;
-                (void)ReadGameplaySyncFrameForRecovery(currentSession, &dmCommit);
-                netplay::bridge::desync_monitor::RecordFrameTick(
-                    currentSession, dmFrame, dmCommit);
-            }
-        }
-
         const bool isDesyncCheckFrame =
             (g_frameTick == 1)
             || (g_frameTick % 120 == 0)
@@ -10112,6 +10091,16 @@ bool InstallNetplayFrameHook()
     //   83 EC 28 E8 ...    sub esp, 0x28; call (1.02j MinGW prologue)
     // We overwrite a complete stolen-instruction span with JMP + NOP padding.
     // -----------------------------------------------------------------------
+#if defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+    // Diagnostic stock-parity arm: the init-time dispatcher wrapper above is
+    // retained, but the active-battle native tick target and call shape remain
+    // byte-for-byte Revival-owned. Exit/recovery behavior is intentionally not
+    // claimed equivalent in this arm; it exists to answer whether the large
+    // per-tick wrapper contributes to the deterministic split.
+    mod::Log(
+        "InstallNetplayFrameHook: native-tick passthrough active; "
+        "per-frame tick detour skipped (diagnostic A/B build)");
+#else
     if (!g_perFrameTickInstalled)
     {
         const uintptr_t perFrameTickRva = g_activeRevival->perFrameTickRva;
@@ -10249,6 +10238,7 @@ bool InstallNetplayFrameHook()
             }
         }
     }
+#endif
 
     if (IsRevival102jProfile())
     {

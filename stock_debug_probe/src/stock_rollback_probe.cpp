@@ -191,7 +191,7 @@ DWORD WINAPI DumpWorkerProc(LPVOID)
 
 bool StartFullDump()
 {
-    if (!ProbeConfigEnabled("full_dump"))
+    if (!ProbeConfigEnabled("full_dump", false))
     {
         Breadcrumb("stock_rollback_probe",
                    "full dump DISABLED via debug_probe.ini (bisection)");

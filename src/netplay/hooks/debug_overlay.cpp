@@ -140,6 +140,7 @@ CRITICAL_SECTION g_rtTextLock;
 bool g_rtTextLockInited = false;
 std::vector<RtTextItem> g_rtTextStaging;
 std::vector<RtTextItem> g_rtTextActive;
+volatile LONG g_rtTextPublished = 0;
 
 void EnsureRtTextLock()
 {
@@ -1047,6 +1048,28 @@ void Render(IDirect3DDevice9* device)
         return;
     }
 
+    namespace ah = netplay::bridge::async_host;
+    const bool debugAvailable = netplay::mod_settings::IsDebugMenuEnabled();
+    const bool wantIndicator =
+        ah::IsActive() && ah::IsMinimized() && !netplay::hooks::IsNetplayMenuActive();
+    const bool wantPanel = debugAvailable && g_panelOpen;
+
+    // Game-RT text overlay items committed by a menu producer. Use the
+    // published bit for the EndScene fast path: once menu text has been
+    // cleared, gameplay frames must not take the RT-text critical section.
+    const bool wantRtText =
+        InterlockedCompareExchange(&g_rtTextPublished, 0, 0) != 0;
+
+    // Once ImGui's window hook is initialized, a closed panel with no badge or
+    // menu text needs no EndScene work. Return before render-target queries,
+    // QPC measurements, swap-chain inspection, or backend calls. The window
+    // hook remains installed and can make wantPanel true on a later frame.
+    const bool needsInitialization = debugAvailable && !g_inited;
+    if (!needsInitialization && !wantPanel && !wantIndicator && !wantRtText)
+    {
+        return;
+    }
+
     // Surface filter - only draw on the 640x480 game render target. EndScene also
     // fires for Revival's window-backbuffer present (different size); drawing there
     // put the overlay on the wrong surface. Skip non-game frames entirely (do not
@@ -1061,12 +1084,9 @@ void Render(IDirect3DDevice9* device)
         }
     }
 
-    // Double-EndScene detection (hardening plan P3.1, measure-first): the
-    // custom DDRAW.dll's Flip can issue TWO EndScene calls in one presented
-    // frame (its text-overlay pass + the main pass). Two game-RT EndScenes
-    // within 4 ms = one such pair. Detection only - render behavior is
-    // unchanged until measurements say the double work matters (skipping one
-    // pass blindly risks drawing on the occluded one).
+#if MOD_LIFECYCLE_TRACE_COMPILED
+    // Trace-build measurement only. QueryPerformanceCounter/Frequency and
+    // interlocked accounting must not run on every shipping EndScene.
     {
         static LARGE_INTEGER s_lastEndScene = {};
         static LONG s_pairCount = 0;
@@ -1094,24 +1114,7 @@ void Render(IDirect3DDevice9* device)
         }
         s_lastEndScene = now;
     }
-
-    namespace ah = netplay::bridge::async_host;
-    const bool debugAvailable = netplay::mod_settings::IsDebugMenuEnabled();
-    // Suppress the top-middle ImGui badge while the netplay menu is open - the
-    // menu already shows the indexed top-right HOSTING badge there. The ImGui
-    // badge is for every OTHER screen (title / gameplay / etc.).
-    const bool wantIndicator =
-        ah::IsActive() && ah::IsMinimized() && !netplay::hooks::IsNetplayMenuActive();
-    const bool wantPanel = debugAvailable && g_panelOpen;
-
-    // Game-RT text overlay items committed by a menu producer (battle log).
-    bool wantRtText = false;
-    if (g_rtTextLockInited)
-    {
-        EnterCriticalSection(&g_rtTextLock);
-        wantRtText = !g_rtTextActive.empty();
-        LeaveCriticalSection(&g_rtTextLock);
-    }
+#endif
 
     // Initialise when the debug option is on (so DELETE works on any screen),
     // when the in-battle indicator needs drawing, or when menu text is queued.
@@ -1299,7 +1302,9 @@ void CommitRtTextFrame()
     EnterCriticalSection(&g_rtTextLock);
     g_rtTextActive.swap(g_rtTextStaging);
     g_rtTextStaging.clear();
+    const LONG published = g_rtTextActive.empty() ? 0 : 1;
     LeaveCriticalSection(&g_rtTextLock);
+    InterlockedExchange(&g_rtTextPublished, published);
 }
 
 void ClearRtText()
@@ -1312,5 +1317,6 @@ void ClearRtText()
     g_rtTextActive.clear();
     g_rtTextStaging.clear();
     LeaveCriticalSection(&g_rtTextLock);
+    InterlockedExchange(&g_rtTextPublished, 0);
 }
 } // namespace netplay::debug_overlay
