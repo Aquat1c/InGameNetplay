@@ -3977,6 +3977,11 @@ bool RequestStopHostingConfirmIfHosting(
         return false;
     }
     g_stopHostingConfirm.active = true;
+    g_stopHostingConfirm.waitingForInputRelease = true;
+    g_stopHostingConfirm.confirmDown[0] = 0;
+    g_stopHostingConfirm.confirmDown[1] = 0;
+    g_stopHostingConfirm.cancelDown[0] = 0;
+    g_stopHostingConfirm.cancelDown[1] = 0;
     g_stopHostingConfirm.selection = 1; // default: Keep hosting
     g_stopHostingConfirm.pendingAction = action;
     g_stopHostingConfirm.pendingLogicalSelection = logicalSelection;
@@ -5380,12 +5385,25 @@ char UpdateNetplayMenu(uint32_t screenContext)
     {
         bool cancel = ConsumeNetplayEscapeEdge();
         bool confirm = false;
+        bool anyModalControlDown = false;
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
             auto* const latch = reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1 + playerIndex);
             const int8_t horizontal = static_cast<int8_t>(inputBytes[playerIndex + 12]);
             const int8_t vertical = static_cast<int8_t>(inputBytes[playerIndex + 14]);
-            if (horizontal != 0 || vertical != 0)
+            const bool axisDown = horizontal != 0 || vertical != 0;
+            const bool confirmDown = inputBytes[playerIndex + 16] != 0;
+            const bool cancelDown = inputBytes[playerIndex + 18] != 0;
+            anyModalControlDown |= axisDown || confirmDown || cancelDown;
+
+            if (g_stopHostingConfirm.waitingForInputRelease)
+            {
+                // Consume the button/axis state that opened the modal. Keeping
+                // the game's axis latch in sync prevents a held direction from
+                // becoming a fresh menu press on the next frame.
+                *latch = axisDown ? 1u : 0u;
+            }
+            else if (axisDown)
             {
                 if (*latch == 0)
                 {
@@ -5398,14 +5416,32 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 *latch = 0;
             }
-            if (inputBytes[playerIndex + 16] == 1) // A = confirm
+
+            if (!g_stopHostingConfirm.waitingForInputRelease
+                && confirmDown
+                && g_stopHostingConfirm.confirmDown[playerIndex] == 0)
             {
                 confirm = true;
             }
-            if (inputBytes[playerIndex + 18] == 1) // B = cancel
+            if (!g_stopHostingConfirm.waitingForInputRelease
+                && cancelDown
+                && g_stopHostingConfirm.cancelDown[playerIndex] == 0)
             {
                 cancel = true;
             }
+            g_stopHostingConfirm.confirmDown[playerIndex] = confirmDown ? 1u : 0u;
+            g_stopHostingConfirm.cancelDown[playerIndex] = cancelDown ? 1u : 0u;
+        }
+
+        if (g_stopHostingConfirm.waitingForInputRelease && !cancel)
+        {
+            if (!anyModalControlDown)
+            {
+                g_stopHostingConfirm.waitingForInputRelease = false;
+                mod::Log("StopHostingConfirm: input released; modal press edges armed");
+            }
+            ++(*inactivityCounter);
+            return 0;
         }
 
         if (cancel)
@@ -5438,8 +5474,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
         }
 
-        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
-        *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
         ++(*inactivityCounter);
         return 0;
     }

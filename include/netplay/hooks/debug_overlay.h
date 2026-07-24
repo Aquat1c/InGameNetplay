@@ -53,6 +53,9 @@ enum class RtTextProfile : uint8_t
     BattleLogHeader,  // battle log panel titles
     BattleLogRow,     // battle log dense rows
     MenuSection,      // small inline section headers between menu rows
+    OverlayTitle,     // HOSTING / JOINING / modal titles
+    OverlayBody,      // modal status, address, error, and option text
+    OverlayHint,      // modal controls and secondary hints
     Count,
 };
 

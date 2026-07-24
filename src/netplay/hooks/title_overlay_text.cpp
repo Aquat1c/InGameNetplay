@@ -801,6 +801,77 @@ bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc)
     return netplay::render::DrawRuntimeTextOverlayGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);
 }
 
+namespace
+{
+constexpr uint32_t kRtOverlayTitle = 0xFFF5F5DCu;
+constexpr uint32_t kRtOverlayText = 0xFFD0D0B4u;
+constexpr uint32_t kRtOverlayBright = 0xFFFFFFFFu;
+constexpr uint32_t kRtOverlayDim = 0xFFC6C6B0u;
+constexpr uint32_t kRtOverlayError = 0xFF8282FFu;
+constexpr uint32_t kRtOverlayRed = 0xFF5050FFu;
+constexpr uint32_t kRtOverlayGreen = 0xFF82FF64u;
+constexpr uint32_t kRtOverlayYellow = 0xFF64DCFFu;
+
+// Transient panels keep their indexed background/frame, but submit their text
+// to the existing game-RT TTF queue. The 5x7 call remains the bootstrap and
+// failure fallback until ImGui has a loaded font atlas.
+void DrawTransientTextCentered(
+    const netplay::font::IndexedSurfaceView& surface,
+    const char* text,
+    int x0,
+    int x1,
+    int y,
+    netplay::debug_overlay::RtTextProfile profile,
+    uint8_t fallbackColor,
+    uint32_t rgba)
+{
+    if (text == nullptr || text[0] == '\0')
+    {
+        return;
+    }
+
+    if (netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        netplay::debug_overlay::RtTextItem item;
+        item.x0 = static_cast<int16_t>(x0);
+        item.x1 = static_cast<int16_t>(x1);
+        item.y = static_cast<int16_t>(y);
+        item.align = netplay::debug_overlay::RtTextAlign::Center;
+        item.profile = profile;
+        item.rgba = rgba;
+        const size_t bytes = (std::min)(std::strlen(text), sizeof(item.text) - 1);
+        std::memcpy(item.text, text, bytes);
+        item.text[bytes] = '\0';
+        netplay::debug_overlay::SubmitRtText(item);
+        if (netplay::debug_overlay::IsRtTextAvailable())
+        {
+            return;
+        }
+    }
+
+    netplay::font::DrawTextCentered5x7(
+        surface,
+        text,
+        x0,
+        x1,
+        y,
+        1,
+        1,
+        fallbackColor);
+}
+
+// TTF items are rendered together at EndScene, after all indexed panel fills.
+// A secondary modal must therefore discard text staged by the covered menu or
+// connection panel; otherwise that older text appears on top of the modal.
+void BeginTopModalTextLayer()
+{
+    if (netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        netplay::debug_overlay::BeginRtTextFrame();
+    }
+}
+} // namespace
+
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 {
     static bool s_loggedForCurrentOverlay = false;
@@ -853,7 +924,10 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const int cL = delayPanelX + 6;
     const int cR = delayPanelX + delayPanelW - 6;
 
-    netplay::font::DrawTextCentered5x7(sv, "MATCH DELAY", cL, cR, delayPanelY + 8, 1, 1, titleColor);
+    DrawTransientTextCentered(
+        sv, "MATCH DELAY", cL, cR, delayPanelY + 8,
+        netplay::debug_overlay::RtTextProfile::OverlayTitle,
+        titleColor, kRtOverlayTitle);
 
     char line[192] = {};
     if (g_delaySetupOverlay.pingMs >= 0)
@@ -864,33 +938,55 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     {
         std::snprintf(line, sizeof(line), "Ping: measuring...");
     }
-    netplay::font::DrawTextCentered5x7(sv, line, cL, cR, delayPanelY + 26, 1, 1, textColor);
+    DrawTransientTextCentered(
+        sv, line, cL, cR, delayPanelY + 26,
+        netplay::debug_overlay::RtTextProfile::OverlayBody,
+        textColor, kRtOverlayText);
 
     std::snprintf(line, sizeof(line), "Delay: %d   (recommended %d)",
         g_delaySetupOverlay.selectedDelay, g_delaySetupOverlay.recommendedDelay);
-    netplay::font::DrawTextCentered5x7(sv, line, cL, cR, delayPanelY + 42, 1, 1, brightColor);
+    DrawTransientTextCentered(
+        sv, line, cL, cR, delayPanelY + 42,
+        netplay::debug_overlay::RtTextProfile::OverlayBody,
+        brightColor, kRtOverlayBright);
 
     std::snprintf(line, sizeof(line), "Range: %d to %d",
         g_delaySetupOverlay.minDelay, g_delaySetupOverlay.maxDelay);
-    netplay::font::DrawTextCentered5x7(sv, line, cL, cR, delayPanelY + 56, 1, 1, dimColor);
+    DrawTransientTextCentered(
+        sv, line, cL, cR, delayPanelY + 56,
+        netplay::debug_overlay::RtTextProfile::OverlayHint,
+        dimColor, kRtOverlayDim);
 
     // Status line: waiting / error / player names.
     if (g_delaySetupOverlay.waitingForRuntimeReady)
     {
-        netplay::font::DrawTextCentered5x7(sv, "Delay submitted. Waiting for sync...", cL, cR, delayPanelY + 72, 1, 1, textColor);
+        DrawTransientTextCentered(
+            sv, "Delay submitted. Waiting for sync...", cL, cR, delayPanelY + 72,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
     }
     else
     {
         if (g_delaySetupOverlay.errorMessage[0] != '\0')
         {
-            netplay::font::DrawTextCentered5x7(sv, g_delaySetupOverlay.errorMessage, cL, cR, delayPanelY + 70, 1, 1, errorColor);
+            DrawTransientTextCentered(
+                sv, g_delaySetupOverlay.errorMessage, cL, cR, delayPanelY + 70,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                errorColor, kRtOverlayError);
         }
         else if (g_delaySetupOverlay.p1Name[0] != '\0' && g_delaySetupOverlay.p2Name[0] != '\0')
         {
             std::snprintf(line, sizeof(line), "%s vs %s", g_delaySetupOverlay.p1Name, g_delaySetupOverlay.p2Name);
-            netplay::font::DrawTextCentered5x7(sv, line, cL, cR, delayPanelY + 70, 1, 1, textColor);
+            DrawTransientTextCentered(
+                sv, line, cL, cR, delayPanelY + 70,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                textColor, kRtOverlayText);
         }
-        netplay::font::DrawTextCentered5x7(sv, "Left/Right: Adjust    A: Confirm    B: Cancel", cL, cR, delayPanelY + 84, 1, 1, dimColor);
+        DrawTransientTextCentered(
+            sv, "Left/Right: Adjust    A: Confirm    B: Cancel",
+            cL, cR, delayPanelY + 84,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            dimColor, kRtOverlayDim);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
@@ -946,12 +1042,32 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             badge = "OPPONENT FOUND!";
             badgeColor = greenColor;
         }
-        const int badgeW = netplay::font::MeasureText5x7Width(badge, 1) + 12;
+        int badgeTextW = netplay::font::MeasureText5x7Width(badge, 1);
+        if (netplay::mod_settings::IsMenuTtfTextEnabled()
+            && netplay::debug_overlay::IsRtTextAvailable())
+        {
+            const int rtWidth = netplay::debug_overlay::MeasureRtTextWidth(
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                badge);
+            if (rtWidth >= 0)
+            {
+                badgeTextW = rtWidth;
+            }
+        }
+        const int badgeW = badgeTextW + 12;
         const int badgeX = 320 - badgeW - 4;
         const int badgeY = 4;
         netplay::font::FillIndexedSurfaceRect(sv, badgeX, badgeY, badgeW, 13, bgColor);
         netplay::font::DrawIndexedSurfaceFrame(sv, badgeX, badgeY, badgeW, 13, badgeColor);
-        netplay::font::DrawTextCentered5x7(sv, badge, badgeX + 2, badgeX + badgeW - 2, badgeY + 3, 1, 1, badgeColor);
+        DrawTransientTextCentered(
+            sv, badge, badgeX + 2, badgeX + badgeW - 2, badgeY + 3,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            badgeColor,
+            netplay::bridge::async_host::IsTimedOut()
+                ? kRtOverlayYellow
+                : (netplay::bridge::async_host::IsPeerFoundHeld()
+                    ? kRtOverlayGreen
+                    : kRtOverlayText));
         netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
         return true;
     }
@@ -967,33 +1083,50 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const int cR = panelX + panelW - 6;
 
     // Centered title.
-    netplay::font::DrawTextCentered5x7(
+    DrawTransientTextCentered(
         sv,
         g_hostingOverlay.challengeMode ? "CHALLENGING" : "HOSTING",
-        cL, cR, panelY + 8, 1, 1, titleColor);
+        cL, cR, panelY + 8,
+        netplay::debug_overlay::RtTextProfile::OverlayTitle,
+        titleColor, kRtOverlayTitle);
 
     char line[192] = {};
     if (g_hostingOverlay.challengeMode)
     {
         std::snprintf(line, sizeof(line), "vs %s", g_hostingOverlay.targetName);
-        netplay::font::DrawTextCentered5x7(sv, line, cL, cR, panelY + 28, 1, 1, brightColor);
-        netplay::font::DrawTextCentered5x7(sv, "B/ESC: Cancel challenge", cL, cR, panelY + 58, 1, 1, textColor);
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            brightColor, kRtOverlayBright);
+        DrawTransientTextCentered(
+            sv, "B/ESC: Cancel challenge", cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            textColor, kRtOverlayText);
     }
     else if (!g_hostingOverlay.ipFetchDone)
     {
-        netplay::font::DrawTextCentered5x7(sv, "Fetching public IP...", cL, cR, panelY + 28, 1, 1, dimColor);
+        DrawTransientTextCentered(
+            sv, "Fetching public IP...", cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            dimColor, kRtOverlayDim);
     }
     else if (g_hostingOverlay.ipFetchFailed)
     {
         std::snprintf(line, sizeof(line), "Port: %u  (IP detection failed)",
             static_cast<unsigned>(g_hostingOverlay.port));
-        netplay::font::DrawTextCentered5x7(sv, line, cL, cR, panelY + 28, 1, 1, textColor);
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
     }
     else
     {
         std::snprintf(line, sizeof(line), "%s:%u",
             g_hostingOverlay.publicIp, static_cast<unsigned>(g_hostingOverlay.port));
-        netplay::font::DrawTextCentered5x7(sv, line, cL, cR, panelY + 28, 1, 1, brightColor);
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            brightColor, kRtOverlayBright);
     }
 
     if (!g_hostingOverlay.challengeMode)
@@ -1003,26 +1136,41 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             && (GetTickCount() - g_hostingOverlay.copiedFlashTick) < 2000;
         if (showCopiedFlash)
         {
-            netplay::font::DrawTextCentered5x7(sv, "Copied to clipboard!", cL, cR, panelY + 42, 1, 1, greenColor);
+            DrawTransientTextCentered(
+                sv, "Copied to clipboard!", cL, cR, panelY + 42,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                greenColor, kRtOverlayGreen);
         }
         else if (g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
         {
-            netplay::font::DrawTextCentered5x7(sv, "Press C to copy IP address", cL, cR, panelY + 42, 1, 1, dimColor);
+            DrawTransientTextCentered(
+                sv, "Press C to copy IP address", cL, cR, panelY + 42,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                dimColor, kRtOverlayDim);
         }
 
         // Bottom line: state / controls.
         if (netplay::bridge::async_host::IsTimedOut())
         {
-            netplay::font::DrawTextCentered5x7(sv, "OPPONENT TIMED OUT   B/ESC: Cancel", cL, cR, panelY + 58, 1, 1, textColor);
+            DrawTransientTextCentered(
+                sv, "OPPONENT TIMED OUT   B/ESC: Cancel", cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                textColor, kRtOverlayText);
         }
         else if (netplay::bridge::async_host::IsPeerFoundHeld())
         {
             // Accept is automatic once this overlay is on screen - no manual key.
-            netplay::font::DrawTextCentered5x7(sv, "OPPONENT FOUND!", cL, cR, panelY + 58, 1, 1, greenColor);
+            DrawTransientTextCentered(
+                sv, "OPPONENT FOUND!", cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                greenColor, kRtOverlayGreen);
         }
         else
         {
-            netplay::font::DrawTextCentered5x7(sv, "D: Minimize    B/ESC: Cancel", cL, cR, panelY + 58, 1, 1, textColor);
+            DrawTransientTextCentered(
+                sv, "D: Minimize    B/ESC: Cancel", cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                textColor, kRtOverlayText);
         }
     }
 
@@ -1056,6 +1204,8 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
         return false;
     }
 
+    BeginTopModalTextLayer();
+
     const netplay::font::IndexedSurfaceView sv = {
         lockedSurface.pixels, lockedSurface.width, lockedSurface.height, lockedSurface.pitch,
     };
@@ -1077,8 +1227,14 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
 
     const int cL = panelX + 6;
     const int cR = panelX + panelW - 6;
-    netplay::font::DrawTextCentered5x7(sv, "STOP HOSTING?", cL, cR, panelY + 8, 1, 1, titleColor);
-    netplay::font::DrawTextCentered5x7(sv, "End the host session to continue?", cL, cR, panelY + 24, 1, 1, textColor);
+    DrawTransientTextCentered(
+        sv, "STOP HOSTING?", cL, cR, panelY + 8,
+        netplay::debug_overlay::RtTextProfile::OverlayTitle,
+        titleColor, kRtOverlayYellow);
+    DrawTransientTextCentered(
+        sv, "End the host session to continue?", cL, cR, panelY + 24,
+        netplay::debug_overlay::RtTextProfile::OverlayBody,
+        textColor, kRtOverlayText);
 
     const char* labels[2] = {"Stop hosting", "Keep hosting"};
     for (int i = 0; i < 2; ++i)
@@ -1089,10 +1245,18 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
         {
             netplay::font::FillIndexedSurfaceRect(sv, panelX + 30, rowY - 1, panelW - 60, 13, hlColor);
         }
-        netplay::font::DrawTextCentered5x7(
-            sv,
-            std::string(selected ? "> " : "  ") + labels[i],
-            cL, cR, rowY + 2, 1, 1, selected ? brightColor : dimColor);
+        char optionText[48] = {};
+        std::snprintf(
+            optionText,
+            sizeof(optionText),
+            "%s%s",
+            selected ? "> " : "  ",
+            labels[i]);
+        DrawTransientTextCentered(
+            sv, optionText, cL, cR, rowY + 2,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            selected ? brightColor : dimColor,
+            selected ? kRtOverlayBright : kRtOverlayDim);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
@@ -1204,17 +1368,29 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     {
         panelTitle = g_joiningOverlay.waitingForGameBegin ? "WAIT TO SPECTATE" : "SPECTATING";
     }
-    netplay::font::DrawTextCentered5x7(sv, panelTitle, cL, cR, panelY + 8, 1, 1, titleColor);
+    DrawTransientTextCentered(
+        sv, panelTitle, cL, cR, panelY + 8,
+        netplay::debug_overlay::RtTextProfile::OverlayTitle,
+        titleColor, kRtOverlayTitle);
 
     char line[192] = {};
     if (g_joiningOverlay.failed)
     {
-        netplay::font::DrawTextCentered5x7(sv, "Connection failed", cL, cR, panelY + 28, 1, 1, redColor);
+        DrawTransientTextCentered(
+            sv, "Connection failed", cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            redColor, kRtOverlayRed);
         if (g_joiningOverlay.errorText[0] != '\0')
         {
-            netplay::font::DrawTextCentered5x7(sv, g_joiningOverlay.errorText, cL, cR, panelY + 42, 1, 1, textColor);
+            DrawTransientTextCentered(
+                sv, g_joiningOverlay.errorText, cL, cR, panelY + 42,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                textColor, kRtOverlayText);
         }
-        netplay::font::DrawTextCentered5x7(sv, "Press any button to dismiss", cL, cR, panelY + 58, 1, 1, dimColor);
+        DrawTransientTextCentered(
+            sv, "Press any button to dismiss", cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            dimColor, kRtOverlayDim);
     }
     else if (g_joiningOverlay.waitingForGameBegin)
     {
@@ -1226,9 +1402,18 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         {
             std::snprintf(line, sizeof(line), "Host is not in a match yet");
         }
-        netplay::font::DrawTextCentered5x7(sv, line, cL, cR, panelY + 28, 1, 1, textColor);
-        netplay::font::DrawTextCentered5x7(sv, "Waiting for game to begin...", cL, cR, panelY + 42, 1, 1, dimColor);
-        netplay::font::DrawTextCentered5x7(sv, "B/ESC: Cancel", cL, cR, panelY + 58, 1, 1, dimColor);
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
+        DrawTransientTextCentered(
+            sv, "Waiting for game to begin...", cL, cR, panelY + 42,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            dimColor, kRtOverlayDim);
+        DrawTransientTextCentered(
+            sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            dimColor, kRtOverlayDim);
     }
     else
     {
@@ -1241,8 +1426,14 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
                 g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
         }
-        netplay::font::DrawTextCentered5x7(sv, line, cL, cR, panelY + 30, 1, 1, textColor);
-        netplay::font::DrawTextCentered5x7(sv, "B/ESC: Cancel", cL, cR, panelY + 58, 1, 1, dimColor);
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 30,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
+        DrawTransientTextCentered(
+            sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            dimColor, kRtOverlayDim);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
@@ -1263,6 +1454,8 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     {
         return false;
     }
+
+    BeginTopModalTextLayer();
 
     if (!s_loggedForCurrentOverlay)
     {
@@ -1315,31 +1508,49 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
         }
         char optionText[40] = {};
         std::snprintf(optionText, sizeof(optionText), "%s %s", selected ? ">" : " ", label);
-        netplay::font::DrawTextCentered5x7(
+        DrawTransientTextCentered(
             sv,
             optionText,
             specPanelX + 40,
             specPanelX + specPanelW - 40,
             y,
-            1,
-            1,
-            selected ? brightColor : dimColor);
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            selected ? brightColor : dimColor,
+            selected ? kRtOverlayBright : kRtOverlayDim);
     };
 
     if (hostNotYetPlayingPrompt)
     {
-        netplay::font::DrawTextCentered5x7(sv, "HOST NOT PLAYING", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
-        netplay::font::DrawTextCentered5x7(sv, "Host is not in a match yet.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
-        netplay::font::DrawTextCentered5x7(sv, "Choose what to do:", sTextL, sTextR, specPanelY + 38, 1, 1, textColor);
+        DrawTransientTextCentered(
+            sv, "HOST NOT PLAYING", sTextL, sTextR, specPanelY + 6,
+            netplay::debug_overlay::RtTextProfile::OverlayTitle,
+            titleColor, kRtOverlayTitle);
+        DrawTransientTextCentered(
+            sv, "Host is not in a match yet.", sTextL, sTextR, specPanelY + 24,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
+        DrawTransientTextCentered(
+            sv, "Choose what to do:", sTextL, sTextR, specPanelY + 38,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
         drawOption(0, "Join", specPanelY + 56);
         drawOption(1, "Wait", specPanelY + 70);
         drawOption(2, "Cancel", specPanelY + 84);
     }
     else
     {
-        netplay::font::DrawTextCentered5x7(sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6, 1, 1, titleColor);
-        netplay::font::DrawTextCentered5x7(sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24, 1, 1, textColor);
-        netplay::font::DrawTextCentered5x7(sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40, 1, 1, textColor);
+        DrawTransientTextCentered(
+            sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6,
+            netplay::debug_overlay::RtTextProfile::OverlayTitle,
+            titleColor, kRtOverlayTitle);
+        DrawTransientTextCentered(
+            sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
+        DrawTransientTextCentered(
+            sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            textColor, kRtOverlayText);
         drawOption(0, "Yes", specPanelY + 60);
         drawOption(1, "No", specPanelY + 76);
     }
@@ -1347,21 +1558,23 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     // Error message (if any) just above the controls footer.
     if (g_spectateConfirmOverlay.errorMessage[0] != '\0')
     {
-        netplay::font::DrawTextCentered5x7(
+        DrawTransientTextCentered(
             sv,
             g_spectateConfirmOverlay.errorMessage,
             sTextL,
             sTextR,
             specPanelY + specPanelH - 26,
-            1,
-            1,
-            errorColor);
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            errorColor,
+            kRtOverlayError);
     }
 
     // Controls footer.
-    netplay::font::DrawTextCentered5x7(
+    DrawTransientTextCentered(
         sv, "Up/Down: Select    A: Confirm    B: Cancel",
-        sTextL, sTextR, specPanelY + specPanelH - 13, 1, 1, dimColor);
+        sTextL, sTextR, specPanelY + specPanelH - 13,
+        netplay::debug_overlay::RtTextProfile::OverlayHint,
+        dimColor, kRtOverlayDim);
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;

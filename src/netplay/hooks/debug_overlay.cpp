@@ -65,6 +65,9 @@ constexpr RtProfileDefaults kRtProfileDefaultsBase = {
     {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
     {"BattleLogRow",    21.0f,  8.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    26.0f, 20.0f, 0.0f},
+    {"OverlayBody",     21.0f, 14.0f, 0.0f},
+    {"OverlayHint",      23.0f, 18.0f, 0.0f},
 };
 // Tuned in-game 2026-07-08 on Yu Gothic (MenuHeader/MenuRow still base
 // values); the bundled Noto Sans JP shares it as the closest approximation.
@@ -75,6 +78,9 @@ constexpr RtProfileDefaults kRtProfileDefaultsJpGothic = {
     {"BattleLogHeader", 24.0f, 19.0f, 0.0f},
     {"BattleLogRow",    18.0f, 13.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    24.0f, 17.0f, 0.0f},
+    {"OverlayBody",     18.0f, 14.0f, 0.0f},
+    {"OverlayHint",      19.0f, 21.0f, -0.2f},
 };
 // Tuned in-game 2026-07-08 on MS Gothic.
 constexpr RtProfileDefaults kRtProfileDefaultsMsGothic = {
@@ -84,6 +90,9 @@ constexpr RtProfileDefaults kRtProfileDefaultsMsGothic = {
     {"BattleLogHeader", 25.0f, 16.0f, 0.0f},
     {"BattleLogRow",    18.0f, 12.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    26.0f, 16.0f, 0.0f},
+    {"OverlayBody",     18.0f, 14.0f, 0.0f},
+    {"OverlayHint",      18.0f, 18.0f, 0.0f},
 };
 // Tuned in-game 2026-07-09 on Meiryo (its own set now, was sharing base).
 constexpr RtProfileDefaults kRtProfileDefaultsMeiryo = {
@@ -93,6 +102,9 @@ constexpr RtProfileDefaults kRtProfileDefaultsMeiryo = {
     {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
     {"BattleLogRow",    20.0f, 12.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    30.0f, 20.0f, 0.0f},
+    {"OverlayBody",     24.0f, 14.0f, 0.0f},
+    {"OverlayHint",      24.0f, 21.0f, 0.0f},
 };
 // Tuned in-game 2026-07-09 on ITC Bolt (Latin display face; smaller body px).
 constexpr RtProfileDefaults kRtProfileDefaultsItcBolt = {
@@ -102,6 +114,21 @@ constexpr RtProfileDefaults kRtProfileDefaultsItcBolt = {
     {"BattleLogHeader", 24.0f, 18.0f, 0.0f},
     {"BattleLogRow",    16.0f, 11.0f, 0.0f},
     {"MenuSection",     15.0f, 16.0f, 0.0f},
+    {"OverlayTitle",    23.0f, 18.0f, 0.0f},
+    {"OverlayBody",     15.0f, 16.0f, 0.0f},
+    {"OverlayHint",      18.0f, 18.0f, 0.0f},
+};
+// Tuned in-game 2026-07-24 on Arial.
+constexpr RtProfileDefaults kRtProfileDefaultsArial = {
+    {"MenuHeader",      22.0f, 14.0f, 0.0f},
+    {"MenuRow",         15.0f, 14.0f, 0.0f},
+    {"Footer",          22.0f, 17.0f, 0.0f},
+    {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
+    {"BattleLogRow",    21.0f,  8.0f, 0.0f},
+    {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    23.0f, 18.0f, 0.0f},
+    {"OverlayBody",     16.0f, 14.0f, 0.0f},
+    {"OverlayHint",      18.0f, 14.0f, 0.0f},
 };
 
 // Active working set: seeded from the resolved face's defaults whenever the
@@ -113,6 +140,9 @@ RtProfileStyle g_rtProfiles[static_cast<size_t>(RtTextProfile::Count)] = {
     {"BattleLogHeader", 26.0f, 14.0f, 0.0f},
     {"BattleLogRow",    21.0f,  8.0f, 0.0f},
     {"MenuSection",     13.0f, 14.0f, 0.0f},
+    {"OverlayTitle",    26.0f, 20.0f, 0.0f},
+    {"OverlayBody",     21.0f, 14.0f, 0.0f},
+    {"OverlayHint",      23.0f, 18.0f, 0.0f},
 };
 char g_rtAppliedFaceLabel[64] = {};
 ImFont* g_rtProfileFonts[static_cast<size_t>(RtTextProfile::Count)] = {};
@@ -187,6 +217,12 @@ float g_asyncPosX = 0.5f;     // fraction of screen width  (0=left, 1=right)
 float g_asyncPosY = 0.0f;     // fraction of screen height (0=top, 1=bottom)
 float g_asyncFontScale = 0.65f;
 float g_asyncBgAlpha = 0.48f; // tuned live via the backslash debug panel
+
+// Shared position adjustment for the transient netplay panels. Values are in
+// the 320x240 menu-logical coordinate space and apply only to their TTF text;
+// panel geometry and the 5x7 fallback remain unchanged.
+float g_transientTextOffsetX = 0.0f;
+float g_transientTextOffsetY = 0.0f;
 
 // stb_truetype (ImGui's built-in rasterizer) only understands TrueType
 // outlines: plain TTF (version 1.0 / 'true') and TTC collections.  CFF-based
@@ -270,7 +306,7 @@ constexpr RtFontFace kRtFontFaces[] = {
     {"Noto Sans JP",   nullptr,        "NotoSansCJKjp-Regular.ttf",     true,  true,  true,  kRtProfileDefaultsJpGothic},
     {"Noto Sans Mono", nullptr,        "NotoSansMonoCJKjp-Regular.ttf", false, true,  true,  kRtProfileDefaultsBase},
     {"Segoe UI",       "segoeui.ttf",  nullptr,                         false, false, true,  kRtProfileDefaultsBase},
-    {"Arial",          "arial.ttf",    nullptr,                         false, false, true,  kRtProfileDefaultsBase},
+    {"Arial",          "arial.ttf",    nullptr,                         false, false, true,  kRtProfileDefaultsArial},
     {"ITC Bolt",       nullptr,        "ITC Bolt\\ITC Bolt.ttf",        false, false, false, kRtProfileDefaultsItcBolt},
 };
 
@@ -452,7 +488,8 @@ bool ProfileWantsJapanese(size_t profileIndex)
 {
     return profileIndex == static_cast<size_t>(RtTextProfile::MenuRow)
         || profileIndex == static_cast<size_t>(RtTextProfile::Footer)
-        || profileIndex == static_cast<size_t>(RtTextProfile::BattleLogRow);
+        || profileIndex == static_cast<size_t>(RtTextProfile::BattleLogRow)
+        || profileIndex == static_cast<size_t>(RtTextProfile::OverlayBody);
 }
 
 // (Re)bake all fonts into the atlas: the async badge font plus one font per
@@ -669,7 +706,9 @@ void LoadRtFonts()
     }
     g_rtExtendedGlyphs = jpMergedAnywhere;
     mod::Log(
-        "DebugOverlay: fonts baked from %s (face='%s' jpCapable=%d jpMerge=%s, %u sizes, profiles %.0f/%.0f/%.0f/%.0f/%.0f/%.0f px)",
+        "DebugOverlay: fonts baked from %s (face='%s' jpCapable=%d jpMerge=%s, "
+        "%u sizes, menu %.0f/%.0f/%.0f/%.0f/%.0f/%.0f px, "
+        "overlay %.0f/%.0f/%.0f px)",
         path != nullptr ? path : "<embedded resource>",
         faceLabel,
         jpCapablePrimary ? 1 : 0,
@@ -680,7 +719,10 @@ void LoadRtFonts()
         g_rtProfiles[2].fontPx,
         g_rtProfiles[3].fontPx,
         g_rtProfiles[4].fontPx,
-        g_rtProfiles[5].fontPx);
+        g_rtProfiles[5].fontPx,
+        g_rtProfiles[6].fontPx,
+        g_rtProfiles[7].fontPx,
+        g_rtProfiles[8].fontPx);
 }
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -906,8 +948,14 @@ void DrawRtTextItems()
         const RtProfileStyle& style = RtStyleFor(item.profile);
         const float fontPx = style.fontPx;
         const ImVec2 textSize = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, item.text);
-        const float rtX0 = static_cast<float>(item.x0) * 2.0f;
-        const float rtX1 = static_cast<float>(item.x1) * 2.0f;
+        const bool transientOverlay =
+            item.profile == RtTextProfile::OverlayTitle
+            || item.profile == RtTextProfile::OverlayBody
+            || item.profile == RtTextProfile::OverlayHint;
+        const float offsetX = transientOverlay ? g_transientTextOffsetX * 2.0f : 0.0f;
+        const float offsetY = transientOverlay ? g_transientTextOffsetY * 2.0f : 0.0f;
+        const float rtX0 = static_cast<float>(item.x0) * 2.0f + offsetX;
+        const float rtX1 = static_cast<float>(item.x1) * 2.0f + offsetX;
         float x = rtX0;
         if (item.align == RtTextAlign::Center)
         {
@@ -925,7 +973,8 @@ void DrawRtTextItems()
         // TTF line height on the profile's cell so rows keep their rhythm.
         const float y = static_cast<float>(item.y) * 2.0f
             + (style.cellRtPx - textSize.y) * 0.5f
-            + style.yBiasRtPx;
+            + style.yBiasRtPx
+            + offsetY;
         const bool clip = item.clipX1 > item.clipX0;
         if (clip)
         {
@@ -961,6 +1010,10 @@ void LogRtProfileValues(const char* reason)
             style.cellRtPx,
             style.yBiasRtPx);
     }
+    mod::Log(
+        "DebugOverlay: transient modal text offset logical=(%.1f, %.1f)",
+        g_transientTextOffsetX,
+        g_transientTextOffsetY);
 }
 
 void DrawDebugPanel()
@@ -1009,6 +1062,26 @@ void DrawDebugPanel()
             ah::IsTimedOut() ? 1 : 0);
 
         ImGui::SeparatorText("RT text profiles");
+        ImGui::SliderFloat(
+            "Modal text X (logical)",
+            &g_transientTextOffsetX,
+            -80.0f,
+            80.0f,
+            "%.1f");
+        ImGui::SliderFloat(
+            "Modal text Y (logical)",
+            &g_transientTextOffsetY,
+            -60.0f,
+            60.0f,
+            "%.1f");
+        if (ImGui::Button("Reset modal text position"))
+        {
+            g_transientTextOffsetX = 0.0f;
+            g_transientTextOffsetY = 0.0f;
+        }
+        ImGui::TextDisabled(
+            "OverlayTitle/Body/Hint below control modal text scale.\n"
+            "Position applies live in the 320x240 logical space.");
         bool fontPxChanged = false;
         for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
         {

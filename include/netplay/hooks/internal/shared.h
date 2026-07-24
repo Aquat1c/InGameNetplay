@@ -233,6 +233,13 @@ extern DebugOverlayState g_debugOverlay;
 struct StopHostingConfirmState
 {
     bool active = false;
+    // The A press that opened the modal must be released before the modal
+    // accepts navigation/confirmation. Per-player button state then provides
+    // true press edges instead of treating a held value as a new press every
+    // frame.
+    bool waitingForInputRelease = true;
+    uint8_t confirmDown[2] = {};
+    uint8_t cancelDown[2] = {};
     int  selection = 1;  // 0 = Stop hosting (Yes), 1 = Keep hosting (No, default)
     netplay::menu::NetplayMenuAction pendingAction = netplay::menu::NetplayMenuAction::BackToMain;
     int  pendingLogicalSelection = 0;
