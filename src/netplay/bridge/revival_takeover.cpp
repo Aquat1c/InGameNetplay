@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/console_handoff_policy.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
@@ -165,7 +166,6 @@ volatile LONG g_injectedTerminateUnknownPidHits = 0;
 volatile LONG g_injectedDelayPromptSerial = 0;
 volatile LONG g_injectedDelayPromptServedSerial = 0;
 volatile LONG g_injectedConnectedFromDelayPromptSerial = 0;
-DWORD g_injectedDelayPromptWaitStartTick = 0;
 volatile LONG g_injectedSpectateConfirmPromptSerial = 0;
 volatile LONG g_injectedSpectateConfirmPromptServedSerial = 0;
 DWORD g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -189,6 +189,8 @@ DWORD g_lastSessionPointerMismatchTick = 0;
 DWORD g_lastRuntimeReadyProbeLogTick = 0;
 uint32_t g_lastRuntimeReadyProbeMask = 0;
 bool g_lastRuntimeReadyProbeMaskValid = false;
+static LONG g_lastNativeDelayTimeoutTraceSerial = 0;
+static DWORD g_lastNativeDelayTimeoutTraceTick = 0;
 DWORD g_lastSpectateConsoleSnapshotTick = 0;
 bool g_localInitAppliedForSession = false;
 bool g_spectatorPostInitAttemptedForSession = false;
@@ -3345,7 +3347,6 @@ void ShutdownHost()
     InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
-    g_injectedDelayPromptWaitStartTick = 0;
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
@@ -3385,7 +3386,6 @@ void EmergencyShutdownHost()
     InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
-    g_injectedDelayPromptWaitStartTick = 0;
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
     g_lastValidatedSessionPtr = 0;
@@ -3749,6 +3749,8 @@ bool StartSession(
             role == NetbridgeRole::Host
                 ? static_cast<LONG>(port)
                 : 0;
+        g_hostBlock->isHostSession =
+            role == NetbridgeRole::Host ? 1 : 0;
         LogRevival102jDeepStep("StartSession.05.shared_block_reset", ioStatus);
     }
 
@@ -3819,6 +3821,8 @@ bool StartSession(
     g_lastRuntimeReadyProbeLogTick = 0;
     g_lastRuntimeReadyProbeMask = 0;
     g_lastRuntimeReadyProbeMaskValid = false;
+    g_lastNativeDelayTimeoutTraceSerial = 0;
+    g_lastNativeDelayTimeoutTraceTick = 0;
     if (outConnectStartTick != nullptr)
     {
         *outConnectStartTick = GetTickCount();
@@ -4066,7 +4070,6 @@ bool StartSession(
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
-    g_injectedDelayPromptWaitStartTick = 0;
     InterlockedExchange(&g_injectedSpectateConfirmPromptSerial, 0);
     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, 0);
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -4092,20 +4095,12 @@ bool StartSession(
     InterlockedIncrement(&g_hostBlock->initSerial);
     LogRevival102jDeepSnapshot("StartSession.13.ipc_payload_initialized", ioStatus);
 
-    std::string primaryInput;
-    std::string auxInput;
-    int menuChoice = 0;
-    if (role == NetbridgeRole::Host)
+    const console_handoff::InitialConsoleInputPlan consoleInputPlan =
+        console_handoff::BuildInitialConsoleInputPlan(role);
+    std::string primaryInput = consoleInputPlan.primaryInput;
+    int menuChoice = consoleInputPlan.menuChoice;
+    if (role == NetbridgeRole::Join)
     {
-        menuChoice = 1;
-        primaryInput = "1\r\n";
-        auxInput = "\r\n";
-    }
-    else if (role == NetbridgeRole::Join)
-    {
-        menuChoice = 3;
-        primaryInput = "3\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
             network::NetworkEndpoint endpoint = {};
@@ -4143,9 +4138,6 @@ bool StartSession(
         // - "Host not yet playing, join as a player?"   -> show Join/Wait/Cancel
         //   in the in-game overlay and let the host-side UI decide whether to
         //   keep waiting, restart as a normal Join, or cancel cleanly.
-        menuChoice = 3;
-        primaryInput = "3\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
             network::NetworkEndpoint endpoint = {};
@@ -4177,9 +4169,6 @@ bool StartSession(
     }
     else if (role == NetbridgeRole::Spectate)
     {
-        menuChoice = 4;
-        primaryInput = "4\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
             network::NetworkEndpoint endpoint = {};
@@ -4218,12 +4207,15 @@ bool StartSession(
 
     CopyString(g_hostBlock->consoleInput, sizeof(g_hostBlock->consoleInput), primaryInput.c_str());
     InterlockedIncrement(&g_hostBlock->consoleSerial);
-    g_hostBlock->consoleInputAux[0] = '\0';
+    CopyString(
+        g_hostBlock->consoleInputAux,
+        sizeof(g_hostBlock->consoleInputAux),
+        consoleInputPlan.auxiliaryInput);
     LONG auxSerialForSession = 0;
-    if (!auxInput.empty())
+    if (g_hostBlock->consoleInputAux[0] != '\0')
     {
-        CopyString(g_hostBlock->consoleInputAux, sizeof(g_hostBlock->consoleInputAux), auxInput.c_str());
-        auxSerialForSession = InterlockedIncrement(&g_hostBlock->consoleAuxSerial);
+        auxSerialForSession =
+            InterlockedIncrement(&g_hostBlock->consoleAuxSerial);
     }
 
     ResetEvent(g_hostInitEvent);
@@ -4408,6 +4400,28 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
             value,
             static_cast<long>(delayPromptSerial),
             static_cast<long>(inputSerial));
+        MOD_LIFECYCLE_TRACE(
+            "CONSOLE_DELAY_INPUT_QUEUE promptSerial=%ld promptServed=%ld "
+            "inputSerial=%ld inputServed=%ld value=%d controlWake=%ld/%ld",
+            static_cast<long>(delayPromptSerial),
+            static_cast<long>(delayPromptServedSerial),
+            static_cast<long>(inputSerial),
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->delayInputServedSerial,
+                    0,
+                    0)),
+            value,
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeRequestSerial,
+                    0,
+                    0)),
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeServedSerial,
+                    0,
+                    0)));
         RefreshRuntimeStatus(ioStatus);
         if (ioStatus != nullptr)
         {
@@ -4642,7 +4656,98 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         return;
     }
 
-    if (!ProcessAlive(ioStatus))
+    const bool helperAlive = ProcessAlive(ioStatus);
+    if (g_hostBlock != nullptr
+        && g_hostBlock->magic == kIpcMagic
+        && g_hostBlock->version == kIpcVersion
+        && g_hostBlock->hostPid != 0)
+    {
+        const LONG nativeTimeoutSerial =
+            InterlockedCompareExchange(
+                &g_hostBlock->nativeDelayTimeoutSerial,
+                0,
+                0);
+        const LONG nativeTimeoutHandled =
+            InterlockedCompareExchange(
+                &g_hostBlock->nativeDelayTimeoutHandledSerial,
+                0,
+                0);
+        if (nativeTimeoutSerial > 0
+            && nativeTimeoutSerial > nativeTimeoutHandled)
+        {
+            const LONG requiredControlWakeSerial =
+                InterlockedCompareExchange(
+                    &g_hostBlock->nativeDelayTimeoutRequiredWakeSerial,
+                    0,
+                    0);
+            const LONG controlWakeRequest =
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeRequestSerial,
+                    0,
+                    0);
+            const LONG controlWakeServed =
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeServedSerial,
+                    0,
+                    0);
+            const bool cleanupReady =
+                console_handoff::IsNativeTimeoutCleanupReady(
+                    helperAlive,
+                    controlWakeServed,
+                    requiredControlWakeSerial);
+            const DWORD now = GetTickCount();
+            if (nativeTimeoutSerial
+                    != g_lastNativeDelayTimeoutTraceSerial
+                || g_lastNativeDelayTimeoutTraceTick == 0
+                || now - g_lastNativeDelayTimeoutTraceTick >= 1000)
+            {
+                g_lastNativeDelayTimeoutTraceSerial =
+                    nativeTimeoutSerial;
+                g_lastNativeDelayTimeoutTraceTick = now;
+                MOD_LIFECYCLE_TRACE(
+                    "NATIVE_DELAY_TIMEOUT_GATE serial=%ld handled=%ld "
+                    "helperAlive=%d controlWake=%ld/%ld required=%ld "
+                    "cleanupReady=%d",
+                    static_cast<long>(nativeTimeoutSerial),
+                    static_cast<long>(nativeTimeoutHandled),
+                    helperAlive ? 1 : 0,
+                    static_cast<long>(controlWakeRequest),
+                    static_cast<long>(controlWakeServed),
+                    static_cast<long>(requiredControlWakeSerial),
+                    cleanupReady ? 1 : 0);
+            }
+
+            if (!cleanupReady)
+            {
+                RefreshRuntimeStatus(ioStatus);
+                return;
+            }
+
+            MOD_LIFECYCLE_TRACE(
+                "NATIVE_DELAY_TIMEOUT_RELEASE serial=%ld evidence=%s "
+                "controlWake=%ld/%ld required=%ld",
+                static_cast<long>(nativeTimeoutSerial),
+                helperAlive ? "bel_served" : "helper_exit",
+                static_cast<long>(controlWakeRequest),
+                static_cast<long>(controlWakeServed),
+                static_cast<long>(requiredControlWakeSerial));
+            mod::Log(
+                "Takeover: native held-delay timeout cleanup complete "
+                "serial=%ld evidence=%s wake=%ld/%ld required=%ld",
+                static_cast<long>(nativeTimeoutSerial),
+                helperAlive ? "BEL served" : "helper exited",
+                static_cast<long>(controlWakeRequest),
+                static_cast<long>(controlWakeServed),
+                static_cast<long>(requiredControlWakeSerial));
+            PublishConsoleError("Opponent timed out.");
+            InterlockedExchange(
+                &g_hostBlock->nativeDelayTimeoutHandledSerial,
+                nativeTimeoutSerial);
+            RefreshRuntimeStatus(ioStatus);
+        }
+    }
+
+    if (!helperAlive)
     {
         RestoreTemporaryHostProtocolOverride(
             "Revival netplay session helper ended before listener acknowledgement");
@@ -5727,7 +5832,6 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
-    g_injectedDelayPromptWaitStartTick = 0;
     InterlockedExchange(&g_injectedSpectateConfirmPromptSerial, 0);
     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, 0);
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -5743,6 +5847,25 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_hostBlock->delayMetricsSerial, 0);
         InterlockedExchange(&g_hostBlock->delayInputSerial, 0);
         InterlockedExchange(&g_hostBlock->delayInputServedSerial, 0);
+        InterlockedExchange(&g_hostBlock->isHostSession, 0);
+        InterlockedExchange(
+            &g_hostBlock->consoleControlWakeRequestSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->consoleControlWakeServedSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->delayPromptTransitionWakeSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutRequiredWakeSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutHandledSerial,
+            0);
         g_hostBlock->delayInputValue = -1;
         g_hostBlock->delayAveragePingMs = -1;
         g_hostBlock->delayMinPingMs = -1;

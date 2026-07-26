@@ -1,6 +1,7 @@
 // IAT stub implementations and extern "C" nb_stub_* wrappers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/console_handoff_policy.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "crash_handler.h"
 
@@ -1560,12 +1561,36 @@ BOOL StubCreateProcessA(
         }();
         const std::string screenPreviewBeforeFlush = DescribeBlockedChildConsoleScreenText();
         const std::string pendingPreviewBeforeFlush = DescribeBlockedChildPendingConsoleText();
+        const bool remoteTimeoutEvidence =
+            ContainsCaseInsensitive(
+                pendingErrorTextBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                screenPreviewBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                pendingPreviewBeforeFlush,
+                "Remote timed out");
+        bool heldDelayTimeout =
+            remoteTimeoutEvidence
+            && TryPublishHeldHostDelayTimeout();
         FlushPendingConsoleOutput("before_CreateProcessA_system");
         LONG errorSerialAfter = PeekPublishedConsoleErrorSerial();
         const bool looksLikePause = LooksLikePauseChildLaunchA(lpApplicationName, lpCommandLine);
+        if (!heldDelayTimeout && HasPendingHeldHostDelayTimeout())
+        {
+            heldDelayTimeout = true;
+        }
         if (errorSerialAfter <= errorSerialBefore)
         {
-            if (!pendingErrorTextBeforeFlush.empty())
+            if (heldDelayTimeout)
+            {
+                MOD_LIFECYCLE_TRACE(
+                    "NATIVE_DELAY_TIMEOUT_CHILD_BLOCKED errorSerial=%ld "
+                    "cleanup=pending",
+                    static_cast<long>(errorSerialAfter));
+            }
+            else if (!pendingErrorTextBeforeFlush.empty())
             {
                 PublishConsoleError(pendingErrorTextBeforeFlush.c_str());
             }
@@ -1580,10 +1605,14 @@ BOOL StubCreateProcessA(
         }
 
         mod::Log(
-            "nb_stub_CreateProcessA: blocked helper child process app='%s' cmd='%s' pause=%d consoleErrorBefore=%ld consoleErrorAfter=%ld pendingError='%s' screenPreview='%s' pendingPreview=%s",
+            "nb_stub_CreateProcessA: blocked helper child process app='%s' cmd='%s' "
+            "pause=%d heldDelayTimeout=%d consoleErrorBefore=%ld "
+            "consoleErrorAfter=%ld pendingError='%s' screenPreview='%s' "
+            "pendingPreview=%s",
             lpApplicationName != nullptr ? lpApplicationName : "",
             lpCommandLine != nullptr ? lpCommandLine : "",
             looksLikePause ? 1 : 0,
+            heldDelayTimeout ? 1 : 0,
             static_cast<long>(errorSerialBefore),
             static_cast<long>(errorSerialAfter),
             pendingErrorTextBeforeFlush.c_str(),
@@ -2128,10 +2157,177 @@ HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProce
     return OpenProcess(requestedAccess, bInheritHandle, dwProcessId);
 }
 
+static volatile LONG g_consoleReadGeneration = 0;
+
+BOOL StubWriteConsoleInputA(
+    HANDLE hConsoleInput,
+    const INPUT_RECORD* lpBuffer,
+    DWORD nLength,
+    LPDWORD lpNumberOfEventsWritten)
+{
+    INPUT_RECORD record = {};
+    const bool recordReadable =
+        lpBuffer != nullptr
+        && nLength == 1
+        && IsReadableRange(lpBuffer, sizeof(record));
+    if (recordReadable)
+    {
+        std::memcpy(&record, lpBuffer, sizeof(record));
+    }
+
+    const bool exactControlWake =
+        recordReadable
+        && console_handoff::IsExactBelControlWake(record, nLength);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_WRITE shape=%s count=%lu eventType=%u "
+        "keyDown=%ld repeat=%u vk=0x%04X scan=0x%04X ascii=0x%02X "
+        "control=0x%08lX",
+        exactControlWake ? "exact" : "passthrough",
+        static_cast<unsigned long>(nLength),
+        recordReadable ? static_cast<unsigned>(record.EventType) : 0u,
+        recordReadable
+            ? static_cast<long>(record.Event.KeyEvent.bKeyDown)
+            : 0l,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wRepeatCount)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualKeyCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualScanCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(
+                static_cast<unsigned char>(
+                    record.Event.KeyEvent.uChar.AsciiChar))
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned long>(
+                record.Event.KeyEvent.dwControlKeyState)
+            : 0ul);
+
+    const bool eventsWrittenWritable =
+        lpNumberOfEventsWritten != nullptr
+        && IsWritableRange(
+            lpNumberOfEventsWritten,
+            sizeof(*lpNumberOfEventsWritten));
+    if (exactControlWake && eventsWrittenWritable)
+    {
+        if (!HasInjectedContext())
+        {
+            (void)EnsureInjectedContextFast();
+        }
+
+        auto relay = [&](SharedBlock* block, HANDLE consoleEvent, const char* sourceTag) -> bool
+        {
+            if (block == nullptr
+                || block->magic != kIpcMagic
+                || block->version != kIpcVersion
+                || block->hostPid == 0
+                || InterlockedCompareExchange(
+                    &block->isHostSession,
+                    0,
+                    0) == 0)
+            {
+                return false;
+            }
+
+            const LONG requestSerial =
+                InterlockedIncrement(
+                    &block->consoleControlWakeRequestSerial);
+            SetLastError(ERROR_SUCCESS);
+            const BOOL signalResult =
+                consoleEvent != nullptr ? SetEvent(consoleEvent) : FALSE;
+            const DWORD signalError =
+                signalResult != FALSE
+                    ? ERROR_SUCCESS
+                    : (consoleEvent != nullptr
+                        ? GetLastError()
+                        : ERROR_NOT_READY);
+            *lpNumberOfEventsWritten = 1;
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_REQUEST serial=%ld source=%s "
+                "signalAttempted=%d signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                consoleEvent != nullptr ? 1 : 0,
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            mod::Log(
+                "Takeover: native console control wake requested serial=%ld "
+                "source=%s signal=%d err=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_RESULT serial=%ld result=1 written=1 "
+                "signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        };
+
+        if (HasInjectedContext()
+            && relay(
+                g_injectedBlock,
+                g_injectedConsoleEvent,
+                "injected"))
+        {
+            return TRUE;
+        }
+
+        TempIpcContext temp = {};
+        const bool relayed =
+            OpenTempIpcContext(&temp, false, true)
+            && relay(temp.block, temp.consoleEvent, "fallback");
+        CloseTempIpcContext(&temp);
+        if (relayed)
+        {
+            return TRUE;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const BOOL nativeResult = WriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
+    const DWORD nativeError =
+        nativeResult != FALSE ? ERROR_SUCCESS : GetLastError();
+    const DWORD nativeWritten =
+        lpNumberOfEventsWritten != nullptr && eventsWrittenWritable
+            ? *lpNumberOfEventsWritten
+            : 0;
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_NATIVE_RESULT exact=%d result=%d written=%lu "
+        "error=%lu",
+        exactControlWake ? 1 : 0,
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeWritten),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
+    return nativeResult;
+}
+
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
 {
     (void)hConsoleInput;
     (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=A generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
     FlushPendingConsoleOutput("before_ReadConsoleA");
 
     auto copyInputOut = [&](const char* input) -> BOOL {
@@ -2199,6 +2395,8 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             return FALSE;
         }
 
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
         for (;;)
         {
             const LONG serial = block->consoleSerial;
@@ -2206,7 +2404,102 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             if (serial > 0 && serial != servedSerial)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=A generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
                 return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=A "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=A generation=%ld "
+                            "serial=%ld bytes=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
@@ -2348,7 +2641,11 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (delayInputSerial > delayInputServedSerial)
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
                     {
                         const int delayValue = block->delayInputValue;
                         char delayLine[16] = {};
@@ -2356,44 +2653,85 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
                         InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
                         InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                        g_injectedDelayPromptWaitStartTick = 0;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=A generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
                         return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
                     }
 
-                    const DWORD nowTick = GetTickCount();
-                    if (g_injectedDelayPromptWaitStartTick == 0)
+                    if (!delayWaitLogged)
                     {
-                        g_injectedDelayPromptWaitStartTick = nowTick;
-                        mod::Log(
-                            "Takeover: delay prompt waiting for overlay selection promptSerial=%ld",
-                            static_cast<long>(promptSerial));
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=A generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
                     }
-                    if (nowTick - g_injectedDelayPromptWaitStartTick < kPromptDelayInputWaitTimeoutMs)
+                    if (consoleEvent != nullptr)
                     {
-                        if (consoleEvent != nullptr)
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
                         {
-                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
-                            if (wait == WAIT_FAILED)
-                            {
-                                break;
-                            }
+                            break;
                         }
-                        else
-                        {
-                            Sleep(10);
-                        }
-                        continue;
                     }
-
-                    InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
-                    InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                    g_injectedDelayPromptWaitStartTick = 0;
-                    mod::Log(
-                        "Takeover: delay prompt timed out; falling back to default promptSerial=%ld",
-                        static_cast<long>(promptSerial));
-                    return serveScriptedInput(block, "\r\n", sourceTag, "prompt_delay_default", promptSerial, true);
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
                 }
-                return FALSE;
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=A generation=%ld "
+                        "state=host_native_wait control=%ld/%ld "
+                        "prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeRequestSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
             }
 
             if (consoleEvent != nullptr)
@@ -2437,11 +2775,21 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
     const DWORD nativeError = GetLastError();
     const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
     mod::Log(
-        "nb_stub_ReadConsoleA: passthrough (ready=%d result=%d read=%lu err=%lu)",
+        "nb_stub_ReadConsoleA: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
         HasInjectedContext() ? 1 : 0,
         nativeResult ? 1 : 0,
         static_cast<unsigned long>(nativeRead),
         static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=A generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
     return nativeResult;
 }
 
@@ -2449,6 +2797,16 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 {
     (void)hConsoleInput;
     (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=W generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
     FlushPendingConsoleOutput("before_ReadConsoleW");
 
     auto copyInputOut = [&](const char* input) -> BOOL {
@@ -2529,6 +2887,8 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             return FALSE;
         }
 
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
         for (;;)
         {
             const LONG serial = block->consoleSerial;
@@ -2536,7 +2896,102 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             if (serial > 0 && serial != servedSerial)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=W generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
                 return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=W "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=W generation=%ld "
+                            "serial=%ld chars=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld api=W",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
@@ -2662,7 +3117,11 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (delayInputSerial > delayInputServedSerial)
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
                     {
                         const int delayValue = block->delayInputValue;
                         char delayLine[16] = {};
@@ -2670,44 +3129,74 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
                         InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
                         InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                        g_injectedDelayPromptWaitStartTick = 0;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=W generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
                         return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
                     }
 
-                    const DWORD nowTick = GetTickCount();
-                    if (g_injectedDelayPromptWaitStartTick == 0)
+                    if (!delayWaitLogged)
                     {
-                        g_injectedDelayPromptWaitStartTick = nowTick;
-                        mod::Log(
-                            "Takeover: delay prompt waiting for overlay selection promptSerial=%ld",
-                            static_cast<long>(promptSerial));
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=W generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
                     }
-                    if (nowTick - g_injectedDelayPromptWaitStartTick < kPromptDelayInputWaitTimeoutMs)
+                    if (consoleEvent != nullptr)
                     {
-                        if (consoleEvent != nullptr)
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
                         {
-                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
-                            if (wait == WAIT_FAILED)
-                            {
-                                break;
-                            }
+                            break;
                         }
-                        else
-                        {
-                            Sleep(10);
-                        }
-                        continue;
                     }
-
-                    InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
-                    InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                    g_injectedDelayPromptWaitStartTick = 0;
-                    mod::Log(
-                        "Takeover: delay prompt timed out; falling back to default promptSerial=%ld",
-                        static_cast<long>(promptSerial));
-                    return serveScriptedInput(block, "\r\n", sourceTag, "prompt_delay_default", promptSerial, true);
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
                 }
-                return FALSE;
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=W generation=%ld "
+                        "state=host_native_wait prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
             }
 
             if (consoleEvent != nullptr)
@@ -2751,11 +3240,21 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
     const DWORD nativeError = GetLastError();
     const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
     mod::Log(
-        "nb_stub_ReadConsoleW: passthrough (ready=%d result=%d read=%lu err=%lu)",
+        "nb_stub_ReadConsoleW: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
         HasInjectedContext() ? 1 : 0,
         nativeResult ? 1 : 0,
         static_cast<unsigned long>(nativeRead),
         static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=W generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
     return nativeResult;
 }
 
@@ -3092,6 +3591,15 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE hConsol
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
 {
     return netplay::bridge::takeover::StubReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten)
+{
+    return netplay::bridge::takeover::StubWriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)

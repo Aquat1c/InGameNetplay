@@ -573,7 +573,9 @@ void ResetNativeWorkflowFlags()
     g_delayMetricsAccumulator.clear();
 }
 
-void NoteConsolePromptLine(const std::string& text)
+void NoteConsolePromptLine(
+    const std::string& text,
+    LONG controlWakeRequestSerialSnapshot)
 {
     if (text.empty())
     {
@@ -710,6 +712,16 @@ void NoteConsolePromptLine(const std::string& text)
     {
         if (ContainsCaseInsensitive(text, mapping.needle))
         {
+            if (std::strcmp(mapping.needle, "Remote timed out") == 0
+                && TryPublishHeldHostDelayTimeout(
+                    controlWakeRequestSerialSnapshot))
+            {
+                mod::Log(
+                    "Takeover: native held-delay timeout observed; "
+                    "deferring console error until reader cleanup text='%s'",
+                    text.c_str());
+                return;
+            }
             mod::Log("Takeover: console error detected='%s' text='%s'", mapping.needle, text.c_str());
             PublishConsoleError(mapping.friendly);
             return;
@@ -816,8 +828,9 @@ void NoteConsolePromptLine(const std::string& text)
     }
 
     const LONG serial = InterlockedIncrement(&g_injectedDelayPromptSerial);
-    PublishDelayPromptSerial(serial);
-    g_injectedDelayPromptWaitStartTick = GetTickCount();
+    PublishDelayPromptSerial(
+        serial,
+        controlWakeRequestSerialSnapshot);
     // Parse the accumulated buffer (includes preceding "Average Ping:" etc.
     // lines) rather than just the prompt line itself.
     bool hasMetrics = false;
@@ -984,10 +997,42 @@ bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
 
 static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line);
 static bool EnqueueConsoleParseChunk(
-    const char* sourceTag, const void* data, size_t bytes, bool wide);
+    const char* sourceTag,
+    const void* data,
+    size_t bytes,
+    bool wide,
+    LONG controlWakeRequestSerialSnapshot);
 static bool EnqueueConsoleParseFlush();
 static void ProcessConsoleTextChunk(
-    const char* sourceTag, const char* text, size_t length);
+    const char* sourceTag,
+    const char* text,
+    size_t length,
+    LONG controlWakeRequestSerialSnapshot);
+
+static LONG CaptureControlWakeRequestSerialSnapshot()
+{
+    auto capture = [](SharedBlock* block) -> LONG
+    {
+        if (block == nullptr
+            || block->magic != kIpcMagic
+            || block->version != kIpcVersion
+            || block->hostPid == 0)
+        {
+            return -1;
+        }
+        return InterlockedCompareExchange(
+            &block->consoleControlWakeRequestSerial,
+            0,
+            0);
+    };
+
+    const LONG injected = capture(g_injectedBlock);
+    if (injected >= 0)
+    {
+        return injected;
+    }
+    return capture(g_hostBlock);
+}
 
 // Public seam for every console/log write interception. Revival calls the
 // intercepted write APIs from its SIMULATION (rollback) thread, and the parse
@@ -1014,12 +1059,23 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     {
         return;
     }
+    const LONG controlWakeRequestSerialSnapshot =
+        CaptureControlWakeRequestSerialSnapshot();
     if (netplay::mod_settings::IsDeferredConsoleParseEnabled()
-        && EnqueueConsoleParseChunk(sourceTag, text, length, /*wide=*/false))
+        && EnqueueConsoleParseChunk(
+            sourceTag,
+            text,
+            length,
+            /*wide=*/false,
+            controlWakeRequestSerialSnapshot))
     {
         return;
     }
-    ProcessConsoleTextChunk(sourceTag, text, length);
+    ProcessConsoleTextChunk(
+        sourceTag,
+        text,
+        length,
+        controlWakeRequestSerialSnapshot);
 }
 
 // Wide-text variant: the UTF-16 -> UTF-8 conversion also moves to the worker
@@ -1065,23 +1121,34 @@ static void LogConsoleWideTextChunk(
     {
         return;
     }
+    const LONG controlWakeRequestSerialSnapshot =
+        CaptureControlWakeRequestSerialSnapshot();
     if (netplay::mod_settings::IsDeferredConsoleParseEnabled()
         && EnqueueConsoleParseChunk(
                sourceTag,
                wideText,
                static_cast<size_t>(wideLen) * sizeof(wchar_t),
-               /*wide=*/true))
+               /*wide=*/true,
+               controlWakeRequestSerialSnapshot))
     {
         return;
     }
     const std::string utf8 = ConvertConsoleWideToUtf8(wideText, wideLen);
     if (!utf8.empty() && IsLikelyTextChunk(utf8.c_str(), utf8.size()))
     {
-        ProcessConsoleTextChunk(sourceTag, utf8.c_str(), utf8.size());
+        ProcessConsoleTextChunk(
+            sourceTag,
+            utf8.c_str(),
+            utf8.size(),
+            controlWakeRequestSerialSnapshot);
     }
 }
 
-static void ProcessConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
+static void ProcessConsoleTextChunk(
+    const char* sourceTag,
+    const char* text,
+    size_t length,
+    LONG controlWakeRequestSerialSnapshot)
 {
     if (sourceTag == nullptr)
     {
@@ -1131,7 +1198,9 @@ static void ProcessConsoleTextChunk(const char* sourceTag, const char* text, siz
         // peer died diagnostics)
         // but don't echo Revival's debug text into the mod log - Revival
         // already writes to its own log files.
-        NoteConsolePromptLine(trimmed);
+        NoteConsolePromptLine(
+            trimmed,
+            controlWakeRequestSerialSnapshot);
     };
 
     for (size_t i = 0; i < length; ++i)
@@ -1230,7 +1299,7 @@ static void FlushPendingConsoleOutputLocked()
         }
 
         // Parse workflow signals but don't echo Revival debug text.
-        NoteConsolePromptLine(trimmed);
+        NoteConsolePromptLine(trimmed, -1);
     };
 
     flushOne("WriteFile", &g_consolePendingWriteFile);
@@ -1301,6 +1370,9 @@ struct OwnedLogEfzEntry
     std::string sourceTag;
     std::string line; // Line: mirror text; ParseChunk: raw payload bytes
     bool wide = false; // ParseChunk payload is UTF-16 needing conversion
+    // Snapshot at the intercepted native write. Deferred parsing may execute
+    // after a later WCI transition; preserving this value keeps causal order.
+    LONG controlWakeRequestSerialSnapshot = -1;
     SYSTEMTIME timestamp = {};
     unsigned long long sequence = 0;
 };
@@ -1778,13 +1850,19 @@ static void ManagedLogEfzWorkerMain()
                 if (!utf8.empty() && IsLikelyTextChunk(utf8.c_str(), utf8.size()))
                 {
                     ProcessConsoleTextChunk(
-                        entry.sourceTag.c_str(), utf8.c_str(), utf8.size());
+                        entry.sourceTag.c_str(),
+                        utf8.c_str(),
+                        utf8.size(),
+                        entry.controlWakeRequestSerialSnapshot);
                 }
             }
             else
             {
                 ProcessConsoleTextChunk(
-                    entry.sourceTag.c_str(), entry.line.data(), entry.line.size());
+                    entry.sourceTag.c_str(),
+                    entry.line.data(),
+                    entry.line.size(),
+                    entry.controlWakeRequestSerialSnapshot);
             }
         }
         else if (entry.kind == OwnedLogEfzEntry::Kind::ParseFlush)
@@ -1890,7 +1968,11 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
 // not started / stopping / teardown / queue overflow) so prompt and error
 // detection never silently drops.
 static bool EnqueueConsoleParseChunk(
-    const char* sourceTag, const void* data, size_t bytes, bool wide)
+    const char* sourceTag,
+    const void* data,
+    size_t bytes,
+    bool wide,
+    LONG controlWakeRequestSerialSnapshot)
 {
     if (data == nullptr || bytes == 0)
     {
@@ -1907,6 +1989,8 @@ static bool EnqueueConsoleParseChunk(
     entry.sourceTag = sourceTag != nullptr ? sourceTag : "unknown";
     entry.line.assign(static_cast<const char*>(data), bytes);
     entry.wide = wide;
+    entry.controlWakeRequestSerialSnapshot =
+        controlWakeRequestSerialSnapshot;
 
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);

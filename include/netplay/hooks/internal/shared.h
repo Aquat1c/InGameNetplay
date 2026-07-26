@@ -149,6 +149,8 @@ struct HostingOverlayState
     uint32_t alternateParseFailures = 0;
     bool copiedToClipboard = false;
     DWORD copiedFlashTick = 0;     // GetTickCount() when copy happened (for brief visual feedback)
+    bool familyFallbackNoticeStarted = false;
+    DWORD familyFallbackNoticeStartTick = 0;
     DWORD listenerWaitStartTick = 0;
     uint32_t listenerMismatchSerial = 0;
     uint16_t listenerMismatchPort = 0;

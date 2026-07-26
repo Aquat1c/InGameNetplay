@@ -1129,24 +1129,17 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     char line[192] = {};
     if (g_hostingOverlay.discoveryInProgress)
     {
-        std::snprintf(
-            line,
-            sizeof(line),
-            "Detecting public %s address...",
-            netplay::network::FamilyName(
-                g_hostingOverlay.effectiveFamily));
-        DrawTransientTextCentered(
-            sv, line, cL, cR, panelY + 28,
-            netplay::debug_overlay::RtTextProfile::OverlayBody,
-            dimColor, kRtOverlayDim);
-        DrawTransientTextCentered(
-            sv,
-            g_hostingOverlay.challengeMode
-                ? "B/ESC: Cancel challenge"
-                : "B/ESC: Cancel hosting",
-            cL, cR, panelY + 58,
-            netplay::debug_overlay::RtTextProfile::OverlayHint,
-            textColor, kRtOverlayText);
+        // Public-address discovery is an implementation detail. Keep it out
+        // of the user-facing panel; the common footer below still provides
+        // the direct-host cancel control exactly once.
+        if (g_hostingOverlay.challengeMode)
+        {
+            DrawTransientTextCentered(
+                sv, "B/ESC: Cancel challenge",
+                cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                textColor, kRtOverlayText);
+        }
     }
     else if (g_hostingOverlay.challengeMode)
     {
@@ -1234,6 +1227,14 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         // Middle line: copy hint or "copied" flash.
         const bool showCopiedFlash = g_hostingOverlay.copiedToClipboard
             && (GetTickCount() - g_hostingOverlay.copiedFlashTick) < 2000;
+        constexpr DWORD kFamilyFallbackNoticeDurationMs = 3000u;
+        const bool showFamilyFallbackNotice =
+            g_hostingOverlay.listenerReady
+            && g_hostingOverlay.usedFamilyFallback
+            && g_hostingOverlay.familyFallbackNoticeStarted
+            && (GetTickCount()
+                - g_hostingOverlay.familyFallbackNoticeStartTick)
+                < kFamilyFallbackNoticeDurationMs;
         if (showCopiedFlash)
         {
             DrawTransientTextCentered(
@@ -1241,8 +1242,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 greenColor, kRtOverlayGreen);
         }
-        else if (g_hostingOverlay.listenerReady
-            && g_hostingOverlay.usedFamilyFallback)
+        else if (showFamilyFallbackNotice)
         {
             if (g_hostingOverlay
                     .automaticFamilyRetryAttempted)
@@ -1259,7 +1259,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 std::snprintf(
                     line,
                     sizeof(line),
-                    "%s address not detected; using %s",
+                    "%s address not detected, using %s",
                     netplay::network::FamilyName(
                         g_hostingOverlay.preferredFamily),
                     netplay::network::FamilyName(

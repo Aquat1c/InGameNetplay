@@ -3383,6 +3383,13 @@ static void PumpHostListenerObservation()
         }
     }
 
+    if (g_hostingOverlay.usedFamilyFallback
+        && !g_hostingOverlay.familyFallbackNoticeStarted)
+    {
+        g_hostingOverlay.familyFallbackNoticeStarted = true;
+        g_hostingOverlay.familyFallbackNoticeStartTick =
+            GetTickCount();
+    }
     g_hostingOverlay.listenerReady = true;
     g_hostingOverlay.familyRetryAllowed = false;
     g_hostingOverlay.port = observation.port;

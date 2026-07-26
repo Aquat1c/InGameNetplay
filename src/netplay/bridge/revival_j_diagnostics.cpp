@@ -287,6 +287,18 @@ void LogSharedBlockState(const char* context)
         static_cast<long>(block->delayInputServedSerial),
         block->delayInputValue);
     mod::Log(
+        "J102_DIAG[%s]: IPC consoleHandoff host=%ld wake=%ld/%ld "
+        "promptTransition=%ld nativeTimeout=%ld/%ld requiredWake=%ld",
+        ctx,
+        static_cast<long>(block->isHostSession),
+        static_cast<long>(block->consoleControlWakeRequestSerial),
+        static_cast<long>(block->consoleControlWakeServedSerial),
+        static_cast<long>(block->delayPromptTransitionWakeSerial),
+        static_cast<long>(block->nativeDelayTimeoutSerial),
+        static_cast<long>(block->nativeDelayTimeoutHandledSerial),
+        static_cast<long>(
+            block->nativeDelayTimeoutRequiredWakeSerial));
+    mod::Log(
         "J102_DIAG[%s]: IPC spectate prompt=%ld/%ld kind=%d input=%ld/%ld value=%d "
         "hits read=%ld auto=%ld createProcess=%ld writeProcess=%ld remoteThread=%ld",
         ctx,

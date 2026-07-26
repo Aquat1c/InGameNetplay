@@ -2,6 +2,7 @@
 
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/bridge/batch_stabilizer.h"
+#include "netplay/bridge/console_handoff_policy.h"
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -871,13 +872,15 @@ void ClearDelayPromptState(const char* reason)
         InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     const LONG oldConnected =
         InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
-    g_injectedDelayPromptWaitStartTick = 0;
 
     LONG oldSharedPrompt = 0;
     LONG oldSharedServed = 0;
     LONG oldMetricsSerial = 0;
     LONG oldInputSerial = 0;
     LONG oldInputServed = 0;
+    LONG oldTransitionWake = 0;
+    LONG oldNativeTimeout = 0;
+    LONG oldNativeTimeoutHandled = 0;
     if (g_hostBlock != nullptr)
     {
         oldSharedPrompt = InterlockedExchange(&g_hostBlock->delayPromptSerial, 0);
@@ -885,6 +888,17 @@ void ClearDelayPromptState(const char* reason)
         oldMetricsSerial = InterlockedExchange(&g_hostBlock->delayMetricsSerial, 0);
         oldInputSerial = InterlockedExchange(&g_hostBlock->delayInputSerial, 0);
         oldInputServed = InterlockedExchange(&g_hostBlock->delayInputServedSerial, 0);
+        oldTransitionWake =
+            InterlockedExchange(
+                &g_hostBlock->delayPromptTransitionWakeSerial,
+                0);
+        oldNativeTimeout =
+            InterlockedExchange(&g_hostBlock->nativeDelayTimeoutSerial, 0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutRequiredWakeSerial,
+            0);
+        oldNativeTimeoutHandled =
+            InterlockedExchange(&g_hostBlock->nativeDelayTimeoutHandledSerial, 0);
         g_hostBlock->delayInputValue = -1;
         g_hostBlock->delayAveragePingMs = -1;
         g_hostBlock->delayMinPingMs = -1;
@@ -898,7 +912,8 @@ void ClearDelayPromptState(const char* reason)
 
     mod::Log(
         "DelayPromptState: cleared reason=%s oldPrompt=%ld oldServed=%ld oldConnected=%ld "
-        "oldSharedPrompt=%ld oldSharedServed=%ld oldMetrics=%ld oldInput=%ld/%ld",
+        "oldSharedPrompt=%ld oldSharedServed=%ld oldMetrics=%ld oldInput=%ld/%ld "
+        "oldTransitionWake=%ld oldNativeTimeout=%ld/%ld",
         reason != nullptr ? reason : "",
         static_cast<long>(oldPrompt),
         static_cast<long>(oldServed),
@@ -907,36 +922,210 @@ void ClearDelayPromptState(const char* reason)
         static_cast<long>(oldSharedServed),
         static_cast<long>(oldMetricsSerial),
         static_cast<long>(oldInputSerial),
-        static_cast<long>(oldInputServed));
+        static_cast<long>(oldInputServed),
+        static_cast<long>(oldTransitionWake),
+        static_cast<long>(oldNativeTimeout),
+        static_cast<long>(oldNativeTimeoutHandled));
 }
 
-void PublishDelayPromptSerial(LONG serial)
+void PublishDelayPromptSerial(
+    LONG serial,
+    LONG controlWakeRequestSerialSnapshot)
 {
     if (serial <= 0)
     {
         return;
     }
 
-    if (g_injectedBlock != nullptr)
+    auto publish = [&](SharedBlock* block)
     {
-        const LONG current = InterlockedCompareExchange(&g_injectedBlock->delayPromptSerial, 0, 0);
+        if (block == nullptr
+            || block->magic != kIpcMagic
+            || block->version != kIpcVersion
+            || block->hostPid == 0)
+        {
+            return;
+        }
+
+        const LONG current =
+            InterlockedCompareExchange(&block->delayPromptSerial, 0, 0);
         if (serial > current)
         {
-            InterlockedExchange(&g_injectedBlock->delayPromptSerial, serial);
+            const LONG currentControlWakeRequest =
+                InterlockedCompareExchange(
+                    &block->consoleControlWakeRequestSerial,
+                    0,
+                    0);
+            const LONG transitionWakeSerial =
+                console_handoff::SelectPromptTransitionWakeSerial(
+                    controlWakeRequestSerialSnapshot,
+                    currentControlWakeRequest);
+            InterlockedExchange(
+                &block->delayPromptTransitionWakeSerial,
+                transitionWakeSerial);
+            InterlockedExchange(&block->delayPromptSerial, serial);
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_DELAY_PROMPT_PUBLISH serial=%ld "
+                "writeWakeSnapshot=%ld currentWakeRequest=%ld "
+                "transitionWake=%ld",
+                static_cast<long>(serial),
+                static_cast<long>(controlWakeRequestSerialSnapshot),
+                static_cast<long>(currentControlWakeRequest),
+                static_cast<long>(transitionWakeSerial));
         }
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        publish(g_injectedBlock);
         return;
     }
 
     TempIpcContext temp = {};
     if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
     {
-        const LONG current = InterlockedCompareExchange(&temp.block->delayPromptSerial, 0, 0);
-        if (serial > current)
-        {
-            InterlockedExchange(&temp.block->delayPromptSerial, serial);
-        }
+        publish(temp.block);
     }
     CloseTempIpcContext(&temp);
+}
+
+bool TryPublishHeldHostDelayTimeout(
+    LONG controlWakeRequestSerialSnapshot)
+{
+    auto publish = [controlWakeRequestSerialSnapshot](
+                       SharedBlock* block) -> bool
+    {
+        if (block == nullptr
+            || block->magic != kIpcMagic
+            || block->version != kIpcVersion
+            || block->hostPid == 0
+            || InterlockedCompareExchange(&block->isHostSession, 0, 0) == 0)
+        {
+            return false;
+        }
+
+        const LONG promptSerial =
+            InterlockedCompareExchange(&block->delayPromptSerial, 0, 0);
+        const LONG promptServedSerial =
+            InterlockedCompareExchange(&block->delayPromptServedSerial, 0, 0);
+        const LONG inputSerial =
+            InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
+        const LONG inputServedSerial =
+            InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
+        if (!console_handoff::IsHeldHostDelayReader(
+                true,
+                promptSerial,
+                promptServedSerial,
+                inputSerial,
+                inputServedSerial))
+        {
+            return false;
+        }
+
+        const LONG published =
+            InterlockedCompareExchange(&block->nativeDelayTimeoutSerial, 0, 0);
+        if (published < promptSerial)
+        {
+            const LONG transitionWakeSerial =
+                InterlockedCompareExchange(
+                    &block->delayPromptTransitionWakeSerial,
+                    0,
+                    0);
+            const LONG currentWakeRequest =
+                InterlockedCompareExchange(
+                    &block->consoleControlWakeRequestSerial,
+                    0,
+                    0);
+            const LONG currentWakeServed =
+                InterlockedCompareExchange(
+                    &block->consoleControlWakeServedSerial,
+                    0,
+                    0);
+
+            // A delayed/screen-derived parse can run after the timeout WCI.
+            // The preserved raw-write snapshot is authoritative when present;
+            // otherwise the first current request after the prompt transition
+            // is the best available causal wake.
+            const LONG requiredWakeSerial =
+                console_handoff::SelectTimeoutRequiredWakeSerial(
+                    controlWakeRequestSerialSnapshot,
+                    transitionWakeSerial,
+                    currentWakeRequest);
+
+            InterlockedExchange(
+                &block->nativeDelayTimeoutRequiredWakeSerial,
+                requiredWakeSerial);
+            InterlockedExchange(
+                &block->nativeDelayTimeoutSerial,
+                promptSerial);
+            MOD_LIFECYCLE_TRACE(
+                "NATIVE_DELAY_TIMEOUT_PUBLISH promptSerial=%ld "
+                "promptServed=%ld input=%ld/%ld writeWakeSnapshot=%ld "
+                "transitionWake=%ld requiredWake=%ld currentWake=%ld/%ld",
+                static_cast<long>(promptSerial),
+                static_cast<long>(promptServedSerial),
+                static_cast<long>(inputSerial),
+                static_cast<long>(inputServedSerial),
+                static_cast<long>(controlWakeRequestSerialSnapshot),
+                static_cast<long>(transitionWakeSerial),
+                static_cast<long>(requiredWakeSerial),
+                static_cast<long>(currentWakeRequest),
+                static_cast<long>(currentWakeServed));
+        }
+        return true;
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        return publish(g_injectedBlock);
+    }
+    if (g_hostBlock != nullptr)
+    {
+        return publish(g_hostBlock);
+    }
+
+    TempIpcContext temp = {};
+    const bool held =
+        OpenTempIpcContext(&temp, false, false)
+        && publish(temp.block);
+    CloseTempIpcContext(&temp);
+    return held;
+}
+
+bool HasPendingHeldHostDelayTimeout()
+{
+    auto pending = [](SharedBlock* block) -> bool
+    {
+        if (block == nullptr
+            || block->magic != kIpcMagic
+            || block->version != kIpcVersion
+            || block->hostPid == 0)
+        {
+            return false;
+        }
+
+        const LONG serial =
+            InterlockedCompareExchange(&block->nativeDelayTimeoutSerial, 0, 0);
+        const LONG handled =
+            InterlockedCompareExchange(&block->nativeDelayTimeoutHandledSerial, 0, 0);
+        return serial > 0 && serial > handled;
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        return pending(g_injectedBlock);
+    }
+    if (g_hostBlock != nullptr)
+    {
+        return pending(g_hostBlock);
+    }
+
+    TempIpcContext temp = {};
+    const bool result =
+        OpenTempIpcContext(&temp, false, false)
+        && pending(temp.block);
+    CloseTempIpcContext(&temp);
+    return result;
 }
 
 void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind)
@@ -1691,12 +1880,6 @@ RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status)
 {
     RuntimeReadyProbe probe = {};
     probe.nativeSyncReady = IsSyncReadyForVsHuman(status);
-    if (probe.nativeSyncReady)
-    {
-        probe.ready = true;
-        probe.source = "native_sync";
-        return probe;
-    }
 
     probe.localInitApplied = g_localInitAppliedForSession;
     if (!probe.localInitApplied)
@@ -1705,8 +1888,7 @@ RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status)
     }
 
     LONG promptSerial = 0;
-    LONG promptServedSerial = 0;
-    ReadDelayPromptSignal(&promptSerial, &promptServedSerial);
+    ReadDelayPromptSignal(&promptSerial, nullptr);
     probe.delayPromptSeen = promptSerial > 0;
     if (!probe.delayPromptSeen)
     {
@@ -1722,10 +1904,18 @@ RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status)
     }
 
     probe.delayInputApplied =
-        (inputSerial > 0 && inputServedSerial >= inputSerial)
-        || (inputSerial <= 0 && promptServedSerial >= promptSerial);
+        console_handoff::IsExplicitDelayInputServed(
+            inputSerial,
+            inputServedSerial);
     if (!probe.delayInputApplied)
     {
+        return probe;
+    }
+
+    if (probe.nativeSyncReady)
+    {
+        probe.ready = true;
+        probe.source = "native_sync_after_explicit_delay";
         return probe;
     }
 
@@ -2779,7 +2969,6 @@ void InitializeInjected()
     g_injectedConsoleAuxScriptOffset = 0;
     g_injectedAutoConsoleFallbackCount = 0;
     g_injectedConsoleOutputHits = 0;
-    g_injectedDelayPromptWaitStartTick = 0;
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
     g_fakeProcessThreadHandle = nullptr;
     g_initCapturedFromWrite = false;
@@ -2861,7 +3050,6 @@ void ShutdownInjected()
     g_injectedConsoleAuxScriptOffset = 0;
     g_injectedAutoConsoleFallbackCount = 0;
     g_injectedConsoleOutputHits = 0;
-    g_injectedDelayPromptWaitStartTick = 0;
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
     g_fakeProcessThreadHandle = nullptr;
     g_initCapturedFromWrite = false;

@@ -212,4 +212,34 @@ if(BUILD_TESTING AND WIN32)
     endif()
 
     add_test(NAME network_endpoint_tests COMMAND network_endpoint_tests)
+
+    add_executable(console_handoff_contract_tests EXCLUDE_FROM_ALL
+        tests/console_handoff_contract_tests.cpp)
+    target_include_directories(console_handoff_contract_tests PRIVATE include)
+    target_compile_features(console_handoff_contract_tests PRIVATE cxx_std_17)
+    target_compile_definitions(console_handoff_contract_tests PRIVATE NOMINMAX)
+
+    if(MSVC)
+        if(EFZ_XP_COMPAT)
+            target_compile_options(console_handoff_contract_tests PRIVATE
+                /W4 /EHsc)
+            target_compile_definitions(console_handoff_contract_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(console_handoff_contract_tests PRIVATE
+                /Zc:threadSafeInit-)
+        else()
+            target_compile_options(console_handoff_contract_tests PRIVATE
+                /W4 /permissive- /EHsc)
+        endif()
+
+        if(EFZ_STATIC_RUNTIME)
+            set_property(TARGET console_handoff_contract_tests PROPERTY
+                MSVC_RUNTIME_LIBRARY
+                "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endif()
+
+    add_test(
+        NAME console_handoff_contract_tests
+        COMMAND console_handoff_contract_tests)
 endif()

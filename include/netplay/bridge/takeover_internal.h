@@ -22,13 +22,12 @@ namespace netplay::bridge::takeover
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kIpcMagic = 0x4E425247;
-constexpr uint32_t kIpcVersion = 4;
+constexpr uint32_t kIpcVersion = 5;
 constexpr char kSharedBlockName[] = "EFZNetbridge_Shared";
 constexpr char kInitReadyEventName[] = "EFZNetbridge_InitReady";
 constexpr char kConsoleReadyEventName[] = "EFZNetbridge_ConsoleReady";
 constexpr DWORD kStartTimeoutMs = 15000;
 constexpr DWORD kLatePatchRetryLogIntervalMs = 3000;
-constexpr DWORD kPromptDelayInputWaitTimeoutMs = 30000;
 constexpr DWORD kPromptSpectateConfirmWaitTimeoutMs = 30000;
 
 // Version-specific Revival addresses and offsets live in
@@ -117,6 +116,19 @@ struct SharedBlock
     volatile LONG hostListenerPort = 0;
     volatile LONG hostListenerProcessId = 0;
     volatile LONG hostExpectedListenerPort = 0;
+    volatile LONG isHostSession = 0;
+    // Native Host reader cancellation. EfzRevival writes one exact
+    // VK_RETURN/BEL INPUT_RECORD before joining the outgoing console reader.
+    volatile LONG consoleControlWakeRequestSerial = 0;
+    volatile LONG consoleControlWakeServedSerial = 0;
+    // The exact BEL generation that replaces the generic Host reader with the
+    // real delay reader. The prompt text is written before that replacement.
+    volatile LONG delayPromptTransitionWakeSerial = 0;
+    volatile LONG nativeDelayTimeoutSerial = 0;
+    // The timeout transition's exact BEL generation. Recovery cannot publish
+    // until this generation has actually been returned by ReadConsole.
+    volatile LONG nativeDelayTimeoutRequiredWakeSerial = 0;
+    volatile LONG nativeDelayTimeoutHandledSerial = 0;
 };
 #pragma pack(pop)
 
@@ -212,7 +224,6 @@ extern volatile LONG g_injectedTerminateUnknownPidHits;
 extern volatile LONG g_injectedDelayPromptSerial;
 extern volatile LONG g_injectedDelayPromptServedSerial;
 extern volatile LONG g_injectedConnectedFromDelayPromptSerial;
-extern DWORD g_injectedDelayPromptWaitStartTick;
 extern volatile LONG g_injectedSpectateConfirmPromptSerial;
 extern volatile LONG g_injectedSpectateConfirmPromptServedSerial;
 extern DWORD g_injectedSpectateConfirmPromptWaitStartTick;
@@ -302,7 +313,9 @@ void BeginManagedLogEfzWrite();
 void EndManagedLogEfzWrite();
 bool IsManagedLogEfzWriteActive();
 void ResetNativeWorkflowFlags();
-void NoteConsolePromptLine(const std::string& text);
+void NoteConsolePromptLine(
+    const std::string& text,
+    LONG controlWakeRequestSerialSnapshot = -1);
 std::string* SelectPendingConsoleLine(const char* sourceTag);
 bool IsLikelyRevivalDiskLogPath(const std::string& path);
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length);
@@ -551,11 +564,16 @@ void* EnsureRevivalErrorCodeNullGuardStub();
 bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsoleEvent);
 void CloseTempIpcContext(TempIpcContext* ctx);
 void ClearDelayPromptState(const char* reason);
-void PublishDelayPromptSerial(LONG serial);
+void PublishDelayPromptSerial(
+    LONG serial,
+    LONG controlWakeRequestSerialSnapshot);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
 void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
+bool TryPublishHeldHostDelayTimeout(
+    LONG controlWakeRequestSerialSnapshot = -1);
+bool HasPendingHeldHostDelayTimeout();
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
 void PublishConsoleDesyncWarning(const char* warnText);
 void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize);
@@ -680,6 +698,7 @@ BOOL StubTerminateProcess(HANDLE hProcess, UINT uExitCode);
 HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
 BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
+BOOL StubWriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten);
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved);
 BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved);
