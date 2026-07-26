@@ -8,9 +8,9 @@
 #include "netplay/core/battle_log_menu.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/core/network_capability.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
-#include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
 
@@ -22,10 +22,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -133,6 +136,361 @@ struct PendingLobbySpectateWait
     std::string hostIp;
 };
 PendingLobbySpectateWait g_pendingLobbySpectateWait;
+
+enum class HostDiscoveryOwner : uint8_t
+{
+    Direct = 0,
+    LobbyChallenge,
+};
+
+struct PendingHostDiscovery
+{
+    uint64_t generation = 0;
+    HostDiscoveryOwner owner = HostDiscoveryOwner::Direct;
+    uint16_t port = 0;
+    netplay::network::NetworkFamily originalPreferredFamily =
+        netplay::network::NetworkFamily::IPv4;
+    netplay::network::NetworkFamily discoveryFamily =
+        netplay::network::NetworkFamily::IPv4;
+    bool allowAlternateFamily = true;
+    bool automaticFamilyRetryAttempted = false;
+    std::string nickname;
+    bool writeNicknameToIni = true;
+    int targetPlayerId = 0;
+    std::string targetName;
+    // Immutable copy of a completed prewarmed local-family scan. The public
+    // IP worker may read it, but it never starts or waits for a scan itself.
+    bool capabilitySnapshotAvailable = false;
+    netplay::network::LocalNetworkCapabilitySnapshot capabilitySnapshot;
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> completed{false};
+    netplay::lobby::PublicIpDiscoveryResult result;
+};
+
+struct PendingLobbyChallengePublish
+{
+    bool active = false;
+    int targetPlayerId = 0;
+    std::string targetName;
+    std::string publicAddress;
+    netplay::network::NetworkFamily preferredFamily =
+        netplay::network::NetworkFamily::IPv4;
+    netplay::network::NetworkFamily family =
+        netplay::network::NetworkFamily::IPv4;
+    uint16_t port = 0;
+    bool automaticFamilyRetryAttempted = false;
+};
+
+std::shared_ptr<PendingHostDiscovery> g_pendingHostDiscovery;
+PendingLobbyChallengePublish g_pendingLobbyChallengePublish;
+uint64_t g_directHostDiscoveryGeneration = 0;
+
+// Local family capability is collected independently of Host. The cache is
+// advisory only: a missing/stale result never delays hosting, and Revival's
+// actual listener acknowledgement remains the final authority.
+constexpr DWORD kLocalNetworkCapabilityCacheMaxAgeMs = 30000u;
+
+struct PendingLocalNetworkCapabilityScan
+{
+    std::atomic<bool> completed{false};
+    netplay::network::LocalNetworkCapabilitySnapshot snapshot;
+};
+
+std::shared_ptr<PendingLocalNetworkCapabilityScan>
+    g_pendingLocalNetworkCapabilityScan;
+netplay::network::LocalNetworkCapabilitySnapshot
+    g_cachedLocalNetworkCapability;
+bool g_hasCachedLocalNetworkCapability = false;
+
+struct HostDiscoveryThreadContext
+{
+    std::shared_ptr<PendingHostDiscovery> task;
+    HMODULE moduleReference = nullptr;
+};
+
+DWORD WINAPI HostDiscoveryThreadMain(void* rawContext)
+{
+    auto* context =
+        static_cast<HostDiscoveryThreadContext*>(rawContext);
+    HMODULE moduleReference =
+        context != nullptr ? context->moduleReference : nullptr;
+    std::shared_ptr<PendingHostDiscovery> task;
+    if (context != nullptr)
+    {
+        task = std::move(context->task);
+        delete context;
+    }
+
+    if (task)
+    {
+        try
+        {
+            task->result =
+                netplay::lobby::DiscoverPublicIpSynchronously(
+                    task->discoveryFamily,
+                    &task->cancelled,
+                    task->allowAlternateFamily,
+                    task->capabilitySnapshotAvailable
+                        ? &task->capabilitySnapshot
+                        : nullptr);
+        }
+        catch (...)
+        {
+            task->result = {};
+            task->result.preferredFamily =
+                task->discoveryFamily;
+            task->result.effectiveFamily =
+                task->discoveryFamily;
+            mod::Log(
+                "PUBLIC_IP_DISCOVERY_WORKER_EXCEPTION "
+                "generation=%llu family=%s",
+                static_cast<unsigned long long>(
+                    task->generation),
+                netplay::network::FamilyName(
+                    task->discoveryFamily));
+        }
+        task->completed.store(true, std::memory_order_release);
+        task.reset();
+    }
+
+    // The worker owns a module reference acquired before CreateThread. Release
+    // it atomically with thread exit so normal FreeLibrary cannot unmap this
+    // code (or shut down logging) while discovery is still running.
+    if (moduleReference != nullptr)
+    {
+        FreeLibraryAndExitThread(moduleReference, 0);
+    }
+    return 0;
+}
+
+struct LocalNetworkCapabilityThreadContext
+{
+    std::shared_ptr<PendingLocalNetworkCapabilityScan> task;
+    HMODULE moduleReference = nullptr;
+};
+
+DWORD WINAPI LocalNetworkCapabilityThreadMain(void* rawContext)
+{
+    auto* context =
+        static_cast<LocalNetworkCapabilityThreadContext*>(rawContext);
+    HMODULE moduleReference =
+        context != nullptr ? context->moduleReference : nullptr;
+    std::shared_ptr<PendingLocalNetworkCapabilityScan> task;
+    if (context != nullptr)
+    {
+        task = std::move(context->task);
+        delete context;
+    }
+
+    if (task)
+    {
+        try
+        {
+            task->snapshot =
+                netplay::network::ScanLocalNetworkCapabilities();
+        }
+        catch (...)
+        {
+            task->snapshot = {};
+            task->snapshot.ipv4.family =
+                netplay::network::NetworkFamily::IPv4;
+            task->snapshot.ipv6.family =
+                netplay::network::NetworkFamily::IPv6;
+            task->snapshot.completedTick = GetTickCount();
+            mod::Log(
+                "LOCAL_NETWORK_CAPABILITY_SCAN_EXCEPTION "
+                "action=retain_unknown_capability");
+        }
+        task->completed.store(true, std::memory_order_release);
+        task.reset();
+    }
+
+    // Keep this module mapped until the worker has finished touching its
+    // code and task state. Do not join this worker from menu teardown or
+    // DllMain; a completed result is simply consumed on a later menu entry.
+    if (moduleReference != nullptr)
+    {
+        FreeLibraryAndExitThread(moduleReference, 0);
+    }
+    return 0;
+}
+
+static DWORD LocalNetworkCapabilitySnapshotAgeMs(
+    const netplay::network::LocalNetworkCapabilitySnapshot& snapshot)
+{
+    return GetTickCount() - snapshot.completedTick;
+}
+
+static bool IsCachedLocalNetworkCapabilityFresh()
+{
+    return g_hasCachedLocalNetworkCapability
+        && LocalNetworkCapabilitySnapshotAgeMs(
+               g_cachedLocalNetworkCapability)
+            <= kLocalNetworkCapabilityCacheMaxAgeMs;
+}
+
+static void LogLocalNetworkCapabilitySnapshot(
+    const char* event,
+    const netplay::network::LocalNetworkCapabilitySnapshot& snapshot)
+{
+    const auto LogFamily = [event, &snapshot](
+                               const netplay::network::LocalFamilyCapability&
+                                   capability) {
+        mod::Log(
+            "LOCAL_NETWORK_CAPABILITY_SCAN event=%s family=%s state=%s "
+            "listenerStage=%s listenerError=%d addresses=%u "
+            "strongestScope=%s routeAttempted=%d routeAvailable=%d "
+            "routeUnavailable=%d routeError=%d routeSource=%s ageMs=%lu",
+            event != nullptr ? event : "",
+            netplay::network::FamilyName(capability.family),
+            netplay::network::LocalFamilyCapabilityStateName(
+                capability.state),
+            netplay::network::ProbeStageName(
+                capability.listenerProbe.stage),
+            capability.listenerProbe.nativeError,
+            capability.bindableAddressCount,
+            netplay::network::LocalAddressScopeName(
+                capability.strongestAddressScope),
+            capability.routeProbeAttempted ? 1 : 0,
+            capability.routeAvailable ? 1 : 0,
+            capability.routeDefinitelyUnavailable ? 1 : 0,
+            capability.routeNativeError,
+            netplay::network::LocalAddressScopeName(
+                capability.routeSourceScope),
+            static_cast<unsigned long>(
+                LocalNetworkCapabilitySnapshotAgeMs(snapshot)));
+    };
+    LogFamily(snapshot.ipv4);
+    LogFamily(snapshot.ipv6);
+}
+
+static void PromoteCompletedLocalNetworkCapabilityScan()
+{
+    const std::shared_ptr<PendingLocalNetworkCapabilityScan> task =
+        g_pendingLocalNetworkCapabilityScan;
+    if (!task
+        || !task->completed.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    g_cachedLocalNetworkCapability = task->snapshot;
+    g_hasCachedLocalNetworkCapability = true;
+    if (g_pendingLocalNetworkCapabilityScan == task)
+    {
+        g_pendingLocalNetworkCapabilityScan.reset();
+    }
+    LogLocalNetworkCapabilitySnapshot(
+        "completed", g_cachedLocalNetworkCapability);
+}
+
+static bool TryGetFreshLocalNetworkCapabilitySnapshot(
+    netplay::network::LocalNetworkCapabilitySnapshot* outSnapshot,
+    DWORD* outAgeMs = nullptr)
+{
+    PromoteCompletedLocalNetworkCapabilityScan();
+    if (!g_hasCachedLocalNetworkCapability)
+    {
+        return false;
+    }
+
+    const DWORD ageMs = LocalNetworkCapabilitySnapshotAgeMs(
+        g_cachedLocalNetworkCapability);
+    if (outAgeMs != nullptr)
+    {
+        *outAgeMs = ageMs;
+    }
+    if (ageMs > kLocalNetworkCapabilityCacheMaxAgeMs)
+    {
+        return false;
+    }
+    if (outSnapshot != nullptr)
+    {
+        *outSnapshot = g_cachedLocalNetworkCapability;
+    }
+    return true;
+}
+
+static void EnsureLocalNetworkCapabilityScanScheduled(const char* trigger)
+{
+    PromoteCompletedLocalNetworkCapabilityScan();
+    if (g_pendingLocalNetworkCapabilityScan
+        || IsCachedLocalNetworkCapabilityFresh())
+    {
+        return;
+    }
+
+    std::shared_ptr<PendingLocalNetworkCapabilityScan> task;
+    try
+    {
+        task = std::make_shared<PendingLocalNetworkCapabilityScan>();
+    }
+    catch (...)
+    {
+        mod::Log(
+            "LOCAL_NETWORK_CAPABILITY_SCAN_BEGIN_FAILED trigger=%s "
+            "reason=allocation",
+            trigger != nullptr ? trigger : "");
+        return;
+    }
+
+    HMODULE moduleReference = nullptr;
+    const BOOL retainedModule = GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCSTR>(&LocalNetworkCapabilityThreadMain),
+        &moduleReference);
+    auto* context = retainedModule != FALSE
+        ? new (std::nothrow) LocalNetworkCapabilityThreadContext()
+        : nullptr;
+    if (context == nullptr)
+    {
+        if (moduleReference != nullptr)
+        {
+            FreeLibrary(moduleReference);
+        }
+        mod::Log(
+            "LOCAL_NETWORK_CAPABILITY_SCAN_BEGIN_FAILED trigger=%s "
+            "reason=%s",
+            trigger != nullptr ? trigger : "",
+            retainedModule == FALSE
+                ? "module_reference"
+                : "allocation");
+        return;
+    }
+
+    context->task = task;
+    context->moduleReference = moduleReference;
+    g_pendingLocalNetworkCapabilityScan = task;
+    HANDLE worker = CreateThread(
+        nullptr,
+        0,
+        &LocalNetworkCapabilityThreadMain,
+        context,
+        0,
+        nullptr);
+    if (worker == nullptr)
+    {
+        const DWORD error = GetLastError();
+        delete context;
+        g_pendingLocalNetworkCapabilityScan.reset();
+        FreeLibrary(moduleReference);
+        mod::Log(
+            "LOCAL_NETWORK_CAPABILITY_SCAN_BEGIN_FAILED trigger=%s "
+            "reason=CreateThread error=%lu",
+            trigger != nullptr ? trigger : "",
+            static_cast<unsigned long>(error));
+        return;
+    }
+    CloseHandle(worker);
+    mod::Log(
+        "LOCAL_NETWORK_CAPABILITY_SCAN_BEGIN trigger=%s cacheAgeMs=%lu",
+        trigger != nullptr ? trigger : "",
+        g_hasCachedLocalNetworkCapability
+            ? static_cast<unsigned long>(
+                LocalNetworkCapabilitySnapshotAgeMs(
+                    g_cachedLocalNetworkCapability))
+            : 0ul);
+}
 
 void PlayLobbyChallengeAlert(uint32_t screenContext);
 
@@ -2082,95 +2440,1100 @@ void ResetSpectateConfirmOverlayState()
 } // namespace (close anonymous to expose hosting overlay functions)
 
 // ---------------------------------------------------------------------------
-// Hosting overlay - shows "Hosting on IP:PORT" while waiting for a client.
-// A background thread fetches the public IPv4 from api4.ipify.org.
+// Hosting overlay - discovers a family-matched public address before starting
+// the Revival netplay session. The worker owns only its task result; the menu
+// thread is the sole writer of overlay and bridge state.
 // ---------------------------------------------------------------------------
 void ResetHostingOverlayState()
 {
+    ++g_directHostDiscoveryGeneration;
+    if (g_pendingHostDiscovery)
+    {
+        g_pendingHostDiscovery->cancelled.store(true);
+        g_pendingHostDiscovery.reset();
+    }
+    g_pendingLobbyChallengePublish = {};
     g_hostingOverlay = {};
 }
 
-static bool TryFetchIpFromUrl(const char* url, const char* label)
+static void BeginHostDiscovery(
+    uint16_t port,
+    netplay::network::NetworkFamily originalPreferredFamily,
+    netplay::network::NetworkFamily discoveryFamily,
+    bool allowAlternateFamily,
+    bool automaticFamilyRetryAttempted,
+    const char* nickname,
+    bool writeNicknameToIni,
+    HostDiscoveryOwner owner,
+    int targetPlayerId,
+    const char* targetName)
 {
-    constexpr uint32_t kTimeoutMs = 5000;
-    std::string body;
-    std::string error;
-    // verifyPeer=false: the embedded mbedTLS build has no CA root store,
-    // so certificate verification always fails.  This request only fetches
-    // a plain-text public IP address - no sensitive data.
-    if (!netplay::tls::HttpGet(
-            url,
-            false,
-            kTimeoutMs,
-            kTimeoutMs,
-            &body,
-            &error))
-    {
-        mod::Log("HostingOverlay: %s fetch failed: %s", label, error.c_str());
-        return false;
-    }
+    // Scheduling only creates a worker; it never runs a local socket probe on
+    // the game thread. Host consumes a completed fresh result if one exists,
+    // otherwise it starts its normal global-address discovery immediately.
+    EnsureLocalNetworkCapabilityScanScheduled("host_requested");
+    netplay::network::LocalNetworkCapabilitySnapshot capabilitySnapshot;
+    DWORD capabilitySnapshotAgeMs = 0;
+    const bool capabilitySnapshotAvailable =
+        TryGetFreshLocalNetworkCapabilitySnapshot(
+            &capabilitySnapshot, &capabilitySnapshotAgeMs);
 
-    // Trim whitespace / newlines from the response
-    while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
-    {
-        body.pop_back();
-    }
-    if (!body.empty() && body.size() < sizeof(g_hostingOverlay.publicIp))
-    {
-        std::memcpy(g_hostingOverlay.publicIp, body.c_str(), body.size() + 1);
-        mod::Log("HostingOverlay: %s = %s", label, g_hostingOverlay.publicIp);
-        return true;
-    }
-    mod::Log("HostingOverlay: %s bad response body size=%zu", label, body.size());
-    return false;
-}
-
-static void FetchPublicIpThread()
-{
-    // Try IPv4 first (api4.ipify.org), fall back to IPv6 (api6.ipify.org)
-    // if the ISP doesn't support IPv4.
-    if (TryFetchIpFromUrl("https://api4.ipify.org", "public IPv4"))
-    {
-        g_hostingOverlay.ipFetchFailed = false;
-        g_hostingOverlay.ipFetchDone = true;
-        return;
-    }
-    mod::Log("HostingOverlay: IPv4 unavailable, trying IPv6 fallback...");
-    if (TryFetchIpFromUrl("https://api6.ipify.org", "public IPv6"))
-    {
-        g_hostingOverlay.ipFetchFailed = false;
-        g_hostingOverlay.ipFetchDone = true;
-        return;
-    }
-    g_hostingOverlay.ipFetchFailed = true;
-    g_hostingOverlay.ipFetchDone = true;
-    mod::Log("HostingOverlay: all IP detection methods failed");
-}
-
-void ActivateHostingOverlay(uint16_t port)
-{
     ResetHostingOverlayState();
     g_hostingOverlay.active = true;
     g_hostingOverlay.port = port;
-    mod::Log("HostingOverlay: activated port=%u, starting IP fetch",
-        static_cast<unsigned>(port));
+    g_hostingOverlay.challengeMode =
+        owner == HostDiscoveryOwner::LobbyChallenge;
+    g_hostingOverlay.preferredFamily = originalPreferredFamily;
+    g_hostingOverlay.effectiveFamily = discoveryFamily;
+    g_hostingOverlay.usedFamilyFallback =
+        originalPreferredFamily != discoveryFamily;
+    g_hostingOverlay.discoveryInProgress = true;
+    g_hostingOverlay.familyRetryAllowed = true;
+    g_hostingOverlay.automaticFamilyRetryAttempted =
+        automaticFamilyRetryAttempted;
+    g_hostingOverlay.writeNicknameToIni = writeNicknameToIni;
+    CopyBoundedText(
+        g_hostingOverlay.hostNickname,
+        sizeof(g_hostingOverlay.hostNickname),
+        nickname);
+    CopyBoundedText(
+        g_hostingOverlay.targetName,
+        sizeof(g_hostingOverlay.targetName),
+        targetName);
 
-    // Fire-and-forget background thread for the blocking HTTP request.
-    std::thread(FetchPublicIpThread).detach();
+    auto task = std::make_shared<PendingHostDiscovery>();
+    task->generation = g_directHostDiscoveryGeneration;
+    task->owner = owner;
+    task->port = port;
+    task->originalPreferredFamily = originalPreferredFamily;
+    task->discoveryFamily = discoveryFamily;
+    task->allowAlternateFamily = allowAlternateFamily;
+    task->automaticFamilyRetryAttempted =
+        automaticFamilyRetryAttempted;
+    task->nickname = nickname != nullptr ? nickname : "";
+    task->writeNicknameToIni = writeNicknameToIni;
+    task->targetPlayerId = targetPlayerId;
+    task->targetName = targetName != nullptr ? targetName : "";
+    task->capabilitySnapshotAvailable = capabilitySnapshotAvailable;
+    if (capabilitySnapshotAvailable)
+    {
+        task->capabilitySnapshot = capabilitySnapshot;
+    }
+    g_pendingHostDiscovery = task;
+
+    mod::Log(
+        "PUBLIC_IP_DISCOVERY_BEGIN owner=%s generation=%llu "
+        "originalPreferred=%s discoveryFamily=%s allowAlternate=%d "
+        "automaticRetry=%d port=%u targetId=%d capabilityCache=%s "
+        "capabilityAgeMs=%lu ipv4=%s ipv6=%s",
+        owner == HostDiscoveryOwner::LobbyChallenge
+            ? "lobby_challenge"
+            : "direct_host",
+        static_cast<unsigned long long>(task->generation),
+        netplay::network::FamilyName(originalPreferredFamily),
+        netplay::network::FamilyName(discoveryFamily),
+        allowAlternateFamily ? 1 : 0,
+        automaticFamilyRetryAttempted ? 1 : 0,
+        static_cast<unsigned>(port),
+        targetPlayerId,
+        capabilitySnapshotAvailable ? "completed" : "unavailable",
+        static_cast<unsigned long>(capabilitySnapshotAgeMs),
+        capabilitySnapshotAvailable
+            ? netplay::network::LocalFamilyCapabilityStateName(
+                capabilitySnapshot.ipv4.state)
+            : "not_ready",
+        capabilitySnapshotAvailable
+            ? netplay::network::LocalFamilyCapabilityStateName(
+                capabilitySnapshot.ipv6.state)
+            : "not_ready");
+
+    HMODULE moduleReference = nullptr;
+    const BOOL retainedModule = GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCSTR>(&HostDiscoveryThreadMain),
+        &moduleReference);
+    auto* context = retainedModule != FALSE
+        ? new (std::nothrow) HostDiscoveryThreadContext()
+        : nullptr;
+    if (context == nullptr)
+    {
+        if (moduleReference != nullptr)
+        {
+            FreeLibrary(moduleReference);
+        }
+        task->result = {};
+        task->result.preferredFamily = discoveryFamily;
+        task->result.effectiveFamily = discoveryFamily;
+        task->completed.store(true, std::memory_order_release);
+        mod::Log(
+            "PUBLIC_IP_DISCOVERY_BEGIN_FAILED generation=%llu "
+            "family=%s reason=%s",
+            static_cast<unsigned long long>(task->generation),
+            netplay::network::FamilyName(discoveryFamily),
+            retainedModule == FALSE
+                ? "module_reference"
+                : "allocation");
+        return;
+    }
+
+    context->task = task;
+    context->moduleReference = moduleReference;
+    HANDLE worker = CreateThread(
+        nullptr,
+        0,
+        &HostDiscoveryThreadMain,
+        context,
+        0,
+        nullptr);
+    if (worker == nullptr)
+    {
+        const DWORD error = GetLastError();
+        delete context;
+        FreeLibrary(moduleReference);
+        task->result = {};
+        task->result.preferredFamily = discoveryFamily;
+        task->result.effectiveFamily = discoveryFamily;
+        task->completed.store(true, std::memory_order_release);
+        mod::Log(
+            "PUBLIC_IP_DISCOVERY_BEGIN_FAILED generation=%llu "
+            "family=%s reason=CreateThread error=%lu",
+            static_cast<unsigned long long>(task->generation),
+            netplay::network::FamilyName(discoveryFamily),
+            static_cast<unsigned long>(error));
+        return;
+    }
+    CloseHandle(worker);
 }
 
-void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port)
+static void BeginDirectHostDiscovery(
+    uint16_t port,
+    netplay::network::NetworkFamily preferredFamily,
+    const char* nickname,
+    bool writeNicknameToIni)
+{
+    BeginHostDiscovery(
+        port,
+        preferredFamily,
+        preferredFamily,
+        true,
+        false,
+        nickname,
+        writeNicknameToIni,
+        HostDiscoveryOwner::Direct,
+        0,
+        nullptr);
+}
+
+void ActivateChallengeHostingOverlay(
+    const char* targetName,
+    uint16_t port,
+    netplay::network::NetworkFamily preferredFamily,
+    netplay::network::NetworkFamily effectiveFamily,
+    bool usedFamilyFallback,
+    const char* publicIp)
 {
     ResetHostingOverlayState();
     g_hostingOverlay.active = true;
     g_hostingOverlay.port = port;
     g_hostingOverlay.challengeMode = true;
+    g_hostingOverlay.preferredFamily = preferredFamily;
+    g_hostingOverlay.effectiveFamily = effectiveFamily;
+    g_hostingOverlay.usedFamilyFallback = usedFamilyFallback;
+    g_hostingOverlay.ipFetchDone = true;
+    g_hostingOverlay.ipFetchFailed = publicIp == nullptr || publicIp[0] == '\0';
+    g_hostingOverlay.sessionQueued = true;
+    g_hostingOverlay.familyRetryAllowed = true;
+    g_hostingOverlay.listenerWaitStartTick = GetTickCount();
+    CopyBoundedText(
+        g_hostingOverlay.publicIp,
+        sizeof(g_hostingOverlay.publicIp),
+        publicIp);
     strncpy_s(g_hostingOverlay.targetName, sizeof(g_hostingOverlay.targetName), targetName, _TRUNCATE);
     g_hostingOverlay.targetName[sizeof(g_hostingOverlay.targetName) - 1] = '\0';
     mod::Log(
-        "HostingOverlay: activated challenge target='%s' port=%u",
+        "HostingOverlay: activated challenge target='%s' port=%u preferred=%s effective=%s fallback=%d",
         g_hostingOverlay.targetName,
-        static_cast<unsigned>(port));
+        static_cast<unsigned>(port),
+        netplay::network::FamilyName(preferredFamily),
+        netplay::network::FamilyName(effectiveFamily),
+        usedFamilyFallback ? 1 : 0);
+}
+
+static void ShowHostStartupFailure(
+    const char* errorText,
+    bool needsBridgeCancel)
+{
+    const std::string error =
+        errorText != nullptr && errorText[0] != '\0'
+            ? errorText
+            : "Unknown Host startup error.";
+    ResetHostingOverlayState();
+    ResetJoiningOverlayState();
+    g_hostingOverlay.active = true;
+    g_hostingOverlay.failed = true;
+    g_hostingOverlay.failureNeedsBridgeCancel =
+        needsBridgeCancel;
+    CopyBoundedText(
+        g_hostingOverlay.errorText,
+        sizeof(g_hostingOverlay.errorText),
+        error.c_str());
+    mod::Log(
+        "REVIVAL_NETPLAY_SESSION_START_FAILED owner=host "
+        "overlay=hosting needsBridgeCancel=%d error='%s'",
+        needsBridgeCancel ? 1 : 0,
+        error.c_str());
+}
+
+static bool HostFailureNeedsBridgeCancel()
+{
+    const auto phase =
+        static_cast<netplay::bridge::NetbridgePhase>(
+            netplay::bridge::GetStatus().phase);
+    return phase != netplay::bridge::NetbridgePhase::Idle;
+}
+
+static netplay::network::NetworkFamily AlternateHostFamily(
+    netplay::network::NetworkFamily family)
+{
+    return family == netplay::network::NetworkFamily::IPv6
+        ? netplay::network::NetworkFamily::IPv4
+        : netplay::network::NetworkFamily::IPv6;
+}
+
+static bool IsLobbyChallengeTargetStillIdle(int targetPlayerId)
+{
+    if (!g_lobbySession || targetPlayerId == 0)
+    {
+        return false;
+    }
+
+    const netplay::lobby::LobbyStatus status =
+        g_lobbySession->GetStatus();
+    if (status.pollState != netplay::lobby::PollState::Polling)
+    {
+        return false;
+    }
+
+    for (const netplay::lobby::LobbyPlayer& player :
+         status.idlePlayers)
+    {
+        if (player.playerId == targetPlayerId)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void PumpDirectHostDiscovery()
+{
+    const std::shared_ptr<PendingHostDiscovery> task =
+        g_pendingHostDiscovery;
+    if (!task
+        || !task->completed.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    if (task->automaticFamilyRetryAttempted
+        && netplay::bridge::IsSessionStartInProgress())
+    {
+        return;
+    }
+
+    if (task->cancelled.load()
+        || task->generation != g_directHostDiscoveryGeneration
+        || !g_hostingOverlay.active)
+    {
+        mod::Log(
+            "PUBLIC_IP_DISCOVERY_RESULT owner=%s generation=%llu "
+            "discarded=1 cancelled=%d currentGeneration=%llu",
+            task->owner == HostDiscoveryOwner::LobbyChallenge
+                ? "lobby_challenge"
+                : "direct_host",
+            static_cast<unsigned long long>(task->generation),
+            task->cancelled.load() ? 1 : 0,
+            static_cast<unsigned long long>(
+                g_directHostDiscoveryGeneration));
+        if (g_pendingHostDiscovery == task)
+        {
+            g_pendingHostDiscovery.reset();
+        }
+        return;
+    }
+
+    const netplay::lobby::PublicIpDiscoveryResult result = task->result;
+    g_pendingHostDiscovery.reset();
+    g_hostingOverlay.discoveryInProgress = false;
+    g_hostingOverlay.ipFetchDone = true;
+    g_hostingOverlay.ipFetchFailed = result.publicIp.empty();
+    g_hostingOverlay.preferredFamily =
+        task->originalPreferredFamily;
+    g_hostingOverlay.effectiveFamily = result.effectiveFamily;
+    g_hostingOverlay.usedFamilyFallback =
+        task->originalPreferredFamily != result.effectiveFamily;
+    g_hostingOverlay.automaticFamilyRetryAttempted =
+        task->automaticFamilyRetryAttempted;
+    g_hostingOverlay.writeNicknameToIni =
+        task->writeNicknameToIni;
+    CopyBoundedText(
+        g_hostingOverlay.hostNickname,
+        sizeof(g_hostingOverlay.hostNickname),
+        task->nickname.c_str());
+    CopyBoundedText(
+        g_hostingOverlay.publicIp,
+        sizeof(g_hostingOverlay.publicIp),
+        result.publicIp.c_str());
+
+    const auto& preferredDiagnostics =
+        result.preferredFamily == netplay::network::NetworkFamily::IPv6
+            ? result.ipv6
+            : result.ipv4;
+    const auto& alternateDiagnostics =
+        result.preferredFamily == netplay::network::NetworkFamily::IPv6
+            ? result.ipv4
+            : result.ipv6;
+    g_hostingOverlay.preferredSourceAttempts =
+        preferredDiagnostics.sourceAttempts;
+    g_hostingOverlay.preferredTransportFailures =
+        preferredDiagnostics.transportFailures;
+    g_hostingOverlay.preferredParseFailures =
+        preferredDiagnostics.parseFailures;
+    g_hostingOverlay.alternateSourceAttempts =
+        alternateDiagnostics.sourceAttempts;
+    g_hostingOverlay.alternateTransportFailures =
+        alternateDiagnostics.transportFailures;
+    g_hostingOverlay.alternateParseFailures =
+        alternateDiagnostics.parseFailures;
+
+    mod::Log(
+        "PUBLIC_IP_DISCOVERY_RESULT owner=%s generation=%llu "
+        "originalPreferred=%s discoveryFamily=%s effective=%s fallback=%d "
+        "automaticRetry=%d address='%s' "
+        "preferredAttempts=%u preferredTransport=%u preferredParse=%u "
+        "alternateAttempts=%u alternateTransport=%u alternateParse=%u",
+        task->owner == HostDiscoveryOwner::LobbyChallenge
+            ? "lobby_challenge"
+            : "direct_host",
+        static_cast<unsigned long long>(task->generation),
+        netplay::network::FamilyName(
+            task->originalPreferredFamily),
+        netplay::network::FamilyName(task->discoveryFamily),
+        netplay::network::FamilyName(result.effectiveFamily),
+        task->originalPreferredFamily != result.effectiveFamily
+            ? 1
+            : 0,
+        task->automaticFamilyRetryAttempted ? 1 : 0,
+        result.publicIp.empty() ? "(none)" : result.publicIp.c_str(),
+        preferredDiagnostics.sourceAttempts,
+        preferredDiagnostics.transportFailures,
+        preferredDiagnostics.parseFailures,
+        alternateDiagnostics.sourceAttempts,
+        alternateDiagnostics.transportFailures,
+        alternateDiagnostics.parseFailures);
+
+    if (task->owner == HostDiscoveryOwner::LobbyChallenge)
+    {
+        if (!IsLobbyChallengeTargetStillIdle(
+                task->targetPlayerId))
+        {
+            mod::Log(
+                "LOBBY_ENDPOINT_PUBLISH result=cancelled "
+                "reason=target_not_idle_before_retry_start target='%s' id=%d",
+                task->targetName.c_str(),
+                task->targetPlayerId);
+            ShowHostStartupFailure(
+                "That player is no longer available.",
+                HostFailureNeedsBridgeCancel());
+            return;
+        }
+        if (result.publicIp.empty())
+        {
+            mod::Log(
+                "LOBBY_ENDPOINT_PUBLISH result=cancelled "
+                "reason=public_address_unavailable family=%s target='%s' id=%d",
+                netplay::network::FamilyName(result.effectiveFamily),
+                task->targetName.c_str(),
+                task->targetPlayerId);
+            ShowHostStartupFailure(
+                "A public address could not be detected for the available connection type.",
+                HostFailureNeedsBridgeCancel());
+            return;
+        }
+    }
+
+    netplay::bridge::HostSessionNetworkConfig networkConfig;
+    networkConfig.preferredFamily =
+        task->originalPreferredFamily;
+    networkConfig.effectiveFamily = result.effectiveFamily;
+    networkConfig.publicAddress = result.publicIp;
+    networkConfig.automaticFamilyRetryAttempted =
+        task->automaticFamilyRetryAttempted;
+    netplay::bridge::HostStartFailure startFailure =
+        netplay::bridge::HostStartFailure::None;
+    const bool started = netplay::bridge::StartHostSession(
+        task->port,
+        task->nickname.c_str(),
+        networkConfig,
+        task->writeNicknameToIni,
+        &startFailure);
+    if (!started)
+    {
+        if (startFailure
+                == netplay::bridge::HostStartFailure::FamilyUnavailable
+            && !task->automaticFamilyRetryAttempted)
+        {
+            const netplay::network::NetworkFamily retryFamily =
+                AlternateHostFamily(result.effectiveFamily);
+            mod::Log(
+                "REVIVAL_HOST_FAMILY_RETRY trigger=sync_preflight "
+                "from=%s to=%s owner=%s port=%u",
+                netplay::network::FamilyName(result.effectiveFamily),
+                netplay::network::FamilyName(retryFamily),
+                task->owner == HostDiscoveryOwner::LobbyChallenge
+                    ? "lobby_challenge"
+                    : "direct_host",
+                static_cast<unsigned>(task->port));
+            netplay::bridge::CancelSession(
+                "host_sync_preflight_retry_ack");
+            BeginHostDiscovery(
+                task->port,
+                task->originalPreferredFamily,
+                retryFamily,
+                false,
+                true,
+                task->nickname.c_str(),
+                task->writeNicknameToIni,
+                task->owner,
+                task->targetPlayerId,
+                task->targetName.c_str());
+            return;
+        }
+
+        const netplay::bridge::NetbridgeStatus status =
+            netplay::bridge::GetStatus();
+        ShowHostStartupFailure(
+            status.errorMsg[0] != '\0'
+                ? status.errorMsg
+                : "Could not start the Revival netplay session.",
+            true);
+        return;
+    }
+
+    if (task->owner == HostDiscoveryOwner::LobbyChallenge)
+    {
+        ActivateChallengeHostingOverlay(
+            task->targetName.c_str(),
+            task->port,
+            networkConfig.preferredFamily,
+            networkConfig.effectiveFamily,
+            networkConfig.preferredFamily
+                != networkConfig.effectiveFamily,
+            networkConfig.publicAddress.c_str());
+        g_hostingOverlay.automaticFamilyRetryAttempted =
+            task->automaticFamilyRetryAttempted;
+        g_hostingOverlay.writeNicknameToIni =
+            task->writeNicknameToIni;
+        CopyBoundedText(
+            g_hostingOverlay.hostNickname,
+            sizeof(g_hostingOverlay.hostNickname),
+            task->nickname.c_str());
+
+        g_pendingLobbyChallengePublish.active = true;
+        g_pendingLobbyChallengePublish.targetPlayerId =
+            task->targetPlayerId;
+        g_pendingLobbyChallengePublish.targetName =
+            task->targetName;
+        g_pendingLobbyChallengePublish.publicAddress =
+            networkConfig.publicAddress;
+        g_pendingLobbyChallengePublish.preferredFamily =
+            networkConfig.preferredFamily;
+        g_pendingLobbyChallengePublish.family =
+            networkConfig.effectiveFamily;
+        g_pendingLobbyChallengePublish.port = task->port;
+        g_pendingLobbyChallengePublish
+            .automaticFamilyRetryAttempted =
+            task->automaticFamilyRetryAttempted;
+    }
+    else
+    {
+        g_hostingOverlay.sessionQueued = true;
+        netplay::bridge::async_host::OnHostStarted(
+            task->port,
+            task->nickname.c_str(),
+            networkConfig);
+    }
+    netplay::battle_log::EnsureGameplayOverlayHook();
+    mod::Log(
+        "REVIVAL_NETPLAY_SESSION_START_QUEUED owner=%s preferred=%s "
+        "effective=%s fallback=%d automaticRetry=%d port=%u "
+        "publicAddress='%s'",
+        task->owner == HostDiscoveryOwner::LobbyChallenge
+            ? "lobby_challenge"
+            : "direct_host",
+        netplay::network::FamilyName(networkConfig.preferredFamily),
+        netplay::network::FamilyName(networkConfig.effectiveFamily),
+        networkConfig.preferredFamily != networkConfig.effectiveFamily
+            ? 1
+            : 0,
+        task->automaticFamilyRetryAttempted ? 1 : 0,
+        static_cast<unsigned>(task->port),
+        networkConfig.publicAddress.empty()
+            ? "(none)"
+            : networkConfig.publicAddress.c_str());
+}
+
+static bool BeginAutomaticHostFamilyRetry(
+    netplay::network::NetworkFamily retryFamily,
+    const char* trigger,
+    uint32_t listenerSerial)
+{
+    if (!g_hostingOverlay.active
+        || !g_hostingOverlay.familyRetryAllowed
+        || g_hostingOverlay.automaticFamilyRetryAttempted)
+    {
+        mod::Log(
+            "HOST_FAMILY_FALLBACK_SKIPPED reason=%s "
+            "trigger=%s from=%s requested=%s listenerSerial=%u",
+            !g_hostingOverlay.familyRetryAllowed
+                ? "retry_not_allowed_for_rehost"
+                : "already_attempted",
+            trigger != nullptr ? trigger : "",
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            netplay::network::FamilyName(retryFamily),
+            listenerSerial);
+        return false;
+    }
+
+    const bool lobbyChallenge =
+        g_hostingOverlay.challengeMode;
+    if (lobbyChallenge
+        && (!g_pendingLobbyChallengePublish.active
+            || !IsLobbyChallengeTargetStillIdle(
+                g_pendingLobbyChallengePublish.targetPlayerId)))
+    {
+        mod::Log(
+            "HOST_FAMILY_FALLBACK_SKIPPED reason=lobby_target_not_idle "
+            "trigger=%s listenerSerial=%u",
+            trigger != nullptr ? trigger : "",
+            listenerSerial);
+        netplay::bridge::async_host::Reset();
+        netplay::bridge::CancelSession(
+            "host_family_retry_target_gone");
+        ShowHostStartupFailure(
+            "That player is no longer available.",
+            true);
+        return true;
+    }
+
+    const uint16_t port = g_hostingOverlay.port;
+    const netplay::network::NetworkFamily originalPreferred =
+        g_hostingOverlay.preferredFamily;
+    const netplay::network::NetworkFamily previousFamily =
+        g_hostingOverlay.effectiveFamily;
+    const std::string nickname =
+        g_hostingOverlay.hostNickname;
+    const bool writeNicknameToIni =
+        g_hostingOverlay.writeNicknameToIni;
+    const int targetPlayerId = lobbyChallenge
+        ? g_pendingLobbyChallengePublish.targetPlayerId
+        : 0;
+    const std::string targetName = lobbyChallenge
+        ? g_pendingLobbyChallengePublish.targetName
+        : std::string();
+
+    mod::Log(
+        "HOST_FAMILY_FALLBACK_BEGIN owner=%s trigger=%s attempt=2 "
+        "originalPreferred=%s from=%s to=%s port=%u "
+        "listenerSerial=%u",
+        lobbyChallenge ? "lobby_challenge" : "direct_host",
+        trigger != nullptr ? trigger : "",
+        netplay::network::FamilyName(originalPreferred),
+        netplay::network::FamilyName(previousFamily),
+        netplay::network::FamilyName(retryFamily),
+        static_cast<unsigned>(port),
+        listenerSerial);
+
+    // The helper exists on listener/terminal retry paths. Reset async tracking
+    // without asking it to cancel, then perform exactly one bridge teardown.
+    netplay::bridge::async_host::Reset();
+    netplay::bridge::CancelSession("host_family_retry");
+    BeginHostDiscovery(
+        port,
+        originalPreferred,
+        retryFamily,
+        false,
+        true,
+        nickname.c_str(),
+        writeNicknameToIni,
+        lobbyChallenge
+            ? HostDiscoveryOwner::LobbyChallenge
+            : HostDiscoveryOwner::Direct,
+        targetPlayerId,
+        targetName.c_str());
+    return true;
+}
+
+static bool TryBeginTerminalHostFamilyRetry(
+    const netplay::bridge::NetbridgeStatus& status,
+    netplay::bridge::NetbridgePhase phase)
+{
+    if (!g_hostingOverlay.active
+        || !g_hostingOverlay.sessionQueued
+        || g_hostingOverlay.listenerReady
+        || g_hostingOverlay.automaticFamilyRetryAttempted
+        || (phase != netplay::bridge::NetbridgePhase::Failed
+            && phase
+                != netplay::bridge::NetbridgePhase::SessionEnded))
+    {
+        return false;
+    }
+
+    // Never run a socket probe from this game-thread failure path. A fresh
+    // background result can justify one controlled retry; otherwise preserve
+    // the native failure and let the user see Revival's actual error.
+    EnsureLocalNetworkCapabilityScanScheduled("terminal_host_failure");
+    netplay::network::LocalNetworkCapabilitySnapshot capabilitySnapshot;
+    DWORD capabilityAgeMs = 0;
+    if (!TryGetFreshLocalNetworkCapabilitySnapshot(
+            &capabilitySnapshot, &capabilityAgeMs))
+    {
+        mod::Log(
+            "HOST_FAMILY_FALLBACK_SKIPPED reason=capability_cache_unavailable "
+            "phase=%s family=%s cacheAgeMs=%lu error='%s'",
+            netplay::bridge::PhaseToString(phase),
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            static_cast<unsigned long>(capabilityAgeMs),
+            status.errorMsg);
+        return false;
+    }
+
+    const netplay::network::NetworkFamily retryFamily =
+        AlternateHostFamily(g_hostingOverlay.effectiveFamily);
+    const netplay::network::LocalFamilyCapability& currentCapability =
+        netplay::network::GetFamilyCapability(
+            capabilitySnapshot, g_hostingOverlay.effectiveFamily);
+    const netplay::network::LocalFamilyCapability& retryCapability =
+        netplay::network::GetFamilyCapability(
+            capabilitySnapshot, retryFamily);
+    const bool currentHardUnavailable =
+        currentCapability.state
+        == netplay::network::LocalFamilyCapabilityState::HardUnavailable;
+    const bool currentLocalOnly =
+        currentCapability.state
+        == netplay::network::LocalFamilyCapabilityState::LocalOnly;
+    const bool retryHardUnavailable =
+        retryCapability.state
+        == netplay::network::LocalFamilyCapabilityState::HardUnavailable;
+    const bool retryIsGloballyEligible =
+        netplay::network::CanAttemptGlobalPublicDiscovery(retryCapability);
+    if ((!currentHardUnavailable
+         && !(currentLocalOnly && retryIsGloballyEligible))
+        || retryHardUnavailable)
+    {
+        mod::Log(
+            "HOST_FAMILY_FALLBACK_SKIPPED reason=terminal_failure_not_cache_eligible "
+            "phase=%s family=%s familyState=%s alternate=%s alternateState=%s "
+            "alternateGlobalEligible=%d cacheAgeMs=%lu error='%s'",
+            netplay::bridge::PhaseToString(phase),
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            netplay::network::LocalFamilyCapabilityStateName(
+                currentCapability.state),
+            netplay::network::FamilyName(retryFamily),
+            netplay::network::LocalFamilyCapabilityStateName(
+                retryCapability.state),
+            retryIsGloballyEligible ? 1 : 0,
+            static_cast<unsigned long>(capabilityAgeMs),
+            status.errorMsg);
+        return false;
+    }
+
+    return BeginAutomaticHostFamilyRetry(
+        retryFamily,
+        currentHardUnavailable
+            ? "terminal_cached_hard_unavailable"
+            : "terminal_cached_local_only",
+        0);
+}
+
+static void PumpHostListenerObservation()
+{
+    if (g_hostingOverlay.active
+        && g_hostingOverlay.sessionQueued
+        && g_hostingOverlay.listenerReady
+        && netplay::bridge::async_host::IsActive()
+        && !netplay::bridge::async_host::IsHostListenerReady())
+    {
+        g_hostingOverlay.listenerReady = false;
+        g_hostingOverlay.listenerMismatch = false;
+        mod::Log(
+            "REVIVAL_HOST_ACK_RESET reason=async_rehost_waiting "
+            "family=%s port=%u",
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            static_cast<unsigned>(g_hostingOverlay.port));
+    }
+
+    if (!g_hostingOverlay.active
+        || !g_hostingOverlay.sessionQueued
+        || g_hostingOverlay.listenerReady)
+    {
+        return;
+    }
+
+    constexpr DWORD kChallengeListenerAckTimeoutMs = 15000u;
+    if (g_hostingOverlay.challengeMode
+        && g_hostingOverlay.listenerWaitStartTick != 0
+        && GetTickCount() - g_hostingOverlay.listenerWaitStartTick
+            >= kChallengeListenerAckTimeoutMs)
+    {
+        const netplay::bridge::NetbridgeStatus status =
+            netplay::bridge::GetStatus();
+        mod::Log(
+            "LOBBY_HOST_LISTENER_TIMEOUT elapsedMs=%lu phase=%s "
+            "helperPid=%lu family=%s port=%u action=cancel",
+            static_cast<unsigned long>(
+                GetTickCount()
+                - g_hostingOverlay.listenerWaitStartTick),
+            netplay::bridge::PhaseToString(
+                static_cast<netplay::bridge::NetbridgePhase>(
+                    status.phase)),
+            static_cast<unsigned long>(status.processId),
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            static_cast<unsigned>(g_hostingOverlay.port));
+        netplay::bridge::async_host::Reset();
+        netplay::bridge::CancelSession(
+            "lobby_host_listener_ack_timeout");
+        ShowHostStartupFailure(
+            "Hosting did not start in time. Please try again.",
+            false);
+        return;
+    }
+
+    netplay::bridge::HostListenerObservation observation;
+    if (!netplay::bridge::GetHostListenerObservation(
+            &observation)
+        || !observation.available)
+    {
+        return;
+    }
+
+    const netplay::bridge::NetbridgeStatus bridgeStatus =
+        netplay::bridge::GetStatus();
+    const auto bridgePhase =
+        static_cast<netplay::bridge::NetbridgePhase>(
+            bridgeStatus.phase);
+    const bool peerAlive =
+        netplay::bridge::IsPeerProcessAlive();
+    if (bridgePhase == netplay::bridge::NetbridgePhase::Failed
+        || bridgePhase == netplay::bridge::NetbridgePhase::SessionEnded
+        || bridgePhase == netplay::bridge::NetbridgePhase::Idle
+        || !peerAlive)
+    {
+        mod::Log(
+            "REVIVAL_HOST_ACK_IGNORED reason=session_not_live phase=%s "
+            "peerAlive=%d observedFamily=%s observedPort=%u serial=%u",
+            netplay::bridge::PhaseToString(bridgePhase),
+            peerAlive ? 1 : 0,
+            netplay::network::FamilyName(observation.family),
+            static_cast<unsigned>(observation.port),
+            observation.serial);
+        return;
+    }
+
+    const DWORD listenerCandidateTick = GetTickCount();
+    if (g_hostingOverlay.listenerMismatchSerial
+            != observation.serial)
+    {
+        g_hostingOverlay.listenerMismatchSerial =
+            observation.serial;
+        g_hostingOverlay.listenerMismatchPort =
+            observation.port;
+        g_hostingOverlay.listenerMismatchFirstTick =
+            listenerCandidateTick;
+        mod::Log(
+            "REVIVAL_HOST_LISTENER_CANDIDATE family=%s port=%u "
+            "serial=%u debounceMs=100",
+            netplay::network::FamilyName(observation.family),
+            static_cast<unsigned>(observation.port),
+            observation.serial);
+        return;
+    }
+    if (listenerCandidateTick
+            - g_hostingOverlay.listenerMismatchFirstTick
+        < 100u)
+    {
+        return;
+    }
+
+    if (!observation.portMatches)
+    {
+        g_hostingOverlay.listenerMismatch = true;
+        mod::Log(
+            "REVIVAL_HOST_LISTENER_MISMATCH observedFamily=%s observedPort=%u "
+            "expectedFamily=%s expectedPort=%u familyMatches=%d portMatches=%d "
+            "serial=%u action=cancel reason=port_mismatch",
+            netplay::network::FamilyName(observation.family),
+            static_cast<unsigned>(observation.port),
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            static_cast<unsigned>(g_hostingOverlay.port),
+            observation.familyMatches ? 1 : 0,
+            observation.portMatches ? 1 : 0,
+            observation.serial);
+        netplay::bridge::async_host::Reset();
+        netplay::bridge::CancelSession(
+            "host_listener_family_or_port_mismatch");
+        ShowHostStartupFailure(
+            "Hosting started on an unexpected port. Please try again.",
+            true);
+        return;
+    }
+
+    g_hostingOverlay.listenerMismatch = false;
+    g_hostingOverlay.listenerMismatchSerial = 0;
+    g_hostingOverlay.listenerMismatchPort = 0;
+    g_hostingOverlay.listenerMismatchFirstTick = 0;
+
+    if (observation.expectedFamilyKnown
+        && !observation.familyMatches)
+    {
+        g_hostingOverlay.listenerMismatch = true;
+        mod::Log(
+            "REVIVAL_HOST_LISTENER_MISMATCH observedFamily=%s "
+            "observedPort=%u expectedFamily=%s expectedPort=%u "
+            "serial=%u automaticRetryUsed=%d",
+            netplay::network::FamilyName(observation.family),
+            static_cast<unsigned>(observation.port),
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
+            static_cast<unsigned>(g_hostingOverlay.port),
+            observation.serial,
+            g_hostingOverlay.automaticFamilyRetryAttempted
+                ? 1
+                : 0);
+        if (BeginAutomaticHostFamilyRetry(
+                observation.family,
+                "listener_family_mismatch",
+                observation.serial))
+        {
+            return;
+        }
+
+        netplay::bridge::async_host::Reset();
+        netplay::bridge::CancelSession(
+            "host_listener_family_mismatch_after_retry");
+        ShowHostStartupFailure(
+            "Hosting could not start with either connection type.",
+            true);
+        return;
+    }
+
+    std::string challengeEndpoint;
+    if (g_pendingLobbyChallengePublish.active)
+    {
+        if (!g_lobbySession
+            || !IsLobbyChallengeTargetStillIdle(
+                g_pendingLobbyChallengePublish.targetPlayerId))
+        {
+            mod::Log(
+                "LOBBY_ENDPOINT_PUBLISH result=cancelled "
+                "reason=target_not_idle_after_listener_ack target='%s' "
+                "id=%d listenerSerial=%u",
+                g_pendingLobbyChallengePublish.targetName.c_str(),
+                g_pendingLobbyChallengePublish.targetPlayerId,
+                observation.serial);
+            netplay::bridge::async_host::Reset();
+            netplay::bridge::CancelSession(
+                "lobby_target_gone_before_endpoint_publish");
+            ShowHostStartupFailure(
+                "That player is no longer available.",
+                true);
+            return;
+        }
+
+        netplay::network::NetworkEndpoint endpoint;
+        endpoint.family = observation.family;
+        endpoint.host =
+            g_pendingLobbyChallengePublish.publicAddress;
+        endpoint.port = observation.port;
+        if (!netplay::network::FormatEndpoint(
+                endpoint,
+                &challengeEndpoint))
+        {
+            mod::Log(
+                "LOBBY_ENDPOINT_PUBLISH result=cancelled "
+                "reason=final_endpoint_invalid family=%s address='%s' "
+                "port=%u listenerSerial=%u",
+                netplay::network::FamilyName(observation.family),
+                g_pendingLobbyChallengePublish.publicAddress.c_str(),
+                static_cast<unsigned>(observation.port),
+                observation.serial);
+            netplay::bridge::async_host::Reset();
+            netplay::bridge::CancelSession(
+                "invalid_lobby_endpoint_after_listener_ack");
+            ShowHostStartupFailure(
+                "The public address could not be prepared for this connection.",
+                true);
+            return;
+        }
+    }
+
+    g_hostingOverlay.listenerReady = true;
+    g_hostingOverlay.familyRetryAllowed = false;
+    g_hostingOverlay.port = observation.port;
+    if (netplay::bridge::async_host::IsActive())
+    {
+        (void)netplay::bridge::async_host::NotifyHostListenerReady(
+            observation);
+    }
+    mod::Log(
+        "REVIVAL_HOST_ACK family=%s port=%u serial=%u publicAddress='%s'",
+        netplay::network::FamilyName(observation.family),
+        static_cast<unsigned>(observation.port),
+        observation.serial,
+        g_hostingOverlay.publicIp[0] != '\0'
+            ? g_hostingOverlay.publicIp
+            : "(none)");
+
+    if (g_pendingLobbyChallengePublish.active)
+    {
+        g_lobbySession->SendChallenge(
+            g_pendingLobbyChallengePublish.targetPlayerId,
+            g_pendingLobbyChallengePublish.targetName,
+            challengeEndpoint);
+        mod::Log(
+            "LOBBY_ENDPOINT_PUBLISH result=sent_after_listener_ack target='%s' "
+            "id=%d originalPreferred=%s family=%s fallback=%d "
+            "automaticRetry=%d endpoint='%s' listenerSerial=%u",
+            g_pendingLobbyChallengePublish.targetName.c_str(),
+            g_pendingLobbyChallengePublish.targetPlayerId,
+            netplay::network::FamilyName(
+                g_pendingLobbyChallengePublish.preferredFamily),
+            netplay::network::FamilyName(
+                g_pendingLobbyChallengePublish.family),
+            g_pendingLobbyChallengePublish.preferredFamily
+                    != g_pendingLobbyChallengePublish.family
+                ? 1
+                : 0,
+            g_pendingLobbyChallengePublish
+                    .automaticFamilyRetryAttempted
+                ? 1
+                : 0,
+            challengeEndpoint.c_str(),
+            observation.serial);
+        g_pendingLobbyChallengePublish = {};
+    }
+}
+
+static void RestoreHostingOverlayFromAsyncHost()
+{
+    g_hostingOverlay = {};
+    g_hostingOverlay.active = true;
+    g_hostingOverlay.port =
+        netplay::bridge::async_host::HostPort();
+    g_hostingOverlay.sessionQueued = true;
+    g_hostingOverlay.familyRetryAllowed = false;
+    g_hostingOverlay.listenerReady =
+        netplay::bridge::async_host::IsHostListenerReady();
+    g_hostingOverlay.ipFetchDone = true;
+    g_hostingOverlay.writeNicknameToIni = false;
+    CopyBoundedText(
+        g_hostingOverlay.hostNickname,
+        sizeof(g_hostingOverlay.hostNickname),
+        netplay::bridge::async_host::HostNickname());
+
+    netplay::bridge::HostSessionNetworkConfig networkConfig;
+    if (netplay::bridge::async_host::GetHostNetworkConfig(
+            &networkConfig))
+    {
+        g_hostingOverlay.preferredFamily =
+            networkConfig.preferredFamily;
+        g_hostingOverlay.effectiveFamily =
+            networkConfig.effectiveFamily;
+        g_hostingOverlay.usedFamilyFallback =
+            networkConfig.preferredFamily
+            != networkConfig.effectiveFamily;
+        g_hostingOverlay.automaticFamilyRetryAttempted =
+            networkConfig.automaticFamilyRetryAttempted;
+        g_hostingOverlay.ipFetchFailed =
+            networkConfig.publicAddress.empty();
+        CopyBoundedText(
+            g_hostingOverlay.publicIp,
+            sizeof(g_hostingOverlay.publicIp),
+            networkConfig.publicAddress.c_str());
+
+    }
+    else
+    {
+        // Legacy Host entry points have no immutable discovery snapshot.
+        // Preserve the listener and show an honest "public IP unavailable"
+        // state instead of starting a new discovery that could select a
+        // different family during the same hosting session.
+        g_hostingOverlay.preferredFamily =
+            g_netplayMenuState.hostFamily;
+        g_hostingOverlay.effectiveFamily =
+            g_netplayMenuState.hostFamily;
+        g_hostingOverlay.ipFetchFailed = true;
+    }
+
+    mod::Log(
+        "ASYNC_REHOST_NETWORK_SNAPSHOT restored=1 preferred=%s effective=%s "
+        "fallback=%d automaticRetry=%d port=%u listenerReady=%d "
+        "publicAddress='%s'",
+        netplay::network::FamilyName(
+            g_hostingOverlay.preferredFamily),
+        netplay::network::FamilyName(
+            g_hostingOverlay.effectiveFamily),
+        g_hostingOverlay.usedFamilyFallback ? 1 : 0,
+        g_hostingOverlay.automaticFamilyRetryAttempted
+            ? 1
+            : 0,
+        static_cast<unsigned>(g_hostingOverlay.port),
+        g_hostingOverlay.listenerReady ? 1 : 0,
+        g_hostingOverlay.publicIp[0] != '\0'
+            ? g_hostingOverlay.publicIp
+            : "(none)");
+}
+
+static void LoadSerializedNetplayMenuSettingsFromIni()
+{
+    netplay::bridge::HostProtocolOverrideState protocolOverrideAtLoad;
+    const bool hasSerializedIniRead =
+        netplay::bridge::BeginOptionsIniAccess(
+            false,
+            &protocolOverrideAtLoad);
+    LoadNetplayMenuSettingsFromIni();
+    if (hasSerializedIniRead
+        && protocolOverrideAtLoad.active
+        && g_netplayMenuState.hostFamily
+            != protocolOverrideAtLoad.originalFamily)
+    {
+        mod::Log(
+            "NETPLAY_MENU_PROTOCOL_TRANSIENT_IGNORED loaded=%s "
+            "effective=%s restoredPreference=%s",
+            netplay::network::FamilyName(
+                g_netplayMenuState.hostFamily),
+            netplay::network::FamilyName(
+                protocolOverrideAtLoad.effectiveFamily),
+            netplay::network::FamilyName(
+                protocolOverrideAtLoad.originalFamily));
+        g_netplayMenuState.hostFamily =
+            protocolOverrideAtLoad.originalFamily;
+    }
+    if (hasSerializedIniRead)
+    {
+        netplay::bridge::EndOptionsIniAccess();
+    }
+    else
+    {
+        mod::Log(
+            "EnterNetplayMenu: serialized INI read access unavailable");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,14 +3545,66 @@ void ResetJoiningOverlayState()
     g_joiningOverlay = {};
 }
 
+static std::string FormatNetworkEndpoint(
+    netplay::network::NetworkFamily family,
+    const char* host,
+    uint16_t port)
+{
+    netplay::network::NetworkEndpoint endpoint;
+    endpoint.family = family;
+    endpoint.host = host != nullptr ? host : "";
+    endpoint.port = port;
+    std::string formatted;
+    if (!netplay::network::FormatEndpoint(endpoint, &formatted))
+    {
+        return {};
+    }
+    return formatted;
+}
+
 void ActivateJoiningOverlay(const char* address, uint16_t port)
 {
     ResetJoiningOverlayState();
     g_joiningOverlay.active = true;
     g_joiningOverlay.port = port;
-    strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
+    netplay::network::NetworkHost parsedHost;
+    bool parsed =
+        address != nullptr
+        && netplay::network::ParseBareHost(address, &parsedHost);
+    if (!parsed)
+    {
+        // A direct Join/Spectate address may be a hostname. StartSession
+        // resolves it synchronously and snapshots the exact numeric endpoint
+        // before returning, so use that immutable selection for display and
+        // for a possible Spectate -> Join restart.
+        const netplay::bridge::NetbridgeStatus status =
+            netplay::bridge::GetStatus();
+        parsed =
+            status.port == port
+            && netplay::network::ParseBareHost(
+                status.address,
+                &parsedHost);
+    }
+    if (parsed)
+    {
+        g_joiningOverlay.family = parsedHost.family;
+    }
+    const char* normalizedAddress =
+        parsed ? parsedHost.host.c_str() : address;
+    strncpy_s(
+        g_joiningOverlay.address,
+        sizeof(g_joiningOverlay.address),
+        normalizedAddress != nullptr ? normalizedAddress : "",
+        _TRUNCATE);
     g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
-    mod::Log("JoiningOverlay: activated  target=%s:%u", address, static_cast<unsigned>(port));
+    const std::string endpoint = FormatNetworkEndpoint(
+        g_joiningOverlay.family,
+        g_joiningOverlay.address,
+        port);
+    mod::Log(
+        "JoiningOverlay: activated target=%s family=%s",
+        endpoint.empty() ? "(invalid)" : endpoint.c_str(),
+        netplay::network::FamilyName(g_joiningOverlay.family));
 }
 
 void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port)
@@ -2198,15 +3613,32 @@ void ActivateChallengeJoiningOverlay(const char* targetName, const char* address
     g_joiningOverlay.active = true;
     g_joiningOverlay.port = port;
     g_joiningOverlay.displayTargetName = true;
-    strncpy_s(g_joiningOverlay.address, sizeof(g_joiningOverlay.address), address, _TRUNCATE);
+    netplay::network::NetworkHost parsedHost;
+    const bool parsed =
+        address != nullptr
+        && netplay::network::ParseBareHost(address, &parsedHost);
+    if (parsed)
+    {
+        g_joiningOverlay.family = parsedHost.family;
+    }
+    const char* normalizedAddress = parsed ? parsedHost.host.c_str() : address;
+    strncpy_s(
+        g_joiningOverlay.address,
+        sizeof(g_joiningOverlay.address),
+        normalizedAddress != nullptr ? normalizedAddress : "",
+        _TRUNCATE);
     g_joiningOverlay.address[sizeof(g_joiningOverlay.address) - 1] = '\0';
     strncpy_s(g_joiningOverlay.targetName, sizeof(g_joiningOverlay.targetName), targetName, _TRUNCATE);
     g_joiningOverlay.targetName[sizeof(g_joiningOverlay.targetName) - 1] = '\0';
-    mod::Log(
-        "JoiningOverlay: activated challenge target='%s' address=%s:%u",
-        g_joiningOverlay.targetName,
+    const std::string endpoint = FormatNetworkEndpoint(
+        g_joiningOverlay.family,
         g_joiningOverlay.address,
-        static_cast<unsigned>(port));
+        port);
+    mod::Log(
+        "JoiningOverlay: activated challenge target='%s' endpoint=%s family=%s",
+        g_joiningOverlay.targetName,
+        endpoint.empty() ? "(invalid)" : endpoint.c_str(),
+        netplay::network::FamilyName(g_joiningOverlay.family));
 }
 
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage)
@@ -2239,10 +3671,14 @@ bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string*
     {
         ActivateJoiningOverlay(menuState.joinAddress.c_str(), menuState.joinPort);
         g_joiningOverlay.spectateMode = true;
+        const std::string endpoint = FormatNetworkEndpoint(
+            g_joiningOverlay.family,
+            g_joiningOverlay.address,
+            g_joiningOverlay.port);
         mod::Log(
-            "WaitToSpectate: started spectate session -> %s:%u",
-            menuState.joinAddress.c_str(),
-            static_cast<unsigned>(menuState.joinPort));
+            "WaitToSpectate: started spectate session endpoint=%s family=%s",
+            endpoint.empty() ? "(invalid)" : endpoint.c_str(),
+            netplay::network::FamilyName(g_joiningOverlay.family));
         return true;
     }
 
@@ -2291,10 +3727,14 @@ bool TryStartWaitToSpectateAtAddress(
     {
         ActivateJoiningOverlay(address, port);
         g_joiningOverlay.spectateMode = true;
+        const std::string endpoint = FormatNetworkEndpoint(
+            g_joiningOverlay.family,
+            g_joiningOverlay.address,
+            g_joiningOverlay.port);
         mod::Log(
-            "WaitToSpectate: started spectate session -> %s:%u",
-            address,
-            static_cast<unsigned>(port));
+            "WaitToSpectate: started spectate session endpoint=%s family=%s",
+            endpoint.empty() ? "(invalid)" : endpoint.c_str(),
+            netplay::network::FamilyName(g_joiningOverlay.family));
         return true;
     }
 
@@ -2362,8 +3802,11 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
     (void)screenContext;
     const std::string address = g_joiningOverlay.address;
     const uint16_t port = g_joiningOverlay.port;
+    const netplay::network::NetworkFamily family = g_joiningOverlay.family;
     const bool displayTargetName = g_joiningOverlay.displayTargetName;
     const std::string targetName = g_joiningOverlay.targetName;
+    const std::string formattedEndpoint =
+        FormatNetworkEndpoint(family, address.c_str(), port);
 
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
@@ -2390,9 +3833,9 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
             g_joiningOverlay.targetName[sizeof(g_joiningOverlay.targetName) - 1] = '\0';
         }
         mod::Log(
-            "SpectateConfirmOverlay: restarting pending spectate as Join target=%s:%u started=1",
-            address.c_str(),
-            static_cast<unsigned>(port));
+            "SpectateConfirmOverlay: restarting pending spectate as Join endpoint=%s family=%s started=1",
+            formattedEndpoint.empty() ? "(invalid)" : formattedEndpoint.c_str(),
+            netplay::network::FamilyName(family));
         return true;
     }
 
@@ -2405,9 +3848,9 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
         status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
     SetNetplayStatusMessage(text);
     mod::Log(
-        "SpectateConfirmOverlay: restarting pending spectate as Join failed target=%s:%u error='%s'",
-        address.c_str(),
-        static_cast<unsigned>(port),
+        "SpectateConfirmOverlay: restarting pending spectate as Join failed endpoint=%s family=%s error='%s'",
+        formattedEndpoint.empty() ? "(invalid)" : formattedEndpoint.c_str(),
+        netplay::network::FamilyName(family),
         status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
     return false;
 }
@@ -3351,7 +4794,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
         return;
     }
 
-    LoadNetplayMenuSettingsFromIni();
+    LoadSerializedNetplayMenuSettingsFromIni();
     ResetTitleMenuState(screenContext, 0);
     ResetMenuControlCompatibilityState();
     (void)SyncMenuControlBindings(screenContext);
@@ -3374,6 +4817,10 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     }
 
     g_netplayMenuState.active = true;
+    // Prewarm only local family capability on its own retained worker. The
+    // eventual Host action does not wait for this scan and still performs just
+    // its global public-address lookup.
+    EnsureLocalNetworkCapabilityScanScheduled("enter_netplay_menu");
     g_netplayMenuState.bgmActive = true;
     g_netplayMenuState.menuId = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     g_netplayMenuState.mainSelection = 0;
@@ -3447,10 +4894,7 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     // menu exits (LeaveNetplayMenu keeps it alive while hosting).
     if (netplay::bridge::async_host::IsActive())
     {
-        if (!g_hostingOverlay.active)
-        {
-            ActivateHostingOverlay(netplay::bridge::async_host::HostPort());
-        }
+        RestoreHostingOverlayFromAsyncHost();
         if (netplay::bridge::async_host::ConsumeReturnKeyArrival())
         {
             // Arrived via the F1 return hotkey pressed in gameplay: show the FULL
@@ -3787,7 +5231,8 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
             g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
                 g_netplayMenuState.nickname,
                 g_netplayMenuState.hostPort,
-                &joinedRoom);
+                &joinedRoom,
+                g_netplayMenuState.hostFamily);
         }
         else
         {
@@ -3796,7 +5241,9 @@ void SwitchToMenu(uint32_t screenContext, NetplayMenuId menuId, int selection)
                 static_cast<unsigned>(g_netplayMenuState.hostPort));
             g_lobbySession = std::make_unique<netplay::lobby::LobbySession>(
                 g_netplayMenuState.nickname,
-                g_netplayMenuState.hostPort);
+                g_netplayMenuState.hostPort,
+                nullptr,
+                g_netplayMenuState.hostFamily);
         }
     }
     else if (menuId == NetplayMenuId::Lobby && g_lobbySession)
@@ -4112,34 +5559,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             break;
         }
         const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
-        const bool started = netplay::bridge::StartSession(
-            NetbridgeRole::Host,
+        BeginDirectHostDiscovery(
             g_netplayMenuState.hostPort,
-            "",
+            g_netplayMenuState.hostFamily,
             g_netplayMenuState.nickname.c_str(),
             writeNicknameToIni);
-        if (started)
-        {
-            ActivateHostingOverlay(g_netplayMenuState.hostPort);
-            // Engage async hosting: the prompt will be HELD when a peer connects
-            // until the user accepts, instead of auto-showing the delay overlay.
-            netplay::bridge::async_host::OnHostStarted(
-                g_netplayMenuState.hostPort, g_netplayMenuState.nickname.c_str());
-            // Make sure the D3D9 EndScene overlay hook is live so the in-gameplay
-            // async-host indicator can render once minimized.
-            netplay::battle_log::EnsureGameplayOverlayHook();
-        }
-        else
-        {
-            const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
-            char text[320] = {};
-            snprintf(
-                text,
-                sizeof(text),
-                "Host start failed.\n\n%s",
-                status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
-            ShowStubActionMessage(owner, text);
-        }
         break;
     }
     case NetplayMenuAction::JoinConnect:
@@ -4200,26 +5624,31 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             break;
         }
 
-        // Parse ip:port from the playing pair's hostIp field.
-        std::string spectateAddr = selectedPair.hostIp;
-        uint16_t spectatePort = g_netplayMenuState.joinPort;
-        const size_t colonPos = spectateAddr.rfind(':');
-        if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < spectateAddr.size())
+        netplay::network::NetworkEndpoint spectateEndpoint;
+        if (!netplay::network::ParseEndpoint(
+                selectedPair.hostIp,
+                &spectateEndpoint))
         {
-            const unsigned long parsedPort = std::strtoul(spectateAddr.c_str() + colonPos + 1, nullptr, 10);
-            if (parsedPort > 0 && parsedPort <= 65535)
-            {
-                spectatePort = static_cast<uint16_t>(parsedPort);
-                spectateAddr = spectateAddr.substr(0, colonPos);
-            }
+            mod::Log(
+                "LOBBY_ENDPOINT_CONSUME role=spectate result=rejected raw='%s'",
+                selectedPair.hostIp.c_str());
+            ShowStubActionMessage(
+                owner,
+                "The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port.");
+            break;
         }
 
-        mod::Log("LobbyPlaying0: parsed spectateAddr=%s spectatePort=%u",
-            spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
+        mod::Log(
+            "LOBBY_ENDPOINT_CONSUME role=spectate result=accepted family=%s endpoint='%s'",
+            netplay::network::FamilyName(spectateEndpoint.family),
+            selectedPair.hostIp.c_str());
 
         std::string errorMessage;
         const bool started =
-            TryStartWaitToSpectateAtAddress(spectateAddr.c_str(), spectatePort, &errorMessage);
+            TryStartWaitToSpectateAtAddress(
+                spectateEndpoint.host.c_str(),
+                spectateEndpoint.port,
+                &errorMessage);
         mod::Log("LobbyPlaying0: TryStartWaitToSpectateAtAddress returned %d", started ? 1 : 0);
         if (started)
         {
@@ -4287,29 +5716,36 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 break;
             }
 
-            std::string spectateAddr = entry.spectateIp;
-            uint16_t spectatePort = g_netplayMenuState.joinPort;
-            const size_t specColonPos = spectateAddr.rfind(':');
-            if (specColonPos != std::string::npos && specColonPos > 0 && specColonPos + 1 < spectateAddr.size())
+            netplay::network::NetworkEndpoint spectateEndpoint;
+            if (!netplay::network::ParseEndpoint(
+                    entry.spectateIp,
+                    &spectateEndpoint))
             {
-                const unsigned long parsedPort = std::strtoul(spectateAddr.c_str() + specColonPos + 1, nullptr, 10);
-                if (parsedPort > 0 && parsedPort <= 65535)
-                {
-                    spectatePort = static_cast<uint16_t>(parsedPort);
-                    spectateAddr = spectateAddr.substr(0, specColonPos);
-                }
+                mod::Log(
+                    "LOBBY_ENDPOINT_CONSUME role=spectate result=rejected raw='%s'",
+                    entry.spectateIp.c_str());
+                ShowStubActionMessage(
+                    owner,
+                    "The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port.");
+                break;
             }
 
-            mod::Log("LobbySpectate: spectating '%s' id=%d via %s addr=%s port=%u",
-                entry.name.c_str(), entry.playerId, entry.spectateIp.c_str(),
-                spectateAddr.c_str(), static_cast<unsigned>(spectatePort));
+            mod::Log(
+                "LOBBY_ENDPOINT_CONSUME role=spectate result=accepted player='%s' id=%d family=%s endpoint='%s'",
+                entry.name.c_str(),
+                entry.playerId,
+                netplay::network::FamilyName(spectateEndpoint.family),
+                entry.spectateIp.c_str());
             netplay::lobby::LobbyPlayingPair selectedPair = {};
             const bool foundSelectedPair =
                 TryResolvePlayingPairForLobbyEntry(lobStatus, entry, &selectedPair);
 
             std::string errorMessage;
             const bool started =
-                TryStartWaitToSpectateAtAddress(spectateAddr.c_str(), spectatePort, &errorMessage);
+                TryStartWaitToSpectateAtAddress(
+                    spectateEndpoint.host.c_str(),
+                    spectateEndpoint.port,
+                    &errorMessage);
             if (started)
             {
                 ArmPendingLobbySpectateWait(
@@ -4345,38 +5781,50 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 break;
             }
 
-            // Parse the challenger's ip:port into address + port for StartSession.
-            std::string challengeAddr = entry.ipPort;
-            uint16_t challengePort = g_netplayMenuState.hostPort;
-            const size_t colonPos = entry.ipPort.rfind(':');
-            if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < entry.ipPort.size())
+            netplay::network::NetworkEndpoint challengeEndpoint;
+            if (!netplay::network::ParseEndpoint(
+                    entry.ipPort,
+                    &challengeEndpoint))
             {
-                challengeAddr = entry.ipPort.substr(0, colonPos);
-                const unsigned long parsedPort = std::strtoul(entry.ipPort.c_str() + colonPos + 1, nullptr, 10);
-                if (parsedPort > 0 && parsedPort <= 65535)
-                {
-                    challengePort = static_cast<uint16_t>(parsedPort);
-                }
+                mod::Log(
+                    "LOBBY_ENDPOINT_CONSUME role=join result=rejected challenger='%s' id=%d raw='%s'",
+                    entry.name.c_str(),
+                    entry.playerId,
+                    entry.ipPort.c_str());
+                ShowStubActionMessage(
+                    owner,
+                    "The challenger published an invalid endpoint.\nExpected IPv4:port or [IPv6]:port.");
+                break;
             }
 
-            mod::Log("LobbyAccept: accepting challenge from '%s' id=%d ip=%s addr=%s port=%u",
-                entry.name.c_str(), entry.playerId, entry.ipPort.c_str(),
-                challengeAddr.c_str(), static_cast<unsigned>(challengePort));
+            mod::Log(
+                "LOBBY_ENDPOINT_CONSUME role=join result=accepted challenger='%s' id=%d family=%s endpoint='%s'",
+                entry.name.c_str(),
+                entry.playerId,
+                netplay::network::FamilyName(challengeEndpoint.family),
+                entry.ipPort.c_str());
 
-            // Send pre_accept + accept via the lobby session (async on poll thread).
-            g_lobbySession->AcceptChallenge(entry.playerId, entry.name);
-
-            // Connect to the challenger's address.
+            // Validate and queue the local connection before marking the lobby
+            // challenge accepted. A synchronous family/address rejection must
+            // not leave the lobby busy or send PreAccept without a P2P start.
             const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
             const bool started = netplay::bridge::StartSession(
                 NetbridgeRole::Join,
-                challengePort,
-                challengeAddr.c_str(),
+                challengeEndpoint.port,
+                challengeEndpoint.host.c_str(),
                 g_netplayMenuState.nickname.c_str(),
                 writeNicknameToIni);
             if (started)
             {
-                ActivateChallengeJoiningOverlay(entry.name.c_str(), challengeAddr.c_str(), challengePort);
+                // Send pre_accept + accept via the lobby session (async on its
+                // poll thread) immediately after the local start is queued.
+                g_lobbySession->AcceptChallenge(
+                    entry.playerId,
+                    entry.name);
+                ActivateChallengeJoiningOverlay(
+                    entry.name.c_str(),
+                    challengeEndpoint.host.c_str(),
+                    challengeEndpoint.port);
             }
             else
             {
@@ -4404,41 +5852,139 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             const std::string publicIp = lobStatus.publicIp;
             if (publicIp.empty())
             {
-                ShowStubActionMessage(owner, "Public IP not yet discovered.\nPlease wait a moment and try again.");
+                if (!lobStatus.publicIpDiscoveryComplete)
+                {
+                    ShowStubActionMessage(
+                        owner,
+                        "Detecting your public address.\nPlease wait a moment and try again.");
+                }
+                else
+                {
+                    ShowHostStartupFailure(
+                        "A public address could not be detected. Check your connection and try again.",
+                        false);
+                }
                 break;
             }
 
-            char ipPortBuf[128] = {};
-            snprintf(ipPortBuf, sizeof(ipPortBuf), "%s:%u",
-                publicIp.c_str(), static_cast<unsigned>(g_netplayMenuState.hostPort));
+            netplay::network::NetworkHost publicHost;
+            if (!netplay::network::ParseBareHost(
+                    publicIp,
+                    &publicHost)
+                || publicHost.family != lobStatus.effectiveFamily
+                || !netplay::network::IsGloballyRoutableHost(publicHost))
+            {
+                mod::Log(
+                    "LOBBY_ENDPOINT_PUBLISH result=rejected preferred=%s effective=%s raw='%s' port=%u",
+                    netplay::network::FamilyName(lobStatus.preferredFamily),
+                    netplay::network::FamilyName(lobStatus.effectiveFamily),
+                    publicIp.c_str(),
+                    static_cast<unsigned>(g_netplayMenuState.hostPort));
+                ShowHostStartupFailure(
+                    "The detected public address cannot be used for hosting.",
+                    false);
+                break;
+            }
 
-            mod::Log("LobbyChallenge: challenging '%s' id=%d with our ip=%s",
-                entry.name.c_str(), entry.playerId, ipPortBuf);
+            mod::Log(
+                "LOBBY_ENDPOINT_PUBLISH result=pending_listener_ack "
+                "target='%s' id=%d preferred=%s effective=%s fallback=%d "
+                "publicAddress='%s' requestedPort=%u",
+                entry.name.c_str(),
+                entry.playerId,
+                netplay::network::FamilyName(lobStatus.preferredFamily),
+                netplay::network::FamilyName(lobStatus.effectiveFamily),
+                lobStatus.usedFamilyFallback ? 1 : 0,
+                publicHost.host.c_str(),
+                static_cast<unsigned>(
+                    g_netplayMenuState.hostPort));
 
             // Start hosting first so we're ready to accept connections.
             const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
-            const bool started = netplay::bridge::StartSession(
-                NetbridgeRole::Host,
+            netplay::bridge::HostSessionNetworkConfig networkConfig;
+            networkConfig.preferredFamily =
+                lobStatus.preferredFamily;
+            networkConfig.effectiveFamily =
+                lobStatus.effectiveFamily;
+            networkConfig.publicAddress = publicHost.host;
+            netplay::bridge::HostStartFailure startFailure =
+                netplay::bridge::HostStartFailure::None;
+            const bool started = netplay::bridge::StartHostSession(
                 g_netplayMenuState.hostPort,
-                "",
                 g_netplayMenuState.nickname.c_str(),
-                writeNicknameToIni);
+                networkConfig,
+                writeNicknameToIni,
+                &startFailure);
             if (started)
             {
-                ActivateChallengeHostingOverlay(entry.name.c_str(), g_netplayMenuState.hostPort);
-
-                // Send the challenge to the lobby server (async on poll thread).
-                g_lobbySession->SendChallenge(entry.playerId, entry.name, std::string(ipPortBuf));
+                ActivateChallengeHostingOverlay(
+                    entry.name.c_str(),
+                    g_netplayMenuState.hostPort,
+                    lobStatus.preferredFamily,
+                    lobStatus.effectiveFamily,
+                    lobStatus.usedFamilyFallback,
+                    publicHost.host.c_str());
+                g_hostingOverlay.writeNicknameToIni =
+                    writeNicknameToIni;
+                CopyBoundedText(
+                    g_hostingOverlay.hostNickname,
+                    sizeof(g_hostingOverlay.hostNickname),
+                    g_netplayMenuState.nickname.c_str());
+                g_pendingLobbyChallengePublish.active = true;
+                g_pendingLobbyChallengePublish.targetPlayerId = entry.playerId;
+                g_pendingLobbyChallengePublish.targetName = entry.name;
+                g_pendingLobbyChallengePublish.publicAddress =
+                    publicHost.host;
+                g_pendingLobbyChallengePublish.preferredFamily =
+                    lobStatus.preferredFamily;
+                g_pendingLobbyChallengePublish.family =
+                    lobStatus.effectiveFamily;
+                g_pendingLobbyChallengePublish.port =
+                    g_netplayMenuState.hostPort;
+                netplay::battle_log::EnsureGameplayOverlayHook();
+            }
+            else if (startFailure
+                         == netplay::bridge::HostStartFailure::
+                             FamilyUnavailable)
+            {
+                const netplay::network::NetworkFamily retryFamily =
+                    AlternateHostFamily(lobStatus.effectiveFamily);
+                mod::Log(
+                    "HOST_FAMILY_FALLBACK_BEGIN owner=lobby_challenge "
+                    "trigger=sync_preflight attempt=2 originalPreferred=%s "
+                    "from=%s to=%s port=%u target='%s' id=%d",
+                    netplay::network::FamilyName(
+                        lobStatus.preferredFamily),
+                    netplay::network::FamilyName(
+                        lobStatus.effectiveFamily),
+                    netplay::network::FamilyName(retryFamily),
+                    static_cast<unsigned>(
+                        g_netplayMenuState.hostPort),
+                    entry.name.c_str(),
+                    entry.playerId);
+                netplay::bridge::CancelSession(
+                    "host_sync_preflight_retry_ack");
+                BeginHostDiscovery(
+                    g_netplayMenuState.hostPort,
+                    lobStatus.preferredFamily,
+                    retryFamily,
+                    false,
+                    true,
+                    g_netplayMenuState.nickname.c_str(),
+                    writeNicknameToIni,
+                    HostDiscoveryOwner::LobbyChallenge,
+                    entry.playerId,
+                    entry.name.c_str());
             }
             else
             {
-                const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
-                char text[320] = {};
-                snprintf(text, sizeof(text),
-                    "Host start failed for challenge to '%s'.\n\n%s",
-                    entry.name.c_str(),
-                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
-                ShowStubActionMessage(owner, text);
+                const netplay::bridge::NetbridgeStatus bridgeStatus =
+                    netplay::bridge::GetStatus();
+                ShowHostStartupFailure(
+                    bridgeStatus.errorMsg[0] != '\0'
+                        ? bridgeStatus.errorMsg
+                        : "Could not start the Revival netplay session.",
+                    true);
             }
         }
         break;
@@ -4455,6 +6001,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     auto const processInput = reinterpret_cast<ProcessPlayerInputFn>(RuntimeAddress(kVaProcessPlayerInput));
 
     PumpLobbySessionShutdown();
+    PromoteCompletedLocalNetworkCapabilityScan();
     AdvanceMenuSlideTransition(screenContext);
     if (g_useRuntimeTextOverlay)
     {
@@ -4472,6 +6019,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
     const int gameSystem = GetGameSystem(screenContext);
     processInput(reinterpret_cast<int*>(gameSystem));
     netplay::bridge::Tick();
+    PumpDirectHostDiscovery();
+    PumpHostListenerObservation();
     auto* const rawInputBytes = reinterpret_cast<uint8_t*>(gameSystem);
     std::array<uint8_t, kFilteredMenuInputBytes> menuInputBytes = {};
     std::memcpy(menuInputBytes.data(), rawInputBytes, kFilteredMenuInputBytes);
@@ -4639,6 +6188,54 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    // Public-address discovery runs before the bridge owns a session, so the
+    // normal Connecting-phase cancel handler cannot protect this window.
+    // Treat it as a modal: permit cancellation and suppress all menu actions
+    // until the main thread either queues the session or discards the result.
+    if (g_hostingOverlay.active
+        && g_hostingOverlay.discoveryInProgress
+        && !g_hostingOverlay.sessionQueued)
+    {
+        bool cancelRequested = ConsumeNetplayEscapeEdge();
+        for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 18] == 1)
+            {
+                cancelRequested = true;
+            }
+        }
+        if (cancelRequested)
+        {
+            PlayUiSound(screenContext, kSfxConfirm);
+            const char* discoveryOwner =
+                g_pendingHostDiscovery
+                        && g_pendingHostDiscovery->owner
+                            == HostDiscoveryOwner::LobbyChallenge
+                    ? "lobby_challenge"
+                    : "direct_host";
+            mod::Log(
+                "PUBLIC_IP_DISCOVERY_CANCEL owner=%s generation=%llu "
+                "preferred=%s effective=%s automaticRetry=%d",
+                discoveryOwner,
+                static_cast<unsigned long long>(
+                    g_directHostDiscoveryGeneration),
+                netplay::network::FamilyName(
+                    g_hostingOverlay.preferredFamily),
+                netplay::network::FamilyName(
+                    g_hostingOverlay.effectiveFamily),
+                g_hostingOverlay.automaticFamilyRetryAttempted
+                    ? 1
+                    : 0);
+            ResetHostingOverlayState();
+        }
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
     if (windowFocused && HandleInlineEditInput(screenContext, inputBytes))
     {
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
@@ -4688,36 +6285,29 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 std::string clipText;
                 if (netplay::input::TryReadClipboardAsciiText(owner, &clipText))
                 {
-                    // Trim whitespace
-                    while (!clipText.empty() && (clipText.back() == ' ' || clipText.back() == '\n' || clipText.back() == '\r' || clipText.back() == '\t'))
-                        clipText.pop_back();
-                    while (!clipText.empty() && (clipText.front() == ' ' || clipText.front() == '\n' || clipText.front() == '\r' || clipText.front() == '\t'))
-                        clipText.erase(clipText.begin());
-
-                    // Split on the last ':' to handle IPv6 addresses (e.g. [::1]:7500)
-                    const std::size_t colonPos = clipText.rfind(':');
-                    if (colonPos != std::string::npos && colonPos > 0 && colonPos + 1 < clipText.size())
+                    netplay::network::NetworkEndpoint endpoint;
+                    if (netplay::network::ParseEndpoint(clipText, &endpoint))
                     {
-                        const std::string ipPart = clipText.substr(0, colonPos);
-                        const std::string portPart = clipText.substr(colonPos + 1);
-                        const unsigned long parsedPort = std::strtoul(portPart.c_str(), nullptr, 10);
-                        if (parsedPort > 0 && parsedPort <= 65535 && !ipPart.empty())
-                        {
-                            g_netplayMenuState.joinAddress = ipPart;
-                            g_netplayMenuState.joinPort = static_cast<uint16_t>(parsedPort);
-                            SaveNetplayJoinAddressToIni();
-                            PlayUiSound(screenContext, kSfxConfirm);
-                            mod::Log("JoinPaste: pasted address='%s' port=%u from clipboard",
-                                ipPart.c_str(), static_cast<unsigned>(parsedPort));
-                        }
-                        else
-                        {
-                            mod::Log("JoinPaste: invalid IP:port in clipboard '%s'", clipText.c_str());
-                        }
+                        g_netplayMenuState.joinAddress = endpoint.host;
+                        g_netplayMenuState.joinPort = endpoint.port;
+                        SaveNetplayJoinAddressToIni();
+                        PlayUiSound(screenContext, kSfxConfirm);
+                        std::string canonicalEndpoint;
+                        (void)netplay::network::FormatEndpoint(
+                            endpoint,
+                            &canonicalEndpoint);
+                        mod::Log(
+                            "REMOTE_ENDPOINT_PARSED source=clipboard family=%s endpoint=%s",
+                            netplay::network::FamilyName(endpoint.family),
+                            canonicalEndpoint.c_str());
                     }
                     else
                     {
-                        mod::Log("JoinPaste: no ':' separator found in clipboard '%s'", clipText.c_str());
+                        SetNetplayStatusMessage(
+                            "Invalid endpoint. Use IPv4:port or [IPv6]:port.");
+                        mod::Log(
+                            "JoinPaste: rejected endpoint='%s' expected=IPv4:port_or_[IPv6]:port",
+                            clipText.c_str());
                     }
                 }
                 break;
@@ -4784,7 +6374,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
     };
     auto promoteTerminalBridgeFailureToJoiningOverlay = [&](const netplay::bridge::NetbridgeStatus& status, NetbridgePhase phase) {
-        if (g_joiningOverlay.active)
+        if (g_joiningOverlay.active
+            || (g_hostingOverlay.active
+                && g_hostingOverlay.failed))
         {
             return;
         }
@@ -4803,6 +6395,20 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
+        if (hadHostingOverlay)
+        {
+            netplay::bridge::async_host::Reset();
+            ShowHostStartupFailure(failureText, true);
+            mod::Log(
+                "NetplayTerminal: promoted transient overlay to host failure dialog "
+                "phase=%s delay=%d spectateConfirm=%d hosting=1 "
+                "needsBridgeCancel=1 error='%s'",
+                netplay::bridge::PhaseToString(phase),
+                hadDelayOverlay ? 1 : 0,
+                hadSpectateConfirmOverlay ? 1 : 0,
+                failureText);
+            return;
+        }
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
         g_joiningOverlay.active = true;
@@ -4894,9 +6500,96 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
+    if (TryBeginTerminalHostFamilyRetry(
+            bridgeStatus,
+            bridgePhase))
+    {
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
+    }
+
+    if (g_hostingOverlay.active
+        && !g_hostingOverlay.failed
+        && netplay::bridge::async_host::
+               HasHostListenerStartupFailed())
+    {
+        const char* failureText =
+            bridgeStatus.errorMsg[0] != '\0'
+                ? bridgeStatus.errorMsg
+                : "Hosting could not start. Please try again.";
+        ShowHostStartupFailure(
+            failureText,
+            HostFailureNeedsBridgeCancel());
+        mod::Log(
+            "ASYNC_HOST_LISTENER_START_FAILURE_PROMOTED "
+            "phase=%s needsBridgeCancel=%d error='%s'",
+            netplay::bridge::PhaseToString(bridgePhase),
+            g_hostingOverlay.failureNeedsBridgeCancel
+                ? 1
+                : 0,
+            failureText);
+    }
+
     if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
     {
         promoteTerminalBridgeFailureToJoiningOverlay(bridgeStatus, bridgePhase);
+    }
+
+    if (g_hostingOverlay.active && g_hostingOverlay.failed)
+    {
+        bool dismissed = ConsumeNetplayEscapeEdge();
+        for (int playerIndex = 0;
+             !dismissed && playerIndex < 2;
+             ++playerIndex)
+        {
+            if (inputBytes[playerIndex + 16] == 1
+                || inputBytes[playerIndex + 18] == 1
+                || inputBytes[playerIndex + 20] == 1
+                || inputBytes[playerIndex + 22] == 1)
+            {
+                dismissed = true;
+            }
+        }
+        if (dismissed)
+        {
+            const bool needsBridgeCancel =
+                g_hostingOverlay.failureNeedsBridgeCancel;
+            const std::string failureText =
+                g_hostingOverlay.errorText;
+            PlayUiSound(screenContext, kSfxConfirm);
+            ResetDelaySetupOverlayState();
+            ResetSpectateConfirmOverlayState();
+            ResetHostingOverlayState();
+            ResetJoiningOverlayState();
+            ClearPendingLobbySpectateWait(
+                "dismissed_host_error");
+            netplay::bridge::async_host::Reset();
+            if (needsBridgeCancel)
+            {
+                netplay::bridge::CancelSession(
+                    "dismissed_host_error");
+                notifyLobbySessionEndedForCurrentBridgeRole(
+                    false);
+            }
+            mod::Log(
+                "HostingOverlay: error dismissed by user "
+                "needsBridgeCancel=%d action=%s error='%s'",
+                needsBridgeCancel ? 1 : 0,
+                needsBridgeCancel
+                    ? "bridge_cancel_or_rejection_ack"
+                    : "overlay_only",
+                failureText.c_str());
+        }
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP1) = 0;
+        *reinterpret_cast<uint8_t*>(
+            screenContext + kOffsetInputLatchP2) = 0;
+        ++(*inactivityCounter);
+        return 0;
     }
 
     if (g_pendingLobbySpectateWait.active
@@ -5528,6 +7221,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (!cancelRequested
             && g_hostingOverlay.active
             && !g_hostingOverlay.challengeMode
+            && g_hostingOverlay.listenerReady
             && netplay::bridge::async_host::GetState()
                    == netplay::bridge::async_host::State::Hosting)
         {
@@ -5558,6 +7252,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         // C button (heavy attack, offset 20/21) - copy IP:PORT to clipboard
         if (g_hostingOverlay.active
             && !g_hostingOverlay.challengeMode
+            && g_hostingOverlay.listenerReady
             && g_hostingOverlay.ipFetchDone
             && !g_hostingOverlay.ipFetchFailed)
         {
@@ -5572,16 +7267,22 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
             if (copyRequested)
             {
-                char clipText[192] = {};
-                std::snprintf(clipText, sizeof(clipText), "%s:%u",
+                const std::string clipText = FormatNetworkEndpoint(
+                    g_hostingOverlay.effectiveFamily,
                     g_hostingOverlay.publicIp,
-                    static_cast<unsigned>(g_hostingOverlay.port));
-                if (netplay::bridge::takeover::TryWriteClipboardAscii(clipText))
+                    g_hostingOverlay.port);
+                if (!clipText.empty()
+                    && netplay::bridge::takeover::TryWriteClipboardAscii(
+                        clipText.c_str()))
                 {
                     g_hostingOverlay.copiedToClipboard = true;
                     g_hostingOverlay.copiedFlashTick = GetTickCount();
                     PlayUiSound(screenContext, kSfxConfirm);
-                    mod::Log("HostingOverlay: copied '%s' to clipboard", clipText);
+                    mod::Log(
+                        "HostingOverlay: copied endpoint='%s' family=%s",
+                        clipText.c_str(),
+                        netplay::network::FamilyName(
+                            g_hostingOverlay.effectiveFamily));
                 }
             }
         }

@@ -40,6 +40,30 @@
 			}
 		},
 		{
+			"label": "CMake Configure XP Trace Win32",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--preset",
+				"xp-trace"
+			],
+			"group": "build"
+		},
+		{
+			"label": "CMake Build Trace DLL",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"--preset",
+				"build-xp-trace",
+				"--target",
+				"efz_netplay_mod"
+			],
+			"dependsOn": "CMake Configure XP Trace Win32",
+			"group": "build"
+		},
+		{
 			"label": "Debug DLL Configure",
 			"type": "shell",
 			"command": "cmake",

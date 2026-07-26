@@ -1025,14 +1025,23 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const uint8_t dimColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 176, 198, 198);
     const uint8_t greenColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 100, 255, 130);
     const uint8_t yellowColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 220, 100);
+    const uint8_t redColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 80, 80);
 
     // Minimized: draw a small top-right badge instead of the full panel, so the
     // user can browse the rest of the netplay menu while still hosting.
-    if (!g_hostingOverlay.challengeMode && netplay::bridge::async_host::IsMinimized())
+    if (!g_hostingOverlay.failed
+        && !g_hostingOverlay.challengeMode
+        && netplay::bridge::async_host::IsMinimized())
     {
         const char* badge = "HOSTING";
         uint8_t badgeColor = frameColor;
-        if (netplay::bridge::async_host::IsTimedOut())
+        if (netplay::bridge::async_host::
+                HasHostListenerStartupFailed())
+        {
+            badge = "HOST FAILED";
+            badgeColor = redColor;
+        }
+        else if (netplay::bridge::async_host::IsTimedOut())
         {
             badge = "TIMED OUT";
             badgeColor = yellowColor;
@@ -1063,8 +1072,11 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             sv, badge, badgeX + 2, badgeX + badgeW - 2, badgeY + 3,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             badgeColor,
-            netplay::bridge::async_host::IsTimedOut()
-                ? kRtOverlayYellow
+            netplay::bridge::async_host::
+                    HasHostListenerStartupFailed()
+                ? kRtOverlayRed
+                : netplay::bridge::async_host::IsTimedOut()
+                    ? kRtOverlayYellow
                 : (netplay::bridge::async_host::IsPeerFoundHeld()
                     ? kRtOverlayGreen
                     : kRtOverlayText));
@@ -1090,10 +1102,71 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         netplay::debug_overlay::RtTextProfile::OverlayTitle,
         titleColor, kRtOverlayTitle);
 
-    char line[192] = {};
-    if (g_hostingOverlay.challengeMode)
+    if (g_hostingOverlay.failed)
     {
-        std::snprintf(line, sizeof(line), "vs %s", g_hostingOverlay.targetName);
+        DrawTransientTextCentered(
+            sv, "Hosting failed", cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            redColor, kRtOverlayRed);
+        if (g_hostingOverlay.errorText[0] != '\0')
+        {
+            DrawTransientTextCentered(
+                sv, g_hostingOverlay.errorText,
+                cL, cR, panelY + 42,
+                netplay::debug_overlay::RtTextProfile::OverlayBody,
+                textColor, kRtOverlayText);
+        }
+        DrawTransientTextCentered(
+            sv, "Press any button to dismiss",
+            cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            dimColor, kRtOverlayDim);
+        netplay::draw::ReleaseMenuDrawSurfaceLock(
+            lockedSurface);
+        return true;
+    }
+
+    char line[192] = {};
+    if (g_hostingOverlay.discoveryInProgress)
+    {
+        std::snprintf(
+            line,
+            sizeof(line),
+            "Detecting public %s address...",
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily));
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            dimColor, kRtOverlayDim);
+        DrawTransientTextCentered(
+            sv,
+            g_hostingOverlay.challengeMode
+                ? "B/ESC: Cancel challenge"
+                : "B/ESC: Cancel hosting",
+            cL, cR, panelY + 58,
+            netplay::debug_overlay::RtTextProfile::OverlayHint,
+            textColor, kRtOverlayText);
+    }
+    else if (g_hostingOverlay.challengeMode)
+    {
+        if (!g_hostingOverlay.listenerReady)
+        {
+            std::snprintf(
+                line,
+                sizeof(line),
+                "Starting %s Revival netplay session...",
+                netplay::network::FamilyName(
+                    g_hostingOverlay.effectiveFamily));
+        }
+        else
+        {
+            std::snprintf(
+                line,
+                sizeof(line),
+                "vs %s",
+                g_hostingOverlay.targetName);
+        }
         DrawTransientTextCentered(
             sv, line, cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
@@ -1103,16 +1176,34 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             textColor, kRtOverlayText);
     }
-    else if (!g_hostingOverlay.ipFetchDone)
+    else if (g_hostingOverlay.listenerMismatch)
     {
         DrawTransientTextCentered(
-            sv, "Fetching public IP...", cL, cR, panelY + 28,
+            sv, "Retrying hosting setup...", cL, cR, panelY + 28,
+            netplay::debug_overlay::RtTextProfile::OverlayBody,
+            yellowColor, kRtOverlayYellow);
+    }
+    else if (!g_hostingOverlay.listenerReady)
+    {
+        std::snprintf(
+            line,
+            sizeof(line),
+            "Starting %s Revival netplay session...",
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily));
+        DrawTransientTextCentered(
+            sv, line, cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             dimColor, kRtOverlayDim);
     }
     else if (g_hostingOverlay.ipFetchFailed)
     {
-        std::snprintf(line, sizeof(line), "Port: %u  (IP detection failed)",
+        std::snprintf(
+            line,
+            sizeof(line),
+            "%s ready on port %u; public IP unavailable",
+            netplay::network::FamilyName(
+                g_hostingOverlay.effectiveFamily),
             static_cast<unsigned>(g_hostingOverlay.port));
         DrawTransientTextCentered(
             sv, line, cL, cR, panelY + 28,
@@ -1121,10 +1212,19 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     }
     else
     {
-        std::snprintf(line, sizeof(line), "%s:%u",
-            g_hostingOverlay.publicIp, static_cast<unsigned>(g_hostingOverlay.port));
+        netplay::network::NetworkEndpoint endpoint;
+        endpoint.family = g_hostingOverlay.effectiveFamily;
+        endpoint.host = g_hostingOverlay.publicIp;
+        endpoint.port = g_hostingOverlay.port;
+        std::string formattedEndpoint;
+        if (!netplay::network::FormatEndpoint(
+                endpoint,
+                &formattedEndpoint))
+        {
+            formattedEndpoint = "Invalid detected endpoint";
+        }
         DrawTransientTextCentered(
-            sv, line, cL, cR, panelY + 28,
+            sv, formattedEndpoint.c_str(), cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             brightColor, kRtOverlayBright);
     }
@@ -1141,7 +1241,38 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 greenColor, kRtOverlayGreen);
         }
-        else if (g_hostingOverlay.ipFetchDone && !g_hostingOverlay.ipFetchFailed)
+        else if (g_hostingOverlay.listenerReady
+            && g_hostingOverlay.usedFamilyFallback)
+        {
+            if (g_hostingOverlay
+                    .automaticFamilyRetryAttempted)
+            {
+                std::snprintf(
+                    line,
+                    sizeof(line),
+                    "Automatic retry succeeded with %s",
+                    netplay::network::FamilyName(
+                        g_hostingOverlay.effectiveFamily));
+            }
+            else
+            {
+                std::snprintf(
+                    line,
+                    sizeof(line),
+                    "%s address not detected; using %s",
+                    netplay::network::FamilyName(
+                        g_hostingOverlay.preferredFamily),
+                    netplay::network::FamilyName(
+                        g_hostingOverlay.effectiveFamily));
+            }
+            DrawTransientTextCentered(
+                sv, line, cL, cR, panelY + 42,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                yellowColor, kRtOverlayYellow);
+        }
+        else if (g_hostingOverlay.listenerReady
+            && g_hostingOverlay.ipFetchDone
+            && !g_hostingOverlay.ipFetchFailed)
         {
             DrawTransientTextCentered(
                 sv, "Press C to copy IP address", cL, cR, panelY + 42,
@@ -1150,7 +1281,23 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         }
 
         // Bottom line: state / controls.
-        if (netplay::bridge::async_host::IsTimedOut())
+        if (!g_hostingOverlay.listenerReady)
+        {
+            DrawTransientTextCentered(
+                sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                textColor, kRtOverlayText);
+        }
+        else if (netplay::bridge::async_host::
+                     HasHostListenerStartupFailed())
+        {
+            DrawTransientTextCentered(
+                sv, "HOSTING FAILED   B/ESC: Cancel",
+                cL, cR, panelY + 58,
+                netplay::debug_overlay::RtTextProfile::OverlayHint,
+                textColor, kRtOverlayText);
+        }
+        else if (netplay::bridge::async_host::IsTimedOut())
         {
             DrawTransientTextCentered(
                 sv, "OPPONENT TIMED OUT   B/ESC: Cancel", cL, cR, panelY + 58,
@@ -1296,12 +1443,26 @@ void DrawAsyncHostGameplayOverlay(uint32_t screenContext)
     const uint8_t bgColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 8, 16, 28);
     const uint8_t textColor  = netplay::draw::ResolveBestPaletteColor(screenContext, 200, 224, 224);
     const uint8_t greenColor = netplay::draw::ResolveBestPaletteColor(screenContext, 100, 255, 130);
+    const uint8_t redColor   = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 80, 80);
 
     char msg[160] = {};
     uint8_t col = textColor;
-    if (ah::IsTimedOut())
+    if (ah::HasHostListenerStartupFailed())
     {
-        std::snprintf(msg, sizeof(msg), "Opponent timed out - %s to rehost", ah::ReturnKeyDisplay());
+        std::snprintf(
+            msg,
+            sizeof(msg),
+            "Hosting failed - %s to return",
+            ah::ReturnKeyDisplay());
+        col = redColor;
+    }
+    else if (ah::IsTimedOut())
+    {
+        std::snprintf(
+            msg,
+            sizeof(msg),
+            "Opponent timed out - %s to return",
+            ah::ReturnKeyDisplay());
     }
     else if (ah::IsPeerFoundHeld())
     {
@@ -1423,8 +1584,22 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         }
         else
         {
-            std::snprintf(line, sizeof(line), "Connecting to %s:%u ...",
-                g_joiningOverlay.address, static_cast<unsigned>(g_joiningOverlay.port));
+            netplay::network::NetworkEndpoint endpoint;
+            endpoint.family = g_joiningOverlay.family;
+            endpoint.host = g_joiningOverlay.address;
+            endpoint.port = g_joiningOverlay.port;
+            std::string formattedEndpoint;
+            if (!netplay::network::FormatEndpoint(
+                    endpoint,
+                    &formattedEndpoint))
+            {
+                formattedEndpoint = "invalid endpoint";
+            }
+            std::snprintf(
+                line,
+                sizeof(line),
+                "Connecting to %s ...",
+                formattedEndpoint.c_str());
         }
         DrawTransientTextCentered(
             sv, line, cL, cR, panelY + 30,

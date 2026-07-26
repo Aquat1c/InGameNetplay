@@ -1,4 +1,5 @@
 #include "netplay/core/lobby_client.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
@@ -829,6 +830,8 @@ struct WinInetApi
 WinInetApi& GetWinInetApi()
 {
     static WinInetApi api;
+    static std::mutex initMutex;
+    std::lock_guard<std::mutex> initLock(initMutex);
     if (api.initialized)
     {
         return api;
@@ -1742,7 +1745,504 @@ void ParsePublicRoomSummaries(const std::string& json, std::vector<PublicRoomSum
         }
     }
 }
+
+constexpr DWORD kPublicIpTimeoutMs = 2000;
+
+bool IsPublicIpDiscoveryCancelled(const std::atomic<bool>* cancelFlag)
+{
+    return cancelFlag != nullptr && cancelFlag->load();
+}
+
+network::NetworkFamily NormalizeNetworkFamily(network::NetworkFamily family)
+{
+    return family == network::NetworkFamily::IPv6
+        ? network::NetworkFamily::IPv6
+        : network::NetworkFamily::IPv4;
+}
+
+network::NetworkFamily AlternateNetworkFamily(network::NetworkFamily family)
+{
+    return NormalizeNetworkFamily(family) == network::NetworkFamily::IPv6
+        ? network::NetworkFamily::IPv4
+        : network::NetworkFamily::IPv6;
+}
+
+PublicIpDiscoveryResult::FamilyDiagnostics* DiagnosticsForFamily(
+    PublicIpDiscoveryResult* result,
+    network::NetworkFamily family)
+{
+    if (result == nullptr)
+    {
+        return nullptr;
+    }
+    return NormalizeNetworkFamily(family) == network::NetworkFamily::IPv6
+        ? &result->ipv6
+        : &result->ipv4;
+}
+
+bool TryAcceptPublicIpResponse(
+    std::string body,
+    network::NetworkFamily expectedFamily,
+    const char* source,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || outPublicIp == nullptr)
+    {
+        return false;
+    }
+
+    body = TrimAscii(std::move(body));
+    network::NetworkHost parsedHost;
+    if (!network::ParseBareHost(body, &parsedHost))
+    {
+        ++diagnostics->parseFailures;
+        mod::Log(
+            "PublicIpDiscovery: rejected malformed response source=%s expected=%s bytes=%zu",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            body.size());
+        return false;
+    }
+    if (parsedHost.family != expectedFamily)
+    {
+        ++diagnostics->parseFailures;
+        mod::Log(
+            "PublicIpDiscovery: rejected wrong-family response source=%s expected=%s actual=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            network::FamilyName(parsedHost.family));
+        return false;
+    }
+    if (!network::IsGloballyRoutableHost(parsedHost))
+    {
+        ++diagnostics->nonGlobalResponses;
+        mod::Log(
+            "PublicIpDiscovery: rejected non-global response source=%s expected=%s address=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            parsedHost.host.c_str());
+        return false;
+    }
+
+    *outPublicIp = std::move(parsedHost.host);
+    diagnostics->resolved = true;
+    mod::Log(
+        "PublicIpDiscovery: resolved family=%s source=%s address=%s",
+        network::FamilyName(expectedFamily),
+        source != nullptr ? source : "",
+        outPublicIp->c_str());
+    return true;
+}
+
+bool TryTlsPublicIpSource(
+    const char* url,
+    const char* source,
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    ++diagnostics->sourceAttempts;
+    std::string body;
+    std::string error;
+    if (!netplay::tls::HttpGet(
+            url,
+            false,
+            kPublicIpTimeoutMs,
+            kPublicIpTimeoutMs,
+            &body,
+            &error))
+    {
+        ++diagnostics->transportFailures;
+        mod::Log(
+            "PublicIpDiscovery: transport failure source=%s family=%s detail=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(family),
+            error.empty() ? "(none)" : error.c_str());
+        return false;
+    }
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+    return TryAcceptPublicIpResponse(
+        std::move(body),
+        family,
+        source,
+        diagnostics,
+        outPublicIp);
+}
+
+bool TryWinInetPublicIpSource(
+    const char* url,
+    const char* source,
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    ++diagnostics->sourceAttempts;
+    std::string body = DoHttpGetViaWinInet(
+        url,
+        kPublicIpTimeoutMs,
+        kPublicIpTimeoutMs);
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+    if (body.empty())
+    {
+        // The existing WinINet wrapper exposes an empty body for transport
+        // failures and for unusable empty responses. Record that as a lookup
+        // transport/no-body failure without claiming the address family itself
+        // is unavailable.
+        ++diagnostics->transportFailures;
+        mod::Log(
+            "PublicIpDiscovery: transport/no-body failure source=%s family=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(family));
+        return false;
+    }
+    return TryAcceptPublicIpResponse(
+        std::move(body),
+        family,
+        source,
+        diagnostics,
+        outPublicIp);
+}
+
+bool TryDiscoverPublicIpForFamily(
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    const network::LocalNetworkCapabilitySnapshot* capabilitySnapshot,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    family = NormalizeNetworkFamily(family);
+    if (diagnostics == nullptr)
+    {
+        return false;
+    }
+
+    if (capabilitySnapshot != nullptr)
+    {
+        const network::LocalFamilyCapability& capability =
+            network::GetFamilyCapability(*capabilitySnapshot, family);
+        diagnostics->localCapabilityAvailable = true;
+        diagnostics->localCapability = capability;
+        mod::Log(
+            "PublicIpDiscovery: cached local capability family=%s state=%s "
+            "listenerStage=%s listenerError=%d addresses=%u strongestScope=%s "
+            "routeAttempted=%d routeAvailable=%d routeUnavailable=%d "
+            "routeError=%d routeSource=%s action=%s",
+            network::FamilyName(family),
+            network::LocalFamilyCapabilityStateName(capability.state),
+            network::ProbeStageName(capability.listenerProbe.stage),
+            capability.listenerProbe.nativeError,
+            capability.bindableAddressCount,
+            network::LocalAddressScopeName(
+                capability.strongestAddressScope),
+            capability.routeProbeAttempted ? 1 : 0,
+            capability.routeAvailable ? 1 : 0,
+            capability.routeDefinitelyUnavailable ? 1 : 0,
+            capability.routeNativeError,
+            network::LocalAddressScopeName(capability.routeSourceScope),
+            network::CanAttemptGlobalPublicDiscovery(capability)
+                ? "discover_global"
+                : "skip_global");
+        if (!network::CanAttemptGlobalPublicDiscovery(capability))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        // A missing or stale cache is intentionally not a reason to wait or
+        // run a local socket probe here. This worker is then purely public
+        // address discovery, and Revival's listener is the final authority.
+        mod::Log(
+            "PublicIpDiscovery: local capability family=%s cache=unavailable "
+            "action=discover_global",
+            network::FamilyName(family));
+    }
+
+    const bool ipv6 = family == network::NetworkFamily::IPv6;
+    const char* apiUrl = ipv6 ? "https://api6.ipify.org" : "https://api4.ipify.org";
+    const char* apiLabel = ipv6 ? "api6.ipify.org" : "api4.ipify.org";
+    const char* identUrl = ipv6 ? "http://6.ident.me" : "http://4.ident.me";
+    const char* identLabel = ipv6 ? "6.ident.me" : "4.ident.me";
+    const char* tnediUrl = ipv6 ? "http://6.tnedi.me" : "http://4.tnedi.me";
+    const char* tnediLabel = ipv6 ? "6.tnedi.me" : "4.tnedi.me";
+
+    // These services are independent and each has its own two-second
+    // transport timeout. Running them sequentially could hold Direct Host for
+    // three full timeout windows before the listener is even started. Race the
+    // same-family sources, join them here (the outer discovery worker owns all
+    // lifetimes), then retain the deterministic ipify -> ident.me -> tnedi.me
+    // selection order.
+    struct SourceAttempt
+    {
+        PublicIpDiscoveryResult::FamilyDiagnostics diagnostics;
+        std::string publicIp;
+        bool resolved = false;
+    };
+
+    SourceAttempt apiAttempt;
+    SourceAttempt identAttempt;
+    SourceAttempt tnediAttempt;
+    const bool useTlsForApi = netplay::tls::IsAvailable();
+
+    // GetWinInetApi has a manually initialized runtime symbol table. Resolve
+    // it on this one owner thread before the two/three request threads read it.
+    (void)GetWinInetApi();
+
+    const DWORD familyDiscoveryStartTick = GetTickCount();
+    std::thread apiThread([&]() {
+        apiAttempt.resolved =
+            useTlsForApi
+                ? TryTlsPublicIpSource(
+                      apiUrl,
+                      apiLabel,
+                      family,
+                      cancelFlag,
+                      &apiAttempt.diagnostics,
+                      &apiAttempt.publicIp)
+                : TryWinInetPublicIpSource(
+                      apiUrl,
+                      apiLabel,
+                      family,
+                      cancelFlag,
+                      &apiAttempt.diagnostics,
+                      &apiAttempt.publicIp);
+    });
+    std::thread identThread([&]() {
+        identAttempt.resolved = TryWinInetPublicIpSource(
+            identUrl,
+            identLabel,
+            family,
+            cancelFlag,
+            &identAttempt.diagnostics,
+            &identAttempt.publicIp);
+    });
+    std::thread tnediThread([&]() {
+        tnediAttempt.resolved = TryWinInetPublicIpSource(
+            tnediUrl,
+            tnediLabel,
+            family,
+            cancelFlag,
+            &tnediAttempt.diagnostics,
+            &tnediAttempt.publicIp);
+    });
+
+    apiThread.join();
+    identThread.join();
+    tnediThread.join();
+
+    const SourceAttempt* attempts[] = {
+        &apiAttempt,
+        &identAttempt,
+        &tnediAttempt,
+    };
+    const SourceAttempt* selected = nullptr;
+    for (const SourceAttempt* attempt : attempts)
+    {
+        diagnostics->sourceAttempts +=
+            attempt->diagnostics.sourceAttempts;
+        diagnostics->transportFailures +=
+            attempt->diagnostics.transportFailures;
+        diagnostics->parseFailures +=
+            attempt->diagnostics.parseFailures;
+        diagnostics->nonGlobalResponses +=
+            attempt->diagnostics.nonGlobalResponses;
+        if (selected == nullptr && attempt->resolved)
+        {
+            selected = attempt;
+        }
+    }
+
+    mod::Log(
+        "PublicIpDiscovery: family batch complete family=%s elapsedMs=%lu "
+        "attempts=%u transportFailures=%u parseFailures=%u nonGlobalResponses=%u resolved=%d",
+        network::FamilyName(family),
+        static_cast<unsigned long>(
+            GetTickCount() - familyDiscoveryStartTick),
+        diagnostics->sourceAttempts,
+        diagnostics->transportFailures,
+        diagnostics->parseFailures,
+        diagnostics->nonGlobalResponses,
+        selected != nullptr ? 1 : 0);
+
+    if (selected == nullptr
+        || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    diagnostics->resolved = true;
+    *outPublicIp = selected->publicIp;
+    return true;
+}
 } // namespace
+
+PublicIpDiscoveryResult DiscoverPublicIpSynchronously(
+    network::NetworkFamily preferredFamily,
+    const std::atomic<bool>* cancelFlag,
+    bool allowAlternateFamily,
+    const network::LocalNetworkCapabilitySnapshot* capabilitySnapshot)
+{
+    PublicIpDiscoveryResult result;
+    result.preferredFamily = NormalizeNetworkFamily(preferredFamily);
+    result.effectiveFamily = result.preferredFamily;
+
+    mod::Log(
+        "PublicIpDiscovery: begin preferred=%s capabilityCache=%s",
+        network::FamilyName(result.preferredFamily),
+        capabilitySnapshot != nullptr ? "completed" : "unavailable");
+
+    PublicIpDiscoveryResult::FamilyDiagnostics* preferredDiagnostics =
+        DiagnosticsForFamily(&result, result.preferredFamily);
+    if (TryDiscoverPublicIpForFamily(
+            result.preferredFamily,
+            cancelFlag,
+            capabilitySnapshot,
+            preferredDiagnostics,
+            &result.publicIp))
+    {
+        return result;
+    }
+
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        result.cancelled = true;
+        mod::Log(
+            "PublicIpDiscovery: cancelled preferred=%s",
+            network::FamilyName(result.preferredFamily));
+        return result;
+    }
+
+    if (!allowAlternateFamily)
+    {
+        result.publicIp.clear();
+        mod::Log(
+            "PublicIpDiscovery: no validated %s address detected across %u "
+            "sources; alternate family disabled for controlled retry",
+            network::FamilyName(result.preferredFamily),
+            preferredDiagnostics != nullptr
+                ? preferredDiagnostics->sourceAttempts
+                : 0u);
+        return result;
+    }
+
+    const network::NetworkFamily alternateFamily =
+        AlternateNetworkFamily(result.preferredFamily);
+    mod::Log(
+        "PublicIpDiscovery: no validated %s address detected across %u sources; trying alternate=%s",
+        network::FamilyName(result.preferredFamily),
+        preferredDiagnostics != nullptr ? preferredDiagnostics->sourceAttempts : 0u,
+        network::FamilyName(alternateFamily));
+
+    PublicIpDiscoveryResult::FamilyDiagnostics* alternateDiagnostics =
+        DiagnosticsForFamily(&result, alternateFamily);
+    if (TryDiscoverPublicIpForFamily(
+            alternateFamily,
+            cancelFlag,
+            capabilitySnapshot,
+            alternateDiagnostics,
+            &result.publicIp))
+    {
+        result.effectiveFamily = alternateFamily;
+        result.usedFamilyFallback = true;
+        mod::Log(
+            "PublicIpDiscovery: selected alternate=%s preferred=%s",
+            network::FamilyName(result.effectiveFamily),
+            network::FamilyName(result.preferredFamily));
+        return result;
+    }
+
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        result.cancelled = true;
+        mod::Log(
+            "PublicIpDiscovery: cancelled preferred=%s alternate=%s",
+            network::FamilyName(result.preferredFamily),
+            network::FamilyName(alternateFamily));
+        return result;
+    }
+
+    // If the prewarmed cache proved that the preferred family cannot even
+    // create/bind a listener, retry Revival on the alternate even when neither
+    // public-address service succeeded. This preserves LAN/manual hosting
+    // while avoiding any synchronous local probe on the Host path.
+    if (preferredDiagnostics != nullptr
+        && preferredDiagnostics->localCapabilityAvailable
+        && preferredDiagnostics->localCapability.state
+            == network::LocalFamilyCapabilityState::HardUnavailable
+        && alternateDiagnostics != nullptr
+        && alternateDiagnostics->localCapabilityAvailable
+        && alternateDiagnostics->localCapability.state
+            != network::LocalFamilyCapabilityState::HardUnavailable)
+    {
+        result.publicIp.clear();
+        result.effectiveFamily = alternateFamily;
+        result.usedFamilyFallback = true;
+        mod::Log(
+            "PublicIpDiscovery: selected alternate local Host family=%s "
+            "without public address; preferred=%s capability=%s "
+            "listenerStage=%s nativeError=%d",
+            network::FamilyName(result.effectiveFamily),
+            network::FamilyName(result.preferredFamily),
+            network::LocalFamilyCapabilityStateName(
+                preferredDiagnostics->localCapability.state),
+            network::ProbeStageName(
+                preferredDiagnostics->localCapability.listenerProbe.stage),
+            preferredDiagnostics->localCapability.listenerProbe.nativeError);
+        return result;
+    }
+
+    // Lookup failure alone is not proof that either local socket family is
+    // unavailable. Retain the user's preferred family so LAN/manual hosting
+    // can continue while callers report public-address detection failure.
+    result.publicIp.clear();
+    result.effectiveFamily = result.preferredFamily;
+    result.usedFamilyFallback = false;
+    mod::Log(
+        "PublicIpDiscovery: detection failed preferred=%s attempts=%u transport=%u parse=%u nonGlobal=%u "
+        "preferredCapability=%s alternate=%s attempts=%u transport=%u parse=%u nonGlobal=%u "
+        "alternateCapability=%s; "
+        "retaining preferred family",
+        network::FamilyName(result.preferredFamily),
+        preferredDiagnostics != nullptr ? preferredDiagnostics->sourceAttempts : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->transportFailures : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->parseFailures : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->nonGlobalResponses : 0u,
+        preferredDiagnostics != nullptr
+                && preferredDiagnostics->localCapabilityAvailable
+            ? network::LocalFamilyCapabilityStateName(
+                preferredDiagnostics->localCapability.state)
+            : "not_cached",
+        network::FamilyName(alternateFamily),
+        alternateDiagnostics != nullptr ? alternateDiagnostics->sourceAttempts : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->transportFailures : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->parseFailures : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->nonGlobalResponses : 0u,
+        alternateDiagnostics != nullptr
+                && alternateDiagnostics->localCapabilityAvailable
+            ? network::LocalFamilyCapabilityStateName(
+                alternateDiagnostics->localCapability.state)
+            : "not_cached");
+    return result;
+}
 
 bool ListPublicRooms(std::vector<PublicRoomSummary>* outRooms, std::string* outError)
 {
@@ -1924,9 +2424,11 @@ bool CreateRoom(
 LobbySession::LobbySession(
     std::string nickname,
     uint16_t hostPort,
-    const LobbyJoinedRoom* joinedRoom)
+    const LobbyJoinedRoom* joinedRoom,
+    network::NetworkFamily preferredFamily)
     : m_nickname(std::move(nickname))
     , m_hostPort(hostPort)
+    , m_preferredFamily(NormalizeNetworkFamily(preferredFamily))
 {
     if (joinedRoom != nullptr)
     {
@@ -1952,13 +2454,17 @@ LobbySession::LobbySession(
     m_status.roomCode = m_joinedRoom.roomCode;
     m_status.roomOrigin = m_joinedRoom.origin;
     m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
+    m_status.preferredFamily = m_preferredFamily;
+    m_status.effectiveFamily = m_preferredFamily;
+    m_status.usedFamilyFallback = false;
     m_pollThread = std::thread(&LobbySession::PollThreadEntry, this);
     mod::Log(
-        "LobbySession: started for nickname='%s' prejoined=%d roomCode='%s' origin=%d",
+        "LobbySession: started for nickname='%s' prejoined=%d roomCode='%s' origin=%d preferredFamily=%s",
         m_nickname.c_str(),
         m_hasPrejoinedRoom ? 1 : 0,
         m_joinedRoom.roomCode.c_str(),
-        static_cast<int>(m_joinedRoom.origin));
+        static_cast<int>(m_joinedRoom.origin),
+        network::FamilyName(m_preferredFamily));
 }
 
 LobbySession::~LobbySession()
@@ -1998,6 +2504,18 @@ LobbyStatus LobbySession::GetStatus() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_status;
+}
+
+network::NetworkFamily LobbySession::GetEffectiveFamily() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_status.effectiveFamily;
+}
+
+bool LobbySession::UsedFamilyFallback() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_status.usedFamilyFallback;
 }
 
 bool LobbySession::HasPendingEndActionLocked() const
@@ -3785,84 +4303,32 @@ void LobbySession::StartPublicIpDiscoveryAsync()
 
 void LobbySession::DiscoverPublicIp()
 {
-    constexpr DWORD kPublicIpTimeoutMs = 2000;
-
     if (m_shouldStop.load())
     {
         return;
     }
 
-    // Try the embedded TLS client first (works on all platforms).
-    if (netplay::tls::IsAvailable())
-    {
-        std::string body;
-        std::string error;
-        if (netplay::tls::HttpGet(
-                "https://api.ipify.org",
-                false,
-                kPublicIpTimeoutMs,
-                kPublicIpTimeoutMs,
-                &body,
-                &error))
-        {
-            // Trim whitespace.
-            while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
-            {
-                body.pop_back();
-            }
-            if (!body.empty())
-            {
-                m_publicIp = body;
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_status.publicIp = m_publicIp;
-                mod::Log("LobbySession::DiscoverPublicIp: resolved=%s", m_publicIp.c_str());
-                return;
-            }
-        }
-        mod::Log("LobbySession::DiscoverPublicIp: TLS request failed: %s", error.c_str());
-    }
-
-    if (m_shouldStop.load())
+    const PublicIpDiscoveryResult result =
+        DiscoverPublicIpSynchronously(m_preferredFamily, &m_shouldStop);
+    if (m_shouldStop.load() || result.cancelled)
     {
         return;
     }
 
-    // Fallback: plain HTTP to 4.ident.me (same service Concerto uses) via WinINet.
-    static auto TrimIpBody = [](std::string& s) {
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-        {
-            s.pop_back();
-        }
-    };
-
-    std::string body = DoHttpGetViaWinInet("http://4.ident.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
-    TrimIpBody(body);
-    if (!body.empty())
-    {
-        m_publicIp = body;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.publicIp = m_publicIp;
-        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.ident.me", m_publicIp.c_str());
-        return;
-    }
-
-    if (m_shouldStop.load())
-    {
-        return;
-    }
-
-    body = DoHttpGetViaWinInet("http://4.tnedi.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
-    TrimIpBody(body);
-    if (!body.empty())
-    {
-        m_publicIp = body;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.publicIp = m_publicIp;
-        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.tnedi.me", m_publicIp.c_str());
-        return;
-    }
-
-    mod::Log("LobbySession::DiscoverPublicIp: unable to resolve public IP");
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_publicIp = result.publicIp;
+    m_status.publicIp = result.publicIp;
+    m_status.publicIpDiscoveryComplete = true;
+    m_status.publicIpDetectionFailed = result.publicIp.empty();
+    m_status.preferredFamily = result.preferredFamily;
+    m_status.effectiveFamily = result.effectiveFamily;
+    m_status.usedFamilyFallback = result.usedFamilyFallback;
+    mod::Log(
+        "LobbySession::DiscoverPublicIp: complete preferred=%s effective=%s fallback=%d resolved=%s",
+        network::FamilyName(result.preferredFamily),
+        network::FamilyName(result.effectiveFamily),
+        result.usedFamilyFallback ? 1 : 0,
+        result.publicIp.empty() ? "(none)" : result.publicIp.c_str());
 }
 
 // ---------------------------------------------------------------------------

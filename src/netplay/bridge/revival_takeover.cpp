@@ -3297,6 +3297,13 @@ static void CloseChildJobObject()
 void InitializeHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!RecoverTemporaryHostProtocolOverride(
+            "mod startup"))
+    {
+        mod::Log(
+            "Takeover: Host Protocol crash recovery remains pending; "
+            "new Host attempts will stay blocked until it can be resolved");
+    }
     CleanupNativeHostShadowLogDirectory("startup");
     PrimeManagedLogEfzHistory();
     (void)EnsureHostIpc();
@@ -3320,6 +3327,8 @@ void ShutdownHost()
     StopManagedLogEfzWorker(true);
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
+    RestoreTemporaryHostProtocolOverride(
+        "Revival netplay session host shutdown");
     if (g_revivalProcess != nullptr)
     {
         TerminateProcess(g_revivalProcess, 0);
@@ -3357,6 +3366,8 @@ void EmergencyShutdownHost()
     StopManagedLogEfzWorker(false);
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepSnapshot("EmergencyShutdownHost.01.entry");
+    RestoreTemporaryHostProtocolOverride(
+        "Revival netplay session emergency host shutdown");
     InterlockedExchange(&g_startAbortRequested, 1);
     if (g_revivalProcess != nullptr)
     {
@@ -3531,25 +3542,75 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     LogRevival102jDeepSnapshot("TitleSelection.99.complete", ioStatus);
 }
 
+namespace
+{
+class TemporaryHostProtocolFailureGuard
+{
+public:
+    explicit TemporaryHostProtocolFailureGuard(bool armed)
+        : armed_(armed)
+    {
+    }
+
+    ~TemporaryHostProtocolFailureGuard()
+    {
+        if (armed_)
+        {
+            RestoreTemporaryHostProtocolOverride(
+                "Revival netplay session helper startup failed");
+        }
+    }
+
+    void Disarm()
+    {
+        armed_ = false;
+    }
+
+private:
+    bool armed_ = false;
+};
+} // namespace
+
 bool StartSession(
     NetbridgeRole role,
     uint16_t port,
     const char* address,
+    const char* iniAddress,
     const char* nickname,
     bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol,
     NetbridgeStatus* ioStatus,
     uint32_t* outConnectStartTick)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     mod::Log(
-        "Takeover: StartSession role=%d port=%u address='%s' nickname='%s' writeNicknameToIni=%d",
+        "Takeover: StartSession role=%d port=%u address='%s' iniAddress='%s' nickname='%s' "
+        "writeNicknameToIni=%d family=%s writeHostProtocol=%d",
         static_cast<int>(role),
         static_cast<unsigned>(port),
         (address != nullptr) ? address : "",
+        (iniAddress != nullptr) ? iniAddress : "",
         (nickname != nullptr) ? nickname : "",
-        writeNicknameToIni ? 1 : 0);
+        writeNicknameToIni ? 1 : 0,
+        network::FamilyName(sessionFamily),
+        writeHostProtocol ? 1 : 0);
     LogRevival102jDeepStep("StartSession.01.entry", ioStatus);
+
+    const bool temporaryHostProtocol =
+        role == NetbridgeRole::Host && writeHostProtocol;
+    if (temporaryHostProtocol
+        && !PrepareTemporaryHostProtocolOverride(sessionFamily))
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Revival netplay session Protocol setup failed.");
+        return false;
+    }
+    TemporaryHostProtocolFailureGuard protocolFailureGuard(
+        temporaryHostProtocol);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
     ResetForceLocalPlayInitCount();
@@ -3684,6 +3745,10 @@ bool StartSession(
         g_hostBlock->delayMaxPingMs = -1;
         g_hostBlock->delayRecommended = -1;
         g_hostBlock->delayRangeMax = 20;
+        g_hostBlock->hostExpectedListenerPort =
+            role == NetbridgeRole::Host
+                ? static_cast<LONG>(port)
+                : 0;
         LogRevival102jDeepStep("StartSession.05.shared_block_reset", ioStatus);
     }
 
@@ -3761,12 +3826,18 @@ bool StartSession(
 
     const std::string gameDir = GameDirectory();
     const std::wstring gameDirWide = GameDirectoryWide();
-    if (!WriteIni(static_cast<int>(role), port, address, nickname, writeNicknameToIni))
+    if (!WriteIni(
+            static_cast<int>(role),
+            port,
+            iniAddress,
+            nickname,
+            writeNicknameToIni,
+            sessionFamily,
+            writeHostProtocol))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
         return false;
     }
-
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -4037,23 +4108,13 @@ bool StartSession(
 
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (!clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: join clipboard seeded with address '%s'", clipboardAddress.c_str());
@@ -4062,6 +4123,15 @@ bool StartSession(
                 {
                     mod::Log("Takeover: join clipboard write failed; Revival will use existing clipboard");
                 }
+            }
+            else
+            {
+                mod::Log(
+                    "Takeover: Revival netplay session join endpoint formatting failed "
+                    "family=%s address='%s' port=%u",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
             }
         }
     }
@@ -4078,23 +4148,13 @@ bool StartSession(
 
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (!clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: join-spectate clipboard seeded with address '%s'", clipboardAddress.c_str());
@@ -4103,6 +4163,15 @@ bool StartSession(
                 {
                     mod::Log("Takeover: join-spectate clipboard write failed; Revival will use existing clipboard");
                 }
+            }
+            else
+            {
+                mod::Log(
+                    "Takeover: Revival netplay session join-spectate endpoint formatting failed "
+                    "family=%s address='%s' port=%u",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
             }
         }
     }
@@ -4113,27 +4182,22 @@ bool StartSession(
 
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (!network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                mod::Log("Takeover: spectate address empty after trim; using clipboard option as-is");
+                mod::Log(
+                    "Takeover: Revival netplay session spectate endpoint formatting failed "
+                    "family=%s address='%s' port=%u; using clipboard option as-is",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
             }
             else
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (!TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: spectate clipboard write failed; using option 4 with existing clipboard");
@@ -4290,6 +4354,7 @@ bool StartSession(
     RefreshRuntimeStatus(ioStatus);
     LogRevival102jDeepSnapshot("StartSession.99.armed", ioStatus);
     mod::Log("Takeover: start session armed (asynchronous handshake via Tick)");
+    protocolFailureGuard.Disarm();
     return true;
 }
 
@@ -4565,17 +4630,22 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         return;
     }
 
+    HandleTemporaryHostProtocolListenerAck();
     const NetbridgePhase phase = static_cast<NetbridgePhase>(ioStatus->phase);
     if (phase != NetbridgePhase::Connecting
         && phase != NetbridgePhase::DelaySetup
         && phase != NetbridgePhase::Connected)
     {
+        RestoreTemporaryHostProtocolOverride(
+            "Revival netplay session reached a terminal phase before listener acknowledgement");
         RefreshRuntimeStatus(ioStatus);
         return;
     }
 
     if (!ProcessAlive(ioStatus))
     {
+        RestoreTemporaryHostProtocolOverride(
+            "Revival netplay session helper ended before listener acknowledgement");
         LogRevival102jDeepSnapshot("Tick.10.helper_not_alive_pre_recovery", ioStatus);
         RefreshRuntimeStatus(ioStatus);
         const bool runtimeReady = HasRuntimeReadySignal(ioStatus);
@@ -5337,6 +5407,11 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    RestoreTemporaryHostProtocolOverride(
+        reason != nullptr
+            ? reason
+            : "Revival netplay session cancel");
+
     // Idempotency guard for the normal match-end double-cancel: the flow fires
     // CancelSession twice per boundary - "match_ended" (heavy teardown, parks
     // phase at SessionEnded) then "no_overlay_session_ended" (drives phase to

@@ -20,8 +20,11 @@ bool StartSession(
     NetbridgeRole role,
     uint16_t port,
     const char* address,
+    const char* iniAddress,
     const char* nickname,
     bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol,
     NetbridgeStatus* ioStatus,
     uint32_t* outConnectStartTick);
 void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick);

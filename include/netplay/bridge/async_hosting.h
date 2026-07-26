@@ -1,5 +1,7 @@
 #pragma once
 
+#include "netplay/bridge/session_bridge.h"
+
 #include <cstdint>
 
 // Async hosting - lets a host start a listener, optionally minimize the hosting
@@ -32,6 +34,10 @@ enum class State : uint8_t
 // Host Start action. Transitions Idle -> Hosting and snapshots the current
 // delay-prompt serial so only a NEW prompt counts as "peer found".
 void OnHostStarted(uint16_t port, const char* nickname);
+void OnHostStarted(
+    uint16_t port,
+    const char* nickname,
+    const HostSessionNetworkConfig& networkConfig);
 
 // Per-frame driver. Cheap no-op while Idle. Phase 1: called from bridge::Tick()
 // (title/netplay-menu context). Advances the state machine and self-cancels if
@@ -55,6 +61,14 @@ bool IsPeerFoundHeld();
 // True while a held peer/session timed out (e.g. Revival dropped the prompt or
 // the helper exited). The overlay offers a rehost via the return hotkey.
 bool IsTimedOut();
+
+// Listener readiness is separate from process startup. A pre-ack helper
+// failure is a startup error, not a peer disconnect and must not enter the
+// automatic rehost loop.
+bool IsHostListenerReady();
+bool HasHostListenerStartupFailed();
+bool NotifyHostListenerReady(
+    const HostListenerObservation& observation);
 
 // Display name of the configured return/rehost hotkey (e.g. "F1"), for overlays.
 const char* ReturnKeyDisplay();
@@ -94,4 +108,6 @@ State GetState();
 // Port the host listener was started on (for restoring the hosting overlay when
 // the netplay menu is re-entered after a minimize).
 uint16_t HostPort();
+const char* HostNickname();
+bool GetHostNetworkConfig(HostSessionNetworkConfig* outConfig);
 }

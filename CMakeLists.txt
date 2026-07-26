@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(EFZInGameNetplayMod VERSION 0.1.0 LANGUAGES C CXX)
 
+include(CTest)
+
 option(EFZ_STATIC_RUNTIME "Link MSVC runtime statically for single-DLL deployment" ON)
 option(EFZ_XP_COMPAT "Enable Windows XP-oriented compile settings (requires compatible toolset)" OFF)
 option(EFZ_EMBEDDED_TLS "Enable embedded TLS HTTPS backend using bundled mbedTLS" ON)
@@ -71,6 +73,8 @@ add_library(efz_netplay_mod SHARED
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
     src/netplay/core/mod_settings.cpp
+    src/netplay/core/network_capability.cpp
+    src/netplay/core/network_endpoint.cpp
     src/netplay/core/options_keybinds.cpp
     src/netplay/core/patch_utils.cpp
     src/netplay/core/tls_http_client.cpp
@@ -176,4 +180,36 @@ if(Python3_Interpreter_FOUND AND EXISTS "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}")
         COMMAND "${Python3_EXECUTABLE}" "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Verifying EfzRevival 1.02j profile and hook contracts against raw binaries")
+endif()
+
+if(BUILD_TESTING AND WIN32)
+    add_executable(network_endpoint_tests EXCLUDE_FROM_ALL
+        tests/network_endpoint_tests.cpp
+        src/netplay/core/network_capability.cpp
+        src/netplay/core/network_endpoint.cpp)
+    target_include_directories(network_endpoint_tests PRIVATE include)
+    target_compile_features(network_endpoint_tests PRIVATE cxx_std_17)
+    target_compile_definitions(network_endpoint_tests PRIVATE NOMINMAX)
+    target_link_libraries(network_endpoint_tests PRIVATE ws2_32)
+
+    if(MSVC)
+        if(EFZ_XP_COMPAT)
+            target_compile_options(network_endpoint_tests PRIVATE /W4 /EHsc)
+            target_compile_definitions(network_endpoint_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(network_endpoint_tests PRIVATE
+                /Zc:threadSafeInit-)
+        else()
+            target_compile_options(network_endpoint_tests PRIVATE
+                /W4 /permissive- /EHsc)
+        endif()
+
+        if(EFZ_STATIC_RUNTIME)
+            set_property(TARGET network_endpoint_tests PROPERTY
+                MSVC_RUNTIME_LIBRARY
+                "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endif()
+
+    add_test(NAME network_endpoint_tests COMMAND network_endpoint_tests)
 endif()

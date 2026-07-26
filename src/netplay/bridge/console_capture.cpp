@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cwchar>
 #include <deque>
+#include <limits>
 #include <share.h>
 #include <thread>
 
@@ -476,6 +477,68 @@ DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool
     return metrics;
 }
 
+bool TryParseHostListenerLine(
+    const std::string& text,
+    network::NetworkFamily* outFamily,
+    uint16_t* outPort)
+{
+    if (outFamily == nullptr || outPort == nullptr)
+    {
+        return false;
+    }
+
+    static constexpr char kIpv4Prefix[] =
+        "Hosting using UDP IPv4 on port ";
+    static constexpr char kIpv6Prefix[] =
+        "Hosting using UDP IPv6 on port ";
+
+    network::NetworkFamily family = network::NetworkFamily::IPv4;
+    size_t prefixLength = 0;
+    if (text.compare(0, sizeof(kIpv4Prefix) - 1, kIpv4Prefix) == 0)
+    {
+        family = network::NetworkFamily::IPv4;
+        prefixLength = sizeof(kIpv4Prefix) - 1;
+    }
+    else if (text.compare(0, sizeof(kIpv6Prefix) - 1, kIpv6Prefix) == 0)
+    {
+        family = network::NetworkFamily::IPv6;
+        prefixLength = sizeof(kIpv6Prefix) - 1;
+    }
+    else
+    {
+        return false;
+    }
+
+    if (text.size() <= prefixLength)
+    {
+        return false;
+    }
+
+    uint32_t port = 0;
+    for (size_t index = prefixLength; index < text.size(); ++index)
+    {
+        const char c = text[index];
+        if (c < '0' || c > '9')
+        {
+            return false;
+        }
+        port = port * 10u + static_cast<uint32_t>(c - '0');
+        if (port > std::numeric_limits<uint16_t>::max())
+        {
+            return false;
+        }
+    }
+
+    if (port == 0)
+    {
+        return false;
+    }
+
+    *outFamily = family;
+    *outPort = static_cast<uint16_t>(port);
+    return true;
+}
+
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial)
 {
     g_delayPromptMetrics = metrics;
@@ -514,6 +577,23 @@ void NoteConsolePromptLine(const std::string& text)
 {
     if (text.empty())
     {
+        return;
+    }
+
+    network::NetworkFamily listenerFamily = network::NetworkFamily::IPv4;
+    uint16_t listenerPort = 0;
+    if (TryParseHostListenerLine(
+            text,
+            &listenerFamily,
+            &listenerPort))
+    {
+        PublishHostListenerObservation(listenerFamily, listenerPort);
+        mod::Log(
+            "Takeover: Revival netplay session listener acknowledged "
+            "family=%s port=%u text='%s'",
+            network::FamilyName(listenerFamily),
+            static_cast<unsigned>(listenerPort),
+            text.c_str());
         return;
     }
 
@@ -1085,10 +1165,11 @@ static void ProcessConsoleTextChunk(const char* sourceTag, const char* text, siz
         }
     }
 
-    // Revival writes characters without newlines via WriteConsoleOutputCharacterW
-    // (newlines are cursor moves only). Check for known workflow/error keywords
-    // in the partially-accumulated buffer and flush immediately so prompts and
-    // failures are visible to the bridge without waiting for a newline.
+    // Revival's WriteConsoleOutputCharacter path injects a synthetic newline
+    // when its cursor moves to another row. Listener observations are only
+    // published from that completed-line path. Publishing a parseable partial
+    // port here is unsafe: expected port 10 is also a valid prefix of 10800.
+    // The bounded listener-ack timeout diagnoses a genuinely missing boundary.
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
         static const char* kImmediateFlushKeywords[] = {

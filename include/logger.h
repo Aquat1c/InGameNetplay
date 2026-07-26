@@ -17,8 +17,8 @@ void FlushLoggerSync();
 
 #if defined(EFZ_LIFECYCLE_TRACE)
 // Runtime toggle for the compiled-in lifecycle/investigation tracing.
-// Defaults to DISABLED even in trace builds; an investigation enables it
-// explicitly via [Others] LifecycleTrace=1 (read in mod_settings::Reload).
+// Defaults to enabled in trace builds; [Others] LifecycleTrace=0 can disable
+// it explicitly (read in mod_settings::Reload).
 bool IsLifecycleTraceEnabled();
 void SetLifecycleTraceEnabled(bool enabled);
 #endif

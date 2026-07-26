@@ -1,5 +1,7 @@
 #pragma once
 
+#include "netplay/core/network_capability.h"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -22,6 +24,46 @@ enum class RoomOrigin : uint8_t
     GlobalLobby = 0,
     PlayerRooms = 1,
 };
+
+struct PublicIpDiscoveryResult
+{
+    struct FamilyDiagnostics
+    {
+        uint32_t sourceAttempts = 0;
+        uint32_t transportFailures = 0;
+        uint32_t parseFailures = 0;
+        uint32_t nonGlobalResponses = 0;
+        bool resolved = false;
+        // Populated only when the caller supplied an already-completed
+        // background capability snapshot. Public discovery never probes
+        // sockets itself.
+        bool localCapabilityAvailable = false;
+        network::LocalFamilyCapability localCapability = {};
+    };
+
+    network::NetworkFamily preferredFamily = network::NetworkFamily::IPv4;
+    network::NetworkFamily effectiveFamily = network::NetworkFamily::IPv4;
+    std::string publicIp;
+    bool usedFamilyFallback = false;
+    bool cancelled = false;
+    FamilyDiagnostics ipv4;
+    FamilyDiagnostics ipv6;
+};
+
+// Synchronously discovers a public numeric address. All sources for the
+// preferred family are exhausted before the alternate family is tried.
+// When both families fail, publicIp remains empty. A definitively unavailable
+// preferred family may still select an available alternate for LAN/manual
+// hosting. |allowAlternateFamily| is false for a controlled one-family retry.
+// |capabilitySnapshot| is optional, immutable worker output; when absent this
+// function performs only global-address discovery and never runs local socket
+// capability probes. |cancelFlag| is optional and must outlive this call.
+PublicIpDiscoveryResult DiscoverPublicIpSynchronously(
+    network::NetworkFamily preferredFamily,
+    const std::atomic<bool>* cancelFlag = nullptr,
+    bool allowAlternateFamily = true,
+    const network::LocalNetworkCapabilitySnapshot* capabilitySnapshot =
+        nullptr);
 
 struct PublicRoomSummary
 {
@@ -95,6 +137,11 @@ struct LobbyStatus
     std::vector<LobbyPlayingPair> playing;        // up to kMaxPlayingPairs
     std::string statusMessage; // human-readable status or error text
     std::string publicIp;      // our discovered public IP (empty until resolved)
+    bool publicIpDiscoveryComplete = false;
+    bool publicIpDetectionFailed = false;
+    network::NetworkFamily preferredFamily = network::NetworkFamily::IPv4;
+    network::NetworkFamily effectiveFamily = network::NetworkFamily::IPv4;
+    bool usedFamilyFallback = false;
     std::string roomType;
     std::string roomAlias;
     std::string roomCode;
@@ -130,11 +177,14 @@ class LobbySession
 public:
     // |nickname| is the player's display name; |hostPort| is the port they are
     // hosting on (0 if not hosting), advertised in the join request so other
-    // players can initiate P2P connections.
+    // players can initiate P2P connections. |preferredFamily| controls public
+    // address discovery; the alternate family is tried only after all matching
+    // sources for the preferred family fail.
     explicit LobbySession(
         std::string nickname,
         uint16_t hostPort = 0,
-        const LobbyJoinedRoom* joinedRoom = nullptr);
+        const LobbyJoinedRoom* joinedRoom = nullptr,
+        network::NetworkFamily preferredFamily = network::NetworkFamily::IPv4);
     ~LobbySession();
 
     // Non-copyable, non-movable.
@@ -152,6 +202,9 @@ public:
 
     // Returns the host port this session was created with.
     uint16_t GetHostPort() const { return m_hostPort; }
+    network::NetworkFamily GetPreferredFamily() const { return m_preferredFamily; }
+    network::NetworkFamily GetEffectiveFamily() const;
+    bool UsedFamilyFallback() const;
 
     // Returns our player ID assigned by the server (0 if not yet joined).
     int GetPlayerId() const;
@@ -279,6 +332,7 @@ private:
 
     std::string m_nickname;
     uint16_t m_hostPort = 0;
+    network::NetworkFamily m_preferredFamily = network::NetworkFamily::IPv4;
 
     // Lobby session credentials set by DoJoin.
     LobbyJoinedRoom m_joinedRoom = {};

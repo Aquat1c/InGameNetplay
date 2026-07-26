@@ -22,7 +22,7 @@ namespace netplay::bridge::takeover
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kIpcMagic = 0x4E425247;
-constexpr uint32_t kIpcVersion = 2;
+constexpr uint32_t kIpcVersion = 4;
 constexpr char kSharedBlockName[] = "EFZNetbridge_Shared";
 constexpr char kInitReadyEventName[] = "EFZNetbridge_InitReady";
 constexpr char kConsoleReadyEventName[] = "EFZNetbridge_ConsoleReady";
@@ -108,6 +108,15 @@ struct SharedBlock
     // docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md.
     volatile LONG consoleDesyncWarnSerial = 0;
     char consoleDesyncWarnText[128] = {};
+    // Native listener acknowledgement. The serial is a seqlock: odd while a
+    // writer is updating and even for a completed record. The publisher PID
+    // prevents a delayed line from a retiring helper being accepted as the
+    // next consecutive session's listener.
+    volatile LONG hostListenerSerial = 0;
+    volatile LONG hostListenerFamily = 0; // NetworkFamily numeric value (4/6)
+    volatile LONG hostListenerPort = 0;
+    volatile LONG hostListenerProcessId = 0;
+    volatile LONG hostExpectedListenerPort = 0;
 };
 #pragma pack(pop)
 
@@ -550,6 +559,29 @@ void PublishConsoleError(const char* errorText);
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
 void PublishConsoleDesyncWarning(const char* warnText);
 void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize);
+void PublishHostListenerObservation(
+    network::NetworkFamily family,
+    uint16_t port);
+void ClearHostListenerObservation();
+bool ReadHostListenerObservation(
+    LONG* outSerial,
+    network::NetworkFamily* outFamily,
+    uint16_t* outPort,
+    DWORD* outProcessId);
+void HandleTemporaryHostProtocolListenerAck();
+void HandleTemporaryHostProtocolListenerAck(
+    DWORD expectedProcessId,
+    uint16_t expectedPort);
+bool RecoverTemporaryHostProtocolOverride(const char* reason);
+bool PrepareTemporaryHostProtocolOverride(
+    network::NetworkFamily effectiveFamily);
+void RestoreTemporaryHostProtocolOverride(const char* reason);
+bool GetHostProtocolOverrideState(
+    HostProtocolOverrideState* outState);
+bool BeginOptionsIniAccess(
+    bool writeAccess,
+    HostProtocolOverrideState* outState);
+void EndOptionsIniAccess();
 void ClearPeerQuitDiagnostic();
 void AppendPeerQuitDiagnostic(const char* text);
 void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize);
@@ -589,7 +621,9 @@ bool WriteIni(
     uint16_t port,
     const char* address,
     const char* nickname,
-    bool writeNicknameToIni);
+    bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol);
 bool IsCurrentProcessRevival();
 bool IsRunningUnderWine();
 void InitializeInjected();

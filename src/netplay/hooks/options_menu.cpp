@@ -3,6 +3,7 @@
 #include "efz_netplay_state.h"
 #include "logger.h"
 #include "mod_version.h"
+#include "netplay/bridge/session_bridge.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/options_keybinds.h"
@@ -69,6 +70,10 @@ struct Item
     std::wstring rawKeyName;
     std::string currentValue;
     std::string originalValue;
+    // Exact parsed INI text. Protocol is normalized for display/runtime, but
+    // an untouched malformed or differently-cased value must not be rewritten
+    // merely because the user saved another option.
+    std::string originalIniValue;
     std::string tooltipSummary;
     std::vector<std::string> choiceValues;
     int lineIndex = -1;
@@ -157,11 +162,56 @@ struct State
     ModalOverlayState modal = {};
     DWORD statusExpireTick = 0;
     std::string statusMessage;
+    std::string lastSaveError;
     std::array<NetplayMenuEntry, kVisibleRowCount + 1> entries = {};
     NetplayMenuSpec spec = {};
 };
 
 State g_state = {};
+
+class ScopedOptionsIniAccess
+{
+public:
+    explicit ScopedOptionsIniAccess(bool writeAccess)
+        : acquired_(
+              netplay::bridge::BeginOptionsIniAccess(
+                  writeAccess,
+                  &overrideState_))
+    {
+    }
+
+    ~ScopedOptionsIniAccess()
+    {
+        Release();
+    }
+
+    ScopedOptionsIniAccess(const ScopedOptionsIniAccess&) = delete;
+    ScopedOptionsIniAccess& operator=(
+        const ScopedOptionsIniAccess&) = delete;
+
+    bool Acquired() const
+    {
+        return acquired_;
+    }
+
+    const netplay::bridge::HostProtocolOverrideState& OverrideState() const
+    {
+        return overrideState_;
+    }
+
+    void Release()
+    {
+        if (acquired_)
+        {
+            netplay::bridge::EndOptionsIniAccess();
+            acquired_ = false;
+        }
+    }
+
+private:
+    bool acquired_ = false;
+    netplay::bridge::HostProtocolOverrideState overrideState_ = {};
+};
 
 void EnsureSpecInitialized();
 std::wstring TrimWide(std::wstring_view value);
@@ -658,6 +708,13 @@ std::string ResolveRevivalIniPath()
 
 ItemKind InferItemKind(const std::string& key, const std::string& value)
 {
+    // Protocol is identified by its key, not by whatever value happened to be
+    // on disk. This keeps a malformed/missing family from degrading into an
+    // unrestricted text field.
+    if (key == "Protocol")
+    {
+        return ItemKind::Protocol;
+    }
     if (keybinds::IsBindableValue(value))
     {
         return ItemKind::KeyBinding;
@@ -669,10 +726,6 @@ ItemKind InferItemKind(const std::string& key, const std::string& value)
     if (value == "0" || value == "1")
     {
         return ItemKind::BoolInt;
-    }
-    if (value == "IPv4" || value == "IPv6")
-    {
-        return ItemKind::Protocol;
     }
     if (key == "Port" || key == "MaxRollback"
         || key.find("Window") != std::string::npos
@@ -1233,7 +1286,10 @@ bool CommitExit(uint32_t screenContext, bool saveChanges)
 {
     if (saveChanges && !SaveItemsToDisk())
     {
-        g_state.modal.errorMessage = "Save failed.";
+        g_state.modal.errorMessage =
+            !g_state.lastSaveError.empty()
+            ? g_state.lastSaveError
+            : "Save failed.";
         return false;
     }
 
@@ -1501,6 +1557,17 @@ bool LoadItemsFromIni()
     g_state.modal = {};
     ClearStatusMessage();
 
+    ScopedOptionsIniAccess iniAccess(false);
+    if (!iniAccess.Acquired())
+    {
+        SetStatusMessage("EfzRevival.ini is temporarily busy.");
+        mod::Log(
+            "OptionsMenu: failed to acquire serialized INI read access");
+        return false;
+    }
+    const netplay::bridge::HostProtocolOverrideState& protocolOverride =
+        iniAccess.OverrideState();
+
     std::wstring text;
     FileEncoding encoding = FileEncoding::Utf16Le;
     if (!ReadWideTextFile(g_state.iniPath, &text, &encoding))
@@ -1573,6 +1640,49 @@ bool LoadItemsFromIni()
         item.rawKeyName = keyWide;
         item.currentValue = value;
         item.originalValue = value;
+        item.originalIniValue = value;
+        if (item.kind == ItemKind::Protocol)
+        {
+            if (currentSection == "Network" && protocolOverride.active)
+            {
+                item.currentValue = netplay::network::FamilyName(
+                    protocolOverride.originalFamily);
+                item.originalValue = item.currentValue;
+                item.originalIniValue =
+                    protocolOverride.originalValueExisted
+                    ? protocolOverride.originalValue
+                    : item.currentValue;
+                mod::Log(
+                    "OptionsMenu: temporary Network.Protocol override "
+                    "hidden original=%s effective=%s originalExisted=%d",
+                    netplay::network::FamilyName(
+                        protocolOverride.originalFamily),
+                    netplay::network::FamilyName(
+                        protocolOverride.effectiveFamily),
+                    protocolOverride.originalValueExisted ? 1 : 0);
+            }
+            else
+            {
+                netplay::network::NetworkFamily family =
+                    netplay::network::NetworkFamily::IPv4;
+                if (netplay::network::TryParseFamilyName(
+                        item.currentValue,
+                        &family))
+                {
+                    item.currentValue =
+                        netplay::network::FamilyName(family);
+                }
+                else
+                {
+                    mod::Log(
+                        "OptionsMenu: invalid Network.Protocol='%s'; "
+                        "presenting safe IPv4 fallback",
+                        item.currentValue.c_str());
+                    item.currentValue = "IPv4";
+                }
+                item.originalValue = item.currentValue;
+            }
+        }
         item.tooltipSummary = ResolveTooltipSummary(currentSection, key, commentLines);
         item.lineIndex = lineIndex;
         g_state.items.push_back(std::move(item));
@@ -1851,9 +1961,25 @@ void ApplyRuntimeNetplaySettings()
         }
         else if (item.keyName == "Address")
         {
-            if (netplay::validation::IsValidJoinAddress(item.currentValue))
+            netplay::network::RemoteHostInput hostInput = {};
+            if (netplay::network::ParseRemoteHostInput(
+                    item.currentValue,
+                    &hostInput))
             {
-                hooks::g_netplayMenuState.joinAddress = item.currentValue;
+                hooks::g_netplayMenuState.joinAddress =
+                    hostInput.host;
+            }
+        }
+        else if (item.keyName == "Protocol")
+        {
+            netplay::network::NetworkFamily family =
+                netplay::network::NetworkFamily::IPv4;
+            if (netplay::network::TryParseFamilyName(item.currentValue, &family))
+            {
+                hooks::g_netplayMenuState.hostFamily = family;
+                mod::Log(
+                    "NET_FAMILY_CONFIG source=options value=%s",
+                    netplay::network::FamilyName(family));
             }
         }
     }
@@ -1878,8 +2004,39 @@ void ApplyRuntimeNetplaySettings()
 
 bool SaveItemsToDisk()
 {
+    g_state.lastSaveError.clear();
     if (g_state.iniPath.empty() || g_state.lines.empty())
     {
+        g_state.lastSaveError = "EfzRevival.ini is unavailable.";
+        return false;
+    }
+
+    ScopedOptionsIniAccess iniAccess(true);
+    if (!iniAccess.Acquired())
+    {
+        if (iniAccess.OverrideState().active)
+        {
+            g_state.lastSaveError =
+                "Host restart active. Wait, then save again.";
+            SetStatusMessage(
+                "Host listener is restarting; settings were not saved.");
+            mod::Log(
+                "OptionsMenu: save blocked "
+                "reason=temporary_host_protocol_override "
+                "original=%s effective=%s",
+                netplay::network::FamilyName(
+                    iniAccess.OverrideState().originalFamily),
+                netplay::network::FamilyName(
+                    iniAccess.OverrideState().effectiveFamily));
+        }
+        else
+        {
+            g_state.lastSaveError =
+                "EfzRevival.ini is temporarily busy.";
+            mod::Log(
+                "OptionsMenu: save blocked "
+                "reason=serialized_ini_access_unavailable");
+        }
         return false;
     }
 
@@ -1903,7 +2060,14 @@ bool SaveItemsToDisk()
         }
         if (item.lineIndex >= 0 && item.lineIndex < static_cast<int>(updatedLines.size()))
         {
-            updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
+            const std::string& valueToPersist =
+                item.kind == ItemKind::Protocol
+                        && !IsDirty(item)
+                    ? item.originalIniValue
+                    : item.currentValue;
+            updatedLines[static_cast<size_t>(item.lineIndex)] =
+                item.rawKeyName + L"="
+                + Utf8ToWide(valueToPersist);
             continue;
         }
     }
@@ -1976,13 +2140,19 @@ bool SaveItemsToDisk()
     const std::wstring joined = JoinLines(updatedLines);
     if (!WriteWideTextFile(g_state.iniPath, joined, g_state.encoding))
     {
+        g_state.lastSaveError = "Could not write EfzRevival.ini.";
         mod::Log("OptionsMenu: failed to save '%s'", g_state.iniPath.c_str());
         return false;
     }
 
+    iniAccess.Release();
     g_state.lines = std::move(updatedLines);
     for (Item& item : g_state.items)
     {
+        if (item.kind != ItemKind::Protocol || IsDirty(item))
+        {
+            item.originalIniValue = item.currentValue;
+        }
         item.originalValue = item.currentValue;
     }
     ApplyRuntimeNetplaySettings();
@@ -2080,7 +2250,9 @@ std::string BuildSettingLabel(const Item& item)
 
 size_t GetStringEditLimit(const Item& item)
 {
-    if (item.sectionName == "Network" && item.keyName == "Name")
+    if (item.sectionName == "Network"
+        && (item.keyName == "Name"
+            || item.keyName == "Address"))
     {
         return 63;
     }
@@ -2425,6 +2597,19 @@ bool CommitEdit()
             SetEditError("Invalid nickname");
             return false;
         }
+    }
+    else if (item.sectionName == "Network"
+             && item.keyName == "Address")
+    {
+        netplay::network::RemoteHostInput hostInput = {};
+        if (!netplay::network::ParseRemoteHostInput(
+                value,
+                &hostInput))
+        {
+            SetEditError("Invalid address");
+            return false;
+        }
+        value = hostInput.host;
     }
 
     item.currentValue = value;
@@ -2881,7 +3066,10 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             else
             {
                 hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
-                g_state.modal.errorMessage = "Save failed.";
+                g_state.modal.errorMessage =
+                    !g_state.lastSaveError.empty()
+                    ? g_state.lastSaveError
+                    : "Save failed.";
             }
         }
         else

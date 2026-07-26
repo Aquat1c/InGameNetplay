@@ -4,6 +4,7 @@
 #include "netplay/core/inline_edit.h"
 #include "netplay/core/lobby_client.h"
 #include "netplay/core/menu_model.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/patch_utils.h"
 #include "netplay/render/menu_overlay.h"
 #include "netplay/render/sprite_font_map.h"
@@ -43,6 +44,8 @@ struct NetplayMenuState
     int mainSelection = 0;
     int optionCount = netplay::constants::kNetplayDefaultOptionCount;
     int backIndex = netplay::constants::kNetplayDefaultBackIndex;
+    netplay::network::NetworkFamily hostFamily =
+        netplay::network::NetworkFamily::IPv4;
     uint16_t hostPort = netplay::constants::kDefaultNetplayPort;
     std::string joinAddress = "127.0.0.1";
     uint16_t joinPort = netplay::constants::kDefaultNetplayPort;
@@ -118,18 +121,46 @@ struct HostingOverlayState
     bool active = false;
     uint16_t port = 0;
     bool challengeMode = false;
+    netplay::network::NetworkFamily preferredFamily =
+        netplay::network::NetworkFamily::IPv4;
+    netplay::network::NetworkFamily effectiveFamily =
+        netplay::network::NetworkFamily::IPv4;
+    bool usedFamilyFallback = false;
+    bool discoveryInProgress = false;
+    bool sessionQueued = false;
+    bool listenerReady = false;
+    bool listenerMismatch = false;
+    bool familyRetryAllowed = false;
+    bool automaticFamilyRetryAttempted = false;
+    bool failed = false;
+    bool failureNeedsBridgeCancel = false;
+    bool writeNicknameToIni = true;
     char publicIp[128] = {};       // filled asynchronously
+    char hostNickname[64] = {};
     char targetName[64] = {};
+    char errorText[128] = {};
     bool ipFetchDone = false;      // true once background fetch completes (success or fail)
     bool ipFetchFailed = false;    // true if all attempts failed
+    uint32_t preferredSourceAttempts = 0;
+    uint32_t preferredTransportFailures = 0;
+    uint32_t preferredParseFailures = 0;
+    uint32_t alternateSourceAttempts = 0;
+    uint32_t alternateTransportFailures = 0;
+    uint32_t alternateParseFailures = 0;
     bool copiedToClipboard = false;
     DWORD copiedFlashTick = 0;     // GetTickCount() when copy happened (for brief visual feedback)
+    DWORD listenerWaitStartTick = 0;
+    uint32_t listenerMismatchSerial = 0;
+    uint16_t listenerMismatchPort = 0;
+    DWORD listenerMismatchFirstTick = 0;
 };
 
 struct JoiningOverlayState
 {
     bool active = false;
     uint16_t port = 0;
+    netplay::network::NetworkFamily family =
+        netplay::network::NetworkFamily::IPv4;
     bool displayTargetName = false;
     bool spectateMode = false;
     bool waitingForGameBegin = false;
@@ -263,8 +294,13 @@ bool HasNetplayStatusMessage();
 void ClearNetplayStatusMessage();
 std::string GetNetplayStatusMessage();
 void PlayUiSound(uint32_t screenContext, unsigned short soundIndex);
-void ActivateHostingOverlay(uint16_t port);
-void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port);
+void ActivateChallengeHostingOverlay(
+    const char* targetName,
+    uint16_t port,
+    netplay::network::NetworkFamily preferredFamily,
+    netplay::network::NetworkFamily effectiveFamily,
+    bool usedFamilyFallback,
+    const char* publicIp);
 void ResetHostingOverlayState();
 void ActivateJoiningOverlay(const char* address, uint16_t port);
 void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port);

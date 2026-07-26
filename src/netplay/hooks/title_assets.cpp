@@ -2,6 +2,7 @@
 
 #include "logger.h"
 #include "netplay/assets/assets.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/validation.h"
 
 #include <array>
@@ -22,6 +23,11 @@ using netplay::assets::ResolveNetplayBackgroundPath;
 using netplay::assets::ResolveNetplayObjectsPath;
 using netplay::assets::ResolveTitleObjectsPath;
 using netplay::assets::NetplayObjectProfile;
+using netplay::network::FamilyName;
+using netplay::network::NetworkFamily;
+using netplay::network::ParseRemoteHostInput;
+using netplay::network::RemoteHostInput;
+using netplay::network::TryParseFamilyName;
 using netplay::validation::IsValidNickname;
 using netplay::validation::ParsePort;
 
@@ -300,30 +306,6 @@ std::string ReadIniValueUtf8(
     return TrimAscii(WideToUtf8(std::wstring(buffer.data())));
 }
 
-bool IsValidStoredJoinAddress(const std::string& address)
-{
-    if (address.empty() || address.size() > 127)
-    {
-        return false;
-    }
-
-    for (char c : address)
-    {
-        const bool ok =
-            std::isalnum(static_cast<unsigned char>(c)) != 0
-            || c == '.'
-            || c == ':'
-            || c == '-'
-            || c == '_'
-            || c == '['
-            || c == ']';
-        if (!ok)
-        {
-            return false;
-        }
-    }
-    return true;
-}
 } // namespace
 
 HMODULE ResolveCurrentModule()
@@ -493,11 +475,14 @@ bool LoadTitleAssets(uint32_t screenContext)
 
 void LoadNetplayMenuSettingsFromIni()
 {
+    g_netplayMenuState.hostFamily = NetworkFamily::IPv4;
+
     const std::wstring wideIniPath = ResolveRevivalIniPathWide();
     const std::string iniPath = WideToUtf8(wideIniPath).empty() ? "EfzRevival.ini" : WideToUtf8(wideIniPath);
     if (GetFileAttributesW(wideIniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         mod::Log("LoadNetplayMenuSettingsFromIni: ini not found path='%s' (using in-memory defaults)", iniPath.c_str());
+        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Protocol missing (defaulting 'IPv4')");
         return;
     }
 
@@ -525,6 +510,29 @@ void LoadNetplayMenuSettingsFromIni()
         mod::Log(
             "LoadNetplayMenuSettingsFromIni: NetplayMenu.Theme missing/empty (keeping '%s')",
             NetplayMenuThemeToString(g_netplayMenuState.theme));
+    }
+
+    const std::string protocolText = ReadIniValueUtf8(wideIniPath, L"Network", L"Protocol");
+    if (!protocolText.empty())
+    {
+        NetworkFamily parsedFamily = NetworkFamily::IPv4;
+        if (TryParseFamilyName(protocolText, &parsedFamily))
+        {
+            g_netplayMenuState.hostFamily = parsedFamily;
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: loaded Network.Protocol='%s'",
+                FamilyName(g_netplayMenuState.hostFamily));
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Protocol='%s' (defaulting 'IPv4')",
+                protocolText.c_str());
+        }
+    }
+    else
+    {
+        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Protocol missing/empty (defaulting 'IPv4')");
     }
 
     const std::string nickname = ReadIniValueUtf8(wideIniPath, L"Network", L"Name");
@@ -559,9 +567,10 @@ void LoadNetplayMenuSettingsFromIni()
     const std::string joinAddress = ReadIniValueUtf8(wideIniPath, L"Network", L"Address");
     if (!joinAddress.empty())
     {
-        if (IsValidStoredJoinAddress(joinAddress))
+        RemoteHostInput parsedInput;
+        if (ParseRemoteHostInput(joinAddress, &parsedInput))
         {
-            g_netplayMenuState.joinAddress = joinAddress;
+            g_netplayMenuState.joinAddress = parsedInput.host;
             mod::Log("LoadNetplayMenuSettingsFromIni: loaded Network.Address='%s'", g_netplayMenuState.joinAddress.c_str());
         }
         else
@@ -618,7 +627,8 @@ void SaveNetplayJoinAddressToIni()
         return;
     }
 
-    if (!IsValidStoredJoinAddress(joinAddress))
+    RemoteHostInput parsedInput;
+    if (!ParseRemoteHostInput(joinAddress, &parsedInput))
     {
         mod::Log(
             "SaveNetplayJoinAddressToIni: invalid Network.Address='%s' (skipping write path='%s')",
@@ -627,7 +637,7 @@ void SaveNetplayJoinAddressToIni()
         return;
     }
 
-    const std::wstring wideJoinAddress = Utf8ToWide(joinAddress);
+    const std::wstring wideJoinAddress = Utf8ToWide(parsedInput.host);
     if (WritePrivateProfileStringW(
             L"Network",
             L"Address",
@@ -637,15 +647,16 @@ void SaveNetplayJoinAddressToIni()
     {
         mod::Log(
             "SaveNetplayJoinAddressToIni: failed Network.Address='%s' path='%s' err=%lu",
-            joinAddress.c_str(),
+            parsedInput.host.c_str(),
             iniPath.c_str(),
             static_cast<unsigned long>(GetLastError()));
         return;
     }
 
+    g_netplayMenuState.joinAddress = parsedInput.host;
     mod::Log(
         "SaveNetplayJoinAddressToIni: wrote Network.Address='%s' path='%s'",
-        joinAddress.c_str(),
+        g_netplayMenuState.joinAddress.c_str(),
         iniPath.c_str());
 }
 

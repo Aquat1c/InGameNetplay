@@ -249,7 +249,8 @@ void LogSharedBlockState(const char* context)
     mod::Log(
         "J102_DIAG[%s]: IPC block=0x%08lX magic=0x%08lX version=%lu "
         "hostPid=%lu hostBase=0x%08lX hostTs=0x%08lX initSerial=%ld "
-        "init=(%d,%d) console=%ld aux=%ld error=%ld peerQuit=%ld",
+        "init=(%d,%d) console=%ld aux=%ld error=%ld peerQuit=%ld "
+        "listener=%ld/%ld/%ld/pid=%ld expectedPort=%ld",
         ctx,
         static_cast<unsigned long>(reinterpret_cast<uintptr_t>(block)),
         static_cast<unsigned long>(block->magic),
@@ -263,7 +264,12 @@ void LogSharedBlockState(const char* context)
         static_cast<long>(block->consoleSerial),
         static_cast<long>(block->consoleAuxSerial),
         static_cast<long>(block->consoleErrorSerial),
-        static_cast<long>(block->peerQuitDiagnosticSerial));
+        static_cast<long>(block->peerQuitDiagnosticSerial),
+        static_cast<long>(block->hostListenerSerial),
+        static_cast<long>(block->hostListenerFamily),
+        static_cast<long>(block->hostListenerPort),
+        static_cast<long>(block->hostListenerProcessId),
+        static_cast<long>(block->hostExpectedListenerPort));
     mod::Log(
         "J102_DIAG[%s]: IPC delay prompt=%ld/%ld metrics=%ld avg=%d min=%d max=%d "
         "recommend=%d range=%d..%d input=%ld/%ld value=%d",

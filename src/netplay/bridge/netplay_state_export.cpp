@@ -15,8 +15,10 @@
 #include "netplay/bridge/netplay_state_export.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "efz_netplay_state.h"
@@ -33,6 +35,69 @@ namespace netplay::bridge::state_export
 {
 
 void UpdateNow(const NetbridgeStatus& status);
+
+namespace
+{
+bool FormatConnectionEndpoint(
+    const NetbridgeStatus& status,
+    char* output,
+    size_t outputSize)
+{
+    if (output == nullptr || outputSize == 0)
+    {
+        return false;
+    }
+    output[0] = '\0';
+
+    // SessionBridge normalizes numeric addresses before storing them in
+    // NetbridgeStatus. Keep this export path allocation-free: it also runs
+    // from the gameplay export pulse, where address parsing or heap work
+    // would add avoidable timing work.
+    const size_t addressLength = std::strlen(status.address);
+    const bool ipv6 = std::strchr(status.address, ':') != nullptr;
+    char portText[6] = {};
+    const int portLength = std::snprintf(
+        portText,
+        sizeof(portText),
+        "%u",
+        static_cast<unsigned>(status.port));
+    if (portLength <= 0)
+    {
+        return false;
+    }
+
+    const size_t required =
+        addressLength
+        + static_cast<size_t>(portLength)
+        + 1 // ':'
+        + (ipv6 ? 2 : 0) // '[' and ']'
+        + 1; // NUL
+    if (required > outputSize)
+    {
+        return false;
+    }
+
+    char* cursor = output;
+    if (ipv6)
+    {
+        *cursor++ = '[';
+    }
+    std::memcpy(cursor, status.address, addressLength);
+    cursor += addressLength;
+    if (ipv6)
+    {
+        *cursor++ = ']';
+    }
+    *cursor++ = ':';
+    std::memcpy(
+        cursor,
+        portText,
+        static_cast<size_t>(portLength));
+    cursor += portLength;
+    *cursor = '\0';
+    return true;
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Module-local state
@@ -1088,17 +1153,30 @@ void UpdateNow(const NetbridgeStatus& status)
     s.connectionAddress[0] = '\0';
     if (status.address[0] != '\0')
     {
+        bool connectionAddressComplete = false;
         if (status.port != 0)
         {
-            std::snprintf(s.connectionAddress, sizeof(s.connectionAddress),
-                "%s:%u", status.address, static_cast<unsigned>(status.port));
+            connectionAddressComplete = FormatConnectionEndpoint(
+                status,
+                s.connectionAddress,
+                sizeof(s.connectionAddress));
         }
         else
         {
-            std::snprintf(s.connectionAddress, sizeof(s.connectionAddress),
-                "%s", status.address);
+            const size_t rawLength = std::strlen(status.address);
+            if (rawLength < sizeof(s.connectionAddress))
+            {
+                std::memcpy(
+                    s.connectionAddress,
+                    status.address,
+                    rawLength + 1);
+                connectionAddressComplete = true;
+            }
         }
-        caps |= EFZ_CAP_CONNECTION;
+        if (connectionAddressComplete)
+        {
+            caps |= EFZ_CAP_CONNECTION;
+        }
     }
 
     s.capabilityFlags = caps;

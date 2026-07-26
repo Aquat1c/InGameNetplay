@@ -3,8 +3,10 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/bridge/batch_stabilizer.h"
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include <windows.h>
 
@@ -13,6 +15,80 @@ namespace netplay::bridge::takeover
 
 namespace
 {
+constexpr DWORD kProtocolRecoveryMarkerMagic = 0x50524645u; // "EFRP"
+constexpr DWORD kProtocolRecoveryMarkerVersion = 1u;
+constexpr size_t kProtocolRecoveryExpectedCapacity = 16u;
+constexpr size_t kProtocolRecoveryOriginalCapacity = 1024u;
+constexpr wchar_t kProtocolRecoveryMarkerSuffix[] =
+    L".efz_netplay_mod.host_protocol_recovery";
+
+// This fixed-size sidecar is flushed and atomically renamed into place before
+// Network.Protocol is changed. Encoding the prior value as UTF-16 avoids
+// losing empty, whitespace, or punctuation-bearing INI values after a crash.
+struct ProtocolRecoveryMarkerDisk
+{
+    DWORD magic = kProtocolRecoveryMarkerMagic;
+    DWORD version = kProtocolRecoveryMarkerVersion;
+    DWORD recordSize = 0;
+    DWORD originalValueExisted = 0;
+    DWORD expectedCharCount = 0;
+    DWORD originalCharCount = 0;
+    wchar_t expectedValue[kProtocolRecoveryExpectedCapacity] = {};
+    wchar_t originalValue[kProtocolRecoveryOriginalCapacity] = {};
+    DWORD checksum = 0;
+};
+
+struct TemporaryHostProtocolOverride
+{
+    bool active = false;
+    bool previousValueExisted = false;
+    std::wstring iniPath;
+    std::wstring previousValue;
+    std::wstring writtenValue;
+    network::NetworkFamily writtenFamily = network::NetworkFamily::IPv4;
+    LONG listenerCandidateSerial = 0;
+    DWORD listenerCandidateProcessId = 0;
+    network::NetworkFamily listenerCandidateFamily =
+        network::NetworkFamily::IPv4;
+    uint16_t listenerCandidatePort = 0;
+    DWORD listenerCandidateFirstTick = 0;
+    LONG lastRejectedListenerSerial = 0;
+};
+
+TemporaryHostProtocolOverride g_temporaryHostProtocolOverride = {};
+std::recursive_mutex g_temporaryHostProtocolMutex;
+
+bool ReadProtocolValue(
+    const std::wstring& iniPath,
+    bool* outExists,
+    std::wstring* outValue)
+{
+    if (outExists == nullptr || outValue == nullptr || iniPath.empty())
+    {
+        return false;
+    }
+
+    static constexpr wchar_t kMissingSentinel[] =
+        L"{EFZ_NETPLAY_PROTOCOL_VALUE_MISSING}";
+    wchar_t value[1024] = {};
+    const DWORD length = GetPrivateProfileStringW(
+        L"Network",
+        L"Protocol",
+        kMissingSentinel,
+        value,
+        static_cast<DWORD>(sizeof(value) / sizeof(value[0])),
+        iniPath.c_str());
+    if (length >= (sizeof(value) / sizeof(value[0])) - 1)
+    {
+        return false;
+    }
+
+    const std::wstring readValue(value, value + length);
+    *outExists = readValue != kMissingSentinel;
+    *outValue = *outExists ? readValue : std::wstring();
+    return true;
+}
+
 std::string WideToUtf8(const std::wstring& wide)
 {
     if (wide.empty())
@@ -85,6 +161,452 @@ std::wstring Utf8ToWide(const std::string& utf8)
     }
 
     return wide;
+}
+
+std::wstring ProtocolRecoveryMarkerPath(const std::wstring& iniPath)
+{
+    return iniPath + kProtocolRecoveryMarkerSuffix;
+}
+
+DWORD ComputeProtocolRecoveryMarkerChecksum(
+    const ProtocolRecoveryMarkerDisk& marker)
+{
+    constexpr DWORD kFnvOffset = 2166136261u;
+    constexpr DWORD kFnvPrime = 16777619u;
+    const auto* bytes =
+        reinterpret_cast<const unsigned char*>(&marker);
+    DWORD hash = kFnvOffset;
+    for (size_t index = 0;
+         index < offsetof(ProtocolRecoveryMarkerDisk, checksum);
+         ++index)
+    {
+        hash ^= bytes[index];
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+bool RemoveProtocolRecoveryMarker(
+    const std::wstring& markerPath,
+    const char* reason)
+{
+    if (DeleteFileW(markerPath.c_str()) != FALSE)
+    {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND
+        || error == ERROR_PATH_NOT_FOUND)
+    {
+        return true;
+    }
+
+    mod::Log(
+        "Takeover: Host Protocol recovery marker removal failed "
+        "reason='%s' path='%s' err=%s",
+        reason != nullptr ? reason : "",
+        WideToUtf8(markerPath).c_str(),
+        ErrorString(error).c_str());
+    return false;
+}
+
+bool ReadProtocolRecoveryMarker(
+    const std::wstring& markerPath,
+    bool* outFound,
+    ProtocolRecoveryMarkerDisk* outMarker)
+{
+    if (outFound == nullptr || outMarker == nullptr)
+    {
+        return false;
+    }
+
+    *outFound = false;
+    *outMarker = {};
+    HANDLE file = CreateFileW(
+        markerPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND
+            || error == ERROR_PATH_NOT_FOUND)
+        {
+            return true;
+        }
+
+        mod::Log(
+            "Takeover: Host Protocol recovery marker open failed "
+            "path='%s' err=%s",
+            WideToUtf8(markerPath).c_str(),
+            ErrorString(error).c_str());
+        return false;
+    }
+
+    *outFound = true;
+    LARGE_INTEGER fileSize = {};
+    DWORD bytesRead = 0;
+    ProtocolRecoveryMarkerDisk marker = {};
+    const bool readOk =
+        GetFileSizeEx(file, &fileSize) != FALSE
+        && fileSize.QuadPart
+            == static_cast<LONGLONG>(sizeof(marker))
+        && ReadFile(
+               file,
+               &marker,
+               static_cast<DWORD>(sizeof(marker)),
+               &bytesRead,
+               nullptr)
+            != FALSE
+        && bytesRead == sizeof(marker);
+    const DWORD readError = readOk ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    if (!readOk)
+    {
+        mod::Log(
+            "Takeover: Host Protocol recovery marker read failed "
+            "path='%s' size=%lld bytesRead=%lu err=%s",
+            WideToUtf8(markerPath).c_str(),
+            static_cast<long long>(fileSize.QuadPart),
+            static_cast<unsigned long>(bytesRead),
+            ErrorString(readError).c_str());
+        return false;
+    }
+
+    const bool lengthsValid =
+        marker.expectedCharCount
+            < kProtocolRecoveryExpectedCapacity
+        && marker.originalCharCount
+            < kProtocolRecoveryOriginalCapacity;
+    const bool originalStateValid =
+        marker.originalValueExisted <= 1u
+        && (marker.originalValueExisted != 0u
+            || marker.originalCharCount == 0u);
+    if (marker.magic != kProtocolRecoveryMarkerMagic
+        || marker.version != kProtocolRecoveryMarkerVersion
+        || marker.recordSize != sizeof(marker)
+        || !lengthsValid
+        || !originalStateValid
+        || marker.checksum
+            != ComputeProtocolRecoveryMarkerChecksum(marker))
+    {
+        mod::Log(
+            "Takeover: Host Protocol recovery marker validation failed "
+            "path='%s' magic=0x%08lX version=%lu size=%lu",
+            WideToUtf8(markerPath).c_str(),
+            static_cast<unsigned long>(marker.magic),
+            static_cast<unsigned long>(marker.version),
+            static_cast<unsigned long>(marker.recordSize));
+        return false;
+    }
+
+    if (marker.expectedValue[marker.expectedCharCount] != L'\0'
+        || marker.originalValue[marker.originalCharCount] != L'\0')
+    {
+        mod::Log(
+            "Takeover: Host Protocol recovery marker string validation "
+            "failed path='%s'",
+            WideToUtf8(markerPath).c_str());
+        return false;
+    }
+
+    const std::wstring expected(
+        marker.expectedValue,
+        marker.expectedValue + marker.expectedCharCount);
+    if (expected != L"IPv4" && expected != L"IPv6")
+    {
+        mod::Log(
+            "Takeover: Host Protocol recovery marker expected value "
+            "invalid path='%s' expected='%s'",
+            WideToUtf8(markerPath).c_str(),
+            WideToUtf8(expected).c_str());
+        return false;
+    }
+
+    *outMarker = marker;
+    return true;
+}
+
+bool WriteProtocolRecoveryMarker(
+    const std::wstring& iniPath,
+    bool originalValueExisted,
+    const std::wstring& originalValue,
+    const std::wstring& expectedValue)
+{
+    if (expectedValue.empty()
+        || expectedValue.size()
+            >= kProtocolRecoveryExpectedCapacity
+        || originalValue.size()
+            >= kProtocolRecoveryOriginalCapacity)
+    {
+        return false;
+    }
+
+    ProtocolRecoveryMarkerDisk marker = {};
+    marker.recordSize = sizeof(marker);
+    marker.originalValueExisted =
+        originalValueExisted ? 1u : 0u;
+    marker.expectedCharCount =
+        static_cast<DWORD>(expectedValue.size());
+    marker.originalCharCount =
+        originalValueExisted
+            ? static_cast<DWORD>(originalValue.size())
+            : 0u;
+    std::memcpy(
+        marker.expectedValue,
+        expectedValue.data(),
+        expectedValue.size() * sizeof(wchar_t));
+    if (originalValueExisted && !originalValue.empty())
+    {
+        std::memcpy(
+            marker.originalValue,
+            originalValue.data(),
+            originalValue.size() * sizeof(wchar_t));
+    }
+    marker.checksum =
+        ComputeProtocolRecoveryMarkerChecksum(marker);
+
+    const std::wstring markerPath =
+        ProtocolRecoveryMarkerPath(iniPath);
+    const std::wstring temporaryPath = markerPath + L".tmp";
+    HANDLE file = CreateFileW(
+        temporaryPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        mod::Log(
+            "Takeover: Host Protocol recovery marker temporary open "
+            "failed path='%s' err=%s",
+            WideToUtf8(temporaryPath).c_str(),
+            ErrorString(GetLastError()).c_str());
+        return false;
+    }
+
+    DWORD bytesWritten = 0;
+    bool writeOk =
+        WriteFile(
+            file,
+            &marker,
+            static_cast<DWORD>(sizeof(marker)),
+            &bytesWritten,
+            nullptr)
+            != FALSE
+        && bytesWritten == sizeof(marker);
+    DWORD writeError =
+        writeOk ? ERROR_SUCCESS : GetLastError();
+    if (writeOk && FlushFileBuffers(file) == FALSE)
+    {
+        writeOk = false;
+        writeError = GetLastError();
+    }
+    CloseHandle(file);
+    if (!writeOk)
+    {
+        (void)DeleteFileW(temporaryPath.c_str());
+        mod::Log(
+            "Takeover: Host Protocol recovery marker temporary write "
+            "failed path='%s' bytesWritten=%lu err=%s",
+            WideToUtf8(temporaryPath).c_str(),
+            static_cast<unsigned long>(bytesWritten),
+            ErrorString(writeError).c_str());
+        return false;
+    }
+
+    if (MoveFileExW(
+            temporaryPath.c_str(),
+            markerPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING
+                | MOVEFILE_WRITE_THROUGH)
+        == FALSE)
+    {
+        const DWORD error = GetLastError();
+        (void)DeleteFileW(temporaryPath.c_str());
+        mod::Log(
+            "Takeover: Host Protocol recovery marker commit failed "
+            "path='%s' err=%s",
+            WideToUtf8(markerPath).c_str(),
+            ErrorString(error).c_str());
+        return false;
+    }
+
+    mod::Log(
+        "Takeover: Host Protocol recovery marker committed "
+        "path='%s' originalExisted=%d original='%s' expected='%s'",
+        WideToUtf8(markerPath).c_str(),
+        originalValueExisted ? 1 : 0,
+        WideToUtf8(originalValue).c_str(),
+        WideToUtf8(expectedValue).c_str());
+    return true;
+}
+
+bool WriteAndVerifyProtocolValue(
+    const std::wstring& iniPath,
+    bool valueExisted,
+    const std::wstring& value)
+{
+    const wchar_t* writeValue =
+        valueExisted ? value.c_str() : nullptr;
+    if (WritePrivateProfileStringW(
+            L"Network",
+            L"Protocol",
+            writeValue,
+            iniPath.c_str())
+        == FALSE)
+    {
+        return false;
+    }
+
+    // Force any profile API cache to disk before validating and before the
+    // recovery marker is removed.
+    (void)WritePrivateProfileStringW(
+        nullptr,
+        nullptr,
+        nullptr,
+        iniPath.c_str());
+
+    bool verifiedExists = false;
+    std::wstring verifiedValue;
+    return ReadProtocolValue(
+               iniPath,
+               &verifiedExists,
+               &verifiedValue)
+        && verifiedExists == valueExisted
+        && (!valueExisted || verifiedValue == value);
+}
+
+bool RecoverProtocolOverrideFromMarkerUnlocked(
+    const std::wstring& iniPath,
+    const char* reason)
+{
+    const std::wstring markerPath =
+        ProtocolRecoveryMarkerPath(iniPath);
+    bool markerFound = false;
+    ProtocolRecoveryMarkerDisk marker = {};
+    if (!ReadProtocolRecoveryMarker(
+            markerPath,
+            &markerFound,
+            &marker))
+    {
+        return false;
+    }
+    if (!markerFound)
+    {
+        return true;
+    }
+
+    const std::wstring expectedValue(
+        marker.expectedValue,
+        marker.expectedValue + marker.expectedCharCount);
+    const std::wstring originalValue(
+        marker.originalValue,
+        marker.originalValue + marker.originalCharCount);
+    bool currentExists = false;
+    std::wstring currentValue;
+    if (!ReadProtocolValue(
+            iniPath,
+            &currentExists,
+            &currentValue))
+    {
+        mod::Log(
+            "Takeover: Host Protocol crash recovery deferred "
+            "reason='%s' path='%s' readCurrent=0",
+            reason != nullptr ? reason : "",
+            WideToUtf8(iniPath).c_str());
+        return false;
+    }
+
+    if (currentExists && currentValue == expectedValue)
+    {
+        const bool originalExisted =
+            marker.originalValueExisted != 0u;
+        if (!WriteAndVerifyProtocolValue(
+                iniPath,
+                originalExisted,
+                originalValue))
+        {
+            mod::Log(
+                "Takeover: Host Protocol crash recovery restore failed "
+                "reason='%s' path='%s' originalExisted=%d "
+                "original='%s' expected='%s' err=%s",
+                reason != nullptr ? reason : "",
+                WideToUtf8(iniPath).c_str(),
+                originalExisted ? 1 : 0,
+                WideToUtf8(originalValue).c_str(),
+                WideToUtf8(expectedValue).c_str(),
+                ErrorString(GetLastError()).c_str());
+            return false;
+        }
+
+        if (!RemoveProtocolRecoveryMarker(markerPath, reason))
+        {
+            return false;
+        }
+
+        mod::Log(
+            "Takeover: Host Protocol crash recovery restored preference "
+            "reason='%s' originalExisted=%d original='%s' temporary='%s'",
+            reason != nullptr ? reason : "",
+            originalExisted ? 1 : 0,
+            WideToUtf8(originalValue).c_str(),
+            WideToUtf8(expectedValue).c_str());
+        return true;
+    }
+
+    // A user or external editor changed Protocol after the marker was
+    // committed. Preserve that newer state and retire only our marker.
+    if (!RemoveProtocolRecoveryMarker(markerPath, reason))
+    {
+        return false;
+    }
+
+    mod::Log(
+        "Takeover: Host Protocol crash recovery preserved newer value "
+        "reason='%s' currentExisted=%d current='%s' expectedTemporary='%s'",
+        reason != nullptr ? reason : "",
+        currentExists ? 1 : 0,
+        WideToUtf8(currentValue).c_str(),
+        WideToUtf8(expectedValue).c_str());
+    return true;
+}
+
+void CopyHostProtocolOverrideStateUnlocked(
+    HostProtocolOverrideState* outState)
+{
+    if (outState == nullptr)
+    {
+        return;
+    }
+
+    HostProtocolOverrideState state = {};
+    state.active = g_temporaryHostProtocolOverride.active;
+    state.originalValueExisted =
+        g_temporaryHostProtocolOverride.previousValueExisted;
+    state.effectiveFamily =
+        g_temporaryHostProtocolOverride.writtenFamily;
+    state.originalValue = WideToUtf8(
+        g_temporaryHostProtocolOverride.previousValue);
+
+    network::NetworkFamily originalFamily =
+        network::NetworkFamily::IPv4;
+    if (!state.originalValueExisted
+        || !network::TryParseFamilyName(
+            state.originalValue,
+            &originalFamily))
+    {
+        originalFamily = network::NetworkFamily::IPv4;
+    }
+    state.originalFamily = originalFamily;
+    *outState = std::move(state);
 }
 
 bool IsActiveRevivalVersionTag(const char* versionTag)
@@ -563,6 +1085,126 @@ void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize)
     {
         outText[0] = '\0';
     }
+}
+
+void PublishHostListenerObservation(
+    network::NetworkFamily family,
+    uint16_t port)
+{
+    auto publish = [&](SharedBlock* block)
+    {
+        InterlockedIncrement(&block->hostListenerSerial);
+        InterlockedExchange(
+            &block->hostListenerFamily,
+            static_cast<LONG>(family));
+        InterlockedExchange(
+            &block->hostListenerPort,
+            static_cast<LONG>(port));
+        InterlockedExchange(
+            &block->hostListenerProcessId,
+            static_cast<LONG>(GetCurrentProcessId()));
+        InterlockedIncrement(&block->hostListenerSerial);
+    };
+
+    if (g_injectedBlock != nullptr)
+    {
+        publish(g_injectedBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        publish(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+void ClearHostListenerObservation()
+{
+    auto clear = [](SharedBlock* block)
+    {
+        InterlockedExchange(&block->hostListenerSerial, 0);
+        InterlockedExchange(&block->hostListenerFamily, 0);
+        InterlockedExchange(&block->hostListenerPort, 0);
+        InterlockedExchange(&block->hostListenerProcessId, 0);
+    };
+
+    if (g_hostBlock != nullptr)
+    {
+        clear(g_hostBlock);
+        return;
+    }
+    if (g_injectedBlock != nullptr)
+    {
+        clear(g_injectedBlock);
+        return;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        clear(temp.block);
+    }
+    CloseTempIpcContext(&temp);
+}
+
+bool ReadHostListenerObservation(
+    LONG* outSerial,
+    network::NetworkFamily* outFamily,
+    uint16_t* outPort,
+    DWORD* outProcessId)
+{
+    if (g_hostBlock == nullptr)
+    {
+        return false;
+    }
+
+    const LONG serialBefore =
+        InterlockedCompareExchange(&g_hostBlock->hostListenerSerial, 0, 0);
+    if (serialBefore <= 0 || (serialBefore & 1) != 0)
+    {
+        return false;
+    }
+    const LONG family =
+        InterlockedCompareExchange(&g_hostBlock->hostListenerFamily, 0, 0);
+    const LONG port =
+        InterlockedCompareExchange(&g_hostBlock->hostListenerPort, 0, 0);
+    const LONG processId =
+        InterlockedCompareExchange(
+            &g_hostBlock->hostListenerProcessId,
+            0,
+            0);
+    const LONG serialAfter =
+        InterlockedCompareExchange(&g_hostBlock->hostListenerSerial, 0, 0);
+    if (serialBefore != serialAfter
+        || (serialAfter & 1) != 0
+        || (family != static_cast<LONG>(network::NetworkFamily::IPv4)
+            && family != static_cast<LONG>(network::NetworkFamily::IPv6))
+        || port < 0
+        || port > 65535
+        || processId <= 0)
+    {
+        return false;
+    }
+
+    if (outSerial != nullptr)
+    {
+        *outSerial = serialAfter;
+    }
+    if (outFamily != nullptr)
+    {
+        *outFamily = static_cast<network::NetworkFamily>(family);
+    }
+    if (outPort != nullptr)
+    {
+        *outPort = static_cast<uint16_t>(port);
+    }
+    if (outProcessId != nullptr)
+    {
+        *outProcessId = static_cast<DWORD>(processId);
+    }
+    return true;
 }
 
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize)
@@ -1525,13 +2167,407 @@ uintptr_t ResolveInjectedExpectedRevivalBase()
     return base;
 }
 
+bool RecoverTemporaryHostProtocolOverride(const char* reason)
+{
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+
+    // An active record belongs to this process and retains the richer
+    // in-memory listener state. Normal teardown/ack paths restore it.
+    if (g_temporaryHostProtocolOverride.active)
+    {
+        return true;
+    }
+
+    std::wstring wideIniPath = GameDirectoryWide();
+    if (!wideIniPath.empty())
+    {
+        wideIniPath += L"\\";
+    }
+    wideIniPath += L"EfzRevival.ini";
+    return RecoverProtocolOverrideFromMarkerUnlocked(
+        wideIniPath,
+        reason);
+}
+
+bool PrepareTemporaryHostProtocolOverride(
+    network::NetworkFamily effectiveFamily)
+{
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+
+    if (effectiveFamily != network::NetworkFamily::IPv4
+        && effectiveFamily != network::NetworkFamily::IPv6)
+    {
+        return false;
+    }
+
+    RestoreTemporaryHostProtocolOverride(
+        "superseded by new Revival netplay session Host attempt");
+    if (g_temporaryHostProtocolOverride.active)
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol preparation rejected "
+            "because prior temporary override could not be restored");
+        return false;
+    }
+
+    std::wstring wideIniPath = GameDirectoryWide();
+    if (!wideIniPath.empty())
+    {
+        wideIniPath += L"\\";
+    }
+    wideIniPath += L"EfzRevival.ini";
+
+    if (!RecoverProtocolOverrideFromMarkerUnlocked(
+            wideIniPath,
+            "before new Revival netplay session Host override"))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol preparation rejected "
+            "because crash recovery is unresolved");
+        return false;
+    }
+
+    TemporaryHostProtocolOverride pending = {};
+    pending.iniPath = wideIniPath;
+    pending.writtenValue = Utf8ToWide(network::FamilyName(effectiveFamily));
+    pending.writtenFamily = effectiveFamily;
+    if (pending.writtenValue.empty()
+        || !ReadProtocolValue(
+            wideIniPath,
+            &pending.previousValueExisted,
+            &pending.previousValue))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol snapshot failed "
+            "path='%s'",
+            WideToUtf8(wideIniPath).c_str());
+        return false;
+    }
+
+    if (!WriteProtocolRecoveryMarker(
+            wideIniPath,
+            pending.previousValueExisted,
+            pending.previousValue,
+            pending.writtenValue))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol preparation rejected "
+            "because recovery marker could not be committed");
+        return false;
+    }
+
+    if (!WriteAndVerifyProtocolValue(
+            wideIniPath,
+            true,
+            pending.writtenValue))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session temporary Protocol write failed "
+            "effective=%s err=%s",
+            network::FamilyName(effectiveFamily),
+            ErrorString(GetLastError()).c_str());
+        (void)RecoverProtocolOverrideFromMarkerUnlocked(
+            wideIniPath,
+            "temporary Host Protocol write failed");
+        return false;
+    }
+
+    pending.active = true;
+    g_temporaryHostProtocolOverride = std::move(pending);
+    mod::Log(
+        "Takeover: Revival netplay session temporary Protocol written "
+        "effective=%s previousExisted=%d previous='%s'",
+        network::FamilyName(effectiveFamily),
+        g_temporaryHostProtocolOverride.previousValueExisted ? 1 : 0,
+        WideToUtf8(
+            g_temporaryHostProtocolOverride.previousValue).c_str());
+    return true;
+}
+
+void RestoreTemporaryHostProtocolOverride(const char* reason)
+{
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+
+    if (!g_temporaryHostProtocolOverride.active)
+    {
+        return;
+    }
+
+    bool currentExists = false;
+    std::wstring currentValue;
+    if (!ReadProtocolValue(
+            g_temporaryHostProtocolOverride.iniPath,
+            &currentExists,
+            &currentValue))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol restore deferred "
+            "reason='%s' readCurrent=0",
+            reason != nullptr ? reason : "");
+        return;
+    }
+
+    // Do not overwrite a preference edited after this Host attempt started.
+    if (!currentExists
+        || currentValue != g_temporaryHostProtocolOverride.writtenValue)
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol restore skipped "
+            "reason='%s' currentChanged=1 current='%s' expected='%s'",
+            reason != nullptr ? reason : "",
+            WideToUtf8(currentValue).c_str(),
+            WideToUtf8(g_temporaryHostProtocolOverride.writtenValue).c_str());
+        if (!RemoveProtocolRecoveryMarker(
+                ProtocolRecoveryMarkerPath(
+                    g_temporaryHostProtocolOverride.iniPath),
+                reason))
+        {
+            return;
+        }
+        g_temporaryHostProtocolOverride = {};
+        return;
+    }
+
+    if (!WriteAndVerifyProtocolValue(
+            g_temporaryHostProtocolOverride.iniPath,
+            g_temporaryHostProtocolOverride.previousValueExisted,
+            g_temporaryHostProtocolOverride.previousValue))
+    {
+        mod::Log(
+            "Takeover: Revival netplay session Protocol restore or "
+            "verification failed "
+            "reason='%s' err=%s",
+            reason != nullptr ? reason : "",
+            ErrorString(GetLastError()).c_str());
+        return;
+    }
+
+    if (!RemoveProtocolRecoveryMarker(
+            ProtocolRecoveryMarkerPath(
+                g_temporaryHostProtocolOverride.iniPath),
+            reason))
+    {
+        return;
+    }
+
+    mod::Log(
+        "Takeover: Revival netplay session Protocol preference restored "
+        "reason='%s' previousExisted=%d previous='%s' temporary='%s'",
+        reason != nullptr ? reason : "",
+        g_temporaryHostProtocolOverride.previousValueExisted ? 1 : 0,
+        WideToUtf8(g_temporaryHostProtocolOverride.previousValue).c_str(),
+        WideToUtf8(g_temporaryHostProtocolOverride.writtenValue).c_str());
+    g_temporaryHostProtocolOverride = {};
+}
+
+void HandleTemporaryHostProtocolListenerAck()
+{
+    const LONG expectedPort =
+        g_hostBlock != nullptr
+            ? InterlockedCompareExchange(
+                  &g_hostBlock->hostExpectedListenerPort,
+                  0,
+                  0)
+            : 0;
+    HandleTemporaryHostProtocolListenerAck(
+        g_revivalProcessId,
+        expectedPort > 0 && expectedPort <= 65535
+            ? static_cast<uint16_t>(expectedPort)
+            : 0);
+}
+
+void HandleTemporaryHostProtocolListenerAck(
+    DWORD expectedProcessId,
+    uint16_t expectedPort)
+{
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+
+    if (!g_temporaryHostProtocolOverride.active)
+    {
+        return;
+    }
+
+    LONG serial = 0;
+    network::NetworkFamily observedFamily = network::NetworkFamily::IPv4;
+    uint16_t observedPort = 0;
+    DWORD observedProcessId = 0;
+    if (!ReadHostListenerObservation(
+            &serial,
+            &observedFamily,
+            &observedPort,
+            &observedProcessId))
+    {
+        return;
+    }
+
+    const bool familyMatches =
+        observedFamily == g_temporaryHostProtocolOverride.writtenFamily;
+    const bool processMatches =
+        expectedProcessId != 0
+        && observedProcessId == expectedProcessId;
+    const bool portMatches =
+        expectedPort != 0
+        && observedPort == expectedPort;
+    if (!familyMatches || !processMatches || !portMatches)
+    {
+        if (serial
+            != g_temporaryHostProtocolOverride
+                   .lastRejectedListenerSerial)
+        {
+            g_temporaryHostProtocolOverride
+                .lastRejectedListenerSerial = serial;
+            mod::Log(
+                "Takeover: Revival netplay session listener Protocol "
+                "candidate rejected serial=%ld observedFamily=%s "
+                "observedPort=%u observedPid=%lu expectedFamily=%s "
+                "expectedPort=%u expectedPid=%lu familyMatch=%d "
+                "portMatch=%d processMatch=%d",
+                static_cast<long>(serial),
+                network::FamilyName(observedFamily),
+                static_cast<unsigned>(observedPort),
+                static_cast<unsigned long>(observedProcessId),
+                network::FamilyName(
+                    g_temporaryHostProtocolOverride.writtenFamily),
+                static_cast<unsigned>(expectedPort),
+                static_cast<unsigned long>(expectedProcessId),
+                familyMatches ? 1 : 0,
+                portMatches ? 1 : 0,
+                processMatches ? 1 : 0);
+        }
+        g_temporaryHostProtocolOverride.listenerCandidateSerial = 0;
+        g_temporaryHostProtocolOverride.listenerCandidateProcessId = 0;
+        g_temporaryHostProtocolOverride.listenerCandidateFamily =
+            network::NetworkFamily::IPv4;
+        g_temporaryHostProtocolOverride.listenerCandidatePort = 0;
+        g_temporaryHostProtocolOverride.listenerCandidateFirstTick = 0;
+        return;
+    }
+
+    const DWORD nowTick = GetTickCount();
+    const bool sameCandidate =
+        g_temporaryHostProtocolOverride.listenerCandidateSerial
+                == serial
+        && g_temporaryHostProtocolOverride
+               .listenerCandidateProcessId
+                == observedProcessId
+        && g_temporaryHostProtocolOverride.listenerCandidateFamily
+                == observedFamily
+        && g_temporaryHostProtocolOverride.listenerCandidatePort
+                == observedPort;
+    if (!sameCandidate)
+    {
+        g_temporaryHostProtocolOverride.listenerCandidateSerial =
+            serial;
+        g_temporaryHostProtocolOverride.listenerCandidateProcessId =
+            observedProcessId;
+        g_temporaryHostProtocolOverride.listenerCandidateFamily =
+            observedFamily;
+        g_temporaryHostProtocolOverride.listenerCandidatePort =
+            observedPort;
+        g_temporaryHostProtocolOverride.listenerCandidateFirstTick =
+            nowTick;
+        mod::Log(
+            "Takeover: Revival netplay session listener Protocol "
+            "candidate matched serial=%ld family=%s port=%u pid=%lu "
+            "debounceMs=100",
+            static_cast<long>(serial),
+            network::FamilyName(observedFamily),
+            static_cast<unsigned>(observedPort),
+            static_cast<unsigned long>(observedProcessId));
+        return;
+    }
+
+    if (nowTick
+            - g_temporaryHostProtocolOverride
+                  .listenerCandidateFirstTick
+        < 100u)
+    {
+        return;
+    }
+
+    mod::Log(
+        "Takeover: Revival netplay session listener Protocol ack accepted "
+        "serial=%ld family=%s port=%u pid=%lu",
+        static_cast<long>(serial),
+        network::FamilyName(observedFamily),
+        static_cast<unsigned>(observedPort),
+        static_cast<unsigned long>(observedProcessId));
+    RestoreTemporaryHostProtocolOverride(
+        "stable matching Revival netplay session listener acknowledgement");
+}
+
+bool GetHostProtocolOverrideState(
+    HostProtocolOverrideState* outState)
+{
+    if (outState == nullptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+    CopyHostProtocolOverrideStateUnlocked(outState);
+    return true;
+}
+
+bool BeginOptionsIniAccess(
+    bool writeAccess,
+    HostProtocolOverrideState* outState)
+{
+    if (outState == nullptr)
+    {
+        return false;
+    }
+
+    g_temporaryHostProtocolMutex.lock();
+    if (!g_temporaryHostProtocolOverride.active)
+    {
+        std::wstring wideIniPath = GameDirectoryWide();
+        if (!wideIniPath.empty())
+        {
+            wideIniPath += L"\\";
+        }
+        wideIniPath += L"EfzRevival.ini";
+        if (!RecoverProtocolOverrideFromMarkerUnlocked(
+                wideIniPath,
+                "Options EfzRevival.ini access"))
+        {
+            g_temporaryHostProtocolMutex.unlock();
+            return false;
+        }
+    }
+
+    CopyHostProtocolOverrideStateUnlocked(outState);
+    if (writeAccess
+        && g_temporaryHostProtocolOverride.active)
+    {
+        g_temporaryHostProtocolMutex.unlock();
+        return false;
+    }
+    return true;
+}
+
+void EndOptionsIniAccess()
+{
+    g_temporaryHostProtocolMutex.unlock();
+}
+
 bool WriteIni(
     int role,
     uint16_t port,
     const char* address,
     const char* nickname,
-    bool writeNicknameToIni)
+    bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol)
 {
+    std::lock_guard<std::recursive_mutex> overrideLock(
+        g_temporaryHostProtocolMutex);
+
     std::wstring wideIniPath = GameDirectoryWide();
     if (!wideIniPath.empty())
     {
@@ -1591,6 +2627,33 @@ bool WriteIni(
         return true;
     };
     bool ok = true;
+    bool wroteProtocol = false;
+
+    if (writeHostProtocol)
+    {
+        if (role != static_cast<int>(NetbridgeRole::Host))
+        {
+            mod::Log(
+                "Takeover: Revival netplay session Protocol write rejected "
+                "for non-Host role=%d",
+                role);
+            return false;
+        }
+
+        wroteProtocol =
+            g_temporaryHostProtocolOverride.active
+            && g_temporaryHostProtocolOverride.writtenFamily
+                == sessionFamily
+            && g_temporaryHostProtocolOverride.iniPath == wideIniPath;
+        if (!wroteProtocol)
+        {
+            mod::Log(
+                "Takeover: Revival netplay session Protocol preflight missing "
+                "or mismatched family=%s",
+                network::FamilyName(sessionFamily));
+            return false;
+        }
+    }
 
     if (writeNicknameToIni && hasNickname)
     {
@@ -1623,8 +2686,16 @@ bool WriteIni(
     }
     ok = writeIniKeyUtf8(L"Network", L"Port", "Network", "Port", portText) && ok;
 
+    if (!ok)
+    {
+        RestoreTemporaryHostProtocolOverride(
+            "Revival netplay session INI write failed");
+    }
+
     mod::Log(
-        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d wroteAddress=%d wrotePort=1",
+        "Takeover: WriteIni path='%s' existed=%d role=%d port=%u nickname='%s' "
+        "address='%s' result=%d writeNicknameToIni=%d wroteNickname=%d "
+        "wroteAddress=%d wrotePort=1 wroteProtocol=%d protocol=%s",
         iniPath.c_str(),
         existed ? 1 : 0,
         role,
@@ -1634,7 +2705,9 @@ bool WriteIni(
         ok ? 1 : 0,
         writeNicknameToIni ? 1 : 0,
         wroteNickname ? 1 : 0,
-        wroteAddress ? 1 : 0);
+        wroteAddress ? 1 : 0,
+        wroteProtocol ? 1 : 0,
+        writeHostProtocol ? network::FamilyName(sessionFamily) : "preserved");
     return ok;
 }
 

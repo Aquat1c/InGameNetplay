@@ -34,7 +34,21 @@ int g_returnInProgressTicks = 0;
 // after a peer disconnects / errors out while we are holding the delay prompt.
 // (Port is the existing g_port.)
 std::string g_nickname;
+HostSessionNetworkConfig g_networkConfig = {};
+bool g_networkConfigValid = false;
+bool g_listenerAcknowledged = false;
+uint32_t g_listenerAckSerial = 0;
+uint32_t g_listenerCandidateSerial = 0;
+DWORD g_listenerCandidateFirstTick = 0;
+DWORD g_listenerWaitStartTick = 0;
+bool g_listenerStartupFailed = false;
+// Direct Host's visible title flow owns the one allowed family retry for the
+// initial immutable config. Keep the first helper alive long enough for that
+// flow to consume a stable same-port/wrong-family observation.
+bool g_deferInitialFamilyMismatchToTitleFlow = false;
+bool g_initialFamilyMismatchDeferred = false;
 int g_autoRehostCooldownTicks = 0;
+constexpr DWORD kListenerAckTimeoutMs = 15000;
 
 // On-arrival actions queued when the return hotkey is pressed while minimized.
 bool g_acceptOnArrival = false;
@@ -75,12 +89,46 @@ void SetState(State next, const char* reason)
 // starts a fresh one on the same port + nickname, then returns to Hosting.
 void AutoRehost(const char* reason)
 {
-    mod::Log("ASYNC_HOST_AUTO_REHOST reason=%s port=%u", reason != nullptr ? reason : "",
-        static_cast<unsigned>(g_port));
+    g_deferInitialFamilyMismatchToTitleFlow = false;
+    g_initialFamilyMismatchDeferred = false;
+    mod::Log(
+        "ASYNC_HOST_AUTO_REHOST reason=%s port=%u family=%s fallback=%d "
+        "automaticRetry=%d publicAddress='%s'",
+        reason != nullptr ? reason : "",
+        static_cast<unsigned>(g_port),
+        g_networkConfigValid
+            ? network::FamilyName(g_networkConfig.effectiveFamily)
+            : "legacy-INI",
+        g_networkConfigValid
+                && g_networkConfig.preferredFamily
+                    != g_networkConfig.effectiveFamily
+            ? 1
+            : 0,
+        g_networkConfigValid
+                && g_networkConfig.automaticFamilyRetryAttempted
+            ? 1
+            : 0,
+        g_networkConfigValid ? g_networkConfig.publicAddress.c_str() : "");
     CancelSession(reason != nullptr ? reason : "async_host_auto_rehost");
 
-    const bool ok = StartSession(
-        NetbridgeRole::Host, g_port, "", g_nickname.c_str(), /*writeNicknameToIni=*/false);
+    g_listenerAcknowledged = false;
+    g_listenerAckSerial = 0;
+    g_listenerCandidateSerial = 0;
+    g_listenerCandidateFirstTick = 0;
+    g_listenerWaitStartTick = GetTickCount();
+    g_listenerStartupFailed = false;
+    const bool ok = g_networkConfigValid
+        ? StartHostSession(
+              g_port,
+              g_nickname.c_str(),
+              g_networkConfig,
+              /*writeNicknameToIni=*/false)
+        : StartSession(
+              NetbridgeRole::Host,
+              g_port,
+              "",
+              g_nickname.c_str(),
+              /*writeNicknameToIni=*/false);
 
     g_peerWasAlive = false;
     g_returnInProgress = false;
@@ -106,10 +154,33 @@ void AutoRehost(const char* reason)
 
 } // namespace
 
-void OnHostStarted(uint16_t port, const char* nickname)
+static void BeginHostTracking(
+    uint16_t port,
+    const char* nickname,
+    const HostSessionNetworkConfig* networkConfig)
 {
     g_port = port;
     g_nickname = (nickname != nullptr) ? nickname : "";
+    if (networkConfig != nullptr)
+    {
+        g_networkConfig = *networkConfig;
+        g_networkConfigValid = true;
+    }
+    else
+    {
+        g_networkConfig = {};
+        g_networkConfigValid = false;
+    }
+    g_listenerAcknowledged = false;
+    g_listenerAckSerial = 0;
+    g_listenerCandidateSerial = 0;
+    g_listenerCandidateFirstTick = 0;
+    g_listenerWaitStartTick = GetTickCount();
+    g_listenerStartupFailed = false;
+    g_deferInitialFamilyMismatchToTitleFlow =
+        networkConfig != nullptr
+        && !networkConfig->automaticFamilyRetryAttempted;
+    g_initialFamilyMismatchDeferred = false;
     g_autoRehostCooldownTicks = 0;
     g_minimized = false;
     g_acceptOnArrival = false;
@@ -144,9 +215,43 @@ void OnHostStarted(uint16_t port, const char* nickname)
 
     SetState(State::Hosting, "host_started");
     mod::Log(
-        "ASYNC_HOST_BEGIN role=host port=%u promptSerialBase=%d returnKey='%s' vk=0x%02X",
+        "ASYNC_HOST_BEGIN role=host port=%u promptSerialBase=%d returnKey='%s' "
+        "vk=0x%02X family=%s fallback=%d automaticRetry=%d "
+        "publicAddress='%s'",
         static_cast<unsigned>(port), g_lastPromptSerial,
-        g_returnKeyDisplay.c_str(), g_returnKeyVk);
+        g_returnKeyDisplay.c_str(), g_returnKeyVk,
+        g_networkConfigValid
+            ? network::FamilyName(g_networkConfig.effectiveFamily)
+            : "legacy-INI",
+        g_networkConfigValid
+                && g_networkConfig.preferredFamily
+                    != g_networkConfig.effectiveFamily
+            ? 1
+            : 0,
+        g_networkConfigValid
+                && g_networkConfig.automaticFamilyRetryAttempted
+            ? 1
+            : 0,
+        g_networkConfigValid ? g_networkConfig.publicAddress.c_str() : "");
+}
+
+void OnHostStarted(uint16_t port, const char* nickname)
+{
+    HostSessionNetworkConfig activeConfig = {};
+    if (GetActiveHostSessionNetworkConfig(&activeConfig))
+    {
+        BeginHostTracking(port, nickname, &activeConfig);
+        return;
+    }
+    BeginHostTracking(port, nickname, nullptr);
+}
+
+void OnHostStarted(
+    uint16_t port,
+    const char* nickname,
+    const HostSessionNetworkConfig& networkConfig)
+{
+    BeginHostTracking(port, nickname, &networkConfig);
 }
 
 void Tick()
@@ -166,6 +271,81 @@ void Tick()
 
     const NetbridgeStatus status = GetStatus();
     const NetbridgePhase phase = static_cast<NetbridgePhase>(status.phase);
+    const bool peerAliveNow = IsPeerProcessAlive();
+    if (peerAliveNow)
+    {
+        // Latch the same liveness sample used for listener validation. The
+        // helper can exit between two polls, so polling again after accepting
+        // the acknowledgement could otherwise miss the alive -> dead edge.
+        g_peerWasAlive = true;
+    }
+
+    const bool listenerSessionLive =
+        phase != NetbridgePhase::Failed
+        && phase != NetbridgePhase::SessionEnded
+        && phase != NetbridgePhase::Idle
+        && peerAliveNow;
+    if (!g_listenerAcknowledged && listenerSessionLive)
+    {
+        HostListenerObservation observation = {};
+        if (GetHostListenerObservation(&observation))
+        {
+            const DWORD nowTick = GetTickCount();
+            if (g_listenerCandidateSerial
+                    != observation.serial)
+            {
+                g_listenerCandidateSerial =
+                    observation.serial;
+                g_listenerCandidateFirstTick = nowTick;
+            }
+            else if (nowTick - g_listenerCandidateFirstTick
+                         >= 100u
+                     && NotifyHostListenerReady(observation))
+            {
+                // Continue through this tick so normal peer/liveness tracking
+                // starts immediately after the native listener is confirmed.
+            }
+            else if (nowTick - g_listenerCandidateFirstTick
+                             >= 100u
+                     && observation.expectedFamilyKnown
+                     && (!observation.familyMatches
+                         || !observation.portMatches))
+            {
+                if (g_deferInitialFamilyMismatchToTitleFlow
+                    && observation.portMatches
+                    && !observation.familyMatches
+                    && !g_initialFamilyMismatchDeferred)
+                {
+                    // The title pump runs immediately after this Tick. Defer
+                    // exactly once; if ownership is unexpectedly absent, the
+                    // next tick treats the mismatch as terminal instead of
+                    // suppressing the listener timeout forever.
+                    g_initialFamilyMismatchDeferred = true;
+                    mod::Log(
+                        "ASYNC_HOST_LISTENER_MISMATCH observedFamily=%s "
+                        "observedPort=%u familyMatches=0 portMatches=1 "
+                        "serial=%u action=defer_to_title_flow",
+                        network::FamilyName(observation.family),
+                        static_cast<unsigned>(observation.port),
+                        observation.serial);
+                    return;
+                }
+                mod::Log(
+                    "ASYNC_HOST_LISTENER_MISMATCH observedFamily=%s "
+                    "observedPort=%u familyMatches=%d portMatches=%d serial=%u",
+                    network::FamilyName(observation.family),
+                    static_cast<unsigned>(observation.port),
+                    observation.familyMatches ? 1 : 0,
+                    observation.portMatches ? 1 : 0,
+                    observation.serial);
+                g_listenerStartupFailed = true;
+                CancelSession("host_listener_ack_mismatch");
+                SetState(State::TimedOut, "listener_ack_mismatch");
+                return;
+            }
+        }
+    }
+
     const bool fatalProfileFailure =
         phase == NetbridgePhase::Failed
         && std::strcmp(status.errorMsg, "Unsupported EfzRevival.dll profile") == 0;
@@ -178,7 +358,46 @@ void Tick()
         return;
     }
 
-    if (g_autoRehostCooldownTicks == 0
+    if (!g_listenerAcknowledged
+        && (phase == NetbridgePhase::Failed
+            || phase == NetbridgePhase::SessionEnded))
+    {
+        mod::Log(
+            "ASYNC_HOST_START_FAILED_BEFORE_LISTENER phase=%s error='%s' "
+            "action=stop_auto_rehost",
+            PhaseToString(phase),
+            status.errorMsg);
+        g_listenerStartupFailed = true;
+        SetState(State::TimedOut, "listener_start_failed");
+        return;
+    }
+
+    if (!g_listenerAcknowledged
+        && g_listenerWaitStartTick != 0
+        && phase != NetbridgePhase::Idle
+        && GetTickCount() - g_listenerWaitStartTick
+            >= kListenerAckTimeoutMs)
+    {
+        mod::Log(
+            "ASYNC_HOST_LISTENER_TIMEOUT elapsedMs=%lu phase=%s "
+            "helperPid=%lu family=%s port=%u action=cancel",
+            static_cast<unsigned long>(
+                GetTickCount() - g_listenerWaitStartTick),
+            PhaseToString(phase),
+            static_cast<unsigned long>(status.processId),
+            g_networkConfigValid
+                ? network::FamilyName(
+                      g_networkConfig.effectiveFamily)
+                : "legacy-INI",
+            static_cast<unsigned>(g_port));
+        g_listenerStartupFailed = true;
+        CancelSession("host_listener_ack_timeout");
+        SetState(State::TimedOut, "listener_ack_timeout");
+        return;
+    }
+
+    if (g_listenerAcknowledged
+        && g_autoRehostCooldownTicks == 0
         && (g_state == State::Hosting || g_state == State::PeerFoundHeld))
     {
         // While hosting (BEFORE the user accepts), a peer disconnect or session
@@ -191,11 +410,7 @@ void Tick()
         //    is stale in gameplay, but never spuriously Failed there).
         bool disconnected = false;
         const char* why = "";
-        if (IsPeerProcessAlive())
-        {
-            g_peerWasAlive = true;
-        }
-        else if (g_peerWasAlive)
+        if (!peerAliveNow && g_peerWasAlive)
         {
             disconnected = true;
             why = "helper_gone";
@@ -362,6 +577,47 @@ bool IsTimedOut()
     return g_state == State::TimedOut;
 }
 
+bool IsHostListenerReady()
+{
+    return g_listenerAcknowledged;
+}
+
+bool HasHostListenerStartupFailed()
+{
+    return g_listenerStartupFailed;
+}
+
+bool NotifyHostListenerReady(
+    const HostListenerObservation& observation)
+{
+    if (!observation.available
+        || !observation.portMatches
+        || (observation.expectedProcessKnown
+            && !observation.processMatches)
+        || (observation.expectedFamilyKnown
+            && !observation.familyMatches))
+    {
+        return false;
+    }
+
+    if (!g_listenerAcknowledged
+        || g_listenerAckSerial != observation.serial)
+    {
+        g_listenerAcknowledged = true;
+        g_listenerAckSerial = observation.serial;
+        g_listenerWaitStartTick = 0;
+        g_listenerStartupFailed = false;
+        g_deferInitialFamilyMismatchToTitleFlow = false;
+        g_initialFamilyMismatchDeferred = false;
+        mod::Log(
+            "ASYNC_HOST_LISTENER_READY family=%s port=%u serial=%u",
+            network::FamilyName(observation.family),
+            static_cast<unsigned>(observation.port),
+            observation.serial);
+    }
+    return true;
+}
+
 bool ShouldSuppressDelayOverlay()
 {
     return g_state == State::PeerFoundHeld;
@@ -434,6 +690,16 @@ void Reset()
     g_returnInProgress = false;
     g_returnKeyWasDown = false;
     g_peerWasAlive = false;
+    g_listenerAcknowledged = false;
+    g_listenerAckSerial = 0;
+    g_listenerCandidateSerial = 0;
+    g_listenerCandidateFirstTick = 0;
+    g_listenerWaitStartTick = 0;
+    g_listenerStartupFailed = false;
+    g_deferInitialFamilyMismatchToTitleFlow = false;
+    g_initialFamilyMismatchDeferred = false;
+    g_networkConfig = {};
+    g_networkConfigValid = false;
     SetState(State::Idle, "reset");
 }
 
@@ -445,5 +711,20 @@ State GetState()
 uint16_t HostPort()
 {
     return g_port;
+}
+
+const char* HostNickname()
+{
+    return g_nickname.c_str();
+}
+
+bool GetHostNetworkConfig(HostSessionNetworkConfig* outConfig)
+{
+    if (outConfig == nullptr || !g_networkConfigValid)
+    {
+        return false;
+    }
+    *outConfig = g_networkConfig;
+    return true;
 }
 } // namespace netplay::bridge::async_host

@@ -1,5 +1,7 @@
 #include "netplay/core/validation.h"
 
+#include "netplay/core/network_endpoint.h"
+
 #include <cctype>
 #include <cstdlib>
 
@@ -32,20 +34,10 @@ bool ParsePort(const std::string& text, uint16_t* outPort)
 
 bool IsValidJoinAddress(const std::string& address)
 {
-    if (address.empty() || address.size() > 63)
-    {
-        return false;
-    }
-
-    for (char c : address)
-    {
-        const bool ok = std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' || c == ':' || c == '-' || c == '_';
-        if (!ok)
-        {
-            return false;
-        }
-    }
-    return true;
+    netplay::network::RemoteHostInput parsedInput;
+    return netplay::network::ParseRemoteHostInput(
+        address,
+        &parsedInput);
 }
 
 bool IsValidNickname(const std::string& nickname)
@@ -130,5 +122,3 @@ bool IsValidLobbyRoomCode(const std::string& roomCode)
     return true;
 }
 }
-
-

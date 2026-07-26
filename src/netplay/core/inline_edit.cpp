@@ -4,6 +4,7 @@
 #include "netplay/core/constants.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/menu_model.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
 
@@ -45,7 +46,14 @@ bool IsCharacterAllowed(NetplayMenuAction action, char c)
     case NetplayMenuAction::JoinEditPort:
         return c >= '0' && c <= '9';
     case NetplayMenuAction::JoinEditAddress:
-        return std::isalnum(uc) != 0 || c == '.' || c == ':' || c == '-' || c == '_';
+        return std::isalnum(uc) != 0
+            || c == '.'
+            || c == ':'
+            || c == '-'
+            || c == '_'
+            || c == '%'
+            || c == '['
+            || c == ']';
     case NetplayMenuAction::PlayerRoomsEditCode:
         return std::isalnum(uc) != 0 || c == '.' || c == '-' || c == '_';
     case NetplayMenuAction::NicknameEdit:
@@ -451,14 +459,20 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
         break;
     }
     case NetplayMenuAction::JoinEditAddress:
-        if (!netplay::validation::IsValidJoinAddress(value))
+    {
+        netplay::network::RemoteHostInput parsedInput;
+        if (!netplay::network::ParseRemoteHostInput(
+                value,
+                &parsedInput))
         {
             SetError(state, "INVALID ADDRESS");
             mod::Log("InlineEdit: invalid join address '%s'", value.c_str());
             return false;
         }
+        value = parsedInput.host;
         values->joinAddress = value;
         break;
+    }
     case NetplayMenuAction::NicknameEdit:
         if (!netplay::validation::IsValidNickname(value))
         {

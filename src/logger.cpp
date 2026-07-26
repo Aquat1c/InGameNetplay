@@ -511,7 +511,10 @@ void Log(const char* fmt, ...)
 #if defined(EFZ_LIFECYCLE_TRACE)
 namespace
 {
-std::atomic<bool> g_lifecycleTraceEnabled{false};
+// Trace binaries must capture startup before mod_settings::Reload can read an
+// optional override. The release binary compiles this state and all trace call
+// sites out entirely.
+std::atomic<bool> g_lifecycleTraceEnabled{true};
 }
 
 bool IsLifecycleTraceEnabled()

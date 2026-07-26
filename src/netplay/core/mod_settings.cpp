@@ -225,11 +225,11 @@ void Reload()
 
 #if defined(EFZ_LIFECYCLE_TRACE)
     // Investigation trace runtime toggle. Compiled in only for trace builds
-    // (xp-trace preset); defaults OFF so even a trace binary is quiet until an
-    // investigation explicitly opts in. Ignored entirely in end-user builds -
-    // the key has no effect there and the trace call sites are absent.
+    // (xp-trace preset) and enabled by default there so a diagnostic DLL cannot
+    // silently omit the evidence it was built to collect. An explicit
+    // LifecycleTrace=0 can still quiet it. Ignored entirely in end-user builds.
     mod::SetLifecycleTraceEnabled(
-        ReadBoolValue(L"Others", L"LifecycleTrace", false, iniPath));
+        ReadBoolValue(L"Others", L"LifecycleTrace", true, iniPath));
 #endif
 }
 

@@ -895,7 +895,7 @@ void DrawAsyncIndicator()
     ImU32 textColor = IM_COL32(255, 255, 255, 255);
     if (ah::IsTimedOut())
     {
-        std::snprintf(msg, sizeof(msg), "Opponent timed out - %s to rehost", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), "Opponent timed out - %s to return", ah::ReturnKeyDisplay());
         textColor = IM_COL32(255, 210, 210, 255);
     }
     else if (ah::IsPeerFoundHeld())

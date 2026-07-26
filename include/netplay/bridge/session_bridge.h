@@ -1,7 +1,10 @@
 #pragma once
 
+#include "netplay/core/network_endpoint.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace netplay::bridge
 {
@@ -28,6 +31,62 @@ enum class NetbridgePhase : int
     Connected = 3,
     Failed = 4,
     SessionEnded = 5,
+};
+
+// Immutable network selection for one explicit Host attempt. The title/lobby
+// preflight owns public-address discovery; the bridge only validates and
+// snapshots its result so helper startup and async rehosts cannot drift if the
+// INI/options change while the Revival netplay session is active.
+struct HostSessionNetworkConfig
+{
+    network::NetworkFamily preferredFamily = network::NetworkFamily::IPv4;
+    network::NetworkFamily effectiveFamily = network::NetworkFamily::IPv4;
+    std::string publicAddress;
+    bool automaticFamilyRetryAttempted = false;
+};
+
+// Snapshot of the short-lived EfzRevival.ini Protocol override used while a
+// Host helper starts. originalFamily is the user's next-session preference
+// (invalid/missing values normalize to IPv4); effectiveFamily is the family
+// temporarily written for the active helper attempt.
+struct HostProtocolOverrideState
+{
+    bool active = false;
+    bool originalValueExisted = false;
+    network::NetworkFamily originalFamily =
+        network::NetworkFamily::IPv4;
+    network::NetworkFamily effectiveFamily =
+        network::NetworkFamily::IPv4;
+    std::string originalValue;
+};
+
+// Synchronous result classification for the explicit Host preflight. A
+// queued worker reports later native failures through NetbridgeStatus; only
+// FamilyUnavailable is safe for the frontend to retry on the other family.
+enum class HostStartFailure : uint8_t
+{
+    None = 0,
+    InvalidRequest,
+    FamilyUnavailable,
+    StartAlreadyInProgress,
+};
+
+// Native EfzRevival.exe acknowledgement parsed from:
+//   Hosting using UDP IPv4|IPv6 on port N
+// This is an internal C++ status seam, deliberately separate from
+// NetbridgeStatus so the existing exported by-value ABI remains unchanged.
+struct HostListenerObservation
+{
+    bool available = false;
+    bool expectedFamilyKnown = false;
+    bool familyMatches = false;
+    bool portMatches = false;
+    bool expectedProcessKnown = false;
+    bool processMatches = false;
+    uint32_t serial = 0;
+    uint32_t processId = 0;
+    network::NetworkFamily family = network::NetworkFamily::IPv4;
+    uint16_t port = 0;
 };
 
 struct NetbridgeStatus
@@ -105,6 +164,28 @@ bool StartSession(
     const char* address,
     const char* nickname,
     bool writeNicknameToIni = true);
+// Explicit Host entry point used after family-specific public-address
+// preflight. Unlike legacy StartSession(Host, ...), this temporarily writes the
+// effective Protocol for the helper, then restores the user's preferred INI
+// value after the native listener acknowledgement (or on failure/cancel).
+bool StartHostSession(
+    uint16_t port,
+    const char* nickname,
+    const HostSessionNetworkConfig& networkConfig,
+    bool writeNicknameToIni = true,
+    HostStartFailure* outFailure = nullptr);
+bool GetActiveHostSessionNetworkConfig(HostSessionNetworkConfig* outConfig);
+bool GetHostListenerObservation(HostListenerObservation* outObservation);
+bool IsSessionStartInProgress();
+bool GetHostProtocolOverrideState(HostProtocolOverrideState* outState);
+// Serializes the Options reader/writer with bridge-owned EfzRevival.ini
+// updates. A successful call keeps an internal recursive lock held until the
+// matching EndOptionsIniAccess(). Write access is rejected (with no lock held)
+// while a temporary Host Protocol override is active.
+bool BeginOptionsIniAccess(
+    bool writeAccess,
+    HostProtocolOverrideState* outState);
+void EndOptionsIniAccess();
 bool ApplyInputDelay(int delayFrames);
 bool AnswerSpectatePromptChoice(int choice);
 bool PrepareVsHumanHandoff();
@@ -113,6 +194,8 @@ bool RequiresNativeVsHumanSyncForHandoff();
 // the helper. Returns true when the helper completed the native broadcast.
 // Safe to call from normal game/window callbacks; do not call under loader lock.
 bool RequestPeerQuitBeforeLocalExit(const char* reason);
+// A synchronous validation/family rejection is acknowledged here without
+// invoking Revival teardown because no start worker or helper was created.
 void CancelSession(const char* reason);
 bool ConsumeRevivalExitInterception(int* outMode);
 void CompleteGameplayExitRecovery(int mode, const char* origin);
