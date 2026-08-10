@@ -3,6 +3,8 @@
 // Not part of the public API - only included by src/netplay/bridge/*.cpp files.
 
 #include "netplay/bridge/revival_addresses.h"
+#include "netplay/bridge/external_launcher_guard.h"
+#include "netplay/bridge/revival_launch_policy.h"
 #include "netplay/bridge/session_bridge.h"
 #include "logger.h"
 
@@ -52,6 +54,13 @@ constexpr int kNetplayRoleNone      = 0;  // not in a netplay session
 constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
 constexpr int kNetplayRoleClient    = 2;  // joined (P2 side - inputs swapped)
 constexpr int kNetplayRoleSpectator = 3;  // spectating
+
+enum class PeerProcessOwnership : uint8_t
+{
+    None = 0,
+    SpawnedHelper,
+    ExternalLauncherParent,
+};
 
 // ---------------------------------------------------------------------------
 // Shared structures
@@ -194,6 +203,8 @@ extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
 extern HANDLE g_revivalProcess;
 extern DWORD g_revivalProcessId;
+extern PeerProcessOwnership g_peerProcessOwnership;
+extern revival_launch::LaunchDisposition g_launchDisposition;
 extern int g_localRoleFlag;
 extern int g_netplayRole;
 extern uintptr_t g_hostRevivalBase;
@@ -242,7 +253,13 @@ extern bool g_spectatorPostInitSucceededForSession;
 extern volatile LONG g_deferredLifecycleWorkRequested;
 extern volatile LONG g_deferredTitleSelection;
 extern bool g_tournamentReturnCleanupPending;
+// Set once the launcher-owned Tournament session has actually left its
+// initial title screen.  Until then, title mode 0 is startup—not a completed
+// match—and must not trigger the ordinary Tournament return cleanup.
+extern volatile LONG g_externalTournamentInitialTitleLeft;
+void ArmTournamentReturnCleanup(const char* reason);
 extern uintptr_t g_remoteInjectedSelfBase;
+extern uintptr_t g_externalLauncherGuardRemoteBase;
 extern DWORD g_lastLatePatchRetryTick;
 extern DWORD g_lastLatePatchRetryLogTick;
 extern DWORD g_latePatchRetryAttempts;
@@ -350,8 +367,14 @@ bool SetLocalRoleFlag(int roleFlag, const char* reason);
 bool SetRoleFlagDirect(int roleFlag, const char* reason);
 bool NeutralizeTournamentAutoNav();
 bool SaveTournamentExePatches();
+// Adopt the already-applied, exact native Tournament patch set without
+// snapshotting its live JMP/NOP bytes as the restoration originals.
+bool AdoptExistingTournamentExePatchState();
 bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
+bool SaveAndApplyExternalTournamentExitGuard();
+bool IsExternalTournamentExitGuardOwned();
+bool ArmExternalLauncherExitRecovery();
 void PrimeGracefulQuitRingForSession();
 bool RestoreDllExitProcessPatches();
 bool AreDllExitPatchesSaved();
@@ -393,6 +416,14 @@ void StabilizeOnlineSessionBindingAfterInit(int initMode);
 void RepairRollbackHistoryBindingsIfNeeded();
 void MarkRevivalSyncDiagnosticsSessionStart(const char* context);
 bool InstallNetplayFrameHook();
+bool RemoveNetplayFrameHook();
+bool HasAnyNetplayFrameHookInstalled();
+bool HasNetplayPerFrameTickHookInstalled();
+void SetExternalLauncherAttachPending(bool pending);
+bool WaitForExternalLauncherAttachBoundary(DWORD timeoutMs);
+bool IsExternalLauncherAttachBoundaryPending();
+bool CompleteExternalLauncherAttachBoundary(bool commit);
+void EmergencyQuarantineExternalLauncherAttachBoundary();
 // Force the game mode index to 0 (title screen).
 // Safe to call from the crash handler VEH where minimal code should run.
 bool ForceGameModeToTitle();
@@ -543,6 +574,7 @@ bool HasPeerProcessExitSignal();
 // mechanism.  Defined in revival_memory.cpp; read by iat_stubs.cpp.
 extern jmp_buf       g_netplayFrameJmpBuf;
 extern volatile bool g_netplayFrameJmpActive;
+extern volatile DWORD g_netplayFrameJmpOwnerThreadId;
 
 // Secondary setjmp buffer used by title/menu update hooks as a fallback
 // recovery path when ExitProcess fires outside OurFrameDispatch.
@@ -550,6 +582,7 @@ extern volatile bool g_netplayFrameJmpActive;
 // read by iat_stubs.cpp.
 extern jmp_buf       g_netplayUiJmpBuf;
 extern volatile bool g_netplayUiJmpActive;
+extern volatile DWORD g_netplayUiJmpOwnerThreadId;
 
 // ---------------------------------------------------------------------------
 // IPC, config, module loading (ipc_shared.cpp)
@@ -615,6 +648,17 @@ void CloseProcessHandle(
     NetbridgeStatus* status,
     bool waitForPeerWatcher = true);
 bool ProcessAlive(NetbridgeStatus* status);
+bool CanTerminatePeerProcess();
+bool IsExternalLauncherPeerProcess();
+BOOL TerminatePeerProcessIfOwned(
+    UINT exitCode,
+    const char* context,
+    bool waitForExit = true);
+bool ReleasePeerProcessAfterTerminationAttempt(
+    BOOL terminationSucceeded,
+    NetbridgeStatus* status,
+    const char* context,
+    bool waitForPeerWatcher = true);
 bool IsSyncReadyForVsHuman(const NetbridgeStatus* status);
 bool RequiresNativeVsHumanSyncForHandoff(const NetbridgeStatus* status);
 RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status);
@@ -622,13 +666,29 @@ uint32_t BuildRuntimeReadyProbeMask(const RuntimeReadyProbe& probe);
 bool HasRuntimeReadySignal(const NetbridgeStatus* status);
 bool EnsureHostIpc();
 void CloseHostIpc();
-bool EnsureLocalRevivalLoaded();
+bool ResetHostSharedBlockForSession(
+    bool isHostSession,
+    uint16_t expectedListenerPort,
+    const char* reason);
+uint32_t BeginManagedSessionBoundary(const char* reason);
+bool EnsureLocalRevivalLoaded(bool prepareManagedSession = false);
+// Reports whether an adopted Online/Spectator generation is still parked and
+// needs the hooks-layer simulation handoff before its first native title tick.
+bool NeedsExternalLauncherSimulationHandoff();
+// Finishes a deferred launcher-owned Online/Spectator/Tournament attach after
+// title/UI patch installation. Other launch dispositions are a successful
+// no-op. simulationHandoffReady is meaningful only for Online/Spectator.
+bool CompleteExternalLauncherUiAttachment(
+    bool hooksInstalled,
+    bool simulationHandoffReady);
 void ReinitLocalPlay();
 // Custom exception code historically used for ExitProcess interception.
 // Retained for diagnostic purposes in crash handler log output.
 static constexpr DWORD kExitProcessInterceptedException = 0xE0EF0001u;
 
 bool PatchRevivalDllExitProcess();
+bool IsRevivalDllExitProcessIatPatched();
+bool RestoreRevivalDllExitProcessIat();
 bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva);
 void NeutralizeRevivalSessionVtable();
 uintptr_t ResolveHostRevivalBase();
@@ -695,7 +755,10 @@ LPVOID StubVirtualAllocEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWOR
 BOOL StubVirtualFreeEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
 BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten);
 HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId);
-BOOL StubTerminateProcess(HANDLE hProcess, UINT uExitCode);
+BOOL StubTerminateProcess(
+    HANDLE hProcess,
+    UINT uExitCode,
+    const void* callerReturnAddress);
 HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
 BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);

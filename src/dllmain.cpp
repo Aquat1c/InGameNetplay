@@ -5,32 +5,66 @@
 #include "crash_handler.h"
 #include "logger.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
 
 namespace
 {
+volatile LONG g_passiveInitialization = 0;
+
 DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
 {
     const auto moduleHandle = static_cast<HMODULE>(moduleHandleRaw);
-    netplay::mod_settings::Reload();
-    mod::InitializeLogger(
-        moduleHandle,
-        netplay::mod_settings::IsConsoleEnabled(),
-        netplay::mod_settings::IsFileLoggingEnabled());
-    mod::InstallCrashHandlers(moduleHandle, false);
-    mod::Log("Module attached at %p", moduleHandle);
-
-    netplay::bridge::Initialize();
-
-    if (!netplay::InstallHooks())
+    bool startupCompleted = false;
+    __try
     {
-        mod::Log("InstallHooks failed");
+        netplay::mod_settings::Reload();
+        mod::InitializeLogger(
+            moduleHandle,
+            netplay::mod_settings::IsConsoleEnabled(),
+            netplay::mod_settings::IsFileLoggingEnabled());
+        mod::InstallCrashHandlers(moduleHandle, false);
+        mod::Log("Module attached at %p", moduleHandle);
+
+        if (!netplay::bridge::Initialize())
+        {
+            mod::Log(
+                "Bridge initialization stayed passive; skipping all game/UI hooks");
+            InterlockedExchange(&g_passiveInitialization, 1);
+            mod::UninstallCrashHandlers();
+            mod::ShutdownLogger();
+            return 0;
+        }
+
+        const bool hooksInstalled = netplay::InstallHooks();
+        if (!hooksInstalled)
+        {
+            mod::Log("InstallHooks failed");
+        }
+        else
+        {
+            mod::Log("InstallHooks succeeded");
+        }
+        if (!netplay::bridge::CompleteLauncherUiAttachment(hooksInstalled))
+        {
+            mod::Log(
+                "Launcher UI attachment boundary completion failed");
+        }
+        startupCompleted = true;
     }
-    else
+    __finally
     {
-        mod::Log("InstallHooks succeeded");
+        if (!startupCompleted)
+        {
+            // A blind timeout is unsafe while title code may be mid-patch.
+            // The worker's SEH termination handler is the only asynchronous
+            // release authority: it publishes managed recovery first, then
+            // atomically quarantines a still-pending adopted tick.
+            netplay::bridge::EmergencyQuarantineLauncherUiAttachment();
+        }
     }
 
     return 0;
@@ -71,6 +105,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
     {
         DisableThreadLibraryCalls(hModule);
 
+        // An externally launched, mod-owned Revival session injects this DLL
+        // back into its verified parent solely to neutralize one exact cleanup
+        // TerminateProcess call. Detect that marker before Wine's broad IAT
+        // patch or the ordinary injected-helper bootstrap can run.
+        if (netplay::bridge::takeover::TryStartExternalLauncherGuardProcess())
+        {
+            break;
+        }
+
         if (netplay::bridge::IsCurrentProcessRevival())
         {
             // Under Wine/Proton the helper process is NOT created suspended,
@@ -93,6 +136,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
             break;
         }
 
+        // In launcher-first mode, native Revival installs its Tournament EXE
+        // hooks immediately after this DllMain returns. Preserve the actual
+        // preimage now so later managed cleanup restores prior mod ownership
+        // instead of guessing stock bytes.
+        netplay::bridge::takeover::
+            CaptureTournamentExePreimageAtProcessAttach();
+
         HANDLE thread = CreateThread(nullptr, 0, InitializeModThread, hModule, 0, nullptr);
         if (thread != nullptr)
         {
@@ -101,11 +151,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
         break;
     }
     case DLL_PROCESS_DETACH:
+        if (netplay::bridge::takeover::IsExternalLauncherGuardProcess())
+        {
+            netplay::bridge::takeover::ShutdownExternalLauncherGuardProcess();
+            break;
+        }
+
         if (netplay::bridge::IsCurrentProcessRevival())
         {
             netplay::bridge::ShutdownInjectedProcess();
             mod::UninstallCrashHandlers();
             mod::ShutdownLogger();
+            break;
+        }
+
+        // A fail-closed launcher admission already unwound the transient
+        // logger/crash-handler setup and installed no game/UI hooks.
+        if (InterlockedCompareExchange(
+                &g_passiveInitialization, 0, 0) != 0)
+        {
             break;
         }
 

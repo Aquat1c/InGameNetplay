@@ -2,6 +2,10 @@
 
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/external_launcher_guard.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
+#include "netplay/bridge/revival_launcher_probe.h"
+#include "netplay/bridge/session_lifecycle.h"
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -799,6 +803,26 @@ void AppendPeerQuitDiagnosticBlock(SharedBlock* block, const char* text)
         _TRUNCATE);
     InterlockedIncrement(&block->peerQuitDiagnosticSerial);
 }
+
+bool IsCompatibleTempPeerQuitDiagnosticBlock(const SharedBlock* block)
+{
+    if (block == nullptr
+        || block->magic != kIpcMagic
+        || block->version != kIpcVersion)
+    {
+        return false;
+    }
+
+    if (!IsExternalLauncherGuardProcess())
+    {
+        return true;
+    }
+
+    DWORD guardedChildPid = 0;
+    return GetExternalLauncherGuardChildProcessId(&guardedChildPid)
+        && guardedChildPid != 0
+        && block->hostPid == guardedChildPid;
+}
 } // namespace
 
 void* EnsureRevivalErrorCodeNullGuardStub()
@@ -1411,7 +1435,8 @@ void ClearPeerQuitDiagnostic()
     }
 
     TempIpcContext temp = {};
-    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    if (OpenTempIpcContext(&temp, false, false)
+        && IsCompatibleTempPeerQuitDiagnosticBlock(temp.block))
     {
         ClearPeerQuitDiagnosticBlock(temp.block);
     }
@@ -1437,7 +1462,8 @@ void AppendPeerQuitDiagnostic(const char* text)
     }
 
     TempIpcContext temp = {};
-    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    if (OpenTempIpcContext(&temp, false, false)
+        && IsCompatibleTempPeerQuitDiagnosticBlock(temp.block))
     {
         AppendPeerQuitDiagnosticBlock(temp.block, text);
     }
@@ -1740,6 +1766,17 @@ void CloseProcessHandle(
     NetbridgeStatus* status,
     bool waitForPeerWatcher)
 {
+    const bool externalLauncherParent =
+        g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent;
+    if (externalLauncherParent)
+    {
+        // Stop delivering this launcher's blocked-hard-close serials to the
+        // session that is ending.  The guard retains its own exact process
+        // handle and keeps the parent's narrow TerminateProcess protection
+        // active until that launcher actually exits.
+        RetireExternalLauncherGuardSignalDelivery();
+    }
     StopPeerProcessExitWatch(waitForPeerWatcher);
     ResetInjectedPeerQuitBroadcastState();
     if (g_revivalProcess != nullptr)
@@ -1748,7 +1785,9 @@ void CloseProcessHandle(
         g_revivalProcess = nullptr;
     }
     g_revivalProcessId = 0;
+    g_peerProcessOwnership = PeerProcessOwnership::None;
     g_remoteInjectedSelfBase = 0;
+    g_externalLauncherGuardRemoteBase = 0;
     g_lastLatePatchRetryTick = 0;
     g_lastLatePatchRetryLogTick = 0;
     g_latePatchRetryAttempts = 0;
@@ -1763,6 +1802,10 @@ void CloseProcessHandle(
     {
         status->processId = 0;
     }
+    if (externalLauncherParent)
+    {
+        (void)ReapExternalLauncherGuardIfParentExited();
+    }
 }
 
 bool ProcessAlive(NetbridgeStatus* status)
@@ -1772,8 +1815,41 @@ bool ProcessAlive(NetbridgeStatus* status)
         return false;
     }
     DWORD exitCode = 0;
-    if (GetExitCodeProcess(g_revivalProcess, &exitCode) == FALSE || exitCode != STILL_ACTIVE)
+    const BOOL exitCodeRead = GetExitCodeProcess(g_revivalProcess, &exitCode);
+    const bool externalLauncherParent =
+        g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent;
+    if (!exitCodeRead && externalLauncherParent)
     {
+        // Query failure is not proof of exit. Preserve the exact terminating
+        // handle and make StartSession report the previous generation busy.
+        mod::Log(
+            "Takeover: retaining exact external Revival parent after liveness query failure pid=%lu err=%lu",
+            static_cast<unsigned long>(g_revivalProcessId),
+            static_cast<unsigned long>(GetLastError()));
+        return true;
+    }
+    if (!exitCodeRead || exitCode != STILL_ACTIVE)
+    {
+        if (externalLauncherParent)
+        {
+            const DWORD waitResult = WaitForSingleObject(g_revivalProcess, 0);
+            if (waitResult != WAIT_OBJECT_0)
+            {
+                mod::Log(
+                    "Takeover: retaining exact external Revival parent until process object signals pid=%lu exitCode=%lu wait=%lu",
+                    static_cast<unsigned long>(g_revivalProcessId),
+                    static_cast<unsigned long>(exitCode),
+                    static_cast<unsigned long>(waitResult));
+                return true;
+            }
+            // A retained termination-timeout handle has now signaled. Normalize
+            // the launcher-origin state before the next StartSession performs
+            // direct-session preflight; clean precommit failures never reach
+            // this path because they release their peer slot immediately.
+            g_launchDisposition =
+                revival_launch::LaunchDisposition::DirectGameHost;
+        }
         CloseProcessHandle(status);
         return false;
     }
@@ -2062,21 +2138,739 @@ void CloseHostIpc()
     g_hostRevivalBase = 0;
 }
 
-bool EnsureLocalRevivalLoaded()
+bool ResetHostSharedBlockForSession(
+    bool isHostSession,
+    uint16_t expectedListenerPort,
+    const char* reason)
 {
+    if (g_hostBlock == nullptr)
+    {
+        return false;
+    }
+
+    mod::Log(
+        "Takeover: resetting SharedBlock reason='%s' initSerial=%ld consoleSerial=%ld",
+        reason != nullptr ? reason : "unknown",
+        static_cast<long>(g_hostBlock->initSerial),
+        static_cast<long>(g_hostBlock->consoleSerial));
+    const uint32_t savedMagic = g_hostBlock->magic;
+    const uint32_t savedVersion = g_hostBlock->version;
+    const uint32_t savedPid = g_hostBlock->hostPid;
+    const uint32_t savedBase = g_hostBlock->hostRevivalBase;
+    const uint32_t savedTimestamp = g_hostBlock->hostRevivalTimestamp;
+    std::memset(g_hostBlock, 0, sizeof(SharedBlock));
+    g_hostBlock->magic = savedMagic;
+    g_hostBlock->version = savedVersion;
+    g_hostBlock->hostPid = savedPid;
+    g_hostBlock->hostRevivalBase = savedBase;
+    g_hostBlock->hostRevivalTimestamp = savedTimestamp;
+    g_hostBlock->delayInputValue = -1;
+    g_hostBlock->delayAveragePingMs = -1;
+    g_hostBlock->delayMinPingMs = -1;
+    g_hostBlock->delayMaxPingMs = -1;
+    g_hostBlock->delayRecommended = -1;
+    g_hostBlock->delayRangeMax = 20;
+    g_hostBlock->hostExpectedListenerPort =
+        isHostSession ? static_cast<LONG>(expectedListenerPort) : 0;
+    g_hostBlock->isHostSession = isHostSession ? 1 : 0;
+    return true;
+}
+
+bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
+{
+    static bool launcherStartupResolved = false;
+    static bool launcherStartupAllowed = true;
+
+    // Control-plane reap only. A retired launcher guard may outlive the
+    // session whose process slot was released; collect it once that exact
+    // parent has exited without re-enabling old signal delivery.
+    (void)ReapExternalLauncherGuardIfParentExited();
+
     if (g_localInitFn != nullptr)
     {
         EnsureHostLogEfzIatPatched(true);
         PublishHostRevivalBase();
-        if (!PatchRevivalErrorCodeNullGuard())
+        if (prepareManagedSession
+            && g_launchDisposition
+                == revival_launch::LaunchDisposition::AttachExistingPractice)
+        {
+            // The first launcher-first Practice observation is deliberately
+            // passive.  A later call reaches here only when the user starts a
+            // mod-managed session from that surviving EFZ process.  Convert
+            // it to the ordinary direct-host baseline now: never call init a
+            // second time, but install the same recovery boundaries the
+            // direct efz.exe startup path would already own.
+            const bool nullGuardReady = PatchRevivalErrorCodeNullGuard();
+            bool frameHookReady = InstallNetplayFrameHook();
+            if (!frameHookReady
+                && HasNetplayPerFrameTickHookInstalled())
+            {
+                // Tick-first publication makes a dispatcher failure safely
+                // resumable without losing the active recovery boundary.
+                frameHookReady = InstallNetplayFrameHook();
+            }
+            const bool tickHookReady =
+                HasNetplayPerFrameTickHookInstalled();
+            const bool exitIatReady = tickHookReady
+                && PatchRevivalDllExitProcess();
+            if (!nullGuardReady || !tickHookReady || !exitIatReady)
+            {
+                mod::Log(
+                    "LauncherBootstrap: Practice-to-managed conversion failed nullGuard=%d frame=%d tick=%d iat=%d",
+                    nullGuardReady ? 1 : 0,
+                    frameHookReady ? 1 : 0,
+                    tickHookReady ? 1 : 0,
+                    exitIatReady ? 1 : 0);
+                return false;
+            }
+            if (!frameHookReady)
+            {
+                mod::Log(
+                    "LauncherBootstrap: Practice conversion retained active tick-only recovery; init-only dispatcher unavailable");
+            }
+            g_launchDisposition =
+                revival_launch::LaunchDisposition::DirectGameHost;
+            mod::Log(
+                "LauncherBootstrap: Practice process converted to managed direct-session baseline initCalls=0");
+        }
+        const bool launcherOwnedObject =
+            g_launchDisposition
+                == revival_launch::LaunchDisposition::AttachExistingPractice
+            || g_launchDisposition
+                == revival_launch::LaunchDisposition::AdoptExternalOnline
+            || g_launchDisposition
+                == revival_launch::LaunchDisposition::AdoptExternalSpectator
+            || g_launchDisposition
+                == revival_launch::LaunchDisposition::AttachExistingTournament;
+        if (!launcherOwnedObject && !PatchRevivalErrorCodeNullGuard())
         {
             mod::Log("Takeover: warning failed to verify EfzRevival null-guard");
+        }
+        if (prepareManagedSession
+            && g_launchDisposition
+                == revival_launch::LaunchDisposition::DirectGameHost)
+        {
+            bool frameHookReady = InstallNetplayFrameHook();
+            if (!frameHookReady
+                && HasNetplayPerFrameTickHookInstalled())
+            {
+                frameHookReady = InstallNetplayFrameHook();
+            }
+            const bool tickHookReady =
+                HasNetplayPerFrameTickHookInstalled();
+            const bool exitIatReady = tickHookReady
+                && PatchRevivalDllExitProcess();
+            if (!tickHookReady || !exitIatReady)
+            {
+                mod::Log(
+                    "Takeover: managed-session recovery preflight failed frame=%d tick=%d iat=%d",
+                    frameHookReady ? 1 : 0,
+                    tickHookReady ? 1 : 0,
+                    exitIatReady ? 1 : 0);
+                return false;
+            }
         }
         if (g_localRoleFlag < 0)
         {
             g_localRoleFlag = kLocalRoleLocalPlay;
         }
         return true;
+    }
+
+    if (!launcherStartupResolved)
+    {
+        RevivalLauncherProbe probe =
+            ProbeRevivalLauncherStartup(10000u);
+        g_launchDisposition = probe.disposition;
+        launcherStartupResolved = true;
+
+        const bool attachPractice =
+            probe.disposition
+                == revival_launch::LaunchDisposition::AttachExistingPractice;
+        const bool adoptOnline =
+            probe.disposition
+                == revival_launch::LaunchDisposition::AdoptExternalOnline;
+        const bool adoptSpectator =
+            probe.disposition
+                == revival_launch::LaunchDisposition::AdoptExternalSpectator;
+        const bool attachTournament =
+            probe.disposition
+                == revival_launch::LaunchDisposition::AttachExistingTournament;
+        const bool externalActive = adoptOnline || adoptSpectator;
+        const bool managedExisting = externalActive || attachTournament;
+
+        if (probe.disposition
+                == revival_launch::LaunchDisposition::PassiveFailClosed
+            || probe.disposition
+                == revival_launch::LaunchDisposition::AwaitExternalSession)
+        {
+            launcherStartupAllowed = false;
+            mod::Log(
+                "LauncherBootstrap: passive/fail-closed disposition=%d; "
+                "leaving native Revival state untouched",
+                static_cast<int>(probe.disposition));
+            ReleaseRevivalLauncherProbe(&probe);
+            return false;
+        }
+
+        if (attachPractice || managedExisting)
+        {
+            g_localRevivalModule = GetModuleHandleA("EfzRevival.dll");
+            const RevivalInitFn existingInitFn = g_localRevivalModule != nullptr
+                ? reinterpret_cast<RevivalInitFn>(
+                    GetProcAddress(g_localRevivalModule, "init"))
+                : nullptr;
+            if (g_localRevivalModule == nullptr
+                || existingInitFn == nullptr
+                || probe.profile == nullptr
+                || g_activeRevival == nullptr
+                || g_activeRevival->peTimestamp
+                    != probe.profile->peTimestamp
+                || g_activeRevival->launcherExeTimestamp
+                    != probe.profile->launcherExeTimestamp)
+            {
+                launcherStartupAllowed = false;
+                mod::Log(
+                    "LauncherBootstrap: exact session changed before attach; fail closed");
+                ReleaseRevivalLauncherProbe(&probe);
+                return false;
+            }
+
+            if (attachPractice)
+            {
+                if (!RevalidateRevivalLauncherStartup(probe))
+                {
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: Practice session changed during attach; fail closed");
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+
+                // Practice remains native/passive: record the already-loaded
+                // module so later title UI can coexist, but install no
+                // simulation, ExitProcess, parent, or lifecycle hooks and do
+                // not call exported init a second time.
+                g_localInitFn = existingInitFn;
+                g_localRoleFlag = probe.role;
+                g_lastValidatedSessionPtr = probe.sessionPtr;
+                PublishHostRevivalBase();
+                mod::Log(
+                    "LauncherBootstrap: attached exact Practice session version=%s role=%d session=0x%08lX initCalls=0 policy=passive",
+                    probe.profile->versionTag,
+                    probe.role,
+                    static_cast<unsigned long>(probe.sessionPtr));
+                ReleaseRevivalLauncherProbe(&probe);
+                return true;
+            }
+
+            if (attachTournament
+                && (!RevalidateRevivalLauncherStartup(probe)
+                    || !AdoptExistingTournamentExePatchState()))
+            {
+                launcherStartupAllowed = false;
+                g_launchDisposition =
+                    revival_launch::LaunchDisposition::PassiveFailClosed;
+                mod::Log(
+                    "LauncherBootstrap: Tournament object/patch state changed before managed attach; fail closed");
+                ReleaseRevivalLauncherProbe(&probe);
+                return false;
+            }
+
+            uintptr_t externalRemoteBase = 0;
+            bool renderContextSaved = false;
+
+            // Snapshot the mod-only publication state before either attach
+            // path reaches its first live code write.  Online/spectator still
+            // publish this state at their existing point below.  Tournament
+            // publishes only the identity/recovery subset immediately after
+            // exact object/EXE-patch admission so the first tick detour can be
+            // installed before any renderer, IPC, or logging setup runs.
+            const RevivalInitFn priorInitFn = g_localInitFn;
+            const int priorLocalRole = g_localRoleFlag;
+            const uintptr_t priorSessionPtr = g_lastValidatedSessionPtr;
+            const int priorNetplayRole = g_netplayRole;
+            const bool priorLocalInitApplied = g_localInitAppliedForSession;
+            const bool priorSpectatorAttempted =
+                g_spectatorPostInitAttemptedForSession;
+            const bool priorSpectatorSucceeded =
+                g_spectatorPostInitSucceededForSession;
+            const bool priorClientSwapApplied = IsClientInputSwapApplied();
+            const uintptr_t priorExternalRemoteBase =
+                g_externalLauncherGuardRemoteBase;
+            const LONG priorTournamentInitialTitleLeft =
+                InterlockedCompareExchange(
+                    &g_externalTournamentInitialTitleLeft, 0, 0);
+            const LONG priorRevivalExitIntercepted =
+                InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0);
+            const LONG priorRevivalExitMode =
+                InterlockedCompareExchange(&g_revivalExitMode, 0, 0);
+
+            const auto restoreStagedModState = [&]() {
+                g_localInitFn = priorInitFn;
+                g_localRoleFlag = priorLocalRole;
+                g_lastValidatedSessionPtr = priorSessionPtr;
+                g_netplayRole = priorNetplayRole;
+                g_localInitAppliedForSession = priorLocalInitApplied;
+                g_spectatorPostInitAttemptedForSession =
+                    priorSpectatorAttempted;
+                g_spectatorPostInitSucceededForSession =
+                    priorSpectatorSucceeded;
+                SetClientInputSwapApplied(priorClientSwapApplied);
+                g_externalLauncherGuardRemoteBase = priorExternalRemoteBase;
+                InterlockedExchange(
+                    &g_externalTournamentInitialTitleLeft,
+                    priorTournamentInitialTitleLeft);
+                InterlockedExchange(
+                    &g_revivalExitMode,
+                    priorRevivalExitMode);
+                InterlockedExchange(
+                    &g_revivalExitIntercepted,
+                    priorRevivalExitIntercepted);
+            };
+            const auto requestManagedAttachRecovery = [&](const char* reason) {
+                InterlockedExchange(
+                    &g_revivalExitMode,
+                    static_cast<LONG>(probe.role));
+                if (g_hostBlock != nullptr)
+                {
+                    CopyString(
+                        g_hostBlock->consoleErrorText,
+                        sizeof(g_hostBlock->consoleErrorText),
+                        reason != nullptr
+                            ? reason
+                            : "External launcher attachment failed");
+                    InterlockedIncrement(&g_hostBlock->consoleErrorSerial);
+                }
+                // Publish the fatal/recovery latch last.  A quarantined tick
+                // can therefore never observe an exit mode that still belongs
+                // to the prior generation, even when host IPC does not exist.
+                InterlockedExchange(&g_revivalExitIntercepted, 1);
+            };
+
+            bool recoveryArmed = false;
+            bool frameHookReady = false;
+            bool tickHookReady = false;
+            bool attachBoundaryObserved = false;
+            bool exitCallsitesReady = !attachTournament;
+            bool exitIatReady = false;
+
+            if (attachTournament)
+            {
+                // Role 3 may begin with only one queued title input.  Native
+                // Revival can consume that input and call ExitProcess on its
+                // very next tick, so publish the smallest coherent recovery
+                // identity and park that tick before any control-plane setup.
+                (void)BeginManagedSessionBoundary(
+                    "ExternalTournamentAdoption");
+                InterlockedExchange(&g_revivalExitIntercepted, 0);
+                InterlockedExchange(&g_revivalExitMode, -1);
+                InterlockedExchange(&g_startAbortRequested, 0);
+                ResetInjectedPeerQuitBroadcastState();
+                ResetNativeWorkflowFlags();
+                g_delayPromptMetrics = {};
+                g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                g_localInitFn = existingInitFn;
+                g_localRoleFlag = probe.role;
+                g_lastValidatedSessionPtr = probe.sessionPtr;
+                g_netplayRole = kNetplayRoleNone;
+                g_localInitAppliedForSession = true;
+                g_spectatorPostInitAttemptedForSession = false;
+                g_spectatorPostInitSucceededForSession = false;
+                g_externalLauncherGuardRemoteBase = 0;
+                SetClientInputSwapApplied(false);
+                int currentMode = 0;
+                const bool alreadyLeftTitle =
+                    g_activeRevival != nullptr
+                    && SafeReadInt(
+                        reinterpret_cast<const void*>(
+                            g_activeRevival->addrGameModeCurrentIndex),
+                        &currentMode)
+                    && currentMode != 0;
+                InterlockedExchange(
+                    &g_externalTournamentInitialTitleLeft,
+                    alreadyLeftTitle ? 1 : 0);
+
+                SetExternalLauncherAttachPending(true);
+                recoveryArmed = true;
+                frameHookReady = InstallNetplayFrameHook();
+                if (!frameHookReady
+                    && HasNetplayPerFrameTickHookInstalled())
+                {
+                    // Tick-first publication makes a dispatcher failure
+                    // resumable while the acknowledged tick stays parked.
+                    frameHookReady = InstallNetplayFrameHook();
+                }
+                tickHookReady = HasNetplayPerFrameTickHookInstalled();
+                if (!tickHookReady && !HasAnyNetplayFrameHookInstalled())
+                {
+                    SetExternalLauncherAttachPending(false);
+                    (void)RestoreDllExitProcessPatches();
+                    restoreStagedModState();
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: Tournament tick-boundary precommit failed cleanly; native role-3 session remains passive");
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+
+                // The acknowledgement proves every native tick that entered
+                // before the prologue transaction has returned.  While this
+                // one invocation is parked, install both exact child-side
+                // ExitProcess barriers without dropping a native tick.
+                attachBoundaryObserved = tickHookReady
+                    && WaitForExternalLauncherAttachBoundary(5000u);
+                exitCallsitesReady = attachBoundaryObserved
+                    && SaveAndApplyExternalTournamentExitGuard();
+                exitIatReady =
+                    attachBoundaryObserved && tickHookReady
+                    && exitCallsitesReady && PatchRevivalDllExitProcess();
+                if (!frameHookReady || !tickHookReady
+                    || !attachBoundaryObserved || !exitCallsitesReady
+                    || !exitIatReady)
+                {
+                    mod::Log(
+                        "LauncherBootstrap: early Tournament guard publication failed frame=%d tick=%d boundary=%d callsites=%d iat=%d; quarantining parked generation",
+                        frameHookReady ? 1 : 0,
+                        tickHookReady ? 1 : 0,
+                        attachBoundaryObserved ? 1 : 0,
+                        exitCallsitesReady ? 1 : 0,
+                        exitIatReady ? 1 : 0);
+                    requestManagedAttachRecovery(
+                        "External Tournament recovery-guard installation failed");
+                    MarkRevivalSyncDiagnosticsSessionStart(
+                        "ExternalTournamentAdoption_guard_quarantined");
+                    // Keep the acknowledged invocation parked while DllMain's
+                    // worker performs the multi-byte UI patch transaction.
+                    // CompleteExternalLauncherUiAttachment observes the
+                    // fatal latch and performs the single quarantine/unpark.
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return true;
+                }
+
+                if (!RevalidateRevivalLauncherSessionSnapshot(probe))
+                {
+                    mod::Log(
+                        "LauncherBootstrap: Tournament session changed after early guard publication; quarantining parked generation");
+                    requestManagedAttachRecovery(
+                        "External Tournament session changed during guard publication");
+                    MarkRevivalSyncDiagnosticsSessionStart(
+                        "ExternalTournamentAdoption_guard_revalidate_failed");
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return true;
+                }
+            }
+            if (externalActive)
+            {
+                // Protect the exact native launcher before child-side setup.
+                // Its queue-full disconnect fallback calls TerminateProcess;
+                // this narrow guard blocks only that verified cleanup site and
+                // remains pass-through if the child attach later fails.
+                if (!RevalidateRevivalLauncherStartup(probe)
+                    || !InstallExternalLauncherGuard(
+                        probe.parentProcess,
+                        probe.parentPid,
+                        probe.parentCreationTime,
+                        *probe.profile,
+                        &externalRemoteBase))
+                {
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: exact parent guard admission failed; leaving native online session untouched");
+                    CleanupExternalLauncherGuard();
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+
+                if (!RevalidateRevivalLauncherSessionSnapshot(probe))
+                {
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: exact session changed during parent-guard handshake; fail closed");
+                    CleanupExternalLauncherGuard();
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+
+                // Keep the probe's exact parent handle alive through the final
+                // parked-session revalidation.  That validator deliberately
+                // brackets the mutable object snapshot with this same process
+                // object/creation-time witness; moving the handle here made
+                // every otherwise-valid Online/Spectator attach fail its final
+                // check and enter managed title recovery.  The session/watcher
+                // owns an independent duplicate instead.
+                HANDLE sessionParentProcess = nullptr;
+                if (!DuplicateHandle(
+                        GetCurrentProcess(),
+                        probe.parentProcess,
+                        GetCurrentProcess(),
+                        &sessionParentProcess,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS))
+                {
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: external parent handle duplication failed err=%lu; leaving native online session untouched",
+                        static_cast<unsigned long>(GetLastError()));
+                    CleanupExternalLauncherGuard();
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+                g_revivalProcess = sessionParentProcess;
+                g_revivalProcessId = probe.parentPid;
+                g_peerProcessOwnership =
+                    PeerProcessOwnership::ExternalLauncherParent;
+                if (!StartPeerProcessExitWatch())
+                {
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: external parent watcher failed; "
+                        "leaving native online session untouched");
+                    CloseProcessHandle(nullptr);
+                    CleanupExternalLauncherGuard();
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+            }
+
+            // Do not hold the transaction open waiting for the renderer.
+            // Capture immediately when available; cleanup helpers retry the
+            // capture lazily if EFZ has not published it yet.
+            renderContextSaved = SaveRenderContext();
+            if (!renderContextSaved)
+            {
+                mod::Log(
+                    "LauncherBootstrap: renderer not published yet; continuing with lazy recovery capture");
+            }
+
+            const bool externalHost =
+                adoptOnline && probe.activePlayer == 0;
+            if (!EnsureHostIpc()
+                || !ResetHostSharedBlockForSession(
+                    externalHost,
+                    0,
+                    attachTournament
+                        ? "ExternalTournamentAdoption"
+                        : "ExternalLauncherAdoption"))
+            {
+                if (attachTournament)
+                {
+                    // The active tick and both child exit barriers are already
+                    // published.  Never roll this generation back to native
+                    // execution merely because optional control-plane setup
+                    // failed; hostBlock may legitimately still be null here.
+                    mod::Log(
+                        "LauncherBootstrap: host IPC unavailable after Tournament guard publication; quarantining parked generation");
+                    requestManagedAttachRecovery(
+                        "External Tournament host IPC setup failed");
+                    MarkRevivalSyncDiagnosticsSessionStart(
+                        "ExternalTournamentAdoption_ipc_quarantined");
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return true;
+                }
+                launcherStartupAllowed = false;
+                g_launchDisposition =
+                    revival_launch::LaunchDisposition::PassiveFailClosed;
+                mod::Log(
+                    "LauncherBootstrap: host IPC unavailable before existing-session attach; no child hooks published; parent guard cancelled/pass-through");
+                CloseProcessHandle(nullptr);
+                CleanupExternalLauncherGuard();
+                ReleaseRevivalLauncherProbe(&probe);
+                return false;
+            }
+
+            // Tournament already owns its coherent hook/recovery identity and
+            // is parked behind both exit barriers.  Finish the nonessential
+            // per-session control latches now.  Online/spectator retain their
+            // original publication order after parent/render/IPC setup.
+            if (!attachTournament)
+            {
+                (void)BeginManagedSessionBoundary(
+                    "ExternalLauncherAdoption");
+                InterlockedExchange(&g_revivalExitIntercepted, 0);
+                InterlockedExchange(&g_revivalExitMode, -1);
+            }
+            if (!attachTournament)
+            {
+                InterlockedExchange(&g_startAbortRequested, 0);
+                ResetInjectedPeerQuitBroadcastState();
+                ResetNativeWorkflowFlags();
+                g_delayPromptMetrics = {};
+                g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                g_externalLauncherGuardRemoteBase = externalRemoteBase;
+                g_spectatorPostInitAttemptedForSession = false;
+                g_spectatorPostInitSucceededForSession = false;
+                g_localInitFn = existingInitFn;
+                g_localRoleFlag = probe.role;
+                g_lastValidatedSessionPtr = probe.sessionPtr;
+                if (adoptSpectator)
+                {
+                    g_netplayRole = kNetplayRoleSpectator;
+                    g_localInitAppliedForSession = true;
+                    g_spectatorPostInitAttemptedForSession = true;
+                    g_spectatorPostInitSucceededForSession = true;
+                    SetClientInputSwapApplied(false);
+                }
+                else
+                {
+                    g_netplayRole = probe.activePlayer == 1
+                        ? kNetplayRoleClient
+                        : kNetplayRoleHost;
+                    SetClientInputSwapApplied(probe.activePlayer == 1);
+                    g_localInitAppliedForSession = true;
+                }
+            }
+
+            PublishHostRevivalBase();
+            g_hostBlock->initParams[0] = probe.role;
+            g_hostBlock->initParams[1] = 102;
+            InterlockedIncrement(&g_hostBlock->initSerial);
+            EnsureHostLogEfzIatPatched(true);
+            PrimeGracefulQuitRingForSession();
+
+            if (!attachTournament)
+            {
+                // Preserve the established Online/Spectator order: parent,
+                // renderer, IPC, and coherent mod publication all precede the
+                // tick/ExitProcess boundary for those already-live sessions.
+                SetExternalLauncherAttachPending(true);
+                recoveryArmed = ArmExternalLauncherExitRecovery();
+                frameHookReady =
+                    recoveryArmed && InstallNetplayFrameHook();
+                if (!frameHookReady
+                    && HasNetplayPerFrameTickHookInstalled())
+                {
+                    // A dispatcher write can fail transiently after the active
+                    // tick boundary is live.  Its exact tick-only state is
+                    // resumable; retry once before quarantining the generation.
+                    frameHookReady = InstallNetplayFrameHook();
+                }
+                tickHookReady = HasNetplayPerFrameTickHookInstalled();
+                if (!tickHookReady && !HasAnyNetplayFrameHookInstalled())
+                {
+                    SetExternalLauncherAttachPending(false);
+                    (void)RestoreDllExitProcessPatches();
+                    restoreStagedModState();
+                    CloseProcessHandle(nullptr);
+                    CleanupExternalLauncherGuard();
+                    launcherStartupAllowed = false;
+                    g_launchDisposition =
+                        revival_launch::LaunchDisposition::PassiveFailClosed;
+                    mod::Log(
+                        "LauncherBootstrap: frame-hook precommit failed cleanly; no child simulation/ExitProcess hook remains and parent guard is cancelled/pass-through");
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return false;
+                }
+
+                // The acknowledgement can only be emitted by an entry through
+                // the new tick detour.  Waiting for it proves that any native
+                // tick which entered before the prologue write has returned.
+                attachBoundaryObserved = tickHookReady
+                    && WaitForExternalLauncherAttachBoundary(5000u);
+                exitIatReady =
+                    attachBoundaryObserved && tickHookReady && recoveryArmed
+                    && PatchRevivalDllExitProcess();
+                if (!frameHookReady || !tickHookReady
+                    || !attachBoundaryObserved || !recoveryArmed
+                    || !exitCallsitesReady || !exitIatReady)
+                {
+                    mod::Log(
+                        "LauncherBootstrap: post-publication attach failure frame=%d tick=%d boundary=%d arm=%d callsites=%d iat=%d; retaining coherent managed state and scheduling title recovery",
+                        frameHookReady ? 1 : 0,
+                        tickHookReady ? 1 : 0,
+                        attachBoundaryObserved ? 1 : 0,
+                        recoveryArmed ? 1 : 0,
+                        exitCallsitesReady ? 1 : 0,
+                        exitIatReady ? 1 : 0);
+                    if (tickHookReady)
+                    {
+                        requestManagedAttachRecovery(
+                            "External launcher recovery-hook installation failed");
+                    }
+                    MarkRevivalSyncDiagnosticsSessionStart(
+                        "ExternalLauncherAdoption_quarantined");
+                    // Keep an observed invocation parked through DllMain's
+                    // title/UI patch transaction even on failure.  The
+                    // post-InstallHooks finalizer sees the fatal latch and
+                    // performs the sole quarantine/release; unblocking here
+                    // would let recovery race multi-byte title patch writes.
+                    ReleaseRevivalLauncherProbe(&probe);
+                    return true;
+                }
+            }
+
+            // Revalidate after both live boundaries are installed. At this
+            // point publication is intentionally one-way: a changed/destroyed
+            // native object is recovered without running one more native tick,
+            // rather than racing a live hook rollback.
+            if (!RevalidateRevivalLauncherSessionSnapshot(probe))
+            {
+                mod::Log(
+                    "LauncherBootstrap: session changed after hook publication; scheduling managed title recovery");
+                requestManagedAttachRecovery(
+                    "External Revival session changed during attachment");
+                MarkRevivalSyncDiagnosticsSessionStart(
+                    "ExternalLauncherAdoption_revalidate_failed");
+                // Tournament and Online/Spectator now share one UI-safe
+                // release point after InstallHooks.  Leave the acknowledged
+                // invocation parked and let that finalizer quarantine it.
+                ReleaseRevivalLauncherProbe(&probe);
+                return true;
+            }
+
+            MarkRevivalSyncDiagnosticsSessionStart(
+                attachTournament
+                    ? "ExternalTournamentAdoption_commit"
+                    : "ExternalLauncherAdoption_commit");
+            if (attachTournament)
+            {
+                // Keep the one acknowledged game-thread invocation parked
+                // until DllMain's worker has installed every title/UI patch.
+                // The title patcher writes multi-byte instructions, so this
+                // boundary is the transaction that prevents torn live code.
+                mod::Log(
+                    "LauncherBootstrap: exact Tournament session ready; holding native tick until title/UI hook installation completes");
+                ReleaseRevivalLauncherProbe(&probe);
+                return true;
+            }
+            // Online/Spectator use the same parked publication boundary as
+            // Tournament.  State-export initialization and multi-byte title
+            // hook installation still happen after this function returns;
+            // releasing here let native title navigation race those writes
+            // and left the exporter active throughout simulation.  The
+            // post-InstallHooks finalizer performs the hooks-layer suspension
+            // first, then commits this exact invocation once.
+            mod::Log(
+                "LauncherBootstrap: exact %s session ready; holding native tick until title/UI installation and simulation handoff complete version=%s role=%d session=0x%08lX parentPid=%lu initCalls=0 renderSaved=%d",
+                adoptSpectator ? "Spectator" : "Online",
+                probe.profile->versionTag,
+                probe.role,
+                static_cast<unsigned long>(probe.sessionPtr),
+                static_cast<unsigned long>(probe.parentPid),
+                renderContextSaved ? 1 : 0);
+            ReleaseRevivalLauncherProbe(&probe);
+            return true;
+        }
+
+        ReleaseRevivalLauncherProbe(&probe);
+    }
+
+    if (!launcherStartupAllowed)
+    {
+        return false;
     }
 
     if (g_localRevivalModule == nullptr)
@@ -2126,20 +2920,168 @@ bool EnsureLocalRevivalLoaded()
     g_localRoleFlag = kLocalRoleLocalPlay;
     mod::Log("Takeover: local init(2,102) result=%d", initResult);
 
+    // Publish the active tick recovery boundary before redirecting the DLL's
+    // noreturn ExitProcess import.  A tick-only state can safely retry the
+    // init-only dispatcher; the inverse ordering could expose an interceptor
+    // with no valid longjmp owner.
+    bool frameHookReady = InstallNetplayFrameHook();
+    if (!frameHookReady && HasNetplayPerFrameTickHookInstalled())
+    {
+        frameHookReady = InstallNetplayFrameHook();
+    }
+    const bool tickHookReady = HasNetplayPerFrameTickHookInstalled();
+    if (!tickHookReady)
+    {
+        mod::Log(
+            "Takeover: required per-frame recovery hook unavailable; direct startup staying passive");
+        return false;
+    }
+    if (!frameHookReady)
+    {
+        mod::Log(
+            "Takeover: warning - init-only dispatcher hook unavailable; active tick recovery remains installed");
+    }
+
     if (!PatchRevivalDllExitProcess())
     {
         mod::Log("Takeover: warning - failed to patch EfzRevival ExitProcess IAT");
     }
 
-    // Install a setjmp recovery wrapper around sub_1006E590 (the DLL's per-
-    // frame dispatcher) so that NeutralizeExitProcess can longjmp back to
-    // safety instead of freezing the main game thread during netplay exit.
-    if (!InstallNetplayFrameHook())
+    return true;
+}
+
+bool NeedsExternalLauncherSimulationHandoff()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool externalOnline =
+        g_launchDisposition
+            == revival_launch::LaunchDisposition::AdoptExternalOnline;
+    const bool externalSpectator =
+        g_launchDisposition
+            == revival_launch::LaunchDisposition::AdoptExternalSpectator;
+    return (externalOnline || externalSpectator)
+        && InterlockedCompareExchange(
+               &g_revivalExitIntercepted, 0, 0) == 0
+        && IsExternalLauncherAttachBoundaryPending();
+}
+
+bool CompleteExternalLauncherUiAttachment(
+    bool hooksInstalled,
+    bool simulationHandoffReady)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool externalOnline =
+        g_launchDisposition
+            == revival_launch::LaunchDisposition::AdoptExternalOnline;
+    const bool externalSpectator =
+        g_launchDisposition
+            == revival_launch::LaunchDisposition::AdoptExternalSpectator;
+    const bool externalSimulation = externalOnline || externalSpectator;
+    const bool externalTournament =
+        g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament;
+    if (!externalSimulation && !externalTournament)
     {
-        mod::Log("Takeover: warning - failed to install netplay frame hook");
+        return true;
     }
 
-    return true;
+    uintptr_t sessionPtr = 0;
+    uintptr_t vtable = 0;
+    const bool attachFailed = InterlockedCompareExchange(
+        &g_revivalExitIntercepted, 0, 0) != 0;
+    const int expectedRole = externalOnline
+        ? kLocalRoleOnline
+        : (externalSpectator
+            ? kLocalRoleSpectate
+            : kLocalRoleTournament);
+    bool exactSession = hooksInstalled && !attachFailed
+        && (!externalSimulation || simulationHandoffReady)
+        && g_activeRevival != nullptr
+        && g_localRoleFlag == expectedRole
+        && ReadRoleFlagFromRevival() == expectedRole
+        && IsExternalLauncherAttachBoundaryPending();
+    if (exactSession)
+    {
+        sessionPtr = ReadSessionPointerFromRevival();
+        const uintptr_t expectedVtableRva = externalOnline
+            ? g_activeRevival->onlineSessionVtableRva
+            : (externalSpectator
+                ? g_activeRevival->spectatorSessionVtableRva
+                : g_activeRevival->tournamentSessionVtableRva);
+        exactSession = sessionPtr != 0
+            && sessionPtr == g_lastValidatedSessionPtr
+            && SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtable)
+            && vtable == reinterpret_cast<uintptr_t>(g_localRevivalModule)
+                + expectedVtableRva
+            && IsRevivalDllExitProcessIatPatched()
+            && HasNetplayPerFrameTickHookInstalled();
+        if (exactSession && externalSimulation)
+        {
+            exactSession = g_peerProcessOwnership
+                    == PeerProcessOwnership::ExternalLauncherParent
+                && g_revivalProcess != nullptr
+                && !HasPeerProcessExitSignal();
+        }
+        else if (exactSession)
+        {
+            exactSession = AdoptExistingTournamentExePatchState()
+                && IsExternalTournamentExitGuardOwned();
+        }
+    }
+
+    if (exactSession)
+    {
+        const bool completed =
+            CompleteExternalLauncherAttachBoundary(true);
+        if (completed)
+        {
+            mod::Log(
+                "LauncherBootstrap: attached exact %s session version=%s role=%d session=0x%08lX initCalls=0 uiHooks=1 simulationSuspended=%d boundaryCommit=1",
+                externalOnline
+                    ? "Online"
+                    : (externalSpectator ? "Spectator" : "Tournament"),
+                g_activeRevival->versionTag,
+                expectedRole,
+                static_cast<unsigned long>(sessionPtr),
+                externalSimulation ? 1 : 0);
+            return true;
+        }
+        exactSession = false;
+    }
+
+    if (g_hostBlock != nullptr && !attachFailed)
+    {
+        CopyString(
+            g_hostBlock->consoleErrorText,
+            sizeof(g_hostBlock->consoleErrorText),
+            !hooksInstalled
+                ? "Launcher title/UI hook installation failed"
+                : (externalSimulation && !simulationHandoffReady
+                    ? "Launcher online simulation handoff failed"
+                    : "Launcher session changed during UI attachment"));
+        InterlockedIncrement(&g_hostBlock->consoleErrorSerial);
+    }
+    InterlockedExchange(
+        &g_revivalExitMode,
+        static_cast<LONG>(expectedRole));
+    InterlockedExchange(&g_revivalExitIntercepted, 1);
+    MarkRevivalSyncDiagnosticsSessionStart(
+        externalSimulation
+            ? "ExternalLauncherAdoption_ui_quarantined"
+            : "ExternalTournamentAdoption_ui_quarantined");
+    const bool completed =
+        CompleteExternalLauncherAttachBoundary(false);
+    mod::Log(
+        "LauncherBootstrap: %s UI attachment quarantined hooks=%d simulationHandoff=%d exactSession=%d priorAttachFailure=%d boundaryQuarantine=%d",
+        externalOnline
+            ? "Online"
+            : (externalSpectator ? "Spectator" : "Tournament"),
+        hooksInstalled ? 1 : 0,
+        simulationHandoffReady ? 1 : 0,
+        exactSession ? 1 : 0,
+        attachFailed ? 1 : 0,
+        completed ? 1 : 0);
+    return completed;
 }
 
 void ReinitLocalPlay()
@@ -2668,6 +3610,172 @@ static void HandleTemporaryHostProtocolListenerAckImpl(
         allowImmediateHandoffAck ? 1 : 0);
     RestoreTemporaryHostProtocolOverride(
         "stable matching Revival netplay session listener acknowledgement");
+}
+
+bool CanTerminatePeerProcess()
+{
+    return g_peerProcessOwnership == PeerProcessOwnership::SpawnedHelper
+        || g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent;
+}
+
+bool IsExternalLauncherPeerProcess()
+{
+    return g_peerProcessOwnership
+        == PeerProcessOwnership::ExternalLauncherParent;
+}
+
+BOOL TerminatePeerProcessIfOwned(
+    UINT exitCode,
+    const char* context,
+    bool waitForExit)
+{
+    if (g_revivalProcess == nullptr)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (!CanTerminatePeerProcess())
+    {
+        mod::Log(
+            "Takeover: refused to terminate unowned Revival process pid=%lu context=%s",
+            static_cast<unsigned long>(g_revivalProcessId),
+            context != nullptr ? context : "unknown");
+        return TRUE;
+    }
+
+    const bool externalLauncherParent =
+        g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent;
+    if (!externalLauncherParent)
+    {
+        return TerminateProcess(g_revivalProcess, exitCode);
+    }
+
+    // The launcher owns Revival's native singleton for the lifetime of the
+    // process.  Merely forgetting our HANDLE leaves that singleton live and
+    // can make every later Host/Join/Spectate start fail.  Terminate only the
+    // exact parent generation admitted by the launcher guard; never fall back
+    // to a PID-only or window-name kill.
+    const DWORD handlePid = GetProcessId(g_revivalProcess);
+    if (g_revivalProcessId == 0
+        || handlePid == 0
+        || handlePid != g_revivalProcessId)
+    {
+        const DWORD error = handlePid == 0
+            ? GetLastError()
+            : ERROR_INVALID_PARAMETER;
+        mod::Log(
+            "Takeover: refused external launcher termination due to handle/PID mismatch expected=%lu actual=%lu context=%s err=%lu",
+            static_cast<unsigned long>(g_revivalProcessId),
+            static_cast<unsigned long>(handlePid),
+            context != nullptr ? context : "unknown",
+            static_cast<unsigned long>(error));
+        SetLastError(error);
+        return FALSE;
+    }
+
+    DWORD observedExitCode = STILL_ACTIVE;
+    if (GetExitCodeProcess(g_revivalProcess, &observedExitCode)
+        && observedExitCode != STILL_ACTIVE)
+    {
+        g_launchDisposition =
+            revival_launch::LaunchDisposition::DirectGameHost;
+        mod::Log(
+            "Takeover: exact external Revival parent already exited pid=%lu code=%lu context=%s",
+            static_cast<unsigned long>(g_revivalProcessId),
+            static_cast<unsigned long>(observedExitCode),
+            context != nullptr ? context : "unknown");
+        return TRUE;
+    }
+
+    if (!HasActiveExactExternalLauncherParent())
+    {
+        mod::Log(
+            "Takeover: refused external launcher termination without exact active guard pid=%lu context=%s",
+            static_cast<unsigned long>(g_revivalProcessId),
+            context != nullptr ? context : "unknown");
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    // Once session teardown owns this generation, no late blocked cleanup
+    // serial from the dying launcher may be delivered to a later session.
+    RetireExternalLauncherGuardSignalDelivery();
+
+    if (!TerminateProcess(g_revivalProcess, exitCode))
+    {
+        const DWORD terminateError = GetLastError();
+        if (GetExitCodeProcess(g_revivalProcess, &observedExitCode)
+            && observedExitCode != STILL_ACTIVE)
+        {
+            g_launchDisposition =
+                revival_launch::LaunchDisposition::DirectGameHost;
+            return TRUE;
+        }
+        SetLastError(terminateError);
+        return FALSE;
+    }
+
+    if (!waitForExit)
+    {
+        g_launchDisposition =
+            revival_launch::LaunchDisposition::DirectGameHost;
+        return TRUE;
+    }
+
+    // TerminateProcess is asynchronous.  Wait for the process object to be
+    // signaled so the native singleton is actually released before the user
+    // can queue the next online session.
+    constexpr DWORD kExternalLauncherExitWaitMs = 2000u;
+    const DWORD waitResult =
+        WaitForSingleObject(g_revivalProcess, kExternalLauncherExitWaitMs);
+    if (waitResult != WAIT_OBJECT_0)
+    {
+        const DWORD waitError = waitResult == WAIT_TIMEOUT
+            ? ERROR_TIMEOUT
+            : GetLastError();
+        mod::Log(
+            "Takeover: exact external Revival parent exit wait failed pid=%lu wait=%lu context=%s err=%lu",
+            static_cast<unsigned long>(g_revivalProcessId),
+            static_cast<unsigned long>(waitResult),
+            context != nullptr ? context : "unknown",
+            static_cast<unsigned long>(waitError));
+        SetLastError(waitError);
+        return FALSE;
+    }
+
+    mod::Log(
+        "Takeover: exact external Revival parent terminated pid=%lu context=%s",
+        static_cast<unsigned long>(g_revivalProcessId),
+        context != nullptr ? context : "unknown");
+    g_launchDisposition =
+        revival_launch::LaunchDisposition::DirectGameHost;
+    return TRUE;
+}
+
+bool ReleasePeerProcessAfterTerminationAttempt(
+    BOOL terminationSucceeded,
+    NetbridgeStatus* status,
+    const char* context,
+    bool waitForPeerWatcher)
+{
+    if (g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent
+        && !terminationSucceeded)
+    {
+        // Keep the only PROCESS_TERMINATE-capable exact-generation handle and
+        // the guard ownership live.  A later start must refuse/retry rather
+        // than colliding with the singleton of a launcher that did not exit.
+        mod::Log(
+            "Takeover: retaining exact external Revival parent after failed termination pid=%lu context=%s",
+            static_cast<unsigned long>(g_revivalProcessId),
+            context != nullptr ? context : "unknown");
+        return false;
+    }
+
+    CloseProcessHandle(status, waitForPeerWatcher);
+    return true;
 }
 
 void StopPeerProcessExitWatch(bool waitForExit)

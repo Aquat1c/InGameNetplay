@@ -146,7 +146,16 @@ bool IsCurrentProcessRevival();
 bool IsRunningUnderWine();
 // In-process IAT patching for Wine - safe to call from DllMain.
 int SelfPatchIat();
-void Initialize();
+// Returns false only when launcher-first admission deliberately fails closed
+// and the mod must leave an existing native Revival session untouched.
+bool Initialize();
+// Must be called once after InstallHooks(), on both success and failure, so a
+// launcher-owned Tournament tick parked for atomic title patching can resume
+// or enter managed quarantine.
+bool CompleteLauncherUiAttachment(bool hooksInstalled);
+// No-lock last resort for an unexpected startup-thread SEH after an adopted
+// tick has parked. Publishes managed recovery before releasing that boundary.
+void EmergencyQuarantineLauncherUiAttachment();
 void Shutdown();
 void EmergencyShutdown();
 void InitializeInjectedProcess();

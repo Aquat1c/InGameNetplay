@@ -20,6 +20,9 @@ void Initialize();
 /// Tear down the shared memory mapping.
 /// Called from session_bridge::Shutdown().
 void Shutdown();
+/// Process-termination detach only: signal and detach the worker without
+/// waiting under the loader lock. OS process teardown reclaims handles/maps.
+void EmergencyShutdown();
 
 /// Populate the exported state from the current bridge status and live game
 /// memory. Called by control-plane ticks and explicit transition publishers,

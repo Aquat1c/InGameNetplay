@@ -48,11 +48,10 @@ uint32_t BeginSessionBoundary(const char* reason)
         "LIFECYCLE ep=%u stage=session_boundary action=begin reason=%s",
         epoch, why);
 
-    // --- Centralized idempotent reset of cross-session mod-owned latches. ---
-    // Each of these is individually idempotent; the whole routine is safe to
-    // run more than once per boundary.  Order is not load-bearing (independent
-    // latches), but we trace each so a two-peer diff can confirm both peers
-    // executed the same reset at the same epoch.
+    // --- Centralized reset of cross-session mod-owned latches. ---
+    // The individual resets are idempotent, but this function is not: every
+    // call advances the epoch. The managed-session authority must invoke it
+    // exactly once per committed boundary.
 
     // Rank 1: legacy gameplay-exit cleanup suppression latch.  Left armed, it
     // suppresses teardown for the whole next session on whichever peer returned

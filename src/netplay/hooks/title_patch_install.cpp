@@ -195,6 +195,7 @@ void RemoveHooks()
 
     g_netplayMenuState = {};
     g_netplayAssetsAvailable = false;
+    g_onlineSimulationUiSuspended.store(false, std::memory_order_release);
     g_spriteFont = {};
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;

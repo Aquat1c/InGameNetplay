@@ -1,6 +1,8 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 
 #include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/external_launcher_guard.h"
+#include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
 
 #include "crash_handler.h"
@@ -129,8 +131,58 @@ bool RunGameplayExitContinuation(const char* origin)
         : "unknown";
     const int recoveredRole = takeover::g_localRoleFlag;
     const DWORD recoveredPid = takeover::g_revivalProcessId;
+    const bool externalLauncherParent =
+        takeover::g_peerProcessOwnership
+            == takeover::PeerProcessOwnership::ExternalLauncherParent;
+
+    if (externalLauncherParent)
+    {
+        // This recovery owns the admitted external generation from this point
+        // onward.  Ignore every late hard-close serial from that old launcher,
+        // while keeping its exact TerminateProcess guard active until the
+        // launcher process itself exits.
+        takeover::RetireExternalLauncherGuardSignalDelivery();
+    }
 
     takeover::LogSessionDiagnosticState("GameplayExitRecovery_entry");
+
+    if (recoveredRole == takeover::kLocalRoleTournament)
+    {
+        // A role-3 object owns live EXE trampolines and a session-scoped DLL
+        // guard.  Its only safe teardown order is the post-tick Tournament
+        // transaction; the generic recovery below neutralizes the vtable and
+        // calls ForceLocalPlayInit before restoring those EXE sites.
+        takeover::ArmTournamentReturnCleanup(originTag);
+        const bool cleanupOk =
+            takeover::CompletePendingTournamentReturnCleanup(nullptr);
+        if (cleanupOk)
+        {
+            InterlockedExchange(&g_menuEntryPending, 0);
+            InterlockedExchange(&g_recoveryCompleted, 1);
+            InterlockedExchange(&g_recoveryInProgress, 0);
+            SetRecoveryState(RecoveryStateCompleted, originTag);
+            mod::Log(
+                "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=1 mode=%d path=tournament_transaction",
+                originTag,
+                recoveredRole);
+            return true;
+        }
+
+        // Keep the pre-native latch live.  The per-frame post-tick owner will
+        // retry byte restoration; destructive init failures remain terminally
+        // quarantined rather than being repeated.
+        InterlockedExchange(
+            &takeover::g_revivalExitMode,
+            static_cast<LONG>(recoveredRole));
+        InterlockedExchange(&takeover::g_revivalExitIntercepted, 1);
+        InterlockedExchange(&g_recoveryInProgress, 0);
+        SetRecoveryState(RecoveryStateIdle, originTag);
+        mod::Log(
+            "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=0 mode=%d path=tournament_quarantine",
+            originTag,
+            recoveredRole);
+        return false;
+    }
 
     // Recovery can fire while the connection is still alive (stall-detector
     // exits, local bypass exits), and the helper is terminated below without
@@ -140,8 +192,7 @@ bool RunGameplayExitContinuation(const char* origin)
     // helper is still alive; if the peer/helper is already dead this fails
     // fast and teardown continues unchanged.
     bool peerQuitSent = false;
-    if ((recoveredRole == takeover::kLocalRoleOnline
-         || recoveredRole == takeover::kLocalRoleSpectate)
+    if (recoveredRole == takeover::kLocalRoleOnline
         && takeover::g_revivalProcess != nullptr)
     {
         peerQuitSent = takeover::RequestInjectedPeerQuitBroadcast(
@@ -199,13 +250,34 @@ bool RunGameplayExitContinuation(const char* origin)
     DWORD termErr = 0;
     BOOL closeOk = TRUE;
     const bool hadHelper = (takeover::g_revivalProcess != nullptr);
-    if (takeover::g_revivalProcess != nullptr)
+    if (takeover::g_revivalProcess != nullptr && !externalLauncherParent)
     {
-        termOk = TerminateProcess(takeover::g_revivalProcess, 0);
+        termOk = takeover::TerminatePeerProcessIfOwned(
+            0, "gameplay_exit_recovery");
         termErr = termOk ? 0 : GetLastError();
+        takeover::StopPeerProcessExitWatch(true);
         closeOk = CloseHandle(takeover::g_revivalProcess);
         takeover::g_revivalProcess = nullptr;
         takeover::g_revivalProcessId = 0;
+        takeover::g_peerProcessOwnership =
+            takeover::PeerProcessOwnership::None;
+    }
+    else if (takeover::g_revivalProcess != nullptr
+             && externalLauncherParent)
+    {
+        // The launcher owns Revival's singleton until its process exits.  Kill
+        // and wait for this exact guard-bound generation before releasing the
+        // ordinary peer slot, otherwise an immediate rehost/rejoin can collide
+        // with the old native singleton.
+        termOk = takeover::TerminatePeerProcessIfOwned(
+            0, "gameplay_exit_recovery_external_launcher");
+        termErr = termOk ? 0 : GetLastError();
+        closeOk = takeover::ReleasePeerProcessAfterTerminationAttempt(
+            termOk,
+            nullptr,
+            "gameplay_exit_recovery_external_launcher")
+            ? TRUE
+            : FALSE;
     }
     mod::Log(
         "GAMEPLAY_EXIT_RECOVERY_STEP terminate_helper result=%d hadHandle=%d pid=%lu termOk=%d closeOk=%d err=%lu origin=%s",
@@ -227,19 +299,19 @@ bool RunGameplayExitContinuation(const char* origin)
     const bool deferredWasSet =
         takeover::ClearDeferredCancelCleanupForRecovery("gameplay_exit_reset_state");
     takeover::ResetGameModeValidation();
-    if (takeover::g_hostBlock != nullptr)
-    {
-        InterlockedExchange(&takeover::g_hostBlock->consoleErrorSerial, 0);
-        takeover::g_hostBlock->consoleErrorText[0] = '\0';
-    }
-    InterlockedExchange(&takeover::g_revivalExitIntercepted, 0);
-    InterlockedExchange(&takeover::g_revivalExitMode, -1);
     mod::Log(
-        "GAMEPLAY_EXIT_RECOVERY_STEP reset_state result=1 deferredCancelWasSet=%d origin=%s",
+        "GAMEPLAY_EXIT_RECOVERY_STEP reset_state deferredCancelWasSet=%d origin=%s",
         deferredWasSet ? 1 : 0,
         originTag);
 
     takeover::g_localInitAppliedForSession = false;
+    const bool parentGenerationReleased =
+        !externalLauncherParent || !hadHelper || (termOk && closeOk);
+    if (parentGenerationReleased)
+    {
+        takeover::g_launchDisposition =
+            revival_launch::LaunchDisposition::DirectGameHost;
+    }
 
     const bool graphicsPatchOk =
         takeover::EnsureRevivalGraphicsPatchSetEnabled(
@@ -271,11 +343,22 @@ bool RunGameplayExitContinuation(const char* origin)
 
     const frontend_return::ReturnResult returnResult =
         frontend_return::BeginReturnToFrontend(request);
-    const bool scheduled = returnResult.accepted
-        && (returnResult.pending || returnResult.completed);
+    // An already-active frontend return is still an owned path to safety even
+    // when this second request was not newly accepted.  Treat any pending
+    // transaction as scheduled so teardown never clears its recovery owner.
+    const bool scheduled = returnResult.pending
+        || (returnResult.accepted && returnResult.completed);
 
     if (scheduled)
     {
+        if (takeover::g_hostBlock != nullptr)
+        {
+            InterlockedExchange(
+                &takeover::g_hostBlock->consoleErrorSerial, 0);
+            takeover::g_hostBlock->consoleErrorText[0] = '\0';
+        }
+        InterlockedExchange(&takeover::g_revivalExitIntercepted, 0);
+        InterlockedExchange(&takeover::g_revivalExitMode, -1);
         InterlockedExchange(&g_menuEntryPending, 1);
         mod::Log(
             "RECOVERY_MENU_PENDING_SET origin=%s mode=%d frameTick=%u",
@@ -291,6 +374,24 @@ bool RunGameplayExitContinuation(const char* origin)
     }
     else
     {
+        // Keep a persistent pre-native quarantine and retry owner when no
+        // frontend path accepted the transition. Never resume the neutralized
+        // native session merely because the first force-title request failed.
+        InterlockedExchange(
+            &takeover::g_revivalExitMode,
+            static_cast<LONG>(recoveredRole));
+        InterlockedExchange(&takeover::g_revivalExitIntercepted, 1);
+        if (takeover::g_hostBlock != nullptr
+            && InterlockedCompareExchange(
+                   &takeover::g_hostBlock->consoleErrorSerial, 0, 0) == 0)
+        {
+            takeover::CopyString(
+                takeover::g_hostBlock->consoleErrorText,
+                sizeof(takeover::g_hostBlock->consoleErrorText),
+                "Frontend recovery was not scheduled");
+            InterlockedIncrement(
+                &takeover::g_hostBlock->consoleErrorSerial);
+        }
         InterlockedExchange(&g_recoveryInProgress, 0);
         InterlockedExchange(&g_menuEntryPending, 0);
         SetRecoveryState(RecoveryStateIdle, originTag);
@@ -302,12 +403,13 @@ bool RunGameplayExitContinuation(const char* origin)
         originTag,
         recoveredRole);
     mod::Log(
-        "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=%d mode=%d",
+        "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=%d initOk=%d mode=%d",
         originTag,
-        scheduled ? 1 : 0,
+        (scheduled && initOk && parentGenerationReleased) ? 1 : 0,
+        initOk ? 1 : 0,
         recoveredRole);
     takeover::LogSessionDiagnosticState("GameplayExitRecovery_exit");
-    return scheduled;
+    return scheduled && initOk && parentGenerationReleased;
 }
 }
 

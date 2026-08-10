@@ -12,12 +12,13 @@
 // that leaked on one peer but not the other are a prime driver of the
 // session-2/session-3 desync.
 //
-// This module provides the single boundary authority:
+// This module provides the boundary authority used by direct sessions and
+// exact launcher-first adoption:
 //   * a monotonic session EPOCH, bumped exactly once per session start at the
-//     one unconditional choke point (takeover::StartSession), used both as a
+//     corresponding managed-session commit point, used both as a
 //     stable identifier for aligning the two peers' lifecycle traces and as the
 //     idempotency key that collapses repeated cleanup calls within one boundary;
-//   * BeginSessionBoundary(), the centralized, idempotent reset of the mod's
+//   * BeginSessionBoundary(), the centralized reset of the mod's
 //     cross-session latches, so match N+1 never inherits match N's state
 //     regardless of how messy match N's exit path was.
 //
@@ -32,13 +33,13 @@ namespace netplay::bridge::session_lifecycle
 // BeginSessionBoundary() returns 1.  Monotonic for the process lifetime.
 uint32_t CurrentSessionEpoch();
 
-// Runs once at the start of every session, from takeover::StartSession's
-// boundary-reset prologue (under the takeover mutex).  Bumps the epoch and
-// performs the centralized idempotent reset of the mod's cross-session latches:
+// Runs exactly once at the start/commit of every managed session, under the
+// takeover mutex. Bumps the epoch and resets the mod's cross-session latches:
 //   * frontend_return consumed-continuation suppression latch (rank 1);
 //   * once-per-process crash-artifact latch (so later-session crashes dump);
 //   * (extend here as further cross-session latches are centralized).
-// Returns the new epoch.  Safe to call more than once per boundary.
+// Returns the new epoch. Calling it more than once creates a new epoch and is
+// therefore not safe within one session boundary.
 uint32_t BeginSessionBoundary(const char* reason);
 
 // Monotonic cleanup-invocation counter, for the "repeated cleanup calls" proof

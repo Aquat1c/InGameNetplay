@@ -20,6 +20,7 @@ ipc_path = root / "src/netplay/bridge/ipc_shared.cpp"
 process_inject_path = root / "src/netplay/bridge/process_inject.cpp"
 session_bridge_path = root / "src/netplay/bridge/session_bridge.cpp"
 title_flow_path = root / "src/netplay/hooks/title_flow.cpp"
+menu_hooks_path = root / "src/netplay/hooks/menu_hooks.cpp"
 player_rooms_path = root / "src/netplay/hooks/player_rooms_menu.cpp"
 frontend_return_path = root / "src/netplay/bridge/frontend_return.cpp"
 async_host_path = root / "src/netplay/bridge/async_hosting.cpp"
@@ -144,8 +145,55 @@ if "HasPeerProcessExitSignal()" not in parity_decision:
     fail("parity decision lost the event-driven helper-exit signal")
 
 dispatch_wrapper = function_slice(revival, "static int RunPerFrameTickDispatch(")
-if dispatch_wrapper.count("g_origPerFrameTick(fixedThis)") != 1:
+if dispatch_wrapper.count(
+    "InvokeOriginalPerFrameTickPreservingNonvolatile(fixedThis)"
+) != 1:
     fail("setjmp wrapper must call the native tick exactly once")
+
+native_call_seam = function_slice(
+    revival,
+    "InvokeOriginalPerFrameTickPreservingNonvolatile(void* /*fixedThis*/)",
+)
+for required in (
+    "push ebp",
+    "push ebx",
+    "push esi",
+    "push edi",
+    "call dword ptr [g_origPerFrameTick]",
+    "pop edi",
+    "pop esi",
+    "pop ebx",
+    "pop ebp",
+):
+    if required not in native_call_seam:
+        fail(f"native tick ABI seam lost register preservation: {required}")
+
+# Disconnect recovery must not arm a fatal native-tick latch and then wait for
+# the skipped title update to consume it. Frontend screens use the managed
+# return transaction, while the recurring gameplay stall classifier remains
+# battle/result-only.
+gameplay_screen_classifier = function_slice(
+    revival, "static bool IsGameplayExitRecoveryScreen("
+)
+if "screen == 1" in gameplay_screen_classifier or "screen == 2" in gameplay_screen_classifier:
+    fail("gameplay stall classifier expanded onto frontend screens")
+managed_frontend_classifier = function_slice(
+    revival, "static bool IsManagedFrontendRecoveryScreen("
+)
+for required_screen in ("screen == 0", "screen == 1", "screen == 2", "screen == 3", "screen == 5"):
+    if required_screen not in managed_frontend_classifier:
+        fail(f"managed disconnect recovery lost frontend route: {required_screen}")
+if revival.count("IsManagedFrontendRecoveryScreen(") != 5:
+    fail("not every tick/frame/watchdog/quit recovery route uses the managed frontend classifier")
+graceful_finalize = function_slice(revival, "static char FinalizeGracefulQuitTeardown(")
+if (
+    "IsManagedFrontendRecoveryScreen(teardownScreen)" not in graceful_finalize
+    or "GameplayExitOrigin::QuitRing" not in graceful_finalize
+):
+    fail("quit-ring teardown can bypass the managed frontend return")
+graceful_signal = function_slice(revival, "static char RecoverFromQuitRingSignal(")
+if "InterlockedExchange(&g_revivalExitIntercepted, 1)" not in graceful_signal:
+    fail("quit-ring grace period lost its pre-native quarantine latch")
 
 console = console_path.read_text(encoding="utf-8", errors="strict")
 producer = function_slice(console, "void LogConsoleTextChunk(")
@@ -226,7 +274,10 @@ if "g_hostBlock->helperCaptureReady" not in start_session:
 if "resumeResult == static_cast<DWORD>(-1)" not in start_session:
     fail("helper ResumeThread failure is not rejected")
 emergency_shutdown = function_slice(takeover, "void EmergencyShutdownHost(")
-if "CloseProcessHandle(nullptr, false)" not in emergency_shutdown:
+if (
+    "CloseProcessHandle(nullptr, false)" not in emergency_shutdown
+    and '"emergency_shutdown_host",\n            false)' not in emergency_shutdown
+):
     fail("loader-lock shutdown can block joining the helper-exit watcher")
 
 # The late helper-IAT safety retry runs on the title thread every 500 ms until
@@ -328,6 +379,24 @@ for required in (
 ):
     if required not in suspend_ui:
         fail(f"online handoff does not verify teardown component: {required}")
+simulation_latch_at = suspend_ui.find(
+    "g_onlineSimulationUiSuspended.store(")
+success_return_at = suspend_ui.find("return true;", simulation_latch_at)
+if not (0 <= simulation_latch_at < success_return_at):
+    fail("online handoff does not latch UI suspension before success")
+
+external_handoff = function_slice(
+    title_flow, "bool PrepareExternalLauncherSimulationHandoffImpl(")
+if "SuspendUiHooksForOnlineSimulation(" not in external_handoff:
+    fail("launcher-first simulation does not use the full UI/export barrier")
+
+menu_hooks = menu_hooks_path.read_text(encoding="utf-8", errors="strict")
+title_update = function_slice(menu_hooks, "static char HookedTitleUpdateImplBody(")
+latch_guard_at = title_update.find("g_onlineSimulationUiSuspended.load(")
+debug_option_at = title_update.find("IsDebugMenuEnabled()")
+overlay_rearm_at = title_update.find("EnsureGameplayOverlayHook()")
+if not (0 <= latch_guard_at < debug_option_at < overlay_rearm_at):
+    fail("title update can re-arm EndScene after online simulation suspension")
 
 frontend_return = frontend_return_path.read_text(encoding="utf-8", errors="strict")
 suspend_updates = function_slice(

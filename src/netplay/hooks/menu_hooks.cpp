@@ -28,6 +28,7 @@ extern "C" uint32_t g_titleCaseReturnAddress = 0;
 std::string g_moduleDirectory;
 bool g_netplayAssetsAvailable = false;
 bool g_titleAssetsOverrideApplied = false;
+std::atomic<bool> g_onlineSimulationUiSuspended{false};
 
 NetplayMenuState g_netplayMenuState;
 StopHostingConfirmState g_stopHostingConfirm;
@@ -352,7 +353,8 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
     // When the debug option is enabled, make sure the D3D9 EndScene overlay hook
     // is installed early (from the title screen) so the ImGui debug overlay can
     // be toggled with DELETE on any screen. Idempotent/cheap once installed.
-    if (netplay::mod_settings::IsDebugMenuEnabled())
+    if (!g_onlineSimulationUiSuspended.load(std::memory_order_acquire)
+        && netplay::mod_settings::IsDebugMenuEnabled())
     {
         (void)netplay::battle_log::EnsureGameplayOverlayHook();
     }
@@ -662,10 +664,18 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 // ---------------------------------------------------------------------------
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 {
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(
+            &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+        static_cast<LONG>(GetCurrentThreadId()));
     netplay::bridge::takeover::g_netplayUiJmpActive = true;
     if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
     {
         netplay::bridge::takeover::g_netplayUiJmpActive = false;
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(
+                &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+            0);
         mod::Log("HookedTitleUpdateImpl: recovered from ExitProcess via ui longjmp");
         // ExitProcess interception flag is already set; skip this frame and let
         // the next title update consume/cleanup in a clean state.
@@ -674,6 +684,10 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 
     const char result = HookedTitleUpdateImplBody(screenContext);
     netplay::bridge::takeover::g_netplayUiJmpActive = false;
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(
+            &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+        0);
     return result;
 }
 

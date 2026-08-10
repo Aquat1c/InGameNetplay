@@ -48,7 +48,19 @@ static uint32_t RemoteExportAddress(uintptr_t remoteBase, const void* localExpor
 std::vector<RemoteModuleRecord> EnumerateRemoteModules(DWORD processId)
 {
     std::vector<RemoteModuleRecord> modules;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        snap = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+            processId);
+        if (snap != INVALID_HANDLE_VALUE
+            || GetLastError() != ERROR_BAD_LENGTH)
+        {
+            break;
+        }
+        Sleep(1);
+    }
     if (snap == INVALID_HANDLE_VALUE)
     {
         return modules;

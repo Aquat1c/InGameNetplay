@@ -1,12 +1,17 @@
 #pragma once
 
+#include "netplay/bridge/revival_launch_policy.h"
 #include "netplay/bridge/session_bridge.h"
 
 namespace netplay::bridge::takeover
 {
+// Loader-lock-safe: captures four fixed EFZ byte ranges before an external
+// Revival launcher can install its role-specific patches. No allocation,
+// logging, locks, or loader APIs are used.
+void CaptureTournamentExePreimageAtProcessAttach();
 bool IsCurrentProcessRevival();
 void DetectRevivalVersion();
-void InitializeHost();
+bool InitializeHost();
 void ShutdownHost();
 void EmergencyShutdownHost();
 void InitializeInjected();

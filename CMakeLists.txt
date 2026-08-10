@@ -55,6 +55,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay_mod.rc
     src/netplay/assets/assets.cpp
     src/netplay/bridge/async_hosting.cpp
+    src/netplay/bridge/external_launcher_guard.cpp
     src/netplay/bridge/frontend_return.cpp
     src/netplay/bridge/gameplay_exit_recovery.cpp
     src/netplay/bridge/session_bridge.cpp
@@ -64,6 +65,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/console_capture.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/revival_j_diagnostics.cpp
+    src/netplay/bridge/revival_launcher_probe.cpp
     src/netplay/bridge/ipc_shared.cpp
     src/netplay/bridge/process_inject.cpp
     src/netplay/bridge/iat_stubs.cpp
@@ -138,6 +140,7 @@ if(WIN32)
     target_link_libraries(efz_netplay_mod PRIVATE ws2_32)
     target_link_libraries(efz_netplay_mod PRIVATE gdiplus)
     target_link_libraries(efz_netplay_mod PRIVATE d3d9)
+    target_link_libraries(efz_netplay_mod PRIVATE advapi32)
     target_link_libraries(efz_netplay_mod PRIVATE minhook)
 endif()
 
@@ -194,6 +197,62 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_simulation_parity.py"
             "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME revival_launcher_adoption_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_revival_launcher_adoption.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME tournament_queue_admission_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_tournament_queue_admission.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME managed_charselect_quit_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_managed_charselect_quit_contract.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME rehost_status_reset_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_rehost_status_reset.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME spectate_prompt_ack_latch_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_spectate_prompt_ack_latch.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+if(BUILD_TESTING)
+    add_executable(revival_launch_policy_tests
+        tests/revival_launch_policy_tests.cpp)
+    target_include_directories(revival_launch_policy_tests PRIVATE include)
+    target_compile_features(revival_launch_policy_tests PRIVATE cxx_std_17)
+
+    if(MSVC)
+        if(EFZ_XP_COMPAT)
+            target_compile_options(revival_launch_policy_tests PRIVATE
+                /W4 /EHsc)
+            target_compile_definitions(revival_launch_policy_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(revival_launch_policy_tests PRIVATE
+                /Zc:threadSafeInit-)
+        else()
+            target_compile_options(revival_launch_policy_tests PRIVATE
+                /W4 /permissive- /EHsc)
+        endif()
+
+        if(EFZ_STATIC_RUNTIME)
+            set_property(TARGET revival_launch_policy_tests PROPERTY
+                MSVC_RUNTIME_LIBRARY
+                "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endif()
+
+    add_test(
+        NAME revival_launch_policy_tests
+        COMMAND revival_launch_policy_tests)
 endif()
 
 if(BUILD_TESTING AND WIN32)

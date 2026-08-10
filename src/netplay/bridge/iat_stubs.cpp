@@ -592,6 +592,7 @@ bool RestoreNeutralizedSessionVtableForCleanup(
 
 typedef VOID (WINAPI *ExitProcessFn)(UINT uExitCode);
 static ExitProcessFn g_realExitProcess = nullptr;
+static ULONG_PTR* g_revivalExitProcessIatSlot = nullptr;
 
 bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
 {
@@ -767,7 +768,9 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     // set a setjmp recovery point, use longjmp to escape without freezing the
     // main thread.  The title-screen hook will then consume the interception
     // flag and re-enter the netplay menu on the next mode-0 frame.
-    if (g_netplayFrameJmpActive)
+    const DWORD currentThreadId = GetCurrentThreadId();
+    if (g_netplayFrameJmpActive
+        && g_netplayFrameJmpOwnerThreadId == currentThreadId)
     {
         mod::Log(
             "NeutralizeExitProcess: longjmp - returning control to game "
@@ -783,7 +786,8 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     // error paths, or early desync during charselect), use the UI-update
     // recovery context instead of returning into unknown compiler-generated
     // post-call code.
-    if (g_netplayUiJmpActive)
+    if (g_netplayUiJmpActive
+        && g_netplayUiJmpOwnerThreadId == currentThreadId)
     {
         mod::Log(
             "NeutralizeExitProcess: ui longjmp - escaping title/menu path "
@@ -792,6 +796,27 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         g_netplayUiJmpActive = false;
         longjmp(g_netplayUiJmpBuf, 1);
         // longjmp does not return.
+    }
+
+    // A jmp_buf is thread-affine. Revival normally reaches ExitProcess from
+    // the EFZ game-loop thread, but never longjmp through another thread's
+    // active frame/title boundary if an unexpected worker calls it. The
+    // interception flag wakes the game-thread recovery path; this noreturn
+    // caller remains parked instead of corrupting the owner's stack.
+    if ((g_netplayFrameJmpActive
+            && g_netplayFrameJmpOwnerThreadId != currentThreadId)
+        || (g_netplayUiJmpActive
+            && g_netplayUiJmpOwnerThreadId != currentThreadId))
+    {
+        mod::Log(
+            "NeutralizeExitProcess: refusing cross-thread longjmp currentTid=%lu frameOwner=%lu uiOwner=%lu",
+            static_cast<unsigned long>(currentThreadId),
+            static_cast<unsigned long>(g_netplayFrameJmpOwnerThreadId),
+            static_cast<unsigned long>(g_netplayUiJmpOwnerThreadId));
+        while (true)
+        {
+            Sleep(INFINITE);
+        }
     }
 
     // For online/spectate: if neither longjmp context is active, ExitProcess
@@ -837,10 +862,10 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         // Step 2: Terminate the dead helper process and close its handle.
         if (g_revivalProcess != nullptr)
         {
-            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
-            CloseHandle(g_revivalProcess);
-            g_revivalProcess = nullptr;
-            g_revivalProcessId = 0;
+            const BOOL termOk = TerminatePeerProcessIfOwned(
+                0, "exitprocess_toctou");
+            (void)ReleasePeerProcessAfterTerminationAttempt(
+                termOk, nullptr, "exitprocess_toctou");
             mod::Log(
                 "NeutralizeExitProcess: TOCTOU step 2 helper terminated=%d",
                 termOk ? 1 : 0);
@@ -899,56 +924,18 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
 
-        // Step 1: Restore DLL Jcc patches (prevents recursive ExitProcess
-        // during the ForceLocalPlayInit below).
-        const bool patchOk = RestoreDllExitProcessPatches();
+        // ExitProcess is noreturn and this callback may be running on a worker
+        // or an unknown native stack.  Never restore executing Jcc/EXE bytes or
+        // destroy the role-3 object inline.  The installed game-thread tick
+        // boundary owns the exact EXE -> destructor/init -> DLL transaction.
+        InterlockedExchange(
+            &g_revivalExitMode,
+            static_cast<LONG>(kLocalRoleTournament));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+        ArmTournamentReturnCleanup("exitprocess_no_boundary");
         mod::Log(
-            "NeutralizeExitProcess: tournament step 1 RestoreDllExitProcessPatches=%d",
-            patchOk ? 1 : 0);
-
-        // Step 2: Restore tournament-specific EXE patches.
-        const bool exeOk = RestoreTournamentExePatches();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 2 RestoreTournamentExePatches=%d",
-            exeOk ? 1 : 0);
-
-        // Step 3: Reinstate a live local-play session.
-        const bool initOk = ForceLocalPlayInit();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 3 ForceLocalPlayInit=%d",
-            initOk ? 1 : 0);
-
-        // Step 4: Clear tournament text and reset stale renderer state.
-        const bool clearOk = ClearRevivalText();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 4 ClearRevivalText=%d",
-            clearOk ? 1 : 0);
-        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
-            "exitprocess_tournament_fallback");
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 4 ResetRevivalTextRenderingAfterCleanup=%d",
-            textOk ? 1 : 0);
-
-        // Step 5: Reset VEH one-shot guard and game-mode validation.
-        mod::ResetCrashRecoveryState();
-        ResetGameModeValidation();
-
-        // Step 6: Force game mode to title screen.
-        const bool modeOk = ForceGameModeToTitle();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 6 ForceGameModeToTitle=%d",
-            modeOk ? 1 : 0);
-        (void)RestoreExeDispatchHookForTitle("NeutralizeExitProcess_tournament");
-
-        // Reset tournament role so the title-screen code doesn't think
-        // we're still in tournament mode.
-        g_localRoleFlag = kLocalRoleLocalPlay;
-
-        mod::Log(
-            "NeutralizeExitProcess: tournament cleanup complete, "
-            "suspending thread (role=%d)",
+            "NeutralizeExitProcess: tournament cleanup delegated to post-tick owner; suspending noreturn caller (role=%d)",
             currentRole);
-        SuspendThread(GetCurrentThread());
         while (true) { Sleep(INFINITE); }
     }
 
@@ -1026,8 +1013,52 @@ bool PatchRevivalDllExitProcess()
                 continue;
             }
 
-            // Save the original resolved address.
-            g_realExitProcess = reinterpret_cast<ExitProcessFn>(iatThunk->u1.Function);
+            const auto current = reinterpret_cast<ExitProcessFn>(
+                iatThunk->u1.Function);
+            if (current == NeutralizeExitProcess)
+            {
+                g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
+                const bool originalIsUsable = g_realExitProcess != nullptr
+                    && g_realExitProcess != NeutralizeExitProcess;
+                mod::Log(
+                    "PatchRevivalDllExitProcess: already patched original=0x%p valid=%d",
+                    reinterpret_cast<void*>(g_realExitProcess),
+                    originalIsUsable ? 1 : 0);
+                return originalIsUsable;
+            }
+
+            HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+            const auto nativeExitProcess = kernel32 != nullptr
+                ? reinterpret_cast<ExitProcessFn>(
+                    GetProcAddress(kernel32, "ExitProcess"))
+                : nullptr;
+            if (nativeExitProcess == nullptr
+                || (g_realExitProcess == nullptr
+                    && current != nativeExitProcess))
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: unrecognized initial IAT owner current=0x%p native=0x%p; refusing to overwrite",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(nativeExitProcess));
+                return false;
+            }
+
+            // Preserve the first real target.  Re-installation is expected
+            // across title/session transitions; it must never replace the
+            // saved noreturn API with our own interceptor or a different,
+            // unverified hook target.
+            if (g_realExitProcess != nullptr && g_realExitProcess != current)
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: IAT ownership changed current=0x%p saved=0x%p; refusing",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(g_realExitProcess));
+                return false;
+            }
+            if (g_realExitProcess == nullptr)
+            {
+                g_realExitProcess = current;
+            }
 
             // Overwrite the IAT entry with our interceptor.
             DWORD oldProtect = 0;
@@ -1037,18 +1068,116 @@ bool PatchRevivalDllExitProcess()
                 return false;
             }
             iatThunk->u1.Function = reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
-            VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
+            BOOL protectRestored = FALSE;
+            DWORD protectRestoreError = ERROR_SUCCESS;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                DWORD ignored = 0;
+                if (VirtualProtect(
+                        &iatThunk->u1.Function,
+                        sizeof(uintptr_t),
+                        oldProtect,
+                        &ignored))
+                {
+                    protectRestored = TRUE;
+                    break;
+                }
+                protectRestoreError = GetLastError();
+            }
+            g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
 
             mod::Log(
-                "PatchRevivalDllExitProcess: patched IAT entry orig=0x%p stub=0x%p",
+                "PatchRevivalDllExitProcess: patched IAT entry orig=0x%p stub=0x%p protectRestored=%d err=%lu",
                 reinterpret_cast<void*>(g_realExitProcess),
-                reinterpret_cast<void*>(NeutralizeExitProcess));
+                reinterpret_cast<void*>(NeutralizeExitProcess),
+                protectRestored ? 1 : 0,
+                static_cast<unsigned long>(protectRestoreError));
             return true;
         }
     }
 
     mod::Log("PatchRevivalDllExitProcess: ExitProcess import not found in kernel32 descriptor");
     return false;
+}
+
+bool IsRevivalDllExitProcessIatPatched()
+{
+    return g_revivalExitProcessIatSlot != nullptr
+        && g_realExitProcess != nullptr
+        && g_realExitProcess != NeutralizeExitProcess
+        && *g_revivalExitProcessIatSlot
+            == reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+}
+
+bool RestoreRevivalDllExitProcessIat()
+{
+    if (g_revivalExitProcessIatSlot == nullptr || g_realExitProcess == nullptr)
+    {
+        return true;
+    }
+
+    const ULONG_PTR interceptor =
+        reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+    const ULONG_PTR original = reinterpret_cast<ULONG_PTR>(g_realExitProcess);
+    const ULONG_PTR current = *g_revivalExitProcessIatSlot;
+    if (current == original)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+        return true;
+    }
+    if (current != interceptor)
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: ownership changed current=0x%p expected=0x%p; refusing",
+            reinterpret_cast<void*>(current),
+            reinterpret_cast<void*>(interceptor));
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            g_revivalExitProcessIatSlot,
+            sizeof(*g_revivalExitProcessIatSlot),
+            PAGE_READWRITE,
+            &oldProtect))
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: VirtualProtect failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    *g_revivalExitProcessIatSlot = original;
+    BOOL protectRestored = FALSE;
+    DWORD protectRestoreError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        DWORD ignored = 0;
+        if (VirtualProtect(
+                g_revivalExitProcessIatSlot,
+                sizeof(*g_revivalExitProcessIatSlot),
+                oldProtect,
+                &ignored))
+        {
+            protectRestored = TRUE;
+            break;
+        }
+        protectRestoreError = GetLastError();
+    }
+    const bool restored = *g_revivalExitProcessIatSlot == original;
+    if (restored)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+    }
+    mod::Log(
+        "RestoreRevivalDllExitProcessIat: restored=%d protectRestored=%d err=%lu original=0x%p",
+        restored ? 1 : 0,
+        protectRestored ? 1 : 0,
+        static_cast<unsigned long>(protectRestoreError),
+        reinterpret_cast<void*>(original));
+    // Byte ownership is the lifecycle-critical result. If the original IAT
+    // target is restored, do not report a live interceptor merely because a
+    // best-effort page-protection retry failed; the failure is logged above.
+    return restored;
 }
 
 constexpr DWORD kRedirectProcessAccess =
@@ -2120,12 +2249,31 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
     return CreateFakeThread(fakeExitCode);
 }
 
-BOOL StubTerminateProcess(HANDLE hProcess, UINT uExitCode)
+BOOL StubTerminateProcess(
+    HANDLE hProcess,
+    UINT uExitCode,
+    const void* callerReturnAddress)
 {
     if (hProcess == nullptr)
     {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
+    }
+
+    // The external-launcher guard is deliberately disjoint from the ordinary
+    // injected-helper context. Block only the exact cleanup call/child pair;
+    // unknown handles and callers go directly to the real API without lazy
+    // IPC bootstrap or logging.
+    const ExternalLauncherTerminateDecision externalDecision =
+        EvaluateExternalLauncherTerminate(hProcess, callerReturnAddress);
+    if (externalDecision == ExternalLauncherTerminateDecision::Block)
+    {
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    if (externalDecision == ExternalLauncherTerminateDecision::PassThrough)
+    {
+        return TerminateProcess(hProcess, uExitCode);
     }
 
     if (!HasInjectedContext())
@@ -3651,7 +3799,14 @@ extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateRemoteThread(HANDLE
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_TerminateProcess(HANDLE hProcess, UINT uExitCode)
 {
-    return netplay::bridge::takeover::StubTerminateProcess(hProcess, uExitCode);
+    // Capture this in the exported IAT target.  Capturing it in the C++
+    // implementation would yield this wrapper's return address inside the
+    // mod rather than the exact EfzRevival.exe cleanup call site.
+    const void* const callerReturnAddress = _ReturnAddress();
+    return netplay::bridge::takeover::StubTerminateProcess(
+        hProcess,
+        uExitCode,
+        callerReturnAddress);
 }
 
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)

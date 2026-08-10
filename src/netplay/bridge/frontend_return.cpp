@@ -619,6 +619,8 @@ void EnsureFrontendReturnUpdateHooksImpl()
 #endif
 }
 
+void RequestForceTitleFallback(const char* reason);
+
 bool RequestNativeExit(const FrontendContext& ctx, ScreenId screen, const char* reason)
 {
     uintptr_t targetContext = ctx.screenContext;
@@ -637,7 +639,14 @@ bool RequestNativeExit(const FrontendContext& ctx, ScreenId screen, const char* 
 
     if (targetContext == 0)
     {
-        FailReturn("native_exit_missing_context");
+        if (g_request.allowForcedFallback)
+        {
+            RequestForceTitleFallback("native_exit_missing_context");
+        }
+        else
+        {
+            FailReturn("native_exit_missing_context");
+        }
         return false;
     }
 
@@ -688,7 +697,14 @@ bool RequestNativeExit(const FrontendContext& ctx, ScreenId screen, const char* 
 
     if (!writeExitOk)
     {
-        FailReturn("native_exit_write_failed");
+        if (g_request.allowForcedFallback)
+        {
+            RequestForceTitleFallback("native_exit_write_failed");
+        }
+        else
+        {
+            FailReturn("native_exit_write_failed");
+        }
         return false;
     }
 
@@ -800,13 +816,17 @@ void PerformLoadingCriticalUnblock(DWORD now)
     {
         if (takeover::g_revivalProcess != nullptr)
         {
-            const HANDLE helper = takeover::g_revivalProcess;
             const DWORD pid = takeover::g_revivalProcessId;
-            const BOOL termOk = TerminateProcess(helper, 0);
+            const BOOL termOk = takeover::TerminatePeerProcessIfOwned(
+                0, "frontend_return_loading_unblock");
             const DWORD termErr = termOk ? 0 : GetLastError();
-            const BOOL closeOk = CloseHandle(helper);
-            takeover::g_revivalProcess = nullptr;
-            takeover::g_revivalProcessId = 0;
+            const BOOL closeOk =
+                takeover::ReleasePeerProcessAfterTerminationAttempt(
+                    termOk,
+                    nullptr,
+                    "frontend_return_loading_unblock")
+                    ? TRUE
+                    : FALSE;
             terminateOk = termOk && closeOk;
             mod::Log(
                 "FRONTEND_RETURN_LOADING_UNBLOCK_STEP step=terminate_helper result=%d pid=%lu termOk=%d closeOk=%d err=%lu",
@@ -897,7 +917,11 @@ void TryForceTitleFallback(const char* reason)
     }
     if (!forceOk)
     {
-        FailReturn("force_title_failed");
+        // A confirmed disconnect has already made the old native session
+        // unsafe to resume. Keep the return transaction active and retry from
+        // the next owned update hook instead of dropping the quarantine and
+        // silently returning to that session.
+        SetState(ReturnState::ForceTitleFallback, "force_title_retry");
         return;
     }
 

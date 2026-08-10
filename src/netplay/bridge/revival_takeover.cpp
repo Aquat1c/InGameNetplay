@@ -6,6 +6,7 @@
 
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
@@ -47,6 +48,7 @@ enum class RevivalProfileSource : uint8_t
     Default = 0,
     DllTimestamp,
     PublishedHostTimestamp,
+    ExternalLauncherGuard,
 };
 
 RevivalProfileSource g_activeRevivalSource = RevivalProfileSource::Default;
@@ -69,6 +71,8 @@ const char* RevivalProfileSourceToString(RevivalProfileSource source)
         return "dll_timestamp";
     case RevivalProfileSource::PublishedHostTimestamp:
         return "published_host_timestamp";
+    case RevivalProfileSource::ExternalLauncherGuard:
+        return "external_launcher_guard";
     case RevivalProfileSource::Default:
     default:
         return "default";
@@ -121,6 +125,9 @@ HMODULE g_localRevivalModule = nullptr;
 RevivalInitFn g_localInitFn = nullptr;
 HANDLE g_revivalProcess = nullptr;
 DWORD g_revivalProcessId = 0;
+PeerProcessOwnership g_peerProcessOwnership = PeerProcessOwnership::None;
+revival_launch::LaunchDisposition g_launchDisposition =
+    revival_launch::LaunchDisposition::DirectGameHost;
 int g_localRoleFlag = -1;
 int g_netplayRole = kNetplayRoleNone;
 uintptr_t g_hostRevivalBase = 0;
@@ -177,6 +184,7 @@ bool g_spectatorPostInitSucceededForSession = false;
 volatile LONG g_deferredLifecycleWorkRequested = 0;
 volatile LONG g_deferredTitleSelection = -1;
 uintptr_t g_remoteInjectedSelfBase = 0;
+uintptr_t g_externalLauncherGuardRemoteBase = 0;
 std::unordered_map<std::string, uint32_t> g_remoteInjectedPatchMap;
 DWORD g_lastLatePatchRetryTick = 0;
 DWORD g_lastLatePatchRetryLogTick = 0;
@@ -186,6 +194,9 @@ bool g_lastLatePatchRetryResultValid = false;
 bool g_lastLatePatchRetryResult = false;
 bool g_observedTakeoverCreatePath = false;
 bool g_tournamentReturnCleanupPending = false;
+volatile LONG g_externalTournamentInitialTitleLeft = 0;
+static volatile LONG g_tournamentReturnCleanupStage = 0;
+static volatile LONG g_tournamentReturnCleanupTerminalFailure = 0;
 std::mutex g_fakeThreadMutex;
 std::vector<FakeThreadInfo> g_fakeThreads;
 std::mutex g_redirectAllocMutex;
@@ -963,6 +974,12 @@ void EnsureActiveRevivalProfile()
             return;
         }
         break;
+    case RevivalProfileSource::ExternalLauncherGuard:
+        if (IsExternalLauncherGuardProcess())
+        {
+            return;
+        }
+        break;
     case RevivalProfileSource::Default:
     default:
         if (revival == nullptr && !hasPublishedTimestamp)
@@ -1091,7 +1108,8 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     {
         return 0x41150u;
     }
-    if (std::strcmp(tag, "1.02f") == 0)
+    if (std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0)
     {
         return 0x41190u;
     }
@@ -1364,6 +1382,7 @@ static InjectedPeerManagerLayout ResolveInjectedPeerManagerLayout()
 
     if (std::strcmp(tag, "1.02e") == 0
         || std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0
         || std::strcmp(tag, "1.02g") == 0
         || std::strcmp(tag, "1.02h") == 0)
     {
@@ -2581,6 +2600,7 @@ enum InjectedPeerQuitBroadcastResult : DWORD
     kInjectedPeerQuitBroadcastResultManagerUnresolved = 4,
     kInjectedPeerQuitBroadcastResultHelperBaseUnresolved = 5,
     kInjectedPeerQuitBroadcastResultNativeCallCrashed = 6,
+    kInjectedPeerQuitBroadcastResultInvalidGuardContext = 7,
 };
 
 constexpr DWORD kInjectedPeerQuitBroadcastResultMask = 0xFFu;
@@ -2787,6 +2807,8 @@ static const char* InjectedPeerQuitBroadcastResultToString(DWORD result)
         return "helper_base_unresolved";
     case kInjectedPeerQuitBroadcastResultNativeCallCrashed:
         return "native_call_crashed";
+    case kInjectedPeerQuitBroadcastResultInvalidGuardContext:
+        return "invalid_guard_context";
     default:
         return "unknown";
     }
@@ -2809,26 +2831,59 @@ DWORD RunInjectedPeerQuitBroadcast()
 {
     g_injectedPeerQuitLastDetail = 0;
     ClearPeerQuitDiagnostic();
-    if (!IsCurrentProcessRevival())
+    const bool narrowExternalGuard = IsExternalLauncherGuardProcess();
+    if (!IsCurrentProcessRevival() && !narrowExternalGuard)
     {
         LogInjectedPeerQuitDiagnosticLine("Takeover: injected peer-quit broadcast skipped (not in EfzRevival.exe)");
         return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultNotRevival);
     }
 
-    if (!HasInjectedContext())
+    if (!narrowExternalGuard && !HasInjectedContext())
     {
         (void)EnsureInjectedContextFast();
     }
 
-    DetectRevivalVersion();
-
-    const DWORD hostPid =
-        (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
+    DWORD hostPid = 0;
+    uint32_t guardRevivalTimestamp = 0;
+    if (narrowExternalGuard)
+    {
+        if (!GetExternalLauncherGuardChildProcessId(
+                &hostPid,
+                &guardRevivalTimestamp)
+            || hostPid == 0)
+        {
+            LogInjectedPeerQuitDiagnosticLine(
+                "Takeover: injected peer-quit broadcast refused (external guard child identity unavailable)");
+            return FinishInjectedPeerQuitBroadcast(
+                kInjectedPeerQuitBroadcastResultInvalidGuardContext);
+        }
+        const RevivalAddressProfile* const guardProfile =
+            FindRevivalProfileByTimestamp(guardRevivalTimestamp);
+        if (guardProfile == nullptr)
+        {
+            LogInjectedPeerQuitDiagnosticLine(
+                "Takeover: injected peer-quit broadcast refused (external guard profile unavailable timestamp=0x%08lX)",
+                static_cast<unsigned long>(guardRevivalTimestamp));
+            return FinishInjectedPeerQuitBroadcast(
+                kInjectedPeerQuitBroadcastResultInvalidGuardContext);
+        }
+        SetActiveRevivalProfile(
+            guardProfile,
+            RevivalProfileSource::ExternalLauncherGuard);
+    }
+    else
+    {
+        DetectRevivalVersion();
+        if (g_injectedBlock != nullptr)
+        {
+            hostPid = static_cast<DWORD>(g_injectedBlock->hostPid);
+        }
+    }
     const uintptr_t sendQuitAllRva = ResolveHelperSendQuitAllRva();
     const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
     LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-quit broadcast begin ready=%d hostPid=%lu version=%s sendQuitAllRva=0x%08lX layoutObj=0x%08lX peerContainerOff=0x%08lX peerBackingOff=0x%08lX quitRingOff=0x%08lX cachedManager=0x%08lX cachedHostPid=%lu cachedStrict=%d",
-        HasInjectedContext() ? 1 : 0,
+        (HasInjectedContext() || narrowExternalGuard) ? 1 : 0,
         static_cast<unsigned long>(hostPid),
         (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
             ? g_activeRevival->versionTag
@@ -3096,6 +3151,11 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         remoteSelfBase = g_remoteInjectedSelfBase;
+        if (g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent)
+        {
+            remoteSelfBase = g_externalLauncherGuardRemoteBase;
+        }
         helperPid = g_revivalProcessId;
         sourceHelperProcess = g_revivalProcess;
         if (g_revivalProcess != nullptr)
@@ -3252,9 +3312,44 @@ static void CloseChildJobObject()
 // Session lifecycle functions (public API from revival_takeover.h).
 // ---------------------------------------------------------------------------
 
-void InitializeHost()
+uint32_t BeginManagedSessionBoundary(const char* reason)
+{
+    // This authority owns only mod-side latches shared by direct sessions and
+    // exact launcher-first adoption. Call it exactly once for a committed
+    // session generation. Native object/input/INI work remains at the direct
+    // StartSession call site.
+    ResetForceLocalPlayInitCount();
+    ResetGameModeValidation();
+    ClearLocalProcessCloseForGameplayStall();
+    netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
+    return netplay::bridge::session_lifecycle::BeginSessionBoundary(reason);
+}
+
+bool InitializeHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Resolve launcher-first ownership before opening/truncating logEfz,
+    // creating ordinary host IPC, or touching any saved host override.
+    // Launcher-owned Tournament is attached without a second init; resolving
+    // that ownership first prevents ordinary host setup from replacing role 3.
+    if (!EnsureLocalRevivalLoaded())
+    {
+        mod::Log("Takeover: host local revival load failed");
+        return false;
+    }
+
+    if (g_launchDisposition
+        == revival_launch::LaunchDisposition::AttachExistingTournament)
+    {
+        // The launcher already owns the role-3 object and native navigation.
+        // EnsureLocalRevivalLoaded performed the exact attach transaction;
+        // ordinary host log/Protocol/IPC recovery has no role in Tournament
+        // and would only add side effects before the parked UI commit.
+        mod::Log(
+            "Takeover: launcher-owned Tournament initialized without ordinary host control-plane startup");
+        return true;
+    }
+
     if (!RecoverTemporaryHostProtocolOverride(
             "mod startup"))
     {
@@ -3265,18 +3360,21 @@ void InitializeHost()
     CleanupNativeHostShadowLogDirectory("startup");
     PrimeManagedLogEfzHistory();
     (void)EnsureHostIpc();
-    if (!EnsureLocalRevivalLoaded())
+
+    // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
+    // before any profile-dependent operations (frame hook, etc.).
+    if (g_launchDisposition
+            != revival_launch::LaunchDisposition::AdoptExternalOnline
+        && g_launchDisposition
+            != revival_launch::LaunchDisposition::AdoptExternalSpectator
+        && g_launchDisposition
+            != revival_launch::LaunchDisposition::AttachExistingTournament)
     {
-        mod::Log("Takeover: host local revival load failed");
-    }
-    else
-    {
-        // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
-        // before any profile-dependent operations (frame hook, etc.).
         (void)SetLocalRoleFlag(kLocalRoleLocalPlay, "host_initialize");
     }
 
     mod::Log("Takeover: host initialized");
+    return true;
 }
 
 void ShutdownHost()
@@ -3287,18 +3385,26 @@ void ShutdownHost()
     LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
     RestoreTemporaryHostProtocolOverride(
         "Revival netplay session host shutdown");
+    BOOL terminateOk = TRUE;
     if (g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(0, "shutdown_host");
     }
-    CloseProcessHandle(nullptr);
+    const bool processReleased =
+        ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, nullptr, "shutdown_host");
     CloseChildJobObject();
     CloseHostIpc();
+    if (processReleased)
+    {
+        CleanupExternalLauncherGuard();
+    }
     CleanupNativeHostShadowLogDirectory("host_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
     g_spectatorPostInitAttemptedForSession = false;
     g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
     InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
@@ -3314,6 +3420,7 @@ void ShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_externalLauncherGuardRemoteBase = 0;
     g_remoteInjectedPatchMap.clear();
     mod::Log("Takeover: host shutdown");
     LogRevival102jDeepStep("ShutdownHost.99.complete");
@@ -3327,18 +3434,30 @@ void EmergencyShutdownHost()
     RestoreTemporaryHostProtocolOverride(
         "Revival netplay session emergency host shutdown");
     InterlockedExchange(&g_startAbortRequested, 1);
+    BOOL terminateOk = TRUE;
     if (g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(
+            0, "emergency_shutdown_host", false);
     }
-    CloseProcessHandle(nullptr, false);
+    const bool processReleased =
+        ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk,
+            nullptr,
+            "emergency_shutdown_host",
+            false);
     CloseChildJobObject();
     CloseHostIpc();
+    if (processReleased)
+    {
+        CleanupExternalLauncherGuard();
+    }
     CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
     g_spectatorPostInitAttemptedForSession = false;
     g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
     InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
@@ -3353,6 +3472,7 @@ void EmergencyShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_externalLauncherGuardRemoteBase = 0;
     g_remoteInjectedPatchMap.clear();
 }
 
@@ -3365,6 +3485,20 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepStep("TitleSelection.01.entry", ioStatus);
+
+    if (g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && g_localRoleFlag == kLocalRoleTournament)
+    {
+        // Every title confirmation during this exact launcher-owned role-3
+        // generation belongs to Revival's native queued navigation. The
+        // original title update has already handled it; the observer must not
+        // defer lifecycle work, destroy the object, or invoke init again.
+        mod::Log(
+            "Takeover: preserved launcher-owned Tournament title confirmation selection=%d (initCalls=0)",
+            selection);
+        return;
+    }
 
     if (IsInsideFrameTick())
     {
@@ -3402,28 +3536,17 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     if (g_localRoleFlag == kLocalRoleTournament)
     {
         LogRevival102jDeepSnapshot("TitleSelection.10.tournament_cleanup_pre", ioStatus);
-        if (g_tournamentReturnCleanupPending)
+        if (!g_tournamentReturnCleanupPending)
         {
-            mod::Log(
-                "Takeover: clearing stale 1.02j tournament return pending flag "
-                "before selection cleanup");
-            g_tournamentReturnCleanupPending = false;
+            ArmTournamentReturnCleanup("title_selection_while_tournament_active");
         }
-        RestoreDllExitProcessPatches();
-        RestoreTournamentExePatches();
-        ForceLocalPlayInit();
-        const bool clearOk = ClearRevivalText();
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
         mod::Log(
-            "Takeover: tournament cleanup before selection ClearRevivalText=%d",
-            clearOk ? 1 : 0);
-        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
-            "tournament_cleanup_before_selection");
-        mod::Log(
-            "Takeover: tournament cleanup before selection ResetRevivalTextRenderingAfterCleanup=%d",
-            textOk ? 1 : 0);
-        g_localRoleFlag = kLocalRoleLocalPlay;
-        mod::Log("Takeover: tournament cleanup before selection=%d", selection);
-        LogRevival102jDeepSnapshot("TitleSelection.11.tournament_cleanup_post", ioStatus);
+            "Takeover: title selection=%d held until transactional Tournament cleanup completes",
+            selection);
+        LogRevival102jDeepSnapshot(
+            "TitleSelection.11.tournament_cleanup_deferred", ioStatus);
+        return;
     }
 
     if (selection == 2)
@@ -3447,9 +3570,73 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
             mod::Log(
                 "Takeover: tournament pre-init SaveRenderContext=%d",
                 renderSavedBefore ? 1 : 0);
-            (void)SaveTournamentExePatches();
-            (void)SaveAndApplyDllExitProcessPatches();
-            (void)SetLocalRoleFlag(kLocalRoleTournament, "title_vs_human_tournament");
+            const bool exeJournalReady = SaveTournamentExePatches();
+            const bool exitGuardsReady = exeJournalReady
+                && SaveAndApplyDllExitProcessPatches();
+            if (!exeJournalReady || !exitGuardsReady)
+            {
+                const bool exeRestoreOk = !exeJournalReady
+                    || RestoreTournamentExePatches();
+                const bool dllRestoreOk = !AreDllExitPatchesSaved()
+                    || RestoreDllExitProcessPatches();
+                mod::Log(
+                    "Takeover: direct Tournament pre-init rejected exeJournal=%d guards=%d exeRestore=%d dllRestore=%d",
+                    exeJournalReady ? 1 : 0,
+                    exitGuardsReady ? 1 : 0,
+                    exeRestoreOk ? 1 : 0,
+                    dllRestoreOk ? 1 : 0);
+                if (!exeRestoreOk || !dllRestoreOk)
+                {
+                    ArmTournamentReturnCleanup(
+                        "direct_tournament_preinit_guard_failure");
+                    InterlockedExchange(
+                        &g_revivalExitMode,
+                        static_cast<LONG>(kLocalRoleTournament));
+                    InterlockedExchange(&g_revivalExitIntercepted, 1);
+                    InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+                }
+                return;
+            }
+
+            const bool roleSwitchReported = SetLocalRoleFlag(
+                kLocalRoleTournament,
+                "title_vs_human_tournament");
+            const int nativeRole = ReadRoleFlagFromRevival();
+            const uintptr_t tournamentSession =
+                ReadSessionPointerFromRevival();
+            uintptr_t tournamentVtable = 0;
+            const bool exactTournamentObject =
+                roleSwitchReported
+                && nativeRole == kLocalRoleTournament
+                && tournamentSession != 0
+                && g_activeRevival != nullptr
+                && g_activeRevival->tournamentSessionVtableRva != 0
+                && SafeReadPtr(
+                    reinterpret_cast<const void*>(tournamentSession),
+                    &tournamentVtable)
+                && tournamentVtable
+                    == reinterpret_cast<uintptr_t>(g_localRevivalModule)
+                        + g_activeRevival->tournamentSessionVtableRva;
+            const bool queueNeutralized = exactTournamentObject
+                && NeutralizeTournamentAutoNav();
+            if (!exactTournamentObject || !queueNeutralized)
+            {
+                mod::Log(
+                    "Takeover: direct Tournament commit rejected roleSwitch=%d nativeRole=%d session=0x%08lX vtable=0x%08lX queue=%d",
+                    roleSwitchReported ? 1 : 0,
+                    nativeRole,
+                    static_cast<unsigned long>(tournamentSession),
+                    static_cast<unsigned long>(tournamentVtable),
+                    queueNeutralized ? 1 : 0);
+                ArmTournamentReturnCleanup(
+                    "direct_tournament_commit_validation_failure");
+                InterlockedExchange(
+                    &g_revivalExitMode,
+                    static_cast<LONG>(kLocalRoleTournament));
+                InterlockedExchange(&g_revivalExitIntercepted, 1);
+                InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+                return;
+            }
             if (!renderSavedBefore)
             {
                 const bool renderSavedAfter = SaveRenderContext();
@@ -3466,7 +3653,9 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
                     "Takeover: 1.02j tournament start text rendering enable=%d",
                     textEnableOk ? 1 : 0);
             }
-            (void)NeutralizeTournamentAutoNav();
+            mod::Log(
+                "Takeover: direct Tournament committed role=3 session=0x%08lX queueNeutralized=1",
+                static_cast<unsigned long>(tournamentSession));
             LogRevival102jDeepSnapshot("TitleSelection.21.tournament_init_post", ioStatus);
         }
         else
@@ -3543,6 +3732,26 @@ bool StartSession(
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // A launcher-first session can release the ordinary peer slot while its
+    // exact parent guard remains protect-only. Reap it opportunistically once
+    // the old parent has exited; this never re-enables retired signal delivery.
+    (void)ReapExternalLauncherGuardIfParentExited();
+    if (g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent
+        && g_revivalProcess != nullptr)
+    {
+        if (ProcessAlive(ioStatus))
+        {
+            SetPhase(
+                ioStatus,
+                NetbridgePhase::Failed,
+                "Previous external Revival launcher is still exiting; try again shortly.");
+            return false;
+        }
+        // ProcessAlive observed the exact retained process object signaled,
+        // normalized the launch disposition, and released the old peer slot.
+    }
+
     mod::Log(
         "Takeover: StartSession role=%d port=%u address='%s' iniAddress='%s' nickname='%s' "
         "writeNicknameToIni=%d family=%s writeHostProtocol=%d",
@@ -3571,17 +3780,7 @@ bool StartSession(
         temporaryHostProtocol);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
-    ResetForceLocalPlayInitCount();
-    ResetGameModeValidation();
-    ClearLocalProcessCloseForGameplayStall();
-    netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
-    // Centralized, idempotent reset of the mod's cross-session latches at the
-    // single unconditional session-start choke point.  Bumps the session epoch
-    // (stable id for two-peer lifecycle-trace alignment) and clears latches
-    // that would otherwise let match N's state survive into match N+1 on one
-    // peer only (frontend continuation-suppression latch; crash-artifact latch).
-    const uint32_t sessionEpoch =
-        netplay::bridge::session_lifecycle::BeginSessionBoundary("StartSession");
+    const uint32_t sessionEpoch = BeginManagedSessionBoundary("StartSession");
     (void)sessionEpoch;
     // Normalize a stranded client input swap before the new session inits.  If
     // the previous session was a client (P2) whose swap was never reversed
@@ -3602,37 +3801,12 @@ bool StartSession(
     {
         LogRevival102jDeepSnapshot("StartSession.02.stale_tournament_pre", ioStatus);
         mod::Log(
-            "StartSession: completing stale 1.02j tournament return cleanup before new session");
-        g_tournamentReturnCleanupPending = false;
-        const bool canReplaceSessionNow = !IsInsideFrameTick();
-        const bool exePatchOk = RestoreTournamentExePatches();
-        const bool initOk = canReplaceSessionNow
-            ? ForceLocalPlayInit()
-            : true;
-        const bool patchOk = RestoreDllExitProcessPatches();
-        const bool clearOk = ClearRevivalText();
-        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
-            "stale_102j_tournament_cleanup_before_session");
-        if (canReplaceSessionNow)
-        {
-            g_localRoleFlag = kLocalRoleLocalPlay;
-        }
-        else
-        {
-            mod::Log(
-                "StartSession: stale tournament object left alive for the "
-                "post-tick netplay init handshake to replace safely");
-        }
-        mod::Log(
-            "StartSession: stale 1.02j tournament cleanup init=%d "
-            "replaceNow=%d exePatch=%d dllPatch=%d clear=%d text=%d",
-            initOk ? 1 : 0,
-            canReplaceSessionNow ? 1 : 0,
-            exePatchOk ? 1 : 0,
-            patchOk ? 1 : 0,
-            clearOk ? 1 : 0,
-            textOk ? 1 : 0);
-        LogRevival102jDeepSnapshot("StartSession.03.stale_tournament_post", ioStatus);
+            "StartSession: rejected while transactional Tournament cleanup is still pending");
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Tournament cleanup is still in progress; try again after returning to title.");
+        return false;
     }
 
     // --- Session boundary cleanup logging ---
@@ -3676,43 +3850,15 @@ bool StartSession(
         return false;
     }
 
-    // Zero the entire shared block to prevent stale data from session 1
-    // leaking into session 2.  Re-populate the header fields that
-    // EnsureHostIpc wrote (magic, version, hostPid, hostRevivalBase)
-    // since StartSession's later code repopulates the rest.
-    if (g_hostBlock != nullptr)
+    if (ResetHostSharedBlockForSession(
+            role == NetbridgeRole::Host,
+            port,
+            "StartSession"))
     {
-        mod::Log("StartSession: resetting SharedBlock (initSerial=%ld consoleSerial=%ld)",
-                 static_cast<long>(g_hostBlock->initSerial),
-                 static_cast<long>(g_hostBlock->consoleSerial));
-        const uint32_t savedMagic = g_hostBlock->magic;
-        const uint32_t savedVersion = g_hostBlock->version;
-        const uint32_t savedPid = g_hostBlock->hostPid;
-        const uint32_t savedBase = g_hostBlock->hostRevivalBase;
-        const uint32_t savedTimestamp = g_hostBlock->hostRevivalTimestamp;
-        memset(g_hostBlock, 0, sizeof(SharedBlock));
-        g_hostBlock->magic = savedMagic;
-        g_hostBlock->version = savedVersion;
-        g_hostBlock->hostPid = savedPid;
-        g_hostBlock->hostRevivalBase = savedBase;
-        g_hostBlock->hostRevivalTimestamp = savedTimestamp;
-        // Restore default values for delay prompt fields.
-        g_hostBlock->delayInputValue = -1;
-        g_hostBlock->delayAveragePingMs = -1;
-        g_hostBlock->delayMinPingMs = -1;
-        g_hostBlock->delayMaxPingMs = -1;
-        g_hostBlock->delayRecommended = -1;
-        g_hostBlock->delayRangeMax = 20;
-        g_hostBlock->hostExpectedListenerPort =
-            role == NetbridgeRole::Host
-                ? static_cast<LONG>(port)
-                : 0;
-        g_hostBlock->isHostSession =
-            role == NetbridgeRole::Host ? 1 : 0;
         LogRevival102jDeepStep("StartSession.05.shared_block_reset", ioStatus);
     }
 
-    if (!EnsureLocalRevivalLoaded())
+    if (!EnsureLocalRevivalLoaded(true))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
         return false;
@@ -4314,15 +4460,18 @@ bool StartSession(
 
     g_revivalProcess = pi.hProcess;
     g_revivalProcessId = pi.dwProcessId;
+    g_peerProcessOwnership = PeerProcessOwnership::SpawnedHelper;
     if (!StartPeerProcessExitWatch())
     {
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
             "Helper process-exit watcher unavailable");
-        (void)TerminateProcess(g_revivalProcess, 0);
+        const BOOL terminateOk =
+            TerminatePeerProcessIfOwned(0, "start_watcher_failure");
         CloseHandle(pi.hThread);
-        CloseProcessHandle(ioStatus);
+        (void)ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, ioStatus, "start_watcher_failure");
         return false;
     }
     g_remoteInjectedSelfBase = remoteBase;
@@ -4848,7 +4997,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             LogRevival102jDeepStep("Tick.20.takeover_create_path_observed", ioStatus);
         }
 
-        if (!g_observedTakeoverCreatePath
+        if (g_peerProcessOwnership == PeerProcessOwnership::SpawnedHelper
+            && !g_observedTakeoverCreatePath
             && g_revivalProcess != nullptr
             && g_revivalProcessId != 0
             && g_remoteInjectedSelfBase != 0
@@ -5666,18 +5816,23 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
             duplicateErr = GetLastError();
         }
 
+        const uintptr_t peerQuitRemoteBase =
+            g_peerProcessOwnership
+                    == PeerProcessOwnership::ExternalLauncherParent
+                ? g_externalLauncherGuardRemoteBase
+                : g_remoteInjectedSelfBase;
         mod::Log(
             "Takeover: cancel session peer-quit prepare reason='%s' sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
             reason != nullptr ? reason : "",
             sourceHelperProcess,
             helperProcess,
             static_cast<unsigned long>(g_revivalProcessId),
-            static_cast<unsigned long>(g_remoteInjectedSelfBase),
+            static_cast<unsigned long>(peerQuitRemoteBase),
             static_cast<unsigned long>(duplicateErr));
 
         const bool peerQuitSent = RequestInjectedPeerQuitBroadcastImpl(
             helperProcess,
-            g_remoteInjectedSelfBase,
+            peerQuitRemoteBase,
             g_revivalProcessId,
             "cancel_session_peer_quit",
             300u);
@@ -5697,13 +5852,15 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     const bool hadProcess = ProcessAlive(ioStatus);
     LogRevival102jDeepStep("CancelSession.10.helper_teardown_begin", ioStatus);
+    BOOL terminateOk = TRUE;
     if (!suppressSharedRecoveryTeardown && hadProcess && g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(0, "cancel_session");
     }
     if (!suppressSharedRecoveryTeardown)
     {
-        CloseProcessHandle(ioStatus);
+        (void)ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, ioStatus, "cancel_session");
         // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
         // spawned by EfzRevival.exe are also terminated.  A fresh job will be
         // created for the next StartSession call.
@@ -6101,12 +6258,34 @@ DelayPromptMetrics GetDelayPromptMetrics()
     return metrics;
 }
 
+void ArmTournamentReturnCleanup(const char* reason)
+{
+    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
+    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
+    g_tournamentReturnCleanupPending = true;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+    mod::Log(
+        "Takeover: tournament return cleanup armed reason=%s",
+        reason != nullptr && reason[0] != '\0' ? reason : "unspecified");
+}
+
 bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (g_localRoleFlag != kLocalRoleTournament)
     {
+        return false;
+    }
+
+    if (g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && InterlockedCompareExchange(
+               &g_externalTournamentInitialTitleLeft, 0, 0) == 0)
+    {
+        // Launcher option 6 begins on game mode 0 while its queued inputs are
+        // still driving the initial title selection. That is startup, not a
+        // completed Tournament return.
         return false;
     }
 
@@ -6125,36 +6304,22 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
     mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
     LogRevival102jDeepSnapshot("TournamentReturn.01.title_observed", ioStatus);
 
-    if (IsActiveRevival102jProfile())
+    if (g_tournamentReturnCleanupPending)
     {
-        if (g_tournamentReturnCleanupPending)
-        {
-            mod::Log(
-                "Takeover: 1.02j tournament return cleanup already pending");
-            return false;
-        }
-
-        // 1.02j's MinGW practice/local session requires a post-init vtable[2]
-        // call before its shared input writer can run.  Only arm the cleanup
-        // here: this callback still runs inside Compact's virtual tick, so
-        // patch restoration and object replacement both belong post-tick.
-        g_tournamentReturnCleanupPending = true;
         mod::Log(
-            "Takeover: 1.02j tournament return cleanup stage 1 complete "
-            "(all destructive work deferred post-tick)");
-        RefreshRuntimeStatus(ioStatus);
-        LogRevival102jDeepSnapshot("TournamentReturn.02.stage1_armed", ioStatus);
-        return true;
+            "Takeover: tournament return cleanup already pending");
+        return false;
     }
 
-    RestoreDllExitProcessPatches();
-    RestoreTournamentExePatches();
-    ForceLocalPlayInit();
-    ClearRevivalText();
-    ResetRevivalTextRenderingAfterCleanup("tournament_return_to_title");
-    g_localRoleFlag = kLocalRoleLocalPlay;
-
+    // This callback runs inside the role-3 virtual tick on every supported
+    // version. Never destroy that object or restore its executing code here;
+    // arm stage 2 and let the post-tick owner perform all destructive work.
+    ArmTournamentReturnCleanup("native_title_return");
+    mod::Log(
+        "Takeover: tournament return cleanup stage 1 complete "
+        "(all destructive work deferred post-tick)");
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TournamentReturn.02.stage1_armed", ioStatus);
     return true;
 }
 
@@ -6171,42 +6336,116 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
     {
         InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
         mod::Log(
-            "Takeover: 1.02j tournament return cleanup remains deferred "
-            "until the active Compact tick returns");
+            "Takeover: tournament return cleanup remains deferred "
+            "until the active role-3 tick returns");
         LogRevival102jDeepSnapshot("TournamentReturn.10.stage2_still_deferred", ioStatus);
         return false;
     }
 
-    g_tournamentReturnCleanupPending = false;
-    mod::Log("Takeover: 1.02j tournament return cleanup stage 2 begin");
+    if (InterlockedCompareExchange(
+            &g_tournamentReturnCleanupTerminalFailure, 0, 0) != 0)
+    {
+        // A prior attempt crossed the object-destruction boundary but could
+        // not construct a verified local session.  Repeating init blindly
+        // would compound an unknown partial state.  Keep the fatal tick latch
+        // and journals owned for diagnosis/recovery instead.
+        return false;
+    }
+
+    mod::Log("Takeover: tournament return cleanup stage 2 begin");
     LogRevival102jDeepSnapshot("TournamentReturn.11.stage2_pre", ioStatus);
+    const auto retainTournamentQuarantine = [&]() {
+        InterlockedExchange(
+            &g_revivalExitMode,
+            static_cast<LONG>(kLocalRoleTournament));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+    };
 
-    const bool exePatchOk = RestoreTournamentExePatches();
-    mod::Log(
-        "Takeover: 1.02j tournament return cleanup stage 2 "
-        "RestoreTournamentExePatches=%d",
-        exePatchOk ? 1 : 0);
+    LONG stage = InterlockedCompareExchange(
+        &g_tournamentReturnCleanupStage, 0, 0);
+    if (stage < 1)
+    {
+        const bool exePatchOk = RestoreTournamentExePatches();
+        mod::Log(
+            "Takeover: tournament return cleanup RestoreTournamentExePatches=%d",
+            exePatchOk ? 1 : 0);
+        if (!exePatchOk)
+        {
+            retainTournamentQuarantine();
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 1);
+        stage = 1;
+    }
 
-    const bool initOk = ForceLocalPlayInit();
-    mod::Log(
-        "Takeover: 1.02j tournament return cleanup stage 2 ForceLocalPlayInit=%d",
-        initOk ? 1 : 0);
-    LogRevival102jDeepSnapshot("TournamentReturn.12.local_init_complete", ioStatus);
+    if (stage < 2)
+    {
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "Takeover: tournament return cleanup ForceLocalPlayInit=%d",
+            initOk ? 1 : 0);
+        if (!initOk)
+        {
+            InterlockedExchange(
+                &g_tournamentReturnCleanupTerminalFailure, 1);
+            retainTournamentQuarantine();
+            mod::Log(
+                "Takeover: tournament cleanup quarantined after unverified local init; refusing repeated destruction/init");
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 2);
+        stage = 2;
+        LogRevival102jDeepSnapshot(
+            "TournamentReturn.12.local_init_complete", ioStatus);
+    }
 
-    const bool dllPatchOk = RestoreDllExitProcessPatches();
-    mod::Log(
-        "Takeover: 1.02j tournament return cleanup stage 2 RestoreDllExitProcessPatches=%d",
-        dllPatchOk ? 1 : 0);
+    if (stage < 3)
+    {
+        const bool dllPatchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "Takeover: tournament return cleanup RestoreDllExitProcessPatches=%d",
+            dllPatchOk ? 1 : 0);
+        if (!dllPatchOk)
+        {
+            retainTournamentQuarantine();
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 3);
+    }
+
+    const bool modeOk = ForceGameModeToTitle();
+    if (!modeOk)
+    {
+        mod::Log(
+            "Takeover: tournament cleanup could not publish title mode; retaining recovery owner");
+        retainTournamentQuarantine();
+        return false;
+    }
 
     const bool clearOk = ClearRevivalText();
     const bool textOk = ResetRevivalTextRenderingAfterCleanup(
         "102j_tournament_return_cleanup_stage2");
     mod::Log(
-        "Takeover: 1.02j tournament return cleanup stage 2 text clear=%d reset=%d",
+        "Takeover: tournament return cleanup text clear=%d reset=%d",
         clearOk ? 1 : 0,
         textOk ? 1 : 0);
 
+    g_tournamentReturnCleanupPending = false;
+    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
+    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
     g_localRoleFlag = kLocalRoleLocalPlay;
+    g_localInitAppliedForSession = false;
+    g_launchDisposition =
+        revival_launch::LaunchDisposition::DirectGameHost;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
+    InterlockedExchange(&g_revivalExitIntercepted, 0);
+    InterlockedExchange(&g_revivalExitMode, -1);
+    if (g_hostBlock != nullptr)
+    {
+        InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
+        g_hostBlock->consoleErrorText[0] = '\0';
+    }
     RefreshRuntimeStatus(ioStatus);
     LogRevival102jDeepSnapshot("TournamentReturn.99.stage2_complete", ioStatus);
     return true;

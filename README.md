@@ -90,9 +90,30 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
 
 5. **Launch the game**
 
-   Launch through **`efz.exe`**. EFZ Mod Manager loads enabled mods automatically on startup.
+   You can launch through either **`efz.exe`** or an exact supported
+   **`EfzRevival.exe` + `EfzRevival.dll` pair**. EFZ Mod Manager loads the mod
+   into the resulting `efz.exe` process in both cases.
 
-   > **Important:** Do **not** start the game through `EfzRevival.exe` or `Concerto.exe` when this mod is enabled. InGameNetplay expects to be injected into the main game process and can crash if those executables are used as the entry point.
+   `efz.exe` remains the normal entry point for the integrated in-game menu.
+   When launched through `EfzRevival.exe`, the mod detects and adopts the
+   already-created Online/Spectator session without calling Revival's exported
+   `init` a second time. Practice is observed passively. An exact Tournament
+   option-6 session is also attached without a duplicate init: Revival keeps
+   its native auto-navigation, while the mod installs its title UI and a
+   managed return-to-title path. Modified, mismatched, or unsupported
+   launcher/DLL pairs fail closed instead of receiving fixed-address hooks.
+
+   Launcher-first Tournament attachment has source/byte-level support for the
+   exact 1.02e, 1.02f, 1.02f-framestepping, 1.02g, 1.02h, 1.02i, and 1.02j
+   pairs. Live testing has exercised 1.02j only so far; the automated natural
+   return could not be completed because EFZ was configured for a controller
+   that was not plugged in. Treat the other versions, and natural return, as
+   not yet live-qualified.
+
+   Tournament selected from a regular `efz.exe` launch remains a separate
+   mod-managed path; it does not use the option-6 existing-session attachment.
+
+   `Concerto.exe` is not a supported entry point.
 
    After a successful install, a new **`NETPLAY`** option should appear on the title screen.
 
@@ -231,22 +252,51 @@ What this means for a regular player:
 - you still need a supported `EfzRevival` installation in your EFZ folder
 - you do **not** need to manually drive the old Revival console flow during normal use
 - the in-game menu is the intended front end, while Revival runs behind it
-- always launch through `efz.exe`, not `EfzRevival.exe` or `Concerto.exe`
+- launch through `efz.exe` for the integrated flow, or through an exact
+  supported `EfzRevival.exe` when you intentionally want Revival's native
+  launcher flow; `Concerto.exe` remains unsupported
+- adopted Online/Spectator disconnect recovery, and the managed
+  launcher-first Tournament completion path, keep the game process alive and
+  route it back toward the title/netplay UI instead of accepting Revival's
+  normal child-process exit
 
 ## Supported Revival Versions
 
 Supported `EfzRevival.dll` versions:
 - `1.02e`
 - `1.02f`
+- `1.02f-framestepping`
 - `1.02g`
-- `1.02h!!!`
-- `1.02i!!!`
+- `1.02h`
+- `1.02i`
 - `1.02j`
 
 Notes:
-- `1.02h!!!` and `1.02i!!!` are the most tested versions.
+- `1.02h` and `1.02i` remain the most exercised legacy builds.
 - `1.02j` uses its own MinGW-specific object, vtable, and lifecycle profile.
-- Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
+- Launcher-first admission requires the catalogued exact EXE/DLL fingerprint
+  for the selected version; unsupported or modified builds stay passive with
+  log output instead of receiving unknown hooks.
+- After a committed launcher-first Online/Spectator session ends, the exact
+  admitted `EfzRevival.exe` parent is terminated and its exit is confirmed
+  before another online attempt is admitted. This closes Revival's terminal
+  pause window and releases its native singleton; admission failures still
+  leave the native launcher untouched.
+- Launcher-first Tournament option 6 validates the exact role-3 object/vtable,
+  native bootstrap and Tournament trampolines, and the remaining suffix of
+  Revival's canonical 22-input auto-navigation queue before attaching. Its
+  survival and title/UI hooks are installed without calling exported init
+  again.
+- The role-3 attach journals the four pre-Revival EFZ patch ranges, parks one
+  acknowledged game-thread tick, revalidates the native state, and installs
+  only the profile's Tournament return Jcc plus the child `ExitProcess` IAT
+  interception before completing title/UI control-plane hooks. Return cleanup
+  restores the journal and exact object ownership transactionally before
+  publishing the Practice/title baseline.
+- Tournament option-6 source and byte contracts cover every version listed
+  above, but live validation currently covers 1.02j only. The configured
+  controller being unplugged prevented an automated natural-return test, so
+  that end-to-end return is not yet claimed as live-verified.
 
 ## Online Simulation Cadence
 
@@ -256,6 +306,12 @@ the mod verifies that its ImGui/EndScene and loading/battle/result update hooks
 are removed and that live-memory state export is quiescent. Host-side Revival
 log IAT capture is disabled; the injected helper owns console parsing and must
 acknowledge that its worker is ready before the helper is resumed.
+
+Launcher-first Online/Spectator adoption keeps its acknowledged native tick
+parked through state-export initialization and title-hook installation. The
+same UI/export barrier then completes outside the bridge mutex before that
+single invocation is released, so launcher-first and in-menu handoffs enter
+simulation with the same recurring-work boundary.
 
 Diagnostic disk flushing and post-join lobby keepalive/public-IP work run below
 the normal-priority EFZ simulation thread. Their queueing, polling intervals,

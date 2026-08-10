@@ -101,7 +101,7 @@ std::array<uint8_t, kFilteredMenuInputBytes> g_filteredMenuInputs = {};
 std::array<uint8_t, kFilteredMenuInputBytes> g_unfocusedHeldMenuInputs = {};
 std::array<uint8_t, 256> g_netplayHotkeyDown = {};
 std::array<uint8_t, 2> g_joinWaitToSpectateButtonDown = {};
-uint64_t g_lastAutoAnsweredSpectatePromptFingerprint = 0;
+uint64_t g_submittedSpectatePromptFingerprint = 0;
 std::thread g_lobbySessionShutdownThread;
 std::atomic<bool> g_lobbySessionShutdownInFlight{false};
 std::atomic<bool> g_lobbySessionShutdownCompleted{false};
@@ -3583,6 +3583,10 @@ static std::string FormatNetworkEndpoint(
 
 void ActivateJoiningOverlay(const char* address, uint16_t port)
 {
+    // A fresh helper generation restarts prompt serials at one. Drop the
+    // previous generation's local submission latch before a new prompt can
+    // be observed, including after PID reuse.
+    g_submittedSpectatePromptFingerprint = 0;
     ResetJoiningOverlayState();
     g_joiningOverlay.active = true;
     g_joiningOverlay.port = port;
@@ -3628,6 +3632,7 @@ void ActivateJoiningOverlay(const char* address, uint16_t port)
 
 void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port)
 {
+    g_submittedSpectatePromptFingerprint = 0;
     ResetJoiningOverlayState();
     g_joiningOverlay.active = true;
     g_joiningOverlay.port = port;
@@ -3780,6 +3785,18 @@ bool IsHostNotYetPlayingSpectatePrompt()
         == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying);
 }
 
+uint64_t SpectatePromptFingerprint(
+    const netplay::bridge::NetbridgeStatus& status)
+{
+    if (status.processId == 0 || status.spectateConfirmPromptSerial <= 0)
+    {
+        return 0;
+    }
+
+    return (static_cast<uint64_t>(status.processId) << 32)
+        | static_cast<uint32_t>(status.spectateConfirmPromptSerial);
+}
+
 void ActivateSpectateConfirmOverlay(int promptKind)
 {
     ResetSpectateConfirmOverlayState();
@@ -3872,7 +3889,11 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
     return false;
 }
 
-bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
+bool HandleSpectateConfirmOverlayInput(
+    uint32_t screenContext,
+    const uint8_t* inputBytes,
+    uint32_t* inactivityCounter,
+    uint64_t promptFingerprint)
 {
     if (!g_spectateConfirmOverlay.active || inputBytes == nullptr || inactivityCounter == nullptr)
     {
@@ -3988,7 +4009,15 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
                 return true;
             }
 
-            mod::Log("SpectateConfirmOverlay: answered choice=%d promptKind=%d", choice, g_spectateConfirmOverlay.promptKind);
+            if (promptFingerprint != 0)
+            {
+                g_submittedSpectatePromptFingerprint = promptFingerprint;
+            }
+            mod::Log(
+                "SpectateConfirmOverlay: answer queued choice=%d promptKind=%d fingerprint=%llu",
+                choice,
+                g_spectateConfirmOverlay.promptKind,
+                static_cast<unsigned long long>(promptFingerprint));
             ResetSpectateConfirmOverlayState();
             return true;
         }
@@ -4018,7 +4047,14 @@ bool HandleSpectateConfirmOverlayInput(uint32_t screenContext, const uint8_t* in
             return true;
         }
 
-        mod::Log("SpectateConfirmOverlay: answered choice=%d", choice);
+        if (promptFingerprint != 0)
+        {
+            g_submittedSpectatePromptFingerprint = promptFingerprint;
+        }
+        mod::Log(
+            "SpectateConfirmOverlay: answer queued choice=%d fingerprint=%llu",
+            choice,
+            static_cast<unsigned long long>(promptFingerprint));
         ResetSpectateConfirmOverlayState();
 
         if (choice == 2)
@@ -4636,6 +4672,9 @@ static bool SuspendUiHooksForOnlineSimulation(
 #endif
     if (windowOk && imguiOk && renderOk && frontendOk)
     {
+        g_onlineSimulationUiSuspended.store(
+            true,
+            std::memory_order_release);
         return true;
     }
 
@@ -4650,6 +4689,9 @@ static bool SuspendUiHooksForOnlineSimulation(
     // The transition has not begun, so restore menu/control-plane ownership
     // and let a later frame retry the handoff after the failed component is
     // recoverable.
+    g_onlineSimulationUiSuspended.store(
+        false,
+        std::memory_order_release);
     netplay::bridge::state_export::ResumeControlPlaneUpdates();
     InstallNetplayWindowHook(screenContext);
     if (netplay::mod_settings::IsMenuTtfTextEnabled())
@@ -4658,6 +4700,43 @@ static bool SuspendUiHooksForOnlineSimulation(
     }
     netplay::bridge::frontend_return::EnsureFrontendReturnUpdateHooks();
     return false;
+}
+
+bool PrepareExternalLauncherSimulationHandoffImpl()
+{
+    int currentScreen = -1;
+    uint32_t titleScreenContext = 0;
+    __try
+    {
+        currentScreen = *reinterpret_cast<const volatile uint8_t*>(
+            kVaCurrentScreenIndex);
+        const auto* const screenTable = reinterpret_cast<const uint32_t*>(
+            RuntimeAddress(kVaScreenObjectTable));
+        titleScreenContext = screenTable[0];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        currentScreen = -1;
+        titleScreenContext = 0;
+    }
+
+    if (titleScreenContext == 0)
+    {
+        mod::Log(
+            "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=external_launcher_adoption component=title_context screen=%d",
+            currentScreen);
+        return false;
+    }
+
+    const bool suspended = SuspendUiHooksForOnlineSimulation(
+        titleScreenContext,
+        "external_launcher_adoption");
+    mod::Log(
+        "EXTERNAL_LAUNCHER_SIMULATION_HANDOFF screen=%d titleContext=0x%08lX suspended=%d",
+        currentScreen,
+        static_cast<unsigned long>(titleScreenContext),
+        suspended ? 1 : 0);
+    return suspended;
 }
 
 void HandoffSpectateSession(uint32_t screenContext)
@@ -4774,6 +4853,7 @@ void HandoffSpectateSession(uint32_t screenContext)
 
 void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 {
+    g_onlineSimulationUiSuspended.store(false, std::memory_order_release);
     netplay::bridge::state_export::ResumeControlPlaneUpdates();
     mod::Log("EnterNetplayMenu: request active=%d skipFadeOut=%d", g_netplayMenuState.active, skipFadeOut ? 1 : 0);
     if (g_netplayMenuState.active)
@@ -6756,16 +6836,19 @@ char UpdateNetplayMenu(uint32_t screenContext)
         bridgeStatus.spectateConfirmPromptSerial > 0
         && bridgeStatus.spectateConfirmPromptServedSerial < bridgeStatus.spectateConfirmPromptSerial
         && bridgeStatus.localInitApplied == 0;
+    const uint64_t promptFingerprint =
+        SpectatePromptFingerprint(bridgeStatus);
+    const bool spectatePromptAnswerSubmitted =
+        spectateConfirmPending
+        && promptFingerprint != 0
+        && g_submittedSpectatePromptFingerprint == promptFingerprint;
     const bool autoJoinSpectatePrompt =
         spectateConfirmPending
         && bridgeStatus.role == static_cast<int>(NetbridgeRole::JoinSpectate)
         && bridgeStatus.spectateConfirmPromptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostAlreadyPlaying);
     if (autoJoinSpectatePrompt)
     {
-        const uint64_t promptFingerprint =
-            (static_cast<uint64_t>(bridgeStatus.processId) << 32)
-            | static_cast<uint32_t>(bridgeStatus.spectateConfirmPromptSerial);
-        if (g_lastAutoAnsweredSpectatePromptFingerprint != promptFingerprint)
+        if (!spectatePromptAnswerSubmitted)
         {
             const bool answered = netplay::bridge::AnswerSpectatePromptChoice(1);
             mod::Log(
@@ -6775,12 +6858,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 static_cast<unsigned>(bridgeStatus.processId));
             if (answered)
             {
-                g_lastAutoAnsweredSpectatePromptFingerprint = promptFingerprint;
+                g_submittedSpectatePromptFingerprint = promptFingerprint;
             }
         }
     }
     if (spectateConfirmPending
         && !autoJoinSpectatePrompt
+        && !spectatePromptAnswerSubmitted
         && !g_spectateConfirmOverlay.active)
     {
         ActivateSpectateConfirmOverlay(bridgeStatus.spectateConfirmPromptKind);
@@ -6825,7 +6909,11 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
         else
         {
-            (void)HandleSpectateConfirmOverlayInput(screenContext, inputBytes, inactivityCounter);
+            (void)HandleSpectateConfirmOverlayInput(
+                screenContext,
+                inputBytes,
+                inactivityCounter,
+                promptFingerprint);
             return 0;
         }
     }
@@ -7578,3 +7666,11 @@ void TriggerNetplayMenuEntry(uint32_t screenContext)
     EnterNetplayMenu(screenContext);
 }
 } // namespace netplay::hooks::internal
+
+namespace netplay
+{
+bool PrepareExternalLauncherSimulationHandoff()
+{
+    return hooks::internal::PrepareExternalLauncherSimulationHandoffImpl();
+}
+} // namespace netplay

@@ -24,6 +24,25 @@ constexpr size_t kMaxSessionPtrOffsets  = 4;
 constexpr size_t kMaxTournamentExePatches    = 4;
 constexpr size_t kMaxTournamentExePatchBytes  = 20;
 
+// Role objects publish different construction-complete witnesses.  Launcher-
+// first admission must observe the profile-specific predicate before treating
+// an otherwise coherent Online/Spectator object as safe to adopt.
+enum class RevivalSessionReadinessCheck : uint8_t
+{
+    None,
+    EqualsOne,
+    NonZero,
+};
+
+constexpr bool RevivalSessionReadinessSatisfied(
+    RevivalSessionReadinessCheck check,
+    uint32_t value)
+{
+    return check == RevivalSessionReadinessCheck::None
+        || (check == RevivalSessionReadinessCheck::EqualsOne && value == 1u)
+        || (check == RevivalSessionReadinessCheck::NonZero && value != 0u);
+}
+
 struct RevivalAddressProfile
 {
     // Human-readable version tag for logging (e.g. "1.02e").
@@ -250,6 +269,59 @@ struct RevivalAddressProfile
     // shared_documentation/RNG_SEEDING_ALL_VERSIONS.md.
     uintptr_t rngEngineStateOffset;
 
+    // -----------------------------------------------------------------------
+    // Exact launcher-first admission identity
+    // -----------------------------------------------------------------------
+
+    // EfzRevival.exe identity paired with this exact DLL build.  Launcher-
+    // first attachment is deliberately stricter than ordinary DLL discovery:
+    // all PE fields, file sizes, and both SHA-256 digests must agree before the
+    // mod reuses a session created by an external Revival launcher.
+    uint32_t launcherExeTimestamp;
+    uint32_t launcherExeSizeOfImage;
+    uint32_t launcherExeEntryPointRva;
+    uint32_t launcherExeFileSize;
+    const char* launcherExeSha256;
+    uint32_t revivalDllFileSize;
+    const char* revivalDllSha256;
+
+    // Canonical globals used for launcher-first admission.  These are kept
+    // separate from the legacy candidate arrays above: secondary candidates
+    // in old builds can contain unrelated singleton/static state and must not
+    // authorize attachment.
+    uintptr_t canonicalRoleFlagOffset;
+    uintptr_t canonicalSessionPtrOffset;
+
+    // Exact session-object identities, expressed as RVAs of their vtables.
+    uintptr_t onlineSessionVtableRva;
+    uintptr_t spectatorSessionVtableRva;
+    uintptr_t practiceSessionVtableRva;
+    uintptr_t tournamentSessionVtableRva;
+
+    // Spectator objects use a smaller, role-specific layout.  Online helper
+    // offsets remain sessionOffsetHelperHandle/sessionOffsetHelperPid.
+    uintptr_t spectatorSessionOffsetHelperHandle;
+    uintptr_t spectatorSessionOffsetHelperPid;
+
+    // Construction-complete witnesses sampled as DWORDs during launcher-first
+    // admission.  Legacy Online sessions publish initComplete == 1; 1.02j
+    // Online and every Spectator layout instead publish a non-null/non-zero
+    // role-specific control field.
+    uintptr_t onlineSessionReadinessOffset;
+    RevivalSessionReadinessCheck onlineSessionReadinessCheck;
+    uintptr_t spectatorSessionReadinessOffset;
+    RevivalSessionReadinessCheck spectatorSessionReadinessCheck;
+
+    // Exact callback reached by the two Tournament EFZ trampolines at
+    // 0x763F04/0x763E50. Launcher-first attachment validates this target
+    // before recovering the displaced pre-Revival bytes from trampoline+9.
+    uintptr_t tournamentExeHookHandlerRva;
+
+    // RVA of the EfzRevival.exe cleanup-path TerminateProcess instruction.
+    // Injector/error cleanup sites are intentionally not covered by the
+    // launcher-child survival guard.
+    uintptr_t launcherCleanupTerminateCallRva;
+
 };
 
 // ---------------------------------------------------------------------------
@@ -317,6 +389,15 @@ constexpr RevivalAddressProfile kRevival_Unsupported = {
     {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
     0u,                                                 // exitProcessNearJccCount
     0u,                                                 // rngEngineStateOffset
+    0u, 0u, 0u, 0u, nullptr,                           // launcher EXE identity
+    0u, nullptr,                                        // Revival DLL file identity
+    0u, 0u,                                             // canonical role/session globals
+    0u, 0u, 0u, 0u,                                    // session vtable RVAs
+    0u, 0u,                                             // spectator helper handle/PID offsets
+    0u, RevivalSessionReadinessCheck::None,             // Online readiness
+    0u, RevivalSessionReadinessCheck::None,             // Spectator readiness
+    0u,                                                 // Tournament EXE hook handler RVA
+    0u,                                                 // launcher cleanup TerminateProcess RVA
 };
 
 // EfzRevival.dll v1.02e - original release, baseline for all addresses.
@@ -379,6 +460,17 @@ constexpr RevivalAddressProfile kRevival_1_02e = {
     {0x0007251Bu, 0x0007252Eu, 0x000742E1u, 0x000742F4u, 0x00074301u, 0u, 0u, 0u},
     5,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
+    0x5EA87633u, 0x000FD000u, 0x00057F8Fu, 1005056u,   // launcher EXE PE/file identity
+    "44CCD28BCFDBD2F407A5DAA03EBB16824D332660CDC07D0A27E69DC4BEB5B19E",
+    704000u,
+    "0A30E2309D36C323E8085886E4C661684F495DA515F2CE1FE67FB70432F0F515",
+    0x000A05D0u, 0x000A02CCu,                          // canonical role/session globals
+    0x000902C0u, 0x000902E4u, 0x00090404u, 0x0009044Cu,
+    52u, 412u,                                          // spectator helper handle/PID
+    1220u, RevivalSessionReadinessCheck::EqualsOne,     // Online initComplete == 1
+    0x42Cu, RevivalSessionReadinessCheck::NonZero,      // Spectator control published
+    0x0006E260u,                                        // Tournament EXE hook handler
+    0x00038E88u,                                        // launcher cleanup TerminateProcess
 };
 
 // EfzRevival.dll v1.02f - minor revision, same .data layout as 1.02e.
@@ -442,6 +534,17 @@ constexpr RevivalAddressProfile kRevival_1_02f = {
     {0x0007254Bu, 0x0007255Eu, 0x00074311u, 0x00074324u, 0x00074331u, 0u, 0u, 0u},
     5,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
+    0x5F8C58B0u, 0x000FD000u, 0x00057FDFu, 1005056u,
+    "B40323D0472A771E9D176F321E8EA47F7BFA1E6A5AD8C38B99649FD4BEA15019",
+    704000u,
+    "B9D21C86F1403EEC9C6262414F4ABDBB9BC2A7ED05FC90222363C2D15802DC86",
+    0x000A05D0u, 0x000A02CCu,
+    0x000902C0u, 0x000902E4u, 0x00090404u, 0x0009044Cu,
+    52u, 412u,
+    1220u, RevivalSessionReadinessCheck::EqualsOne,
+    0x42Cu, RevivalSessionReadinessCheck::NonZero,
+    0x0006E260u,
+    0x00038EC8u,
 };
 
 // Custom framestepping 1.02f build: same data layout as stock 1.02f/1.02g,
@@ -508,6 +611,17 @@ constexpr RevivalAddressProfile kRevival_1_02f_framestepping = {
      0x00074544u, 0x00074551u, 0u, 0u},               // exitProcessNearJccRva
     6,                                                 // exitProcessNearJccCount
     0x000A06ECu,                                       // rngEngineStateOffset
+    0x5F8C58B0u, 0x000FD000u, 0x00057FDFu, 1005056u,
+    "B40323D0472A771E9D176F321E8EA47F7BFA1E6A5AD8C38B99649FD4BEA15019",
+    704512u,
+    "D249BFFC0F879601FFF613C8D6D921FE7109DC617FF2CFB7A7E8C539068C3AA5",
+    0x000A05D0u, 0x000A02CCu,
+    0x000902C0u, 0x000902E4u, 0x00090404u, 0x0009044Cu,
+    52u, 412u,
+    1220u, RevivalSessionReadinessCheck::EqualsOne,
+    0x42Cu, RevivalSessionReadinessCheck::NonZero,
+    0x0006E470u,
+    0x00038EC8u,
 };
 
 // EfzRevival.dll v1.02g - session objects enlarged (host 0x5D0→0x690),
@@ -576,6 +690,17 @@ constexpr RevivalAddressProfile kRevival_1_02g = {
      0x00074561u, 0x00074574u, 0x00074581u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A06ECu,                                        // rngEngineStateOffset
+    0x623F85D8u, 0x000FE000u, 0x0005832Fu, 1006080u,
+    "949C9AAA28F1DDDE89931DC5303500777939A64396BA9D79486E21DF7D303872",
+    704512u,
+    "8A5A268DDC419E38D0E5BD6E3974732D2C9C4A17A62FDDE6E2724B8D80D250E7",
+    0x000A05D0u, 0x000A02CCu,
+    0x000902C0u, 0x000902E4u, 0x00090404u, 0x0009044Cu,
+    52u, 412u,
+    1220u, RevivalSessionReadinessCheck::EqualsOne,
+    0x42Cu, RevivalSessionReadinessCheck::NonZero,
+    0x0006E470u,
+    0x00038FE8u,
 };
 
 // EfzRevival.dll v1.02h - .data shifted +0x20 from e/f/g.
@@ -640,6 +765,17 @@ constexpr RevivalAddressProfile kRevival_1_02h = {
      0x00074CA1u, 0x00074CB4u, 0x00074CC1u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A070Cu,                                        // rngEngineStateOffset
+    0x6292935Eu, 0x000FE000u, 0x00058500u, 1007104u,
+    "E2C8B136A36F829F4178DAF96655EE952FFA465776AE204219CAFC24B74B488F",
+    707584u,
+    "0687E74BB40A8AADC91B591284BC962A320078394BDF7D23B9741D54E937F8AA",
+    0x000A05F0u, 0x000A02ECu,
+    0x00090400u, 0x00090424u, 0x00090544u, 0x0009058Cu,
+    52u, 412u,
+    1220u, RevivalSessionReadinessCheck::EqualsOne,
+    0x42Cu, RevivalSessionReadinessCheck::NonZero,
+    0x0006EAE0u,
+    0x00038F78u,
 };
 
 // EfzRevival.dll v1.02i - largest version (SizeOfImage 0xB3000 vs 0xB2000).
@@ -705,6 +841,17 @@ constexpr RevivalAddressProfile kRevival_1_02i = {
      0x00075231u, 0x00075244u, 0x00075251u, 0u},        // exitProcessNearJccRva
     7,                                                  // exitProcessNearJccCount
     0x000A1788u,                                        // rngEngineStateOffset
+    0x63BF27B6u, 0x000FE000u, 0x0005644Fu, 1005568u,
+    "13389473CC9D1B1C829AA6252AAD3DF654194ABFA37CB572AB6FA514F971A9E0",
+    709632u,
+    "18F91D5CDD8F17FB6CDE90E1AAA3C58A374B4AA80E8E906FDD88CB7FEB9D62D0",
+    0x000A15FCu, 0x000A15F8u,
+    0x000914F0u, 0x00091514u, 0x00091634u, 0x0009167Cu,
+    52u, 412u,
+    1228u, RevivalSessionReadinessCheck::EqualsOne,
+    0x434u, RevivalSessionReadinessCheck::NonZero,
+    0x0006EDB0u,
+    0x0003A068u,
 };
 
 // EfzRevival.dll v1.02j - MinGW refactor build.
@@ -774,6 +921,17 @@ constexpr RevivalAddressProfile kRevival_1_02j = {
     {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
     0,                                                  // exitProcessNearJccCount
     0x0014E984u,                                        // rngEngineStateOffset
+    0x6A3696C8u, 0x00294000u, 0x00001460u, 2673664u,
+    "194710A1C3DFEA3C50AC7CC5779794B986F6DF0F7009FFD5696552467F9CC027",
+    1914880u,
+    "CEDD606869EE6CFA227B385AF27DC92ABC13FE9C2D432935BCBE3B789468A169",
+    0x0014EC40u, 0x0014E980u,
+    0x0016FEF0u, 0x0016FF20u, 0x0016FF80u, 0x0016FEB0u,
+    0x64u, 0x2E0u,
+    0x658u, RevivalSessionReadinessCheck::NonZero,
+    0x588u, RevivalSessionReadinessCheck::NonZero,
+    0x0003CE80u,
+    0x00089A11u,
 };
 
 // Table of all known profiles, for DetectRevivalVersion() iteration.

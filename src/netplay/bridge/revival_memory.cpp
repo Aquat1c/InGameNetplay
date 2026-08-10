@@ -1,6 +1,7 @@
 // Revival DLL memory introspection and session field manipulation.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/core/mod_settings.h"
@@ -20,6 +21,7 @@
 #include <MinHook.h>
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <psapi.h>  // For PROCESS_MEMORY_COUNTERS type only; psapi.dll loaded at runtime
 
 namespace netplay::bridge::takeover
@@ -1555,6 +1557,49 @@ bool NeutralizeTournamentAutoNav()
 
 static uint8_t g_savedTournamentPatches[kMaxTournamentExePatches][kMaxTournamentExePatchBytes];
 static bool g_tournamentPatchesSaved = false;
+static uint8_t
+    g_adoptedTournamentPatchBytes[kMaxTournamentExePatches][kMaxTournamentExePatchBytes] = {};
+static bool g_adoptedTournamentPatchBytesValid = false;
+static DWORD g_tournamentRestorePageProtect[kMaxTournamentExePatches] = {};
+static bool g_tournamentRestorePageProtectPending[kMaxTournamentExePatches] = {};
+static uint8_t
+    g_processAttachTournamentPreimage[kMaxTournamentExePatches][kMaxTournamentExePatchBytes] = {};
+static volatile LONG g_processAttachTournamentPreimageState = 0;
+
+void CaptureTournamentExePreimageAtProcessAttach()
+{
+    static constexpr uintptr_t kAddresses[] = {
+        0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu,
+    };
+    static constexpr size_t kSizes[] = {7u, 7u, 1u, 20u};
+    if (InterlockedCompareExchange(
+            &g_processAttachTournamentPreimageState, -1, 0) != 0)
+    {
+        return;
+    }
+
+    bool captured = false;
+    __try
+    {
+        for (size_t i = 0; i < 4u; ++i)
+        {
+            const auto* const source =
+                reinterpret_cast<const volatile uint8_t*>(kAddresses[i]);
+            for (size_t j = 0; j < kSizes[i]; ++j)
+            {
+                g_processAttachTournamentPreimage[i][j] = source[j];
+            }
+        }
+        captured = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        captured = false;
+    }
+    InterlockedExchange(
+        &g_processAttachTournamentPreimageState,
+        captured ? 1 : -1);
+}
 
 bool SaveTournamentExePatches()
 {
@@ -1579,6 +1624,11 @@ bool SaveTournamentExePatches()
                     reinterpret_cast<const void*>(addr), size);
     }
 
+    g_adoptedTournamentPatchBytesValid = false;
+    std::memset(
+        g_tournamentRestorePageProtectPending,
+        0,
+        sizeof(g_tournamentRestorePageProtectPending));
     g_tournamentPatchesSaved = true;
     mod::Log("SaveTournamentExePatches: saved %zu patch regions",
              g_activeRevival->tournamentExePatchCount);
@@ -1593,48 +1643,126 @@ bool RestoreTournamentExePatches()
         return false;
     }
 
+    uint8_t current[kMaxTournamentExePatches][kMaxTournamentExePatchBytes] = {};
+    bool alreadyOriginal[kMaxTournamentExePatches] = {};
+    for (size_t i = 0; i < g_activeRevival->tournamentExePatchCount; ++i)
+    {
+        const uintptr_t addr = g_activeRevival->tournamentExePatchAddr[i];
+        const size_t size = g_activeRevival->tournamentExePatchSize[i];
+        if (size == 0 || size > kMaxTournamentExePatchBytes
+            || !IsReadableRange(reinterpret_cast<const void*>(addr), size))
+        {
+            mod::Log(
+                "RestoreTournamentExePatches: unreadable/invalid patch index=%zu",
+                i);
+            return false;
+        }
+        std::memcpy(current[i], reinterpret_cast<const void*>(addr), size);
+        alreadyOriginal[i] = std::memcmp(
+            current[i], g_savedTournamentPatches[i], size) == 0;
+
+        bool owned = false;
+        if (g_adoptedTournamentPatchBytesValid)
+        {
+            owned = std::memcmp(
+                current[i], g_adoptedTournamentPatchBytes[i], size) == 0;
+        }
+        else if (i < 2u)
+        {
+            owned = current[i][0] == 0xE9
+                && current[i][5] == 0x90
+                && current[i][6] == 0x90;
+        }
+        else if (i == 2u)
+        {
+            owned = current[i][0] == 0x00;
+        }
+        else if (i == 3u)
+        {
+            owned = true;
+            for (size_t j = 0; j < size; ++j)
+            {
+                owned = owned && current[i][j] == 0x90;
+            }
+        }
+
+        if (!alreadyOriginal[i] && !owned)
+        {
+            mod::Log(
+                "RestoreTournamentExePatches: ownership changed index=%zu; refusing to overwrite",
+                i);
+            return false;
+        }
+    }
+
     int restored = 0;
     for (size_t i = 0; i < g_activeRevival->tournamentExePatchCount; ++i)
     {
         const uintptr_t addr = g_activeRevival->tournamentExePatchAddr[i];
         const size_t size = g_activeRevival->tournamentExePatchSize[i];
-        if (size == 0 || size > kMaxTournamentExePatchBytes)
+        if (alreadyOriginal[i])
         {
+            if (g_tournamentRestorePageProtectPending[i])
+            {
+                DWORD ignored = 0;
+                if (!VirtualProtect(
+                        reinterpret_cast<void*>(addr),
+                        size,
+                        g_tournamentRestorePageProtect[i],
+                        &ignored))
+                {
+                    return false;
+                }
+                g_tournamentRestorePageProtectPending[i] = false;
+            }
+            ++restored;
             continue;
         }
 
         DWORD oldProtect = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(addr), size,
-                           PAGE_EXECUTE_READWRITE, &oldProtect))
+        if (!VirtualProtect(
+                reinterpret_cast<void*>(addr),
+                size,
+                PAGE_EXECUTE_READWRITE,
+                &oldProtect))
         {
-            char beforeLabel[72] = {};
-            std::snprintf(
-                beforeLabel,
-                sizeof(beforeLabel),
-                "RestoreTournamentExePatches[%zu].before",
-                i);
-            LogBytesIfVerbose(beforeLabel, addr, size);
-            LogRevival102jDeepBytes("TournamentPatches.restore_pre", beforeLabel, addr, size);
-            std::memcpy(reinterpret_cast<void*>(addr),
-                        g_savedTournamentPatches[i], size);
-            char afterLabel[72] = {};
-            std::snprintf(
-                afterLabel,
-                sizeof(afterLabel),
-                "RestoreTournamentExePatches[%zu].after",
-                i);
-            LogBytesIfVerbose(afterLabel, addr, size);
-            LogRevival102jDeepBytes("TournamentPatches.restore_post", afterLabel, addr, size);
-            VirtualProtect(reinterpret_cast<void*>(addr), size,
-                           oldProtect, &oldProtect);
+            continue;
+        }
+        g_tournamentRestorePageProtect[i] = oldProtect;
+        g_tournamentRestorePageProtectPending[i] = true;
+        std::memcpy(
+            reinterpret_cast<void*>(addr),
+            g_savedTournamentPatches[i],
+            size);
+        FlushInstructionCache(
+            GetCurrentProcess(), reinterpret_cast<void*>(addr), size);
+        DWORD ignored = 0;
+        const BOOL protectionRestored = VirtualProtect(
+            reinterpret_cast<void*>(addr), size, oldProtect, &ignored);
+        if (protectionRestored != FALSE)
+        {
+            g_tournamentRestorePageProtectPending[i] = false;
+        }
+        if (std::memcmp(
+                reinterpret_cast<const void*>(addr),
+                g_savedTournamentPatches[i],
+                size) == 0
+            && protectionRestored != FALSE)
+        {
             ++restored;
         }
     }
 
-    g_tournamentPatchesSaved = false;
     mod::Log("RestoreTournamentExePatches: restored %d/%zu patches",
              restored, g_activeRevival->tournamentExePatchCount);
-    return restored > 0;
+    if (restored != static_cast<int>(
+            g_activeRevival->tournamentExePatchCount))
+    {
+        return false;
+    }
+    g_tournamentPatchesSaved = false;
+    g_adoptedTournamentPatchBytesValid = false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1653,6 +1781,18 @@ static uint8_t g_savedDllExitProcessBytes[RevivalAddressProfile::kMaxExitProcess
 static uint8_t g_savedDllExitNearJccBytes[RevivalAddressProfile::kMaxExitProcessNearJccPatches][6];
 static uint8_t g_savedRevival102jTournamentExitGuard[2];
 static bool g_revival102jTournamentExitGuardSaved = false;
+static bool g_externalTournamentExitGuardOnlySaved = false;
+static bool g_externalLauncherExitRecoveryArmed = false;
+enum ExternalLauncherAttachState : LONG
+{
+    kExternalAttachIdle = 0,
+    kExternalAttachPending = 1,
+    kExternalAttachCommit = 2,
+    kExternalAttachQuarantine = 3,
+};
+
+static volatile LONG g_externalLauncherAttachState = kExternalAttachIdle;
+static volatile LONG g_externalLauncherAttachObserved = 0;
 static constexpr uintptr_t kRevival102jTournamentExitGuardRva = 0x0004683Fu;
 // g_dllExitProcessPatchesSaved is declared earlier (before RefreshRuntimeStatus).
 
@@ -1924,14 +2064,324 @@ bool SaveAndApplyDllExitProcessPatches()
     return (applied + nearApplied) > 0;
 }
 
+bool SaveAndApplyExternalTournamentExitGuard()
+{
+    if (g_externalTournamentExitGuardOnlySaved)
+    {
+        return g_dllExitProcessPatchesSaved;
+    }
+    if (g_dllExitProcessPatchesSaved || g_activeRevival == nullptr)
+    {
+        mod::Log(
+            "SaveAndApplyExternalTournamentExitGuard: incompatible existing exit-guard ownership");
+        return false;
+    }
+
+    if (IsRevival102jProfile())
+    {
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival == nullptr)
+        {
+            return false;
+        }
+        auto* const guard = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uintptr_t>(revival)
+            + kRevival102jTournamentExitGuardRva);
+        if (!IsReadableRange(guard, 2)
+            || guard[0] != 0x74
+            || guard[1] != 0x7A)
+        {
+            mod::Log(
+                "SaveAndApplyExternalTournamentExitGuard: 1.02j guard is not exact native 74 7A; refusing foreign ownership");
+            return false;
+        }
+        g_savedRevival102jTournamentExitGuard[0] = guard[0];
+        g_savedRevival102jTournamentExitGuard[1] = guard[1];
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(guard, 2, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            return false;
+        }
+        guard[0] = 0x90;
+        guard[1] = 0x90;
+        DWORD ignored = 0;
+        const BOOL protectRestored =
+            VirtualProtect(guard, 2, oldProtect, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), guard, 2);
+        const bool replacementCommitted =
+            guard[0] == 0x90 && guard[1] == 0x90;
+        if (replacementCommitted)
+        {
+            g_revival102jTournamentExitGuardSaved = true;
+            g_externalTournamentExitGuardOnlySaved = true;
+            g_dllExitProcessPatchesSaved = true;
+        }
+        if (!replacementCommitted || protectRestored == FALSE)
+        {
+            return false;
+        }
+        mod::Log(
+            "SaveAndApplyExternalTournamentExitGuard: 1.02j guard patched 74 7A -> 90 90");
+        return true;
+    }
+
+    if (g_activeRevival->exitProcessPatchCount == 0
+        || g_activeRevival->exitProcessPatchRva[0] == 0
+        || g_activeRevival->exitProcessPatchOriginal[0] != 0x74)
+    {
+        mod::Log(
+            "SaveAndApplyExternalTournamentExitGuard: profile lacks exact legacy Tournament guard");
+        return false;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return false;
+    }
+    auto* const guard = reinterpret_cast<uint8_t*>(
+        reinterpret_cast<uintptr_t>(revival)
+        + g_activeRevival->exitProcessPatchRva[0]);
+    const bool readable = IsReadableRange(guard, 2);
+    if (!readable || guard[0] != 0x74 || guard[1] != 0x08)
+    {
+        mod::Log(
+            "SaveAndApplyExternalTournamentExitGuard: legacy guard mismatch RVA=0x%lX found=%02X %02X",
+            static_cast<unsigned long>(
+                g_activeRevival->exitProcessPatchRva[0]),
+            readable ? guard[0] : 0,
+            readable ? guard[1] : 0);
+        return false;
+    }
+
+    g_savedDllExitProcessBytes[0] = guard[0];
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(guard, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        return false;
+    }
+    guard[0] = 0xEB;
+    DWORD ignored = 0;
+    const BOOL protectRestored =
+        VirtualProtect(guard, 1, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), guard, 1);
+    const bool replacementCommitted = guard[0] == 0xEB;
+    if (replacementCommitted)
+    {
+        // Track ownership as soon as the instruction byte is observable, even
+        // if restoring the page protection failed. Managed recovery can then
+        // restore the original guard instead of leaving an unjournaled patch.
+        g_externalTournamentExitGuardOnlySaved = true;
+        g_dllExitProcessPatchesSaved = true;
+    }
+    if (!replacementCommitted || protectRestored == FALSE)
+    {
+        mod::Log(
+            "SaveAndApplyExternalTournamentExitGuard: legacy guard write/protection verification failed RVA=0x%lX",
+            static_cast<unsigned long>(
+                g_activeRevival->exitProcessPatchRva[0]));
+        return false;
+    }
+
+    mod::Log(
+        "SaveAndApplyExternalTournamentExitGuard: legacy Tournament guard RVA=0x%lX patched 74 08 -> EB 08",
+        static_cast<unsigned long>(
+            g_activeRevival->exitProcessPatchRva[0]));
+    return true;
+}
+
+bool IsExternalTournamentExitGuardOwned()
+{
+    if (!g_externalTournamentExitGuardOnlySaved
+        || !g_dllExitProcessPatchesSaved
+        || g_activeRevival == nullptr)
+    {
+        return false;
+    }
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    if (IsRevival102jProfile())
+    {
+        const auto* const guard = reinterpret_cast<const uint8_t*>(
+            base + kRevival102jTournamentExitGuardRva);
+        return IsReadableRange(guard, 2)
+            && guard[0] == 0x90
+            && guard[1] == 0x90;
+    }
+    if (g_activeRevival->exitProcessPatchCount == 0
+        || g_activeRevival->exitProcessPatchRva[0] == 0)
+    {
+        return false;
+    }
+    const auto* const guard = reinterpret_cast<const uint8_t*>(
+        base + g_activeRevival->exitProcessPatchRva[0]);
+    return IsReadableRange(guard, 2)
+        && guard[0] == 0xEB
+        && guard[1] == 0x08;
+}
+
+
+bool ArmExternalLauncherExitRecovery()
+{
+    if (g_dllExitProcessPatchesSaved)
+    {
+        return g_externalLauncherExitRecoveryArmed;
+    }
+
+    // Online/spectator exits are recovered by the local ExitProcess IAT hook
+    // and the frame/tick longjmp boundaries.  The profile Jcc tables guard
+    // tournament-only paths, so mutating those live instructions while an
+    // externally launched online session is already running is unnecessary
+    // and unsafe.  Keep the existing lifecycle flag without touching code.
+    g_externalLauncherExitRecoveryArmed = true;
+    g_dllExitProcessPatchesSaved = true;
+    mod::Log(
+        "ArmExternalLauncherExitRecovery: armed without tournament call-site patches");
+    return true;
+}
+
+void SetExternalLauncherAttachPending(bool pending)
+{
+    if (pending)
+    {
+        InterlockedExchange(&g_externalLauncherAttachObserved, 0);
+        MemoryBarrier();
+    }
+    InterlockedExchange(
+        &g_externalLauncherAttachState,
+        pending ? kExternalAttachPending : kExternalAttachIdle);
+}
+
+bool WaitForExternalLauncherAttachBoundary(DWORD timeoutMs)
+{
+    const DWORD start = GetTickCount();
+    for (;;)
+    {
+        if (InterlockedCompareExchange(
+                &g_externalLauncherAttachObserved, 0, 0) != 0)
+        {
+            return true;
+        }
+        if (GetTickCount() - start >= timeoutMs)
+        {
+            return false;
+        }
+        Sleep(1);
+    }
+}
+
+bool IsExternalLauncherAttachBoundaryPending()
+{
+    return InterlockedCompareExchange(
+               &g_externalLauncherAttachState, 0, 0)
+        == kExternalAttachPending;
+}
+
+bool CompleteExternalLauncherAttachBoundary(bool commit)
+{
+    return InterlockedCompareExchange(
+               &g_externalLauncherAttachState,
+               commit ? kExternalAttachCommit : kExternalAttachQuarantine,
+               kExternalAttachPending)
+        == kExternalAttachPending;
+}
+
+void EmergencyQuarantineExternalLauncherAttachBoundary()
+{
+    if (!IsExternalLauncherAttachBoundaryPending())
+    {
+        return;
+    }
+
+    // This path can run from an SEH termination handler, so it must not log,
+    // allocate, or acquire either bridge mutex.  Publish a coherent recovery
+    // identity before releasing the parked game-thread invocation.  The CAS
+    // prevents a late emergency path from replacing a successful commit.
+    InterlockedExchange(
+        &g_revivalExitMode,
+        static_cast<LONG>(g_localRoleFlag));
+    InterlockedExchange(&g_revivalExitIntercepted, 1);
+    MemoryBarrier();
+    (void)InterlockedCompareExchange(
+        &g_externalLauncherAttachState,
+        kExternalAttachQuarantine,
+        kExternalAttachPending);
+}
+
 bool RestoreDllExitProcessPatches()
 {
+    if (g_externalLauncherExitRecoveryArmed)
+    {
+        g_externalLauncherExitRecoveryArmed = false;
+        g_dllExitProcessPatchesSaved = false;
+        mod::Log(
+            "RestoreDllExitProcessPatches: cleared external launcher recovery arm");
+        return true;
+    }
     if (!g_dllExitProcessPatchesSaved || g_activeRevival == nullptr)
     {
         mod::Log("RestoreDllExitProcessPatches: SKIPPED (saved=%d profile=%p)",
                  g_dllExitProcessPatchesSaved ? 1 : 0,
                  static_cast<const void*>(g_activeRevival));
         return false;
+    }
+
+    if (g_externalTournamentExitGuardOnlySaved
+        && !IsRevival102jProfile())
+    {
+        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+        if (revival == nullptr
+            || g_activeRevival->exitProcessPatchCount == 0
+            || g_activeRevival->exitProcessPatchRva[0] == 0)
+        {
+            return false;
+        }
+        auto* const guard = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uintptr_t>(revival)
+            + g_activeRevival->exitProcessPatchRva[0]);
+        if (!IsReadableRange(guard, 2))
+        {
+            return false;
+        }
+        if (guard[0] == g_savedDllExitProcessBytes[0]
+            && guard[1] == 0x08)
+        {
+            g_externalTournamentExitGuardOnlySaved = false;
+            g_dllExitProcessPatchesSaved = false;
+            return true;
+        }
+        if (guard[0] != 0xEB || guard[1] != 0x08)
+        {
+            mod::Log(
+                "RestoreDllExitProcessPatches: legacy Tournament guard ownership changed; refusing overwrite");
+            return false;
+        }
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(guard, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            return false;
+        }
+        guard[0] = g_savedDllExitProcessBytes[0];
+        DWORD ignored = 0;
+        const BOOL protectRestored =
+            VirtualProtect(guard, 1, oldProtect, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), guard, 1);
+        if (guard[0] != g_savedDllExitProcessBytes[0]
+            || protectRestored == FALSE)
+        {
+            return false;
+        }
+        g_externalTournamentExitGuardOnlySaved = false;
+        g_dllExitProcessPatchesSaved = false;
+        mod::Log(
+            "RestoreDllExitProcessPatches: restored launcher-owned legacy Tournament guard RVA=0x%lX",
+            static_cast<unsigned long>(
+                g_activeRevival->exitProcessPatchRva[0]));
+        return true;
     }
 
     if (IsRevival102jProfile())
@@ -1958,6 +2408,20 @@ bool RestoreDllExitProcessPatches()
             "RestoreDllExitProcessPatches.102j_guard.before",
             reinterpret_cast<uintptr_t>(guard),
             2);
+        if (guard[0] == g_savedRevival102jTournamentExitGuard[0]
+            && guard[1] == g_savedRevival102jTournamentExitGuard[1])
+        {
+            g_revival102jTournamentExitGuardSaved = false;
+            g_externalTournamentExitGuardOnlySaved = false;
+            g_dllExitProcessPatchesSaved = false;
+            return true;
+        }
+        if (guard[0] != 0x90 || guard[1] != 0x90)
+        {
+            mod::Log(
+                "RestoreDllExitProcessPatches: 1.02j Tournament guard ownership changed; refusing overwrite");
+            return false;
+        }
         DWORD oldProtect = 0;
         if (!VirtualProtect(guard, 2, PAGE_EXECUTE_READWRITE, &oldProtect))
         {
@@ -1971,14 +2435,23 @@ bool RestoreDllExitProcessPatches()
         guard[0] = g_savedRevival102jTournamentExitGuard[0];
         guard[1] = g_savedRevival102jTournamentExitGuard[1];
         DWORD ignored = 0;
-        VirtualProtect(guard, 2, oldProtect, &ignored);
+        const BOOL protectionRestored =
+            VirtualProtect(guard, 2, oldProtect, &ignored);
         FlushInstructionCache(GetCurrentProcess(), guard, 2);
         LogBytesIfVerbose(
             "RestoreDllExitProcessPatches.102j_guard.after",
             reinterpret_cast<uintptr_t>(guard),
             2);
 
+        if (guard[0] != g_savedRevival102jTournamentExitGuard[0]
+            || guard[1] != g_savedRevival102jTournamentExitGuard[1]
+            || protectionRestored == FALSE)
+        {
+            return false;
+        }
+
         g_revival102jTournamentExitGuardSaved = false;
+        g_externalTournamentExitGuardOnlySaved = false;
         g_dllExitProcessPatchesSaved = false;
         mod::Log(
             "RestoreDllExitProcessPatches: 1.02j tournament guard "
@@ -2136,6 +2609,38 @@ bool DestroyCurrentSession(const char* caller)
     }
 
     const int currentRole = g_localRoleFlag;
+    const bool strictExternalTournament =
+        currentRole == kLocalRoleTournament
+        && g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament;
+    bool destructionSucceeded = false;
+    bool helperHandleCleanupSucceeded = true;
+
+    if (strictExternalTournament)
+    {
+        // The launcher-owned object may be replaced asynchronously by native
+        // Revival.  Exact vtable/type checks below are not sufficient to
+        // distinguish a newer object of the same type.  Bind destruction to
+        // the generation admitted by the launcher probe and to Revival's
+        // canonical live role before restoring a neutralized vtable or
+        // mutating any native state.
+        const uintptr_t admittedSession = g_lastValidatedSessionPtr;
+        const int nativeRole = ReadRoleFlagFromRevival();
+        if (admittedSession == 0
+            || sessionPtr != admittedSession
+            || nativeRole != kLocalRoleTournament)
+        {
+            mod::Log(
+                "%s: DestroyCurrentSession external Tournament generation mismatch "
+                "session=0x%08lX admitted=0x%08lX modRole=%d nativeRole=%d; retaining object",
+                caller,
+                static_cast<unsigned long>(sessionPtr),
+                static_cast<unsigned long>(admittedSession),
+                currentRole,
+                nativeRole);
+            return false;
+        }
+    }
 
     mod::Log(
         "%s: DestroyCurrentSession starting session=0x%08lX role=%d",
@@ -2160,38 +2665,23 @@ bool DestroyCurrentSession(const char* caller)
         LogRevival102jDeepSnapshot("DestroyCurrentSession.02.identity_restored");
     }
 
-    // Preserve the legacy handle cleanup.  The 1.02j profile has different
-    // object layouts and its verified deleting destructor owns all fields.
-    if (!IsRevival102jProfile()
-        && (currentRole == kLocalRoleOnline || currentRole == kLocalRoleSpectate))
-    {
-        uintptr_t helperHandle = 0;
-        if (SafeReadPtr(
-                reinterpret_cast<const void*>(
-                    sessionPtr + g_activeRevival->sessionOffsetHelperHandle),
-                &helperHandle)
-            && helperHandle != 0
-            && helperHandle != static_cast<uintptr_t>(~uintptr_t(0)))
-        {
-            const BOOL closed =
-                CloseHandle(reinterpret_cast<HANDLE>(helperHandle));
-            mod::Log(
-                "%s: DestroyCurrentSession closed helperHandle=0x%08lX result=%d",
-                caller,
-                static_cast<unsigned long>(helperHandle),
-                closed);
-        }
-    }
-
     // Read vtable pointer.
     uintptr_t vtablePtr = 0;
     if (!SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtablePtr)
         || vtablePtr == 0)
     {
         mod::Log(
-            "%s: DestroyCurrentSession WARN vtable NULL session=0x%08lX, zeroing ptr only",
+            "%s: DestroyCurrentSession WARN vtable NULL session=0x%08lX",
             caller,
             static_cast<unsigned long>(sessionPtr));
+        if (strictExternalTournament)
+        {
+            // This object was created by the launcher.  Losing its identity is
+            // not permission to discard the only live pointer and call init()
+            // over it.  Keep the generation intact for a later quarantined
+            // retry.
+            return false;
+        }
         goto zero_globals;
     }
 
@@ -2200,6 +2690,162 @@ bool DestroyCurrentSession(const char* caller)
         caller,
         static_cast<unsigned long>(vtablePtr),
         static_cast<unsigned long>(vtablePtr - base));
+
+    if (strictExternalTournament)
+    {
+        // Launcher-owned Tournament teardown is deliberately narrower than
+        // the legacy best-effort cleanup below.  Require the exact role-3
+        // object and exact deleting-destructor entry for every supported
+        // profile before freeing anything.  A mismatch leaves the pointer and
+        // restoration journals alive so the post-tick quarantine can retry;
+        // it must never fall through to init(2,102) over an uncertain object.
+        uintptr_t expectedDeletingDtorRva = 0;
+        bool deletingDtorInSlot1 = false;
+        if (g_activeRevival->versionTag != nullptr)
+        {
+            const char* const tag = g_activeRevival->versionTag;
+            if (std::strcmp(tag, "1.02e") == 0
+                || std::strcmp(tag, "1.02f") == 0)
+            {
+                expectedDeletingDtorRva = 0x0002D3F0u;
+            }
+            else if (std::strcmp(tag, "1.02f-framestepping") == 0
+                     || std::strcmp(tag, "1.02g") == 0)
+            {
+                expectedDeletingDtorRva = 0x0002D630u;
+            }
+            else if (std::strcmp(tag, "1.02h") == 0
+                     || std::strcmp(tag, "1.02i") == 0)
+            {
+                expectedDeletingDtorRva = 0x0002D8F0u;
+            }
+            else if (std::strcmp(tag, "1.02j") == 0)
+            {
+                expectedDeletingDtorRva = 0x00048550u;
+                deletingDtorInSlot1 = true;
+            }
+        }
+
+        const uintptr_t expectedVtable = base
+            + g_activeRevival->tournamentSessionVtableRva;
+        uintptr_t deletingDtor = 0;
+        const uintptr_t dtorSlot = vtablePtr
+            + (deletingDtorInSlot1 ? sizeof(uintptr_t) : 0u);
+        if (expectedDeletingDtorRva == 0
+            || g_activeRevival->tournamentSessionVtableRva == 0
+            || vtablePtr != expectedVtable
+            || !SafeReadPtr(
+                reinterpret_cast<const void*>(dtorSlot), &deletingDtor)
+            || deletingDtor != base + expectedDeletingDtorRva)
+        {
+            mod::Log(
+                "%s: DestroyCurrentSession external Tournament identity mismatch "
+                "vtable=0x%08lX expected=0x%08lX dtor=0x%08lX expected=0x%08lX; retaining object",
+                caller,
+                static_cast<unsigned long>(vtablePtr),
+                static_cast<unsigned long>(expectedVtable),
+                static_cast<unsigned long>(deletingDtor),
+                static_cast<unsigned long>(base + expectedDeletingDtorRva));
+            return false;
+        }
+
+        bool destructorCompleted = false;
+        __try
+        {
+            if (deletingDtorInSlot1)
+            {
+                using MinGwDeletingDtorFn =
+                    void(__fastcall*)(void* thisPtr, void* edx);
+                reinterpret_cast<MinGwDeletingDtorFn>(deletingDtor)(
+                    reinterpret_cast<void*>(sessionPtr), nullptr);
+            }
+            else
+            {
+                using ScalarDeletingDtorFn = void(__thiscall*)(void*, int);
+                reinterpret_cast<ScalarDeletingDtorFn>(deletingDtor)(
+                    reinterpret_cast<void*>(sessionPtr), 1);
+            }
+            destructorCompleted = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log(
+                "%s: DestroyCurrentSession external Tournament destructor SEH exception=0x%08lX; retaining generation",
+                caller,
+                static_cast<unsigned long>(GetExceptionCode()));
+        }
+        if (!destructorCompleted)
+        {
+            return false;
+        }
+        destructionSucceeded = true;
+        goto zero_globals;
+    }
+
+    // A helper HANDLE is meaningful only for the exact online/spectator
+    // object layout paired with the recorded role.  Classify the object before
+    // touching either role-specific field so a stale role or unknown vtable
+    // can never make teardown close an unrelated value.  Revival's deleting
+    // destructors do not own these peer-process handles, including 1.02j, so
+    // close the coherent field exactly once before destroying the object.
+    {
+        const uintptr_t sessionVtableRva = vtablePtr >= base
+            ? vtablePtr - base
+            : static_cast<uintptr_t>(~uintptr_t(0));
+        uintptr_t helperHandleOffset = 0;
+        if (currentRole == kLocalRoleOnline
+            && g_activeRevival->onlineSessionVtableRva != 0
+            && sessionVtableRva == g_activeRevival->onlineSessionVtableRva)
+        {
+            helperHandleOffset = g_activeRevival->sessionOffsetHelperHandle;
+        }
+        else if (currentRole == kLocalRoleSpectate
+                 && g_activeRevival->spectatorSessionVtableRva != 0
+                 && sessionVtableRva
+                     == g_activeRevival->spectatorSessionVtableRva)
+        {
+            helperHandleOffset =
+                g_activeRevival->spectatorSessionOffsetHelperHandle;
+        }
+        else if (currentRole == kLocalRoleOnline
+                 || currentRole == kLocalRoleSpectate)
+        {
+            helperHandleCleanupSucceeded = false;
+            mod::Log(
+                "%s: DestroyCurrentSession skipped helper handle: "
+                "role/object mismatch role=%d vtableRva=0x%08lX",
+                caller,
+                currentRole,
+                static_cast<unsigned long>(sessionVtableRva));
+        }
+
+        if (helperHandleOffset != 0)
+        {
+            uintptr_t helperHandle = 0;
+            if (SafeReadPtr(
+                    reinterpret_cast<const void*>(
+                        sessionPtr + helperHandleOffset),
+                    &helperHandle)
+                && helperHandle != 0
+                && helperHandle != static_cast<uintptr_t>(~uintptr_t(0)))
+            {
+                const BOOL closed =
+                    CloseHandle(reinterpret_cast<HANDLE>(helperHandle));
+                if (closed == FALSE)
+                {
+                    helperHandleCleanupSucceeded = false;
+                }
+                mod::Log(
+                    "%s: DestroyCurrentSession closed %s helperHandle=0x%08lX "
+                    "offset=0x%lX result=%d",
+                    caller,
+                    currentRole == kLocalRoleSpectate ? "spectator" : "online",
+                    static_cast<unsigned long>(helperHandle),
+                    static_cast<unsigned long>(helperHandleOffset),
+                    closed);
+            }
+        }
+    }
 
     if (IsRevival102jProfile())
     {
@@ -2279,6 +2925,7 @@ bool DestroyCurrentSession(const char* caller)
             matched->name,
             static_cast<unsigned long>(deletingDtor),
             destructorCompleted ? 1 : 0);
+        destructionSucceeded = destructorCompleted;
         LogRevival102jDeepStep(
             destructorCompleted
                 ? "DestroyCurrentSession.04.deleting_dtor_returned"
@@ -2332,6 +2979,7 @@ bool DestroyCurrentSession(const char* caller)
             currentRole);
 
         dtorFn(reinterpret_cast<void*>(sessionPtr), 1);
+        destructionSucceeded = true;
 
         mod::Log("%s: DestroyCurrentSession destructor completed", caller);
     }
@@ -2380,7 +3028,7 @@ zero_globals:
         zeroed);
     LogRevival102jDeepSnapshot("DestroyCurrentSession.99.globals_zeroed");
 
-    return true;
+    return destructionSucceeded && helperHandleCleanupSucceeded;
 }
 
 // ---------------------------------------------------------------------------
@@ -2862,19 +3510,45 @@ bool ForceLocalPlayInit()
     // for local play.  Keyed off the durable swap-applied flag (not the role,
     // which some exit paths clear without reversing), so it is correct even
     // when g_netplayRole was already reset by an earlier partial teardown.
-    ReverseInputSwapIfClient();
-    g_netplayRole = kNetplayRoleNone;
+    const bool swapWasApplied = IsClientInputSwapApplied();
+    const bool inputSwapRestored =
+        !swapWasApplied || ReverseInputSwapIfClient();
+    const bool strictExternalTournament =
+        g_localRoleFlag == kLocalRoleTournament
+        && g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament;
+    if (strictExternalTournament && !inputSwapRestored)
+    {
+        mod::Log(
+            "ForceLocalPlayInit: external Tournament input ownership could not be normalized; retaining old session");
+        return false;
+    }
 
     // 1.02j installs 0x401642 once, outside exported init(). Capture that
     // persistent hook before the session destructor gets any opportunity to
     // change process hooks. Legacy builds retain their old save ordering.
-    const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+    // Do not let the ordinary reader overwrite the launcher probe's retained
+    // generation immediately before strict Tournament destruction.  The
+    // loose reader observes the live global without updating
+    // g_lastValidatedSessionPtr, so DestroyCurrentSession can still prove it
+    // is freeing the exact object admitted at attach time.
+    const uintptr_t oldSessionPtr = strictExternalTournament
+        ? ReadSessionPointerFromRevivalLoose()
+        : ReadSessionPointerFromRevival();
     if (IsRevival102jProfile())
     {
         SaveExeDispatchHookBytes();
     }
-    DestroyCurrentSession("ForceLocalPlayInit");
+    const bool sessionDestroyed = oldSessionPtr == 0
+        || DestroyCurrentSession("ForceLocalPlayInit");
     LogRevival102jDeepStep("ForceLocalPlayInit.02.old_session_destroyed");
+    if (strictExternalTournament && !sessionDestroyed)
+    {
+        mod::Log(
+            "ForceLocalPlayInit: external Tournament destructor was not proven; refusing init(2,102)");
+        return false;
+    }
+    g_netplayRole = kNetplayRoleNone;
 
     // Prevent init() from chaining another trampoline at 0x401582.
     mod::Log(
@@ -2993,7 +3667,21 @@ bool ForceLocalPlayInit()
             ? "ForceLocalPlayInit.99.post_init_success"
             : "ForceLocalPlayInit.99.post_init_failed");
 
-    return true;
+    const bool localSessionReady = newSessionPtr != 0 && vtableInitOk;
+    const bool recoveryReady = inputSwapRestored
+        && sessionDestroyed
+        && localSessionReady;
+    if (!recoveryReady)
+    {
+        mod::Log(
+            "ForceLocalPlayInit: FAILED swapRestored=%d sessionDestroyed=%d newSession=0x%08lX postInit=%d initResult=%d",
+            inputSwapRestored ? 1 : 0,
+            sessionDestroyed ? 1 : 0,
+            static_cast<unsigned long>(newSessionPtr),
+            vtableInitOk ? 1 : 0,
+            result);
+    }
+    return recoveryReady;
 }
 
 // ---------------------------------------------------------------------------
@@ -3214,6 +3902,13 @@ bool RestoreRenderContext()
 
 bool RestoreRenderContextForGameplayExitCleanup()
 {
+    // Launcher-first adoption may complete before EFZ publishes its renderer.
+    // Capture it at the recovery boundary if it became available later,
+    // before native/local-play cleanup has a chance to clear the global.
+    if (g_savedRenderContext == 0 && !SaveRenderContext())
+    {
+        return false;
+    }
     return RestoreRenderContextInternal(/*consumeSaved=*/false);
 }
 
@@ -4430,11 +5125,13 @@ static TwoByteVectorSnapshot ReadTwoByteVectorSnapshot(uintptr_t vectorAddress)
 // iat_stubs.cpp.  They are declared extern in takeover_internal.h.
 jmp_buf         g_netplayFrameJmpBuf    = {};
 volatile bool   g_netplayFrameJmpActive = false;
+volatile DWORD  g_netplayFrameJmpOwnerThreadId = 0;
 
 // Fallback recovery context armed by HookedTitleUpdateImpl while title/menu
 // logic is executing. Used when ExitProcess fires outside OurFrameDispatch.
 jmp_buf         g_netplayUiJmpBuf       = {};
 volatile bool   g_netplayUiJmpActive    = false;
+volatile DWORD  g_netplayUiJmpOwnerThreadId = 0;
 
 // Trampoline: first 6 original bytes + near JMP back to original+6.
 static uint8_t g_frameHookTrampoline[12] = {};
@@ -4841,6 +5538,280 @@ static bool    g_modeCtorHookSavedValid = false;
 // never chain through stale hooks from a previous session's mode.
 static uint8_t g_modeCtorOriginalBytes[kModeCtorHookCount][kModeCtorHookPatchSize] = {};
 static bool    g_modeCtorOriginalsSaved = false;
+
+static bool IsCommittedExecutableAddress(uintptr_t address)
+{
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (address == 0
+        || VirtualQuery(
+               reinterpret_cast<const void*>(address),
+               &mbi,
+               sizeof(mbi)) == 0
+        || mbi.State != MEM_COMMIT
+        || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+    {
+        return false;
+    }
+
+    switch (mbi.Protect & 0xFFu)
+    {
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool AdoptExistingTournamentExePatchState()
+{
+    // Every supported Revival profile patches the same exact EFZ executable.
+    // A launcher-first Tournament has already replaced these bytes before the
+    // mod may attach, so SaveTournamentExePatches() would journal the JMP/NOP
+    // form and make return-to-title restoration impossible.  Admit only the
+    // complete native patch shape, then recover the actual pre-Revival bytes
+    // from Revival's own trampoline journal. This preserves a compatible mod
+    // that may already have owned either EFZ hook site before native init.
+    static constexpr uintptr_t kExpectedAddresses[] = {
+        0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu,
+    };
+    static constexpr uint8_t kExpectedSizes[] = {7u, 7u, 1u, 20u};
+
+    if (g_activeRevival == nullptr
+        || g_activeRevival->tournamentExePatchCount != 4u
+        || g_activeRevival->tournamentExeHookHandlerRva == 0
+        || ReadRoleFlagFromRevival() != kLocalRoleTournament)
+    {
+        mod::Log(
+            "AdoptExistingTournamentExePatchState: missing exact role/profile contract");
+        return false;
+    }
+
+    uint8_t live[kMaxTournamentExePatches][kMaxTournamentExePatchBytes] = {};
+    for (size_t i = 0; i < 4u; ++i)
+    {
+        if (g_activeRevival->tournamentExePatchAddr[i]
+                != kExpectedAddresses[i]
+            || g_activeRevival->tournamentExePatchSize[i]
+                != kExpectedSizes[i]
+            || !IsReadableRange(
+                reinterpret_cast<const void*>(kExpectedAddresses[i]),
+                kExpectedSizes[i]))
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: profile/live range mismatch index=%zu",
+                i);
+            return false;
+        }
+        std::memcpy(
+            live[i],
+            reinterpret_cast<const void*>(kExpectedAddresses[i]),
+            kExpectedSizes[i]);
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    uintptr_t revivalBase = 0;
+    uintptr_t revivalEnd = 0;
+    if (revival == nullptr
+        || !ReadModuleImageRange(revival, &revivalBase, &revivalEnd))
+    {
+        return false;
+    }
+    const uintptr_t expectedCallback = revivalBase
+        + g_activeRevival->tournamentExeHookHandlerRva;
+    uint8_t displaced[2][kModeCtorHookPatchSize] = {};
+    for (size_t i = 0; i < 2u; ++i)
+    {
+        if (live[i][0] != 0xE9
+            || live[i][5] != 0x90
+            || live[i][6] != 0x90)
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: native JMP shape mismatch index=%zu",
+                i);
+            return false;
+        }
+        int32_t displacement = 0;
+        std::memcpy(&displacement, &live[i][1], sizeof(displacement));
+        const uintptr_t trampoline = static_cast<uintptr_t>(
+            static_cast<intptr_t>(kExpectedAddresses[i] + 5u)
+            + static_cast<intptr_t>(displacement));
+        static constexpr size_t kTrampolineSize =
+            9u + kModeCtorHookPatchSize + 5u;
+        if (!IsCommittedExecutableAddress(trampoline)
+            || !IsReadableRange(
+                reinterpret_cast<const void*>(trampoline),
+                kTrampolineSize))
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: JMP target is not executable index=%zu target=0x%08lX",
+                i,
+                static_cast<unsigned long>(trampoline));
+            return false;
+        }
+
+        uint8_t trampolineBytes[kTrampolineSize] = {};
+        std::memcpy(
+            trampolineBytes,
+            reinterpret_cast<const void*>(trampoline),
+            sizeof(trampolineBytes));
+        if (trampolineBytes[0] != 0x60
+            || trampolineBytes[1] != 0x9C
+            || trampolineBytes[2] != 0xE8
+            || trampolineBytes[7] != 0x9D
+            || trampolineBytes[8] != 0x61
+            || trampolineBytes[16] != 0xE9)
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: trampoline shape mismatch index=%zu",
+                i);
+            return false;
+        }
+        int32_t callbackRel = 0;
+        std::memcpy(
+            &callbackRel, &trampolineBytes[3], sizeof(callbackRel));
+        const uintptr_t callback = static_cast<uintptr_t>(
+            static_cast<intptr_t>(trampoline + 7u)
+            + static_cast<intptr_t>(callbackRel));
+        int32_t returnRel = 0;
+        std::memcpy(
+            &returnRel, &trampolineBytes[17], sizeof(returnRel));
+        const uintptr_t returnTarget = static_cast<uintptr_t>(
+            static_cast<intptr_t>(trampoline + kTrampolineSize)
+            + static_cast<intptr_t>(returnRel));
+        if (callback != expectedCallback
+            || callback < revivalBase
+            || callback >= revivalEnd
+            || !IsCommittedExecutableAddress(callback)
+            || returnTarget != kExpectedAddresses[i] + kModeCtorHookPatchSize)
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: trampoline binding mismatch index=%zu callback=0x%08lX expected=0x%08lX return=0x%08lX",
+                i,
+                static_cast<unsigned long>(callback),
+                static_cast<unsigned long>(expectedCallback),
+                static_cast<unsigned long>(returnTarget));
+            return false;
+        }
+        std::memcpy(
+            displaced[i],
+            &trampolineBytes[9],
+            kModeCtorHookPatchSize);
+    }
+    if (live[2][0] != 0x00)
+    {
+        mod::Log(
+            "AdoptExistingTournamentExePatchState: byte patch mismatch at 0x754C1A");
+        return false;
+    }
+    for (size_t i = 0; i < kExpectedSizes[3]; ++i)
+    {
+        if (live[3][i] != 0x90)
+        {
+            mod::Log(
+                "AdoptExistingTournamentExePatchState: NOP patch mismatch offset=%zu",
+                i);
+            return false;
+        }
+    }
+
+    if (InterlockedCompareExchange(
+            &g_processAttachTournamentPreimageState, 0, 0) != 1
+        || std::memcmp(
+               g_processAttachTournamentPreimage[0],
+               displaced[0],
+               kModeCtorHookPatchSize) != 0
+        || std::memcmp(
+               g_processAttachTournamentPreimage[1],
+               displaced[1],
+               kModeCtorHookPatchSize) != 0)
+    {
+        // A mismatch means this DLL was loaded too late to prove the raw-site
+        // preimage, or a third party changed ownership during native init.
+        // Never guess what cleanup should restore.
+        mod::Log(
+            "AdoptExistingTournamentExePatchState: loader-time preimage does not match Revival trampoline journal; fail closed");
+        return false;
+    }
+
+    // Revival journals the two control-transfer hooks in its trampolines, but
+    // the byte/NOP writes have no native displaced-byte record.  Admit only
+    // the two known prior states for those raw sites: pristine EFZ or the same
+    // idempotent patch already resident.  An arbitrary third-party preimage is
+    // not ours to restore and must remain fail-closed.
+    static constexpr uint8_t kStockBytePatch[1] = {0x01};
+    static constexpr uint8_t kStockNopRegion[20] = {
+        0x8B, 0x4D, 0xFC, 0xC6, 0x81, 0x3E, 0x05, 0x00, 0x00, 0x00,
+        0x8B, 0x55, 0xFC, 0xC6, 0x82, 0x3F, 0x05, 0x00, 0x00, 0x00,
+    };
+    static constexpr uint8_t kPatchedBytePatch[1] = {0x00};
+    static constexpr uint8_t kPatchedNopRegion[20] = {
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    };
+    const bool bytePreimageKnown =
+        std::memcmp(
+            g_processAttachTournamentPreimage[2],
+            kStockBytePatch,
+            sizeof(kStockBytePatch)) == 0
+        || std::memcmp(
+            g_processAttachTournamentPreimage[2],
+            kPatchedBytePatch,
+            sizeof(kPatchedBytePatch)) == 0;
+    const bool nopPreimageKnown =
+        std::memcmp(
+            g_processAttachTournamentPreimage[3],
+            kStockNopRegion,
+            sizeof(kStockNopRegion)) == 0
+        || std::memcmp(
+            g_processAttachTournamentPreimage[3],
+            kPatchedNopRegion,
+            sizeof(kPatchedNopRegion)) == 0;
+    if (!bytePreimageKnown || !nopPreimageKnown)
+    {
+        mod::Log(
+            "AdoptExistingTournamentExePatchState: raw-site loader preimage is not pristine/idempotent; refusing to overwrite another owner");
+        return false;
+    }
+
+    std::memset(g_savedTournamentPatches, 0, sizeof(g_savedTournamentPatches));
+    std::memset(
+        g_tournamentRestorePageProtectPending,
+        0,
+        sizeof(g_tournamentRestorePageProtectPending));
+    for (size_t i = 0; i < 4u; ++i)
+    {
+        std::memcpy(
+            g_savedTournamentPatches[i],
+            g_processAttachTournamentPreimage[i],
+            kExpectedSizes[i]);
+        std::memcpy(
+            g_adoptedTournamentPatchBytes[i],
+            live[i],
+            kExpectedSizes[i]);
+    }
+    g_tournamentPatchesSaved = true;
+    g_adoptedTournamentPatchBytesValid = true;
+
+    // The mode-constructor journal uses the opposite address order.  Seed it
+    // from the recovered displaced bytes so a later ForceLocalPlayInit()
+    // neither builds on the launcher-owned JMPs nor erases an earlier hook.
+    std::memcpy(
+        g_modeCtorOriginalBytes[0],
+        g_processAttachTournamentPreimage[1],
+        kModeCtorHookPatchSize);
+    std::memcpy(
+        g_modeCtorOriginalBytes[1],
+        g_processAttachTournamentPreimage[0],
+        kModeCtorHookPatchSize);
+    g_modeCtorOriginalsSaved = true;
+
+    mod::Log(
+        "AdoptExistingTournamentExePatchState: exact native trampolines admitted; loader-time EFZ restoration journal recovered");
+    return true;
+}
 
 static void SaveModeCtorOriginalBytesOnce()
 {
@@ -5260,12 +6231,18 @@ static volatile bool g_tickRecoveryPending = false;
 #endif
 static void RunFrameDispatch()
 {
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+        static_cast<LONG>(GetCurrentThreadId()));
     g_netplayFrameJmpActive = true;
     if (setjmp(g_netplayFrameJmpBuf) != 0)
     {
         // longjmp path: ExitProcess was intercepted during this frame tick.
         // Signal OurFrameDispatch to execute C++ recovery outside setjmp scope.
         g_netplayFrameJmpActive = false;
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+            0);
         g_frameRecoveryPending = true;
         return;
     }
@@ -5275,6 +6252,9 @@ static void RunFrameDispatch()
         g_origFrameDispatch();
     }
     g_netplayFrameJmpActive = false;
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+        0);
 }
 
 #if defined(_MSC_VER)
@@ -5304,6 +6284,213 @@ static void RunFrameDispatch()
 static uint8_t g_perFrameTickTrampoline[16] = {};
 static bool    g_perFrameTickInstalled      = false;
 static bool    g_perFrameMismatchLogged     = false;
+static uint8_t g_perFrameTickOriginal[8]    = {};
+static size_t  g_perFrameTickOriginalSize   = 0;
+
+namespace
+{
+constexpr size_t kMaxPatchSuspendedThreads = 128;
+
+struct SuspendedThreadSet
+{
+    HANDLE handles[kMaxPatchSuspendedThreads] = {};
+    size_t count = 0;
+};
+
+void ResumeSuspendedThreads(SuspendedThreadSet* threads)
+{
+    if (threads == nullptr)
+    {
+        return;
+    }
+    while (threads->count > 0)
+    {
+        HANDLE thread = threads->handles[--threads->count];
+        (void)ResumeThread(thread);
+        CloseHandle(thread);
+    }
+}
+
+uintptr_t ContextInstructionPointer(const CONTEXT& context)
+{
+#if defined(_WIN64)
+    return static_cast<uintptr_t>(context.Rip);
+#else
+    return static_cast<uintptr_t>(context.Eip);
+#endif
+}
+
+bool SuspendOtherThreadsOutsideCodeRange(
+    const uint8_t* target,
+    size_t size,
+    SuspendedThreadSet* outThreads,
+    bool* outInstructionPointerConflict)
+{
+    if (target == nullptr || size == 0 || outThreads == nullptr
+        || outInstructionPointerConflict == nullptr)
+    {
+        return false;
+    }
+    *outThreads = {};
+    *outInstructionPointerConflict = false;
+
+    const DWORD processId = GetCurrentProcessId();
+    const DWORD currentThreadId = GetCurrentThreadId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    THREADENTRY32 entry = {};
+    entry.dwSize = sizeof(entry);
+    bool ok = Thread32First(snapshot, &entry) != FALSE;
+    while (ok)
+    {
+        if (entry.th32OwnerProcessID == processId
+            && entry.th32ThreadID != currentThreadId)
+        {
+            if (outThreads->count >= kMaxPatchSuspendedThreads)
+            {
+                ok = false;
+                break;
+            }
+
+            HANDLE thread = OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT
+                    | THREAD_QUERY_INFORMATION,
+                FALSE,
+                entry.th32ThreadID);
+            if (thread == nullptr)
+            {
+                ok = false;
+                break;
+            }
+            if (SuspendThread(thread) == static_cast<DWORD>(-1))
+            {
+                CloseHandle(thread);
+                ok = false;
+                break;
+            }
+
+            outThreads->handles[outThreads->count++] = thread;
+            CONTEXT context = {};
+            context.ContextFlags = CONTEXT_CONTROL;
+            if (!GetThreadContext(thread, &context))
+            {
+                ok = false;
+                break;
+            }
+            const uintptr_t ip = ContextInstructionPointer(context);
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+            if (ip >= begin && ip < begin + size)
+            {
+                *outInstructionPointerConflict = true;
+                ok = false;
+                break;
+            }
+        }
+        entry.dwSize = sizeof(entry);
+        if (ok)
+        {
+            ok = Thread32Next(snapshot, &entry) != FALSE;
+            if (!ok && GetLastError() == ERROR_NO_MORE_FILES)
+            {
+                ok = true;
+                break;
+            }
+        }
+    }
+    CloseHandle(snapshot);
+
+    if (!ok)
+    {
+        ResumeSuspendedThreads(outThreads);
+    }
+    return ok;
+}
+
+bool WriteCurrentProcessCodeSafely(
+    uint8_t* target,
+    const uint8_t* expected,
+    const uint8_t* replacement,
+    size_t size)
+{
+    if (target == nullptr || expected == nullptr || replacement == nullptr
+        || size == 0)
+    {
+        return false;
+    }
+
+    constexpr DWORD kPatchSafetyTimeoutMs = 250u;
+    const DWORD start = GetTickCount();
+    for (;;)
+    {
+        SuspendedThreadSet threads = {};
+        bool instructionPointerConflict = false;
+        if (SuspendOtherThreadsOutsideCodeRange(
+                target,
+                size,
+                &threads,
+                &instructionPointerConflict))
+        {
+            bool written = false;
+            bool protectionRestored = true;
+            DWORD protectionRestoreError = ERROR_SUCCESS;
+            if (std::memcmp(target, expected, size) == 0)
+            {
+                DWORD oldProtect = 0;
+                if (VirtualProtect(
+                        target,
+                        size,
+                        PAGE_EXECUTE_READWRITE,
+                        &oldProtect))
+                {
+                    std::memcpy(target, replacement, size);
+                    FlushInstructionCache(GetCurrentProcess(), target, size);
+                    DWORD ignored = 0;
+                    protectionRestored = false;
+                    for (int attempt = 0; attempt < 3; ++attempt)
+                    {
+                        if (VirtualProtect(
+                                target,
+                                size,
+                                oldProtect,
+                                &ignored))
+                        {
+                            protectionRestored = true;
+                            break;
+                        }
+                        protectionRestoreError = GetLastError();
+                    }
+                    // Once replacement bytes are visible, report the patch as
+                    // committed even if restoring the page protection failed.
+                    // Returning false in that state would leave an untracked
+                    // live detour that no rollback path knows it owns.
+                    written = std::memcmp(target, replacement, size) == 0;
+                }
+            }
+            ResumeSuspendedThreads(&threads);
+            if (written && !protectionRestored)
+            {
+                mod::Log(
+                    "WriteCurrentProcessCodeSafely: replacement committed but page protection restore failed target=%p size=%lu err=%lu",
+                    static_cast<void*>(target),
+                    static_cast<unsigned long>(size),
+                    static_cast<unsigned long>(protectionRestoreError));
+            }
+            return written;
+        }
+
+        if (!instructionPointerConflict
+            || GetTickCount() - start >= kPatchSafetyTimeoutMs)
+        {
+            return false;
+        }
+        Sleep(1u);
+    }
+}
+} // namespace
 
 // Guard flag: true while g_origPerFrameTick is running.  ForceLocalPlayInit
 // must NOT run during this window because sub_1006E570 -> vtable[2] ->
@@ -5420,6 +6607,23 @@ static int ReadCurrentGameModeForRecovery()
 static bool IsGameplayExitRecoveryScreen(uint8_t screen)
 {
     return screen == 3 || screen == 5;
+}
+
+// Recovery routing is deliberately broader than gameplay-stall tracking.
+// Title, character-select, and loading disconnects must enter the owned
+// frontend-return transaction too: the legacy path leaves
+// g_revivalExitIntercepted armed while waiting for a title update, but that
+// same latch suppresses the native dispatch which owns the title update.  In
+// character select it also bypasses EFZ's required +45 native-exit cleanup.
+// Keep IsGameplayExitRecoveryScreen() restricted to battle/result so the
+// recurring stall tracker never becomes active on frontend screens.
+static bool IsManagedFrontendRecoveryScreen(uint8_t screen)
+{
+    return screen == 0  // title / netplay menu
+        || screen == 1  // character select
+        || screen == 2  // loading
+        || screen == 3  // battle
+        || screen == 5; // result
 }
 
 static bool ReadGameplaySyncFrameForRecovery(uintptr_t sessionPtr, int* outSyncFrame)
@@ -7110,21 +8314,63 @@ static void MonitorScreenIndexChange()
 #pragma warning(push)
 #pragma warning(disable: 4611)
 #endif
+#if defined(_M_IX86)
+// Revival's MinGW-built session tick can tail-call through code that does not
+// preserve the Microsoft x86 nonvolatile registers.  Calling it as an ordinary
+// C++ function lets MSVC keep an IAT/function value in EDI across the call; the
+// 1.02j path has been observed returning with EDI changed, which makes the
+// wrapper jump through stack data on its very next instruction.  This tiny ABI
+// seam preserves every x86 callee-saved general register itself while leaving
+// ECX (the native this pointer) and EAX (the result) untouched.
+static __declspec(naked) int __fastcall
+InvokeOriginalPerFrameTickPreservingNonvolatile(void* /*fixedThis*/)
+{
+    __asm
+    {
+        push ebp
+        push ebx
+        push esi
+        push edi
+        call dword ptr [g_origPerFrameTick]
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+    }
+}
+#else
+static int InvokeOriginalPerFrameTickPreservingNonvolatile(void* fixedThis)
+{
+    return g_origPerFrameTick(fixedThis);
+}
+#endif
+
 static int RunPerFrameTickDispatch(void* fixedThis)
 {
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+        static_cast<LONG>(GetCurrentThreadId()));
     g_netplayFrameJmpActive = true;
     if (setjmp(g_netplayFrameJmpBuf) != 0)
     {
         // longjmp path: ExitProcess was intercepted during this frame tick.
         g_netplayFrameJmpActive = false;
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+            0);
         g_insideFrameTick = false;
         g_tickRecoveryPending = true;
         return 0;
     }
     g_insideFrameTick = true;
-    const int result = g_origPerFrameTick(fixedThis);
+    const int result =
+        InvokeOriginalPerFrameTickPreservingNonvolatile(fixedThis);
     g_insideFrameTick = false;
     g_netplayFrameJmpActive = false;
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&g_netplayFrameJmpOwnerThreadId),
+        0);
     return result;
 }
 #if defined(_MSC_VER)
@@ -7160,7 +8406,8 @@ static bool NeedsPostNativeControlPath(bool nativeTickSkippedForFatalError)
         || InterlockedCompareExchange(
                &g_gameplayStallLocalProcessCloseActive, 0, 0) != 0
         || InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0
-        || HasPeerProcessExitSignal())
+        || HasPeerProcessExitSignal()
+        || HasExternalLauncherTerminateBlockedSignal())
     {
         return true;
     }
@@ -7184,6 +8431,21 @@ static bool NeedsPostNativeControlPath(bool nativeTickSkippedForFatalError)
         }
     }
 
+    if (g_localRoleFlag == kLocalRoleTournament
+        && g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && InterlockedCompareExchange(
+               &g_externalTournamentInitialTitleLeft, 0, 0) != 0
+        && g_localInitAppliedForSession
+        && g_dllExitProcessPatchesSaved)
+    {
+        // Once launcher-owned Tournament has left its initial title, ordinary
+        // char-select/loading/battle/result ticks need no mod control-plane
+        // work. Event latches above still break out immediately; title mode
+        // remains on the slow path for proactive return cleanup.
+        return screen == 0;
+    }
+
     if (g_localRoleFlag != kLocalRoleOnline
         || !g_localInitAppliedForSession
         || !g_dllExitProcessPatchesSaved)
@@ -7204,16 +8466,94 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     // and cached FPU control restoration.  All screen/session diagnostics,
     // logging, state export, and lifecycle polling happen after this call.
     ++g_frameTick;
-    const bool nativeTickSkippedForFatalError =
+    LONG externalAttachState = InterlockedCompareExchange(
+        &g_externalLauncherAttachState, 0, 0);
+    if (externalAttachState == kExternalAttachPending)
+    {
+        // Park exactly one game-thread invocation at the newly published
+        // boundary.  The control-plane worker either commits, allowing this
+        // same invocation to call the native tick exactly once, or
+        // quarantines it for managed title recovery.  No series of native
+        // ticks is dropped while attachment work completes.
+        InterlockedExchange(&g_externalLauncherAttachObserved, 1);
+        do
+        {
+            Sleep(1);
+            externalAttachState = InterlockedCompareExchange(
+                &g_externalLauncherAttachState, 0, 0);
+        }
+        while (externalAttachState == kExternalAttachPending);
+
+        if (externalAttachState == kExternalAttachCommit)
+        {
+            InterlockedCompareExchange(
+                &g_externalLauncherAttachState,
+                kExternalAttachIdle,
+                kExternalAttachCommit);
+            externalAttachState = kExternalAttachIdle;
+        }
+    }
+    const bool fatalConsoleError =
         g_dllExitProcessPatchesSaved
         && g_hostBlock != nullptr
         && InterlockedCompareExchange(&g_hostBlock->consoleErrorSerial, 0, 0) > 0;
+    const bool externalLauncherHardClose =
+        g_dllExitProcessPatchesSaved
+        && g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent
+        && HasExternalLauncherTerminateBlockedSignal();
+    const bool externalLauncherExited =
+        g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent
+        && HasPeerProcessExitSignal();
+    const bool revivalExitIntercepted = InterlockedCompareExchange(
+        &g_revivalExitIntercepted, 0, 0) != 0;
+    const bool nativeTickSkippedForFatalError =
+        fatalConsoleError || externalLauncherHardClose
+        || externalLauncherExited || revivalExitIntercepted
+        || externalAttachState == kExternalAttachQuarantine;
+
+    if (externalAttachState == kExternalAttachQuarantine)
+    {
+        if (g_localRoleFlag == kLocalRoleTournament
+            && g_launchDisposition
+                == revival_launch::LaunchDisposition::AttachExistingTournament)
+        {
+            // UI/admission failure occurs with this exact invocation already
+            // parked outside the native role-3 tick.  Hand ownership directly
+            // to the same post-tick transactional cleanup used by a normal
+            // Tournament return; a title hook may not exist when UI install
+            // itself was the failure.
+            ArmTournamentReturnCleanup("external_attach_quarantine");
+        }
+        InterlockedCompareExchange(
+            &g_externalLauncherAttachState,
+            kExternalAttachIdle,
+            kExternalAttachQuarantine);
+    }
 
     int result = 0;
     if (!nativeTickSkippedForFatalError)
     {
         NormalizeRevivalFpuStateCachedAtNativeEntry();
         result = RunPerFrameTickDispatch(exeThis);
+    }
+
+    if (g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && InterlockedCompareExchange(
+               &g_externalTournamentInitialTitleLeft, 0, 0) == 0
+        && g_activeRevival != nullptr)
+    {
+        int currentMode = 0;
+        if (SafeReadInt(
+                reinterpret_cast<const void*>(
+                    g_activeRevival->addrGameModeCurrentIndex),
+                &currentMode)
+            && currentMode != 0)
+        {
+            InterlockedExchange(&g_externalTournamentInitialTitleLeft, 1);
+        }
     }
 
     // Steady-state online battle ends here.  Recovery/lifecycle work is
@@ -8338,7 +9678,26 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             return 0;
         }
 
-        if (IsGameplayExitRecoveryScreen(recoveryScreen))
+        if (recoveredRole == kLocalRoleTournament)
+        {
+            // All versions destroy their role-3 object only after its virtual
+            // tick has unwound.  Reuse the exact EXE -> object/init -> DLL
+            // transaction; never run the legacy ForceLocalPlayInit-first path
+            // against a launcher-owned Tournament generation.
+            InterlockedExchange(
+                &g_revivalExitMode,
+                static_cast<LONG>(kLocalRoleTournament));
+            InterlockedExchange(&g_revivalExitIntercepted, 1);
+            ArmTournamentReturnCleanup("tick_exitprocess");
+            const bool cleanupOk =
+                netplay::bridge::CompletePendingTournamentReturnCleanup();
+            mod::Log(
+                "TICK_HOOK: Tournament ExitProcess transactional cleanup=%d",
+                cleanupOk ? 1 : 0);
+            return 0;
+        }
+
+        if (IsManagedFrontendRecoveryScreen(recoveryScreen))
         {
             (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
                 netplay::bridge::recovery::GameplayExitOrigin::TickExitProcess);
@@ -8355,11 +9714,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         // Step 2: Terminate the dead helper process.
         if (g_revivalProcess != nullptr)
         {
-            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+            const BOOL termOk = TerminatePeerProcessIfOwned(
+                0, "tick_exitprocess_recovery");
             const DWORD termErr = termOk ? 0 : GetLastError();
-            CloseHandle(g_revivalProcess);
-            g_revivalProcess = nullptr;
-            g_revivalProcessId = 0;
+            (void)ReleasePeerProcessAfterTerminationAttempt(
+                termOk, nullptr, "tick_exitprocess_recovery");
             mod::Log(
                 "TICK_HOOK: recovery step 2 helper terminated "
                 "(pid=%lu termOk=%d err=%lu)",
@@ -8453,6 +9812,24 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
             return RecoverFromQuitRingSignal(
                 "POST-TICK", quitHeadAfter, quitTailAfter);
         }
+    }
+
+    // The stock launcher normally asks the child to quit through its native
+    // ring.  If that ring is full, its exact cleanup site falls back to
+    // TerminateProcess.  The narrow parent guard blocks only that verified
+    // hard kill and publishes this atomic signal so recovery can keep EFZ
+    // alive and return to the title/menu on the following tick.
+    if (g_dllExitProcessPatchesSaved
+        && ConsumeExternalLauncherTerminateBlockedSignal())
+    {
+        mod::Log(
+            "TICK_HOOK: external Revival launcher hard-close blocked; "
+            "starting title recovery role=%d parentPid=%lu",
+            g_localRoleFlag,
+            static_cast<unsigned long>(g_revivalProcessId));
+        (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+            "external_launcher_terminate_guard");
+        return 0;
     }
 
     // ---- Proactive network-disconnect detection ---------------------------
@@ -8624,7 +10001,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                         return 0;
                     }
 
-                    if (IsGameplayExitRecoveryScreen(wdScreen))
+                    if (IsManagedFrontendRecoveryScreen(wdScreen))
                     {
                         (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
                             netplay::bridge::recovery::GameplayExitOrigin::HelperDeathWatchdog);
@@ -8653,9 +10030,13 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
                     if (g_revivalProcess != nullptr)
                     {
                         const BOOL termOk =
-                            TerminateProcess(g_revivalProcess, 0);
+                            TerminatePeerProcessIfOwned(
+                                0, "helper_death_hard_fallback");
                         const DWORD termErr = termOk ? 0 : GetLastError();
-                        CloseProcessHandle(nullptr);
+                        (void)ReleasePeerProcessAfterTerminationAttempt(
+                            termOk,
+                            nullptr,
+                            "helper_death_hard_fallback");
                         mod::Log(
                             "TICK_HOOK: hard-fallback step 2 helper terminated "
                             "(pid=%lu termOk=%d err=%lu)",
@@ -8776,6 +10157,15 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
         ResetGameModeValidation();
 
         mod::Log("TICK_HOOK: deferred cancel cleanup complete");
+    }
+
+    // Recovery has its own event-only progress owner here.  Screen vtable
+    // restoration can fail or a context can disappear during disconnect; in
+    // that case the active tick boundary still advances the forced-title
+    // fallback instead of leaving an accepted return pending forever.
+    if (netplay::bridge::frontend_return::HasPendingReturn())
+    {
+        netplay::bridge::frontend_return::TickFrontendReturn();
     }
 
     netplay::bridge::recovery::ObserveGameplayExitRecoveryProgress(
@@ -9003,7 +10393,7 @@ static char FinalizeGracefulQuitTeardown(
         return 0;
     }
 
-    if (IsGameplayExitRecoveryScreen(teardownScreen))
+    if (IsManagedFrontendRecoveryScreen(teardownScreen))
     {
         (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
             netplay::bridge::recovery::GameplayExitOrigin::QuitRing);
@@ -9020,11 +10410,11 @@ static char FinalizeGracefulQuitTeardown(
 
     if (g_revivalProcess != nullptr)
     {
-        const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+        const BOOL termOk = TerminatePeerProcessIfOwned(
+            0, "graceful_quit_recovery");
         const DWORD termErr = termOk ? 0 : GetLastError();
-        CloseHandle(g_revivalProcess);
-        g_revivalProcess = nullptr;
-        g_revivalProcessId = 0;
+        (void)ReleasePeerProcessAfterTerminationAttempt(
+            termOk, nullptr, "graceful_quit_recovery");
         mod::Log(
             "TICK_HOOK: graceful-quit step 2 helper terminated "
             "(pid=%lu termOk=%d err=%lu)",
@@ -9271,7 +10661,7 @@ static void OurFrameDispatch()
             return;
         }
 
-        if (IsGameplayExitRecoveryScreen(recoveryScreen))
+        if (IsManagedFrontendRecoveryScreen(recoveryScreen))
         {
             (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
                 netplay::bridge::recovery::GameplayExitOrigin::FrameExitProcess);
@@ -9290,11 +10680,11 @@ static void OurFrameDispatch()
         // resources are released immediately.
         if (g_revivalProcess != nullptr)
         {
-            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
+            const BOOL termOk = TerminatePeerProcessIfOwned(
+                0, "frame_dispatch_recovery");
             const DWORD termErr = termOk ? 0 : GetLastError();
-            CloseHandle(g_revivalProcess);
-            g_revivalProcess = nullptr;
-            g_revivalProcessId = 0;
+            (void)ReleasePeerProcessAfterTerminationAttempt(
+                termOk, nullptr, "frame_dispatch_recovery");
             mod::Log(
                 "OurFrameDispatch: step 2 helper process terminated "
                 "(pid=%lu termOk=%d err=%lu) and handle closed",
@@ -9348,11 +10738,196 @@ static void OurFrameDispatch()
     }
 }
 
-bool InstallNetplayFrameHook()
+#if !defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+static bool InstallNetplayPerFrameTickHookAtBase(uintptr_t base)
 {
-    if (g_frameHookInstalled)
+    if (g_perFrameTickInstalled)
     {
         return true;
+    }
+    if (g_activeRevival == nullptr || base == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t perFrameTickRva = g_activeRevival->perFrameTickRva;
+    uint8_t* const tickTarget =
+        reinterpret_cast<uint8_t*>(base + perFrameTickRva);
+
+    uint8_t tickPrologue[8] = {};
+    bool tickPrologueRead = true;
+    __try
+    {
+        std::memcpy(tickPrologue, tickTarget, sizeof(tickPrologue));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        tickPrologueRead = false;
+    }
+
+    size_t tickStealSize = 0;
+    size_t tickRelInsnOffset = static_cast<size_t>(-1);
+    if (tickPrologueRead
+        && (tickPrologue[0] == 0x55 || tickPrologue[0] == 0x51))
+    {
+        tickStealSize = 6;
+        if (tickPrologue[1] == 0xE8 || tickPrologue[1] == 0xE9)
+        {
+            tickRelInsnOffset = 1;
+        }
+    }
+    else if (tickPrologueRead
+        && tickPrologue[0] == 0x83
+        && tickPrologue[1] == 0xEC
+        && tickPrologue[2] == 0x28
+        && (tickPrologue[3] == 0xE8 || tickPrologue[3] == 0xE9))
+    {
+        tickStealSize = 8;
+        tickRelInsnOffset = 3;
+    }
+
+    if (tickStealSize == 0)
+    {
+        mod::Log(
+            "InstallNetplayFrameHook: per-frame tick unexpected byte "
+            "0x%02X at RVA 0x%lX - skipping",
+            static_cast<unsigned>(tickPrologueRead ? tickPrologue[0] : 0xFF),
+            static_cast<unsigned long>(perFrameTickRva));
+        return false;
+    }
+
+    // Build the active-tick trampoline completely before publishing the
+    // detour.  This hook is intentionally installed first: after the first
+    // live code write every later failure still has a game-thread recovery
+    // boundary, whereas the init-only dispatcher cannot provide that.
+    std::memset(
+        g_perFrameTickTrampoline,
+        0x90,
+        sizeof(g_perFrameTickTrampoline));
+    std::memset(
+        g_perFrameTickOriginal,
+        0,
+        sizeof(g_perFrameTickOriginal));
+    std::memcpy(g_perFrameTickOriginal, tickTarget, tickStealSize);
+    g_perFrameTickOriginalSize = tickStealSize;
+    memcpy(g_perFrameTickTrampoline, tickTarget, tickStealSize);
+
+    if (tickRelInsnOffset != static_cast<size_t>(-1))
+    {
+        int32_t origDisp = 0;
+        memcpy(
+            &origDisp,
+            tickTarget + tickRelInsnOffset + 1,
+            sizeof(origDisp));
+        const uintptr_t origInsnAddr =
+            reinterpret_cast<uintptr_t>(tickTarget) + tickRelInsnOffset;
+        const uintptr_t absTarget = origInsnAddr + 5 + origDisp;
+        const uintptr_t newInsnAddr = reinterpret_cast<uintptr_t>(
+            &g_perFrameTickTrampoline[tickRelInsnOffset]);
+        const int32_t newDisp =
+            static_cast<int32_t>(absTarget - (newInsnAddr + 5));
+        memcpy(
+            &g_perFrameTickTrampoline[tickRelInsnOffset + 1],
+            &newDisp,
+            sizeof(newDisp));
+
+        mod::Log(
+            "InstallNetplayFrameHook: fixed up trampoline E8/E9 at "
+            "+%lu: origDisp=0x%08X newDisp=0x%08X absTarget=%p",
+            static_cast<unsigned long>(tickRelInsnOffset),
+            static_cast<unsigned>(origDisp),
+            static_cast<unsigned>(newDisp),
+            reinterpret_cast<void*>(absTarget));
+    }
+
+    const uintptr_t tickContinue = base + perFrameTickRva + tickStealSize;
+    g_perFrameTickTrampoline[tickStealSize] = 0xE9;
+    const uintptr_t tickJmpFrom =
+        reinterpret_cast<uintptr_t>(
+            &g_perFrameTickTrampoline[tickStealSize])
+        + 5;
+    *reinterpret_cast<int32_t*>(
+        &g_perFrameTickTrampoline[tickStealSize + 1]) =
+        static_cast<int32_t>(tickContinue - tickJmpFrom);
+
+    DWORD tickTrampolineProtect = 0;
+    if (!VirtualProtect(
+            g_perFrameTickTrampoline,
+            sizeof(g_perFrameTickTrampoline),
+            PAGE_EXECUTE_READWRITE,
+            &tickTrampolineProtect))
+    {
+        mod::Log(
+            "InstallNetplayFrameHook: VirtualProtect(tick trampoline) failed");
+        g_perFrameTickOriginalSize = 0;
+        return false;
+    }
+
+    g_origPerFrameTick = reinterpret_cast<PerFrameTickFn>(
+        reinterpret_cast<void*>(g_perFrameTickTrampoline));
+
+    uint8_t tickPatch[8] = {};
+    std::memset(tickPatch, 0x90, sizeof(tickPatch));
+    tickPatch[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(&tickPatch[1]) =
+        static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&OurPerFrameTickHook)
+            - (reinterpret_cast<uintptr_t>(tickTarget) + 5));
+
+    if (!WriteCurrentProcessCodeSafely(
+            tickTarget,
+            g_perFrameTickOriginal,
+            tickPatch,
+            tickStealSize))
+    {
+        mod::Log(
+            "InstallNetplayFrameHook: safe per-frame patch transaction failed");
+        g_perFrameTickOriginalSize = 0;
+        return false;
+    }
+
+    g_perFrameTickInstalled = true;
+    mod::Log(
+        "InstallNetplayFrameHook: per-frame tick hook installed first "
+        "at DLL RVA 0x%lX steal=%lu trampoline at %p "
+        "policy=native_first_exactly_once",
+        static_cast<unsigned long>(perFrameTickRva),
+        static_cast<unsigned long>(tickStealSize),
+        static_cast<void*>(g_perFrameTickTrampoline));
+    return true;
+}
+#endif
+
+bool InstallNetplayFrameHook()
+{
+#if defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+    if (g_frameHookInstalled)
+#else
+    if (g_frameHookInstalled && g_perFrameTickInstalled)
+#endif
+    {
+        return true;
+    }
+    const bool resumeDispatcherOnly =
+#if defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+        false;
+#else
+        g_frameHookInstalled && !g_perFrameTickInstalled;
+#endif
+    const bool resumeTickOnly =
+#if defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+        false;
+#else
+        !g_frameHookInstalled && g_perFrameTickInstalled;
+#endif
+    if ((g_frameHookInstalled || g_perFrameTickInstalled)
+        && !resumeDispatcherOnly && !resumeTickOnly)
+    {
+        mod::Log(
+            "InstallNetplayFrameHook: inconsistent partial state frame=%d tick=%d; refusing",
+            g_frameHookInstalled ? 1 : 0,
+            g_perFrameTickInstalled ? 1 : 0);
+        return false;
     }
 
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
@@ -9363,6 +10938,15 @@ bool InstallNetplayFrameHook()
     }
 
     const uintptr_t base    = reinterpret_cast<uintptr_t>(revival);
+#if !defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+    if (!InstallNetplayPerFrameTickHookAtBase(base))
+    {
+        // No code has been published on a fresh install when this fails.  On
+        // a resumed dispatcher-only transaction, the caller can still verify
+        // and unwind that older init-only detour explicitly.
+        return false;
+    }
+#endif
     const uintptr_t frameHookRva = g_activeRevival->frameHookRva;
     uint8_t* const  target  = reinterpret_cast<uint8_t*>(base + frameHookRva);
 
@@ -9391,13 +10975,28 @@ bool InstallNetplayFrameHook()
 
     uint8_t framePrologue[6] = {};
     bool framePrologueRead = true;
-    __try
+    if (resumeDispatcherOnly)
     {
-        std::memcpy(framePrologue, target, sizeof(framePrologue));
+        // A prior tick-install failure may have left the init-only dispatcher
+        // detour live when its best-effort rollback could not acquire every
+        // thread.  Preserve its original bytes in the trampoline and resume
+        // only the missing active-tick half instead of permanently rejecting
+        // the session as an unrecoverable partial install.
+        std::memcpy(
+            framePrologue,
+            g_frameHookTrampoline,
+            sizeof(framePrologue));
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    else
     {
-        framePrologueRead = false;
+        __try
+        {
+            std::memcpy(framePrologue, target, sizeof(framePrologue));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            framePrologueRead = false;
+        }
     }
 
     constexpr uint8_t kMsvcFrameHookPrologue[6] = {
@@ -9418,7 +11017,8 @@ bool InstallNetplayFrameHook()
         && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
     const bool legacyPushEbpFallback =
         framePrologueRead && framePrologue[0] == 0x55 && !isRevival102j;
-    if (!msvcFrameHook && !mingw102jFrameHook && !legacyPushEbpFallback)
+    if (!resumeDispatcherOnly
+        && !msvcFrameHook && !mingw102jFrameHook && !legacyPushEbpFallback)
     {
         mod::Log(
             "InstallNetplayFrameHook: unsupported frame-hook prologue at RVA 0x%lX "
@@ -9428,7 +11028,7 @@ bool InstallNetplayFrameHook()
             framePrologue[3], framePrologue[4], framePrologue[5]);
         return false;
     }
-    if (legacyPushEbpFallback && !msvcFrameHook)
+    if (!resumeDispatcherOnly && legacyPushEbpFallback && !msvcFrameHook)
     {
         mod::Log(
             "InstallNetplayFrameHook: legacy frame-hook fallback at RVA 0x%lX "
@@ -9437,29 +11037,6 @@ bool InstallNetplayFrameHook()
             framePrologue[0], framePrologue[1], framePrologue[2],
             framePrologue[3], framePrologue[4], framePrologue[5]);
     }
-
-    // Build trampoline: 6 original bytes + JMP-near back to original+6.
-    memcpy(g_frameHookTrampoline, target, 6);
-    const uintptr_t origContinue = base + frameHookRva + 6;
-    g_frameHookTrampoline[6]     = 0xE9; // JMP near rel32
-    const uintptr_t jmpFrom      = reinterpret_cast<uintptr_t>(&g_frameHookTrampoline[6]) + 5;
-    *reinterpret_cast<int32_t*>(&g_frameHookTrampoline[7]) =
-        static_cast<int32_t>(origContinue - jmpFrom);
-    g_frameHookTrampoline[11] = 0x90; // padding NOP
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(
-            g_frameHookTrampoline,
-            sizeof(g_frameHookTrampoline),
-            PAGE_EXECUTE_READWRITE,
-            &oldProtect))
-    {
-        mod::Log("InstallNetplayFrameHook: VirtualProtect(trampoline) failed");
-        return false;
-    }
-
-    g_origFrameDispatch = reinterpret_cast<FrameDispatchFn>(
-        reinterpret_cast<void*>(g_frameHookTrampoline));
 
     // Patch the first 6 bytes of sub_1006E590:
     //   E9 rel32 (5-byte JMP to OurFrameDispatch) + 90 (NOP).
@@ -9470,21 +11047,74 @@ bool InstallNetplayFrameHook()
             reinterpret_cast<uintptr_t>(&OurFrameDispatch)
             - (reinterpret_cast<uintptr_t>(target) + 5));
     patch[5] = 0x90;
-
-    if (!VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &oldProtect))
+    if (resumeDispatcherOnly)
     {
-        mod::Log("InstallNetplayFrameHook: VirtualProtect(target) failed");
-        return false;
+        uint8_t currentDispatcher[sizeof(patch)] = {};
+        bool currentDispatcherRead = true;
+        __try
+        {
+            std::memcpy(
+                currentDispatcher,
+                target,
+                sizeof(currentDispatcher));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            currentDispatcherRead = false;
+        }
+        if (!currentDispatcherRead
+            || std::memcmp(currentDispatcher, patch, sizeof(patch)) != 0
+            || g_origFrameDispatch == nullptr)
+        {
+            mod::Log(
+                "InstallNetplayFrameHook: dispatcher-only ownership changed; refusing tick completion");
+            return false;
+        }
+        mod::Log(
+            "InstallNetplayFrameHook: resuming dispatcher-only transaction with active tick install");
     }
-    memcpy(target, patch, 6);
-    VirtualProtect(target, 6, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), target, 6);
+    else
+    {
+        // Build trampoline: 6 original bytes + JMP-near back to original+6.
+        memcpy(g_frameHookTrampoline, target, 6);
+        const uintptr_t origContinue = base + frameHookRva + 6;
+        g_frameHookTrampoline[6]     = 0xE9; // JMP near rel32
+        const uintptr_t jmpFrom      = reinterpret_cast<uintptr_t>(&g_frameHookTrampoline[6]) + 5;
+        *reinterpret_cast<int32_t*>(&g_frameHookTrampoline[7]) =
+            static_cast<int32_t>(origContinue - jmpFrom);
+        g_frameHookTrampoline[11] = 0x90; // padding NOP
 
-    g_frameHookInstalled = true;
-    mod::Log(
-        "InstallNetplayFrameHook: installed at DLL RVA 0x%lX, trampoline at %p",
-        static_cast<unsigned long>(frameHookRva),
-        static_cast<void*>(g_frameHookTrampoline));
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(
+                g_frameHookTrampoline,
+                sizeof(g_frameHookTrampoline),
+                PAGE_EXECUTE_READWRITE,
+                &oldProtect))
+        {
+            mod::Log("InstallNetplayFrameHook: VirtualProtect(trampoline) failed");
+            return false;
+        }
+
+        g_origFrameDispatch = reinterpret_cast<FrameDispatchFn>(
+            reinterpret_cast<void*>(g_frameHookTrampoline));
+
+        if (!WriteCurrentProcessCodeSafely(
+                target,
+                framePrologue,
+                patch,
+                sizeof(patch)))
+        {
+            mod::Log(
+                "InstallNetplayFrameHook: safe dispatcher patch transaction failed");
+            return false;
+        }
+
+        g_frameHookInstalled = true;
+        mod::Log(
+            "InstallNetplayFrameHook: installed at DLL RVA 0x%lX, trampoline at %p",
+            static_cast<unsigned long>(frameHookRva),
+            static_cast<void*>(g_frameHookTrampoline));
+    }
 
     // -----------------------------------------------------------------------
     // Per-frame tick hook on sub_1006E570 (RVA 0x6E570).
@@ -9510,6 +11140,23 @@ bool InstallNetplayFrameHook()
         "InstallNetplayFrameHook: native-tick passthrough active; "
         "per-frame tick detour skipped (diagnostic A/B build)");
 #else
+    const auto rollbackDispatcherHook = [&]() {
+        if (!g_frameHookInstalled)
+        {
+            return true;
+        }
+        const bool restored = WriteCurrentProcessCodeSafely(
+            target,
+            patch,
+            framePrologue,
+            sizeof(patch));
+        if (restored)
+        {
+            g_frameHookInstalled = false;
+        }
+        return restored;
+    };
+
     if (!g_perFrameTickInstalled)
     {
         const uintptr_t perFrameTickRva = g_activeRevival->perFrameTickRva;
@@ -9554,6 +11201,8 @@ bool InstallNetplayFrameHook()
                 "0x%02X at RVA 0x%lX - skipping",
                 static_cast<unsigned>(tickPrologueRead ? tickPrologue[0] : 0xFF),
                 static_cast<unsigned long>(perFrameTickRva));
+            (void)rollbackDispatcherHook();
+            return false;
         }
         else
         {
@@ -9563,6 +11212,9 @@ bool InstallNetplayFrameHook()
             // memcpy would preserve a displacement that was correct at the
             // original address but wrong at the trampoline address.
             std::memset(g_perFrameTickTrampoline, 0x90, sizeof(g_perFrameTickTrampoline));
+            std::memset(g_perFrameTickOriginal, 0, sizeof(g_perFrameTickOriginal));
+            std::memcpy(g_perFrameTickOriginal, tickTarget, tickStealSize);
+            g_perFrameTickOriginalSize = tickStealSize;
             memcpy(g_perFrameTickTrampoline, tickTarget, tickStealSize);
 
             if (tickRelInsnOffset != static_cast<size_t>(-1))
@@ -9608,6 +11260,9 @@ bool InstallNetplayFrameHook()
             {
                 mod::Log(
                     "InstallNetplayFrameHook: VirtualProtect(tick trampoline) failed");
+                g_perFrameTickOriginalSize = 0;
+                (void)rollbackDispatcherHook();
+                return false;
             }
             else
             {
@@ -9623,19 +11278,20 @@ bool InstallNetplayFrameHook()
                         reinterpret_cast<uintptr_t>(&OurPerFrameTickHook)
                         - (reinterpret_cast<uintptr_t>(tickTarget) + 5));
 
-                DWORD tickTargetProtect = 0;
-                if (!VirtualProtect(
-                        tickTarget, tickStealSize, PAGE_EXECUTE_READWRITE, &tickTargetProtect))
+                if (!WriteCurrentProcessCodeSafely(
+                        tickTarget,
+                        g_perFrameTickOriginal,
+                        tickPatch,
+                        tickStealSize))
                 {
                     mod::Log(
-                        "InstallNetplayFrameHook: VirtualProtect(tick target) failed");
+                        "InstallNetplayFrameHook: safe per-frame patch transaction failed");
+                    g_perFrameTickOriginalSize = 0;
+                    (void)rollbackDispatcherHook();
+                    return false;
                 }
                 else
                 {
-                    memcpy(tickTarget, tickPatch, tickStealSize);
-                    VirtualProtect(tickTarget, tickStealSize, tickTargetProtect, &tickTargetProtect);
-                    FlushInstructionCache(GetCurrentProcess(), tickTarget, tickStealSize);
-
                     g_perFrameTickInstalled = true;
                     mod::Log(
                         "InstallNetplayFrameHook: per-frame tick hook installed "
@@ -9657,7 +11313,88 @@ bool InstallNetplayFrameHook()
             "(stock-parity; no vtable substitution)");
     }
 
-    return true;
+#if defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+    return g_frameHookInstalled;
+#else
+    return g_frameHookInstalled && g_perFrameTickInstalled;
+#endif
+}
+
+bool RemoveNetplayFrameHook()
+{
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr || g_activeRevival == nullptr)
+    {
+        return !g_frameHookInstalled && !g_perFrameTickInstalled;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    bool tickRestored = true;
+    if (g_perFrameTickInstalled)
+    {
+        uint8_t* const tickTarget = reinterpret_cast<uint8_t*>(
+            base + g_activeRevival->perFrameTickRva);
+        uint8_t tickPatch[8] = {};
+        std::memset(tickPatch, 0x90, sizeof(tickPatch));
+        tickPatch[0] = 0xE9;
+        *reinterpret_cast<int32_t*>(&tickPatch[1]) =
+            static_cast<int32_t>(
+                reinterpret_cast<uintptr_t>(&OurPerFrameTickHook)
+                - (reinterpret_cast<uintptr_t>(tickTarget) + 5));
+        tickRestored = g_perFrameTickOriginalSize > 0
+            && g_perFrameTickOriginalSize <= sizeof(tickPatch)
+            && WriteCurrentProcessCodeSafely(
+                tickTarget,
+                tickPatch,
+                g_perFrameTickOriginal,
+                g_perFrameTickOriginalSize);
+        if (tickRestored)
+        {
+            g_perFrameTickInstalled = false;
+        }
+    }
+
+    bool dispatcherRestored = true;
+    if (tickRestored && g_frameHookInstalled)
+    {
+        uint8_t* const frameTarget = reinterpret_cast<uint8_t*>(
+            base + g_activeRevival->frameHookRva);
+        uint8_t framePatch[6] = {};
+        framePatch[0] = 0xE9;
+        *reinterpret_cast<int32_t*>(&framePatch[1]) =
+            static_cast<int32_t>(
+                reinterpret_cast<uintptr_t>(&OurFrameDispatch)
+                - (reinterpret_cast<uintptr_t>(frameTarget) + 5));
+        framePatch[5] = 0x90;
+        dispatcherRestored = WriteCurrentProcessCodeSafely(
+            frameTarget,
+            framePatch,
+            g_frameHookTrampoline,
+            sizeof(framePatch));
+        if (dispatcherRestored)
+        {
+            g_frameHookInstalled = false;
+        }
+    }
+
+    mod::Log(
+        "RemoveNetplayFrameHook: tickRestored=%d dispatcherRestored=%d frame=%d tick=%d",
+        tickRestored ? 1 : 0,
+        dispatcherRestored ? 1 : 0,
+        g_frameHookInstalled ? 1 : 0,
+        g_perFrameTickInstalled ? 1 : 0);
+    return tickRestored && dispatcherRestored
+        && !g_frameHookInstalled && !g_perFrameTickInstalled;
+}
+
+bool HasAnyNetplayFrameHookInstalled()
+{
+    return g_frameHookInstalled || g_perFrameTickInstalled;
+}
+
+bool HasNetplayPerFrameTickHookInstalled()
+{
+    return g_perFrameTickInstalled;
 }
 
 // ---------------------------------------------------------------------------

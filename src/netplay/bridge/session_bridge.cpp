@@ -4,6 +4,7 @@
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/hooks/menu_hooks.h"
 #include "logger.h"
 
 #include <cstdio>
@@ -103,7 +104,7 @@ void JoinFinishedWorkerUnlocked()
     }
 }
 
-void InitializeHostUnlocked(const char* reason)
+bool InitializeHostUnlocked(const char* reason)
 {
     if (!g_tickQpcFrequencyValid)
     {
@@ -117,10 +118,52 @@ void InitializeHostUnlocked(const char* reason)
     g_activeHostNetworkConfigValid = false;
     g_synchronousStartRejected = false;
     SetPhase(NetbridgePhase::Idle, nullptr);
-    takeover::InitializeHost();
-    takeover::Tick(&g_status, &g_connectStartTick);
+    if (!takeover::InitializeHost())
+    {
+        mod::Log(
+            "SessionBridge: initialization declined (reason=%s); "
+            "native Revival remains authoritative",
+            reason != nullptr ? reason : "unknown");
+        return false;
+    }
+
+    const auto disposition = takeover::g_launchDisposition;
+    const bool adoptedOnline =
+        disposition
+            == revival_launch::LaunchDisposition::AdoptExternalOnline;
+    const bool adoptedSpectator =
+        disposition
+            == revival_launch::LaunchDisposition::AdoptExternalSpectator;
+    const bool attachedTournament =
+        disposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament;
+    if (adoptedOnline || adoptedSpectator)
+    {
+        g_status.roleFlag = takeover::g_localRoleFlag;
+        g_status.role = adoptedSpectator
+            ? static_cast<int>(NetbridgeRole::Spectate)
+            : (takeover::g_netplayRole == takeover::kNetplayRoleClient
+                ? static_cast<int>(NetbridgeRole::Join)
+                : static_cast<int>(NetbridgeRole::Host));
+        g_status.processId = takeover::g_revivalProcessId;
+        takeover::RefreshRuntimeStatus(&g_status);
+        SetPhase(NetbridgePhase::Connected, nullptr);
+    }
+    else if (attachedTournament)
+    {
+        // This is not a host/join control-plane session.  Native Revival owns
+        // role 3; the bridge stays initialized only so the title UI and
+        // transactional return-to-title callbacks remain available.
+        g_status.roleFlag = takeover::kLocalRoleTournament;
+        SetPhase(NetbridgePhase::Idle, nullptr);
+    }
+    else
+    {
+        takeover::Tick(&g_status, &g_connectStartTick);
+    }
     g_initialized = true;
     mod::Log("SessionBridge: initialized (role=host, reason=%s)", reason != nullptr ? reason : "unknown");
+    return true;
 }
 } // namespace
 
@@ -139,16 +182,43 @@ int SelfPatchIat()
     return takeover::SelfPatchIat();
 }
 
-void Initialize()
+bool Initialize()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_initialized)
     {
-        return;
+        return true;
     }
 
-    InitializeHostUnlocked("startup");
+    if (!InitializeHostUnlocked("startup"))
+    {
+        return false;
+    }
     state_export::Initialize();
+    return true;
+}
+
+bool CompleteLauncherUiAttachment(bool hooksInstalled)
+{
+    // Do not hold SessionBridge's mutex across the hooks-layer barrier:
+    // SuspendUiHooksForOnlineSimulation requests a final TickExportOnly(),
+    // which acquires this same mutex.  The adopted native tick remains parked
+    // until the takeover finalizer below commits or quarantines it.
+    const bool needsSimulationHandoff =
+        takeover::NeedsExternalLauncherSimulationHandoff();
+    const bool simulationHandoffReady = !needsSimulationHandoff
+        || (hooksInstalled
+            && netplay::PrepareExternalLauncherSimulationHandoff());
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return takeover::CompleteExternalLauncherUiAttachment(
+        hooksInstalled,
+        simulationHandoffReady);
+}
+
+void EmergencyQuarantineLauncherUiAttachment()
+{
+    takeover::EmergencyQuarantineExternalLauncherAttachBoundary();
 }
 
 void Shutdown()
@@ -204,6 +274,7 @@ void EmergencyShutdown()
 {
     // Best-effort teardown for DLL detach during process termination.
     // Avoid blocking joins under loader-lock constraints.
+    state_export::EmergencyShutdown();
     if (!g_mutex.try_lock())
     {
         takeover::RequestAbortStart();
@@ -402,7 +473,10 @@ static bool StartSessionInternal(
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
     {
-        InitializeHostUnlocked("on_demand");
+        if (!InitializeHostUnlocked("on_demand"))
+        {
+            return false;
+        }
     }
 
     JoinFinishedWorkerUnlocked();
@@ -637,6 +711,13 @@ static bool StartSessionInternal(
         writeHostProtocol = true;
     }
 
+    // Publish a clean accepted-request snapshot before the worker starts.
+    // Reusing the previous session status here can briefly expose stale
+    // delay/prompt/sync readiness while phase is already Connecting.  The menu
+    // then activates that old modal (which clears Hosting/Joining) and removes
+    // it again as soon as the worker commits its fresh zero-initialized status,
+    // leaving the new attempt with no visible connection overlay.
+    g_status = {};
     g_status.role = static_cast<int>(role);
     g_status.port = port;
     mod::Log(
@@ -1244,7 +1325,10 @@ void OnTitleSelectionConfirmed(int selection)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
     {
-        InitializeHostUnlocked("title_confirm");
+        if (!InitializeHostUnlocked("title_confirm"))
+        {
+            return;
+        }
     }
 
     const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);

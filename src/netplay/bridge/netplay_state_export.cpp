@@ -710,6 +710,24 @@ void Shutdown()
     mod::Log("StateExport: shutdown");
 }
 
+void EmergencyShutdown()
+{
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updateWorkerStop, 1);
+    if (g_updateEvent != nullptr)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+    if (g_updateWorker.joinable())
+    {
+        // DLL_PROCESS_DETACH(process termination) cannot wait for thread/CRT
+        // teardown while the loader lock is held.  Detaching prevents the
+        // static std::thread destructor from calling std::terminate; the OS is
+        // already reclaiming the process and all kernel objects.
+        g_updateWorker.detach();
+    }
+}
+
 void UpdateNow(const NetbridgeStatus& status)
 {
     // --- Timing guard: detect when Update() itself takes too long ----------
