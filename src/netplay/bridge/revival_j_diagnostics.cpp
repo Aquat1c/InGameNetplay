@@ -15,12 +15,6 @@ namespace
 volatile LONG g_j102DiagnosticSequence = 0;
 volatile LONG g_j102SnapshotSequence = 0;
 
-constexpr uintptr_t kJ102CompactVtableRva = 0x0016FEB0u;
-constexpr uintptr_t kJ102RollbackVtableRva = 0x0016FEF0u;
-constexpr uintptr_t kJ102SpectatorVtableRva = 0x0016FF20u;
-constexpr uintptr_t kJ102ReplayVtableRva = 0x0016FF50u;
-constexpr uintptr_t kJ102PracticeVtableRva = 0x0016FF80u;
-
 struct J102SessionDescriptor
 {
     uintptr_t vtableRva;
@@ -28,47 +22,63 @@ struct J102SessionDescriptor
     size_t objectSize;
 };
 
-constexpr J102SessionDescriptor kJ102SessionDescriptors[] = {
-    {kJ102CompactVtableRva, "compact", 0x380u},
-    {kJ102RollbackVtableRva, "rollback", 0x778u},
-    {kJ102SpectatorVtableRva, "spectator", 0x6A8u},
-    // Replay is a mode-switch identity within Compact's 0x380-byte object.
-    {kJ102ReplayVtableRva, "replay", 0x380u},
-    {kJ102PracticeVtableRva, "practice", 0x2F0u},
-};
-
 const char* ContextOrUnknown(const char* context)
 {
     return context != nullptr && context[0] != '\0' ? context : "unknown";
 }
 
-bool IsActiveJ102Profile()
+const RevivalAddressProfile* ActiveJ102DiagnosticProfile()
 {
     const bool activeProfileMatches = g_activeRevival != nullptr
         && g_activeRevival->versionTag != nullptr
         && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
     if (activeProfileMatches)
     {
-        return true;
+        return g_activeRevival;
     }
 
     // Injected helper callbacks can run before their copy of the bridge has
     // selected g_activeRevival. The host publishes the verified PE timestamp
     // in the shared block, which is sufficient to gate helper-side step logs.
     const SharedBlock* block = g_hostBlock != nullptr ? g_hostBlock : g_injectedBlock;
-    return block != nullptr
-        && block->hostRevivalTimestamp == kRevival_1_02j.peTimestamp;
+    if (block != nullptr)
+    {
+        if (block->hostRevivalTimestamp == kRevival_1_02j.peTimestamp)
+        {
+            return &kRevival_1_02j;
+        }
+        if (block->hostRevivalTimestamp
+            == kRevival_1_02j_20260802.peTimestamp)
+        {
+            return &kRevival_1_02j_20260802;
+        }
+    }
+    return nullptr;
+}
+
+bool IsActiveJ102Profile()
+{
+    return ActiveJ102DiagnosticProfile() != nullptr;
 }
 
 const J102SessionDescriptor* FindJ102SessionDescriptor(uintptr_t vtableRva)
 {
-    for (const J102SessionDescriptor& descriptor : kJ102SessionDescriptors)
+    const RevivalAddressProfile* const profile =
+        ActiveJ102DiagnosticProfile();
+    if (profile == nullptr)
     {
-        if (descriptor.vtableRva == vtableRva)
-        {
-            return &descriptor;
-        }
+        return nullptr;
     }
+    static const J102SessionDescriptor kCompact = {0, "compact", 0x380u};
+    static const J102SessionDescriptor kRollback = {0, "rollback", 0x778u};
+    static const J102SessionDescriptor kSpectator = {0, "spectator", 0x6A8u};
+    static const J102SessionDescriptor kReplay = {0, "replay", 0x380u};
+    static const J102SessionDescriptor kPractice = {0, "practice", 0x2F0u};
+    if (vtableRva == profile->tournamentSessionVtableRva) return &kCompact;
+    if (vtableRva == profile->onlineSessionVtableRva) return &kRollback;
+    if (vtableRva == profile->spectatorSessionVtableRva) return &kSpectator;
+    if (vtableRva == profile->replaySessionVtableRva) return &kReplay;
+    if (vtableRva == profile->practiceSessionVtableRva) return &kPractice;
     return nullptr;
 }
 
@@ -92,6 +102,12 @@ void LogJ102SessionSemanticState(
     uintptr_t vtableRva)
 {
     const char* ctx = ContextOrUnknown(context);
+    const RevivalAddressProfile* const profile =
+        ActiveJ102DiagnosticProfile();
+    if (profile == nullptr)
+    {
+        return;
+    }
     auto readInt = [sessionPtr](uintptr_t offset) {
         int value = -1;
         (void)SafeReadInt(reinterpret_cast<const void*>(sessionPtr + offset), &value);
@@ -108,7 +124,7 @@ void LogJ102SessionSemanticState(
         return value;
     };
 
-    if (vtableRva == kJ102SpectatorVtableRva)
+    if (vtableRva == profile->spectatorSessionVtableRva)
     {
         const uintptr_t p1NameChars = readPtr(0x170u);
         const int p1NameLength = readInt(0x174u);
@@ -149,7 +165,7 @@ void LogJ102SessionSemanticState(
         return;
     }
 
-    if (vtableRva == kJ102RollbackVtableRva)
+    if (vtableRva == profile->onlineSessionVtableRva)
     {
         mod::Log(
             "J102_DIAG[%s]: ROLLBACK active=%d queue=%d delay=%d frame=%d "
@@ -171,7 +187,7 @@ void LogJ102SessionSemanticState(
         return;
     }
 
-    if (vtableRva == kJ102PracticeVtableRva)
+    if (vtableRva == profile->practiceSessionVtableRva)
     {
         mod::Log(
             "J102_DIAG[%s]: PRACTICE stepPending=%u stepCounter=%d paused=%u "
@@ -191,8 +207,8 @@ void LogJ102SessionSemanticState(
         return;
     }
 
-    if (vtableRva == kJ102CompactVtableRva
-        || vtableRva == kJ102ReplayVtableRva)
+    if (vtableRva == profile->tournamentSessionVtableRva
+        || vtableRva == profile->replaySessionVtableRva)
     {
         mod::Log(
             "J102_DIAG[%s]: COMPACT/REPLAY lastScreen=%d matchCount=%d scores=%d-%d",
@@ -454,14 +470,22 @@ void LogDllAndSessionState(const char* context)
     uintptr_t renderContext = 0;
     uintptr_t renderContextBase = 0;
 
-    (void)SafeReadInt(reinterpret_cast<const void*>(base + 0x0014EC40u), &roleFlag);
-    (void)SafeReadInt(reinterpret_cast<const void*>(base + 0x0014EC44u), &initFlag);
-    (void)SafeReadByte(reinterpret_cast<const void*>(base + 0x0014ED64u), &initByte);
-    (void)SafeReadPtr(reinterpret_cast<const void*>(base + 0x0014E980u), &sessionPtr);
-    (void)SafeReadPtr(reinterpret_cast<const void*>(base + 0x0014E924u), &globalState);
-    (void)SafeReadPtr(reinterpret_cast<const void*>(base + 0x0014E914u), &timerPtr);
-    (void)SafeReadPtr(reinterpret_cast<const void*>(base + 0x0014E8D8u), &renderContext);
-    renderContextBase = base + 0x0014E8C0u;
+    const RevivalAddressProfile* const profile =
+        ActiveJ102DiagnosticProfile();
+    if (profile == nullptr)
+    {
+        return;
+    }
+    (void)SafeReadInt(reinterpret_cast<const void*>(base + profile->canonicalRoleFlagOffset), &roleFlag);
+    (void)SafeReadInt(reinterpret_cast<const void*>(base + profile->initFlagOffset), &initFlag);
+    (void)SafeReadByte(reinterpret_cast<const void*>(base + profile->initByteOffset), &initByte);
+    (void)SafeReadPtr(reinterpret_cast<const void*>(base + profile->canonicalSessionPtrOffset), &sessionPtr);
+    (void)SafeReadPtr(reinterpret_cast<const void*>(base + profile->globalStatePtrOffset), &globalState);
+    if (profile->timerPtrOffset != 0)
+        (void)SafeReadPtr(reinterpret_cast<const void*>(base + profile->timerPtrOffset), &timerPtr);
+    if (profile->renderContextGlobalOffset != 0)
+        (void)SafeReadPtr(reinterpret_cast<const void*>(base + profile->renderContextGlobalOffset), &renderContext);
+    renderContextBase = base + profile->renderContextBaseOffset;
 
     mod::Log(
         "J102_DIAG[%s]: DLL base=0x%08lX image=0x%08lX..0x%08lX imageOk=%d "
@@ -481,13 +505,18 @@ void LogDllAndSessionState(const char* context)
         static_cast<unsigned long>(renderContext),
         static_cast<unsigned long>(renderContextBase));
 
-    LogRevival102jDeepBytes(context, "dll.patch_context_core", base + 0x0014E8C0u, 0x80u);
+    LogRevival102jDeepBytes(context, "dll.patch_context_core", base + profile->renderContextBaseOffset, 0x80u);
     LogRevival102jDeepBytes(context, "dll.session_global_window", base + 0x0014E900u, 0xB0u);
     LogRevival102jDeepBytes(context, "dll.role_flag_window", base + 0x0014EC20u, 0x60u);
     LogRevival102jDeepBytes(context, "dll.init_byte_window", base + 0x0014ED40u, 0x40u);
-    LogRevival102jDeepBytes(context, "dll.frame_hook", base + 0x00040200u, 0x40u);
-    LogRevival102jDeepBytes(context, "dll.per_frame_tick", base + 0x00040AD0u, 0x40u);
-    LogRevival102jDeepBytes(context, "dll.tournament_exit_guard", base + 0x00046820u, 0x40u);
+    LogRevival102jDeepBytes(context, "dll.frame_hook", base + profile->frameHookRva, 0x40u);
+    LogRevival102jDeepBytes(context, "dll.per_frame_tick", base + profile->perFrameTickRva, 0x40u);
+    if (profile->tournamentExitGuardRva >= 0x1Fu)
+        LogRevival102jDeepBytes(
+            context,
+            "dll.tournament_exit_guard",
+            base + profile->tournamentExitGuardRva - 0x1Fu,
+            0x40u);
 
     if (sessionPtr == 0)
     {

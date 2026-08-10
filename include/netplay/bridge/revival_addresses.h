@@ -322,6 +322,38 @@ struct RevivalAddressProfile
     // launcher-child survival guard.
     uintptr_t launcherCleanupTerminateCallRva;
 
+    // -----------------------------------------------------------------------
+    // MinGW 1.02j compile-profile details
+    // -----------------------------------------------------------------------
+
+    // The 1.02j releases share an ABI and object layout, but later compiler
+    // outputs move code and vtables independently.  Keep every runtime RVA
+    // that was formerly a one-off 1.02j constant in the exact profile.
+    uintptr_t initExportRva;
+    uint32_t revivalDllSizeOfImage;
+    uint32_t revivalDllEntryPointRva;
+    uintptr_t replaySessionVtableRva;
+    uintptr_t tournamentExitGuardRva;
+    uintptr_t practicePostInitRva;
+    uintptr_t spectatorPostInitRva;
+    uintptr_t memorialPauseIntegrationRva;
+    uintptr_t rollbackReadInputRva;
+    uintptr_t tournamentDeletingDtorRva;
+    uintptr_t onlineDeletingDtorRva;
+    uintptr_t spectatorDeletingDtorRva;
+    uintptr_t replayDeletingDtorRva;
+    uintptr_t practiceDeletingDtorRva;
+
+    // The 2026-08-02 build moved renderer ownership into its paired Ddraw.dll.
+    // Its text helpers no longer require an EfzRender* save/restore cycle.
+    bool usesProceduralDdrawTextApi;
+
+    // Optional exact companion identity.  Zero/null leaves older profiles'
+    // admission behavior unchanged; the renderer-split build requires its
+    // bundled Ddraw.dll because the old/new export ABIs are incompatible.
+    uint32_t companionDdrawFileSize;
+    const char* companionDdrawSha256;
+
 };
 
 // ---------------------------------------------------------------------------
@@ -932,6 +964,111 @@ constexpr RevivalAddressProfile kRevival_1_02j = {
     0x588u, RevivalSessionReadinessCheck::NonZero,
     0x0003CE80u,
     0x00089A11u,
+    0x0012E2B0u, 0x001D9000u, 0x000011F0u,
+    0x0016FF50u,
+    0x0004683Fu,
+    0x0007DE40u,
+    0x0005E640u,
+    0x000777A0u,
+    0x00052740u,
+    0x00048550u,
+    0x00058580u,
+    0x00062900u,
+    0x00075CD0u,
+    0x00080630u,
+    false,
+    0u, nullptr,
+};
+
+// EfzRevival.dll v1.02j - 2026-08-02 renderer-split compile profile.
+// The game/session ABI is the same as the earlier MinGW 1.02j build, while
+// code and vtables moved and the EfzRender implementation was extracted into
+// the exact bundled Ddraw.dll identified below.
+constexpr RevivalAddressProfile kRevival_1_02j_20260802 = {
+    "1.02j",                                            // versionTag / ABI family
+    0x6A6F0F7Bu,                                        // peTimestamp
+    0x4386998Fu,                                        // efzFingerprint
+    0x70000000u,                                        // defaultImageBase
+    0x00790110u,                                        // addrGameModeStructTable
+    0x00790148u,                                        // addrGameModeCurrentIndex
+    {0x0014EC40u, 0u, 0u, 0u},                          // roleFlagOffsets
+    1,                                                  // roleFlagOffsetCount
+    {0x0014E980u, 0u, 0u, 0u},                          // sessionPtrOffsets
+    1,                                                  // sessionPtrOffsetCount
+    0x0014E920u,                                        // globalStatePtrOffset
+    0x0014EC44u,                                        // initFlagOffset / screen cache
+    0x0014ED64u,                                        // initByteOffset
+    0u,                                                 // initOnceGuardOffset
+    0x0014E8C4u,                                        // timerPtrOffset
+    0x0014E8C0u,                                        // renderContextBaseOffset / patch context
+    0u,                                                 // errorCodeIsZeroRva
+    0u,                                                 // errorCodeIsZeroPatchSize
+    0x000542B0u,                                        // startInitPlayerRva
+    0x000541A0u,                                        // inputSwapPairRva
+    0x000418E0u,                                        // frameHookRva
+    0x000421D0u,                                        // perFrameTickRva
+    0u,                                                 // sessionOffsetInitComplete
+    0x310u,                                             // sessionOffsetInputDelay
+    0x448u,                                             // sessionOffsetPingMs
+    0x440u,                                             // sessionOffsetPingStructBase
+    0x31Cu,                                             // sessionOffsetHelperHandle
+    0x560u,                                             // sessionOffsetHelperPid
+    0x308u,                                             // sessionOffsetActivePlayer
+    0x30Cu,                                             // sessionOffsetQueuePlayer
+    0x398u,                                             // sessionOffsetHistoryPrimaryPtr
+    0x39Cu,                                             // sessionOffsetHistorySecondaryPtr
+    0x374u,                                             // sessionOffsetHistoryPrimaryVec
+    0x380u,                                             // sessionOffsetHistorySecondaryVec
+    0x324u,                                             // sessionOffsetCurrentFrame
+    0x32Cu,                                             // sessionOffsetGameModeSnapshot
+    0x328u,                                             // sessionOffsetMatchId
+    0x570u,                                             // sessionOffsetSentinel
+    0x45Eu,                                             // sessionOffsetP1Name
+    0x4DEu,                                             // sessionOffsetP2Name
+    0x568u,                                             // sessionOffsetP1Wins
+    0x56Cu,                                             // sessionOffsetP2Wins
+    4964u,                                              // globalStateOffsetFlag4964
+    4965u,                                              // globalStateOffsetFlag4965
+    82563u,                                             // globalStateOffsetSessionByte
+    0x340u,                                             // tournamentInputQueueOffset
+    0x00078B80u,                                        // clearTextRva (procedural Ddraw thunk)
+    0x000788D0u,                                        // setTextEnabledRva (__stdcall bool)
+    0u,                                                 // renderContextGlobalOffset (removed)
+    {0x763F04u, 0x763E50u, 0x754C1Au, 0x7599EDu},      // tournamentExePatchAddr
+    {7, 7, 1, 20},                                      // tournamentExePatchSize
+    4,                                                  // tournamentExePatchCount
+    {0u, 0u, 0u, 0u},                                  // exitProcessPatchRva
+    {0u, 0u, 0u, 0u},                                  // exitProcessPatchOriginal
+    0,                                                  // exitProcessPatchCount
+    {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},                  // exitProcessNearJccRva
+    0,                                                  // exitProcessNearJccCount
+    0x0014E984u,                                        // rngEngineStateOffset
+    0x6A6F0E2Bu, 0x00294000u, 0x00001460u, 2673664u,
+    "7C7707322B7CDA0B1479DFE97A7260D9E971BA162DFCE755C894B9626FEB1C42",
+    1911296u,
+    "62D9ED74B7931E2BC7EA208109425BC25207C82FACA91A96A55C778F8D568F32",
+    0x0014EC40u, 0x0014E980u,
+    0x0016FBD0u, 0x0016FC00u, 0x0016FC60u, 0x0016FB90u,
+    0x64u, 0x2E0u,
+    0x658u, RevivalSessionReadinessCheck::NonZero,
+    0x588u, RevivalSessionReadinessCheck::NonZero,
+    0x0003CEC0u,
+    0x00089A11u,
+    0x0012DB70u, 0x001D8000u, 0x000011F0u,
+    0x0016FC30u,
+    0x0004777Fu,
+    0x0007F080u,
+    0x0005F540u,
+    0x00078620u,
+    0x00053640u,
+    0x00049490u,
+    0x00059480u,
+    0x00063800u,
+    0x00076B70u,
+    0x00081870u,
+    true,
+    1314816u,
+    "0E072342D87D240E18969BC3663032E0E370EABA24D1FBB8E6C1F6216AD9F603",
 };
 
 // Table of all known profiles, for DetectRevivalVersion() iteration.
@@ -943,6 +1080,7 @@ constexpr const RevivalAddressProfile* kAllRevivalProfiles[] = {
     &kRevival_1_02h,
     &kRevival_1_02i,
     &kRevival_1_02j,
+    &kRevival_1_02j_20260802,
 };
 constexpr size_t kRevivalProfileCount =
     sizeof(kAllRevivalProfiles) / sizeof(kAllRevivalProfiles[0]);

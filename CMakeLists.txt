@@ -203,6 +203,11 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_revival_launcher_adoption.py"
             "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(
+        NAME revival_compile_profile_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_revival_compile_profiles.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
         NAME tournament_queue_admission_contract
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_tournament_queue_admission.py"

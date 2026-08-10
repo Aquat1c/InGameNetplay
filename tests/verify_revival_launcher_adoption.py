@@ -677,10 +677,14 @@ for required in (
     "ReadRoleFlagFromRevival()",
     "sessionPtr != admittedSession",
     "tournamentSessionVtableRva",
+    "tournamentDeletingDtorRva",
+    "onlineDeletingDtorRva",
+    "spectatorDeletingDtorRva",
+    "replayDeletingDtorRva",
+    "practiceDeletingDtorRva",
     "0x0002D3F0u",
     "0x0002D630u",
     "0x0002D8F0u",
-    "0x00048550u",
     "refusing init(2,102)",
 ):
     if required not in destroy and required not in revival:

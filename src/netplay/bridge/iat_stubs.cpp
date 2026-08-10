@@ -440,7 +440,10 @@ static uintptr_t* ActiveDummyVtable(
     {
         return &g_revivalLegacyDummyVtable[0];
     }
-    if (originalVtable == revivalBase + 0x0016FEB0u)
+    if (g_activeRevival != nullptr
+        && g_activeRevival->tournamentSessionVtableRva != 0
+        && originalVtable
+            == revivalBase + g_activeRevival->tournamentSessionVtableRva)
     {
         return &g_revival102jCompactDummyVtable[0];
     }

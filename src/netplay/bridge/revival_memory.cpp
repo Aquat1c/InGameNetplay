@@ -474,17 +474,12 @@ bool IsLikelySessionPointer(uintptr_t sessionPtr, uintptr_t revivalImageBase, ui
         {
             return false;
         }
-        switch (vtable - revivalImageBase)
-        {
-        case 0x0016FEB0u: // Compact
-        case 0x0016FEF0u: // Rollback
-        case 0x0016FF20u: // Spectator
-        case 0x0016FF50u: // Replay
-        case 0x0016FF80u: // Practice
-            return true;
-        default:
-            return false;
-        }
+        const uintptr_t vtableRva = vtable - revivalImageBase;
+        return vtableRva == g_activeRevival->tournamentSessionVtableRva
+            || vtableRva == g_activeRevival->onlineSessionVtableRva
+            || vtableRva == g_activeRevival->spectatorSessionVtableRva
+            || vtableRva == g_activeRevival->replaySessionVtableRva
+            || vtableRva == g_activeRevival->practiceSessionVtableRva;
     }
 
     int delayFrames = -1;
@@ -1793,7 +1788,6 @@ enum ExternalLauncherAttachState : LONG
 
 static volatile LONG g_externalLauncherAttachState = kExternalAttachIdle;
 static volatile LONG g_externalLauncherAttachObserved = 0;
-static constexpr uintptr_t kRevival102jTournamentExitGuardRva = 0x0004683Fu;
 // g_dllExitProcessPatchesSaved is declared earlier (before RefreshRuntimeStatus).
 
 static bool IsRevival102jProfile()
@@ -1805,6 +1799,11 @@ static bool IsRevival102jProfile()
 
 static bool SaveAndApplyRevival102jExitProcessPatches()
 {
+    if (g_activeRevival == nullptr
+        || g_activeRevival->tournamentExitGuardRva == 0)
+    {
+        return false;
+    }
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival == nullptr)
     {
@@ -1813,7 +1812,7 @@ static bool SaveAndApplyRevival102jExitProcessPatches()
 
     auto* const guard =
         reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(revival)
-            + kRevival102jTournamentExitGuardRva);
+            + g_activeRevival->tournamentExitGuardRva);
     LogBytesIfVerbose(
         "SaveAndApplyDllExitProcessPatches.102j_guard.before",
         reinterpret_cast<uintptr_t>(guard),
@@ -1827,7 +1826,7 @@ static bool SaveAndApplyRevival102jExitProcessPatches()
         mod::Log(
             "SaveAndApplyDllExitProcessPatches: 1.02j tournament guard already patched "
             "RVA 0x%lX",
-            static_cast<unsigned long>(kRevival102jTournamentExitGuardRva));
+            static_cast<unsigned long>(g_activeRevival->tournamentExitGuardRva));
         return true;
     }
     if (guard[0] != 0x74 || guard[1] != 0x7A)
@@ -1835,7 +1834,7 @@ static bool SaveAndApplyRevival102jExitProcessPatches()
         mod::Log(
             "SaveAndApplyDllExitProcessPatches: 1.02j tournament guard mismatch "
             "RVA 0x%lX expected 74 7A found %02X %02X",
-            static_cast<unsigned long>(kRevival102jTournamentExitGuardRva),
+            static_cast<unsigned long>(g_activeRevival->tournamentExitGuardRva),
             static_cast<unsigned>(guard[0]),
             static_cast<unsigned>(guard[1]));
         return false;
@@ -1869,7 +1868,7 @@ static bool SaveAndApplyRevival102jExitProcessPatches()
     mod::Log(
         "SaveAndApplyDllExitProcessPatches: 1.02j tournament guard "
         "RVA 0x%lX patched 74 7A -> 90 90",
-        static_cast<unsigned long>(kRevival102jTournamentExitGuardRva));
+        static_cast<unsigned long>(g_activeRevival->tournamentExitGuardRva));
     return true;
 }
 
@@ -2086,7 +2085,7 @@ bool SaveAndApplyExternalTournamentExitGuard()
         }
         auto* const guard = reinterpret_cast<uint8_t*>(
             reinterpret_cast<uintptr_t>(revival)
-            + kRevival102jTournamentExitGuardRva);
+            + g_activeRevival->tournamentExitGuardRva);
         if (!IsReadableRange(guard, 2)
             || guard[0] != 0x74
             || guard[1] != 0x7A)
@@ -2207,7 +2206,7 @@ bool IsExternalTournamentExitGuardOwned()
     if (IsRevival102jProfile())
     {
         const auto* const guard = reinterpret_cast<const uint8_t*>(
-            base + kRevival102jTournamentExitGuardRva);
+            base + g_activeRevival->tournamentExitGuardRva);
         return IsReadableRange(guard, 2)
             && guard[0] == 0x90
             && guard[1] == 0x90;
@@ -2403,7 +2402,7 @@ bool RestoreDllExitProcessPatches()
 
         auto* const guard =
             reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(revival)
-                + kRevival102jTournamentExitGuardRva);
+                + g_activeRevival->tournamentExitGuardRva);
         LogBytesIfVerbose(
             "RestoreDllExitProcessPatches.102j_guard.before",
             reinterpret_cast<uintptr_t>(guard),
@@ -2456,7 +2455,7 @@ bool RestoreDllExitProcessPatches()
         mod::Log(
             "RestoreDllExitProcessPatches: 1.02j tournament guard "
             "RVA 0x%lX restored %02X %02X",
-            static_cast<unsigned long>(kRevival102jTournamentExitGuardRva),
+            static_cast<unsigned long>(g_activeRevival->tournamentExitGuardRva),
             static_cast<unsigned>(guard[0]),
             static_cast<unsigned>(guard[1]));
         LogRevival102jDeepSnapshot("ExitGuard.restore_post");
@@ -2721,7 +2720,8 @@ bool DestroyCurrentSession(const char* caller)
             }
             else if (std::strcmp(tag, "1.02j") == 0)
             {
-                expectedDeletingDtorRva = 0x00048550u;
+                expectedDeletingDtorRva =
+                    g_activeRevival->tournamentDeletingDtorRva;
                 deletingDtorInSlot1 = true;
             }
         }
@@ -2855,12 +2855,17 @@ bool DestroyCurrentSession(const char* caller)
             uintptr_t deletingDtorRva;
             const char* name;
         };
-        static const SessionDtor102j kSessionDtors[] = {
-            {0x0016FEB0u, 0x00048550u, "compact"},
-            {0x0016FEF0u, 0x00058580u, "rollback"},
-            {0x0016FF20u, 0x00062900u, "spectator"},
-            {0x0016FF50u, 0x00075CD0u, "replay"},
-            {0x0016FF80u, 0x00080630u, "practice"},
+        const SessionDtor102j kSessionDtors[] = {
+            {g_activeRevival->tournamentSessionVtableRva,
+             g_activeRevival->tournamentDeletingDtorRva, "compact"},
+            {g_activeRevival->onlineSessionVtableRva,
+             g_activeRevival->onlineDeletingDtorRva, "rollback"},
+            {g_activeRevival->spectatorSessionVtableRva,
+             g_activeRevival->spectatorDeletingDtorRva, "spectator"},
+            {g_activeRevival->replaySessionVtableRva,
+             g_activeRevival->replayDeletingDtorRva, "replay"},
+            {g_activeRevival->practiceSessionVtableRva,
+             g_activeRevival->practiceDeletingDtorRva, "practice"},
         };
 
         const uintptr_t vtableRva = vtablePtr - base;
@@ -3146,12 +3151,11 @@ static bool InvokeRevival102jLocalPostInit(const char* caller)
         return false;
     }
 
-    constexpr uintptr_t kPracticeVtableRva102j = 0x0016FF80u;
-    constexpr uintptr_t kPracticePostInitRva102j = 0x0007DE40u;
     constexpr uintptr_t kPracticeNetplayCtrlOffset102j = 0x02DCu;
     constexpr uintptr_t kPracticeNetplayAuxOffset102j = 0x02E0u;
 
-    const uintptr_t expectedVtable = base + kPracticeVtableRva102j;
+    const uintptr_t expectedVtable =
+        base + g_activeRevival->practiceSessionVtableRva;
     if (vtablePtr != expectedVtable)
     {
         mod::Log(
@@ -3173,7 +3177,8 @@ static bool InvokeRevival102jLocalPostInit(const char* caller)
         return false;
     }
 
-    const uintptr_t expectedPostInit = base + kPracticePostInitRva102j;
+    const uintptr_t expectedPostInit =
+        base + g_activeRevival->practicePostInitRva;
     if (postInit != expectedPostInit)
     {
         mod::Log(
@@ -3249,7 +3254,8 @@ bool IsRevival102jSpectatorPostInitReady(const char* caller)
             &sessionPtr)
         || sessionPtr == 0
         || !SafeReadPtr(reinterpret_cast<const void*>(sessionPtr), &vtablePtr)
-        || vtablePtr != base + 0x0016FF20u)
+        || vtablePtr
+            != base + g_activeRevival->spectatorSessionVtableRva)
     {
         return false;
     }
@@ -3350,12 +3356,11 @@ bool InvokeRevival102jSpectatorPostInit(const char* caller)
         return false;
     }
 
-    constexpr uintptr_t kSpectatorVtableRva102j = 0x0016FF20u;
-    constexpr uintptr_t kSpectatorPostInitRva102j = 0x0005E640u;
     constexpr uintptr_t kSpectatorHelperHandleOffset102j = 0x0064u;
     constexpr uintptr_t kSpectatorHelperPidOffset102j = 0x02E0u;
     constexpr uintptr_t kSpectatorNetplayCtrlOffset102j = 0x0588u;
-    const uintptr_t expectedVtable = base + kSpectatorVtableRva102j;
+    const uintptr_t expectedVtable =
+        base + g_activeRevival->spectatorSessionVtableRva;
     if (vtablePtr != expectedVtable)
     {
         mod::Log(
@@ -3370,7 +3375,8 @@ bool InvokeRevival102jSpectatorPostInit(const char* caller)
     LogRevival102jDeepSnapshot("SpectatorPostInit.02.validated_pre_call");
 
     uintptr_t postInit = 0;
-    const uintptr_t expectedPostInit = base + kSpectatorPostInitRva102j;
+    const uintptr_t expectedPostInit =
+        base + g_activeRevival->spectatorPostInitRva;
     if (!SafeReadPtr(
             reinterpret_cast<const void*>(vtablePtr + 2u * sizeof(uintptr_t)),
             &postInit)
@@ -3796,6 +3802,15 @@ bool SaveRenderContext()
         mod::Log("SaveRenderContext: skipped (no active Revival profile)");
         return false;
     }
+    if (g_activeRevival->usesProceduralDdrawTextApi)
+    {
+        // This compile profile removed getEfzRender and the patch-context
+        // EfzRender* field.  Its paired Ddraw owns renderer lifetime and the
+        // clear/set helpers are context-free procedural imports.
+        g_savedRenderContext = 0;
+        g_renderContextSaved = false;
+        return true;
+    }
     if (g_activeRevival->renderContextGlobalOffset == 0)
     {
         mod::Log(
@@ -3846,6 +3861,12 @@ bool SaveRenderContext()
 
 static bool RestoreRenderContextInternal(bool consumeSaved)
 {
+    if (g_activeRevival != nullptr
+        && g_activeRevival->usesProceduralDdrawTextApi)
+    {
+        (void)consumeSaved;
+        return true;
+    }
     if (g_savedRenderContext == 0)
     {
         return false;
@@ -3936,7 +3957,9 @@ struct Revival102jTextState
 static Revival102jTextState ReadRevival102jTextState()
 {
     Revival102jTextState state = {};
-    if (!IsRevival102jProfile() || g_activeRevival == nullptr)
+    if (!IsRevival102jProfile()
+        || g_activeRevival == nullptr
+        || g_activeRevival->usesProceduralDdrawTextApi)
     {
         return state;
     }
@@ -4027,7 +4050,12 @@ bool ClearRevivalTextWithCurrentRenderContext()
     LogRevival102jTextState("clear_before");
     __try
     {
-        if (g_activeRevival->renderContextBaseOffset != 0
+        if (g_activeRevival->usesProceduralDdrawTextApi)
+        {
+            typedef void(__cdecl* ClearProceduralTextFn)();
+            reinterpret_cast<ClearProceduralTextFn>(fnAddr)();
+        }
+        else if (g_activeRevival->renderContextBaseOffset != 0
             && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0)
         {
             typedef void(__fastcall* ClearTextWithContextFn)(void* thisPtr, void* edx);
@@ -4083,12 +4111,15 @@ bool ClearRevivalText()
         return false;
     }
 
-    // Restore the EfzRender* global if it was zeroed by cleanup code.
-    if (g_savedRenderContext == 0)
+    // Renderer-split builds expose context-free procedural helpers.  Older
+    // builds still need their saved EfzRender* restored before the call.
+    if (!g_activeRevival->usesProceduralDdrawTextApi
+        && g_savedRenderContext == 0)
     {
         (void)SaveRenderContext();
     }
-    if (!RestoreRenderContext())
+    if (!g_activeRevival->usesProceduralDdrawTextApi
+        && !RestoreRenderContext())
     {
         mod::Log("ClearRevivalText: failed to restore render context");
         return false;
@@ -4101,7 +4132,8 @@ static bool RevivalTextRenderingHelperAvailable()
 {
     if (g_activeRevival == nullptr
         || g_activeRevival->setTextEnabledRva == 0
-        || (g_activeRevival->renderContextBaseOffset == 0
+        || (!g_activeRevival->usesProceduralDdrawTextApi
+            && g_activeRevival->renderContextBaseOffset == 0
             && g_activeRevival->renderContextGlobalOffset < 0x18))
     {
         return false;
@@ -4140,11 +4172,19 @@ static bool SetRevivalTextRenderingEnabledWithCurrentRenderContextInternal(
     LogRevival102jTextState(enable ? "set_enabled_before" : "set_disabled_before");
     __try
     {
-        // __thiscall: this in ECX, bool arg on stack.
-        // Use __fastcall with a dummy EDX parameter.
-        typedef void(__fastcall* SetTextEnabledFn)(void* thisPtr, void* edx, int enable);
-        auto setFn = reinterpret_cast<SetTextEnabledFn>(fnAddr);
-        setFn(contextBase, nullptr, enable ? 1 : 0);
+        if (g_activeRevival->usesProceduralDdrawTextApi)
+        {
+            typedef void(__stdcall* SetProceduralTextEnabledFn)(int enable);
+            reinterpret_cast<SetProceduralTextEnabledFn>(fnAddr)(enable ? 1 : 0);
+        }
+        else
+        {
+            // __thiscall: this in ECX, bool arg on stack.
+            // Use __fastcall with a dummy EDX parameter.
+            typedef void(__fastcall* SetTextEnabledFn)(void* thisPtr, void* edx, int enable);
+            auto setFn = reinterpret_cast<SetTextEnabledFn>(fnAddr);
+            setFn(contextBase, nullptr, enable ? 1 : 0);
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -4167,7 +4207,8 @@ static bool SetRevivalTextRenderingEnabledWithCurrentRenderContextInternal(
         static_cast<unsigned long>(fnAddr),
         static_cast<unsigned long>(reinterpret_cast<uintptr_t>(contextBase)));
 
-    if (IsRevival102jProfile())
+    if (IsRevival102jProfile()
+        && !g_activeRevival->usesProceduralDdrawTextApi)
     {
         const Revival102jTextState state = ReadRevival102jTextState();
         const uint8_t expected = enable ? 1u : 0u;
@@ -4307,7 +4348,6 @@ constexpr RevivalGraphicsPatchSite kRevivalGraphicsPatchSites[] = {
     {0x0040AAE0u, {0xE9, 0x20, 0x03, 0x00, 0x00}},
 };
 
-constexpr uintptr_t kRevival102jMemorialPauseIntegrationRva = 0x000777A0u;
 constexpr uintptr_t kRevival102jGraphicsPatchStateOffset = 21u;
 
 uintptr_t ResolveEfzImageVaForPatchVerify(uintptr_t va)
@@ -4452,7 +4492,7 @@ static bool ApplyRevival102jGraphicsPatchSetEnabled(
     void* const patchContext = reinterpret_cast<void*>(
         revivalBase + g_activeRevival->renderContextBaseOffset);
     const uintptr_t fnAddr =
-        revivalBase + kRevival102jMemorialPauseIntegrationRva;
+        revivalBase + g_activeRevival->memorialPauseIntegrationRva;
 
     mod::Log(
         "REVIVAL_GRAPHICS_PATCH_RESTORE_APPLY_102J_BEGIN reason=%s "
@@ -5049,9 +5089,6 @@ void RepairRollbackHistoryBindingsIfNeeded()
     }
 }
 
-static constexpr uintptr_t kRevival102jRollbackVtableRva = 0x0016FEF0u;
-static constexpr size_t kRevival102jRollbackReadInputSlot = 5u;
-static constexpr uintptr_t kRevival102jRollbackReadInputRva = 0x00052740u;
 static constexpr uintptr_t kRevival102jOffsetLocalSide = 0x308u;
 static constexpr uintptr_t kRevival102jOffsetCurrentFrame = 0x324u;
 static constexpr uintptr_t kRevival102jOffsetLocalInputs = 0x374u;
@@ -7899,21 +7936,26 @@ static void LogRevivalSyncDiagnosticSnapshot(
 
     if (dllBase != 0 && g_activeRevival != nullptr)
     {
-        (void)SafeReadWord(
-            reinterpret_cast<const void*>(dllBase + g_activeRevival->initOnceGuardOffset),
-            &initOnceGuard);
-        (void)SafeReadPtr(
-            reinterpret_cast<const void*>(dllBase + g_activeRevival->timerPtrOffset),
-            &timerPtr);
-        (void)SafeReadPtr(
-            reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextGlobalOffset),
-            &renderCtx);
-        (void)SafeReadPtr(
-            reinterpret_cast<const void*>(dllBase + g_activeRevival->globalStatePtrOffset),
-            &globalState);
-        (void)SafeReadInt(
-            reinterpret_cast<const void*>(dllBase + g_activeRevival->initFlagOffset),
-            &initFlag);
+        if (g_activeRevival->initOnceGuardOffset != 0)
+            (void)SafeReadWord(
+                reinterpret_cast<const void*>(dllBase + g_activeRevival->initOnceGuardOffset),
+                &initOnceGuard);
+        if (g_activeRevival->timerPtrOffset != 0)
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(dllBase + g_activeRevival->timerPtrOffset),
+                &timerPtr);
+        if (g_activeRevival->renderContextGlobalOffset != 0)
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextGlobalOffset),
+                &renderCtx);
+        if (g_activeRevival->globalStatePtrOffset != 0)
+            (void)SafeReadPtr(
+                reinterpret_cast<const void*>(dllBase + g_activeRevival->globalStatePtrOffset),
+                &globalState);
+        if (g_activeRevival->initFlagOffset != 0)
+            (void)SafeReadInt(
+                reinterpret_cast<const void*>(dllBase + g_activeRevival->initFlagOffset),
+                &initFlag);
         if (timerPtr != 0)
         {
             (void)SafeReadDouble(reinterpret_cast<const void*>(timerPtr + 16), &timerInterval);
@@ -9067,18 +9109,22 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
 
             if (dllBase != 0)
             {
-                (void)SafeReadWord(
-                    reinterpret_cast<const void*>(dllBase + g_activeRevival->initOnceGuardOffset),
-                    &initOnceGuard);
-                (void)SafeReadPtr(
-                    reinterpret_cast<const void*>(dllBase + g_activeRevival->timerPtrOffset),
-                    &timerPtr);
-                (void)SafeReadPtr(
-                    reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextGlobalOffset),
-                    &renderCtxPtr);
-                (void)SafeReadPtr(
-                    reinterpret_cast<const void*>(dllBase + g_activeRevival->globalStatePtrOffset),
-                    &globalStatePtr);
+                if (g_activeRevival->initOnceGuardOffset != 0)
+                    (void)SafeReadWord(
+                        reinterpret_cast<const void*>(dllBase + g_activeRevival->initOnceGuardOffset),
+                        &initOnceGuard);
+                if (g_activeRevival->timerPtrOffset != 0)
+                    (void)SafeReadPtr(
+                        reinterpret_cast<const void*>(dllBase + g_activeRevival->timerPtrOffset),
+                        &timerPtr);
+                if (g_activeRevival->renderContextGlobalOffset != 0)
+                    (void)SafeReadPtr(
+                        reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextGlobalOffset),
+                        &renderCtxPtr);
+                if (g_activeRevival->globalStatePtrOffset != 0)
+                    (void)SafeReadPtr(
+                        reinterpret_cast<const void*>(dllBase + g_activeRevival->globalStatePtrOffset),
+                        &globalStatePtr);
                 (void)SafeReadPtr(
                     reinterpret_cast<const void*>(dllBase + g_activeRevival->renderContextBaseOffset),
                     &subStructBase);

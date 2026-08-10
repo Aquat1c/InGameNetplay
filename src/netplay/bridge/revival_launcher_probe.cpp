@@ -391,10 +391,42 @@ bool ProfileMatchesDllFile(
 
     uint32_t fileSize = 0;
     std::string sha256;
-    return ReadFileSha256(path, &fileSize, &sha256)
+    const bool revivalMatches = ReadFileSha256(path, &fileSize, &sha256)
         && fileSize == profile.revivalDllFileSize
         && profile.revivalDllSha256 != nullptr
         && _stricmp(profile.revivalDllSha256, sha256.c_str()) == 0;
+    if (!revivalMatches)
+    {
+        return false;
+    }
+
+    if (profile.companionDdrawFileSize == 0
+        || profile.companionDdrawSha256 == nullptr)
+    {
+        return true;
+    }
+
+    // The renderer-split 1.02j DLL and its bundled Ddraw.dll expose mutually
+    // incompatible import/export ABIs compared with the earlier build.  Bind
+    // launcher-first adoption to the exact already-loaded companion instead
+    // of accepting a mixed package that merely shares the Revival DLL name.
+    HMODULE ddraw = GetModuleHandleA("Ddraw.dll");
+    char ddrawPath[MAX_PATH] = {};
+    const DWORD ddrawPathLength = ddraw != nullptr
+        ? GetModuleFileNameA(ddraw, ddrawPath, MAX_PATH)
+        : 0;
+    if (ddrawPathLength == 0 || ddrawPathLength >= MAX_PATH)
+    {
+        return false;
+    }
+
+    uint32_t ddrawFileSize = 0;
+    std::string ddrawSha256;
+    return ReadFileSha256(ddrawPath, &ddrawFileSize, &ddrawSha256)
+        && ddrawFileSize == profile.companionDdrawFileSize
+        && _stricmp(
+            profile.companionDdrawSha256,
+            ddrawSha256.c_str()) == 0;
 }
 
 bool CaptureExactParent(ParentCandidate* outParent, bool* outRevivalNamed)

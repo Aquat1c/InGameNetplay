@@ -868,6 +868,232 @@ static bool VerifyRevival102jBinary(HMODULE module)
     return ok;
 }
 
+static bool VerifyRevival102j20260802Binary(HMODULE module)
+{
+    const RevivalAddressProfile& profile = kRevival_1_02j_20260802;
+    const IMAGE_NT_HEADERS32* nt = nullptr;
+    if (!TryGetModuleNtHeaders32(module, &nt))
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j/20260802 verification failed (bad PE32 header)");
+        return false;
+    }
+
+    bool ok = true;
+    auto require = [&ok](bool condition, const char* label) {
+        if (!condition)
+        {
+            mod::Log(
+                "DetectRevivalVersion: 1.02j/20260802 verification failed (%s)",
+                label);
+            ok = false;
+        }
+    };
+
+    require(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386, "machine");
+    require(nt->FileHeader.NumberOfSections == 9, "section_count");
+    require(
+        nt->OptionalHeader.SizeOfImage == profile.revivalDllSizeOfImage,
+        "size_of_image");
+    require(
+        nt->OptionalHeader.AddressOfEntryPoint
+            == profile.revivalDllEntryPointRva,
+        "entry_point");
+
+    require(ModuleRvaInNamedSection(nt, ".text", profile.frameHookRva, 14), "frameHook section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.perFrameTickRva, 20), "perFrameTick section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.inputSwapPairRva, 24), "inputSwap section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.startInitPlayerRva, 20), "startInit section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.clearTextRva, 8), "clearText section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.setTextEnabledRva, 22), "setText section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.sessionPtrOffsets[0], sizeof(uintptr_t)), "sessionPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.roleFlagOffsets[0], sizeof(int)), "roleFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.globalStatePtrOffset, sizeof(uintptr_t)), "globalState section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.initFlagOffset, sizeof(int)), "initFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.initByteOffset, sizeof(uint8_t)), "initByte section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.timerPtrOffset, sizeof(uintptr_t)), "timerPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.renderContextBaseOffset, sizeof(uintptr_t)), "patchContext section");
+
+    const uintptr_t loadedBase = reinterpret_cast<uintptr_t>(module);
+    const uint32_t initRefs[] = {
+        static_cast<uint32_t>(loadedBase + profile.roleFlagOffsets[0]),
+        static_cast<uint32_t>(loadedBase + profile.sessionPtrOffsets[0]),
+        static_cast<uint32_t>(loadedBase + profile.initFlagOffset),
+        static_cast<uint32_t>(loadedBase + profile.initByteOffset),
+        0x00401582u,
+        static_cast<uint32_t>(loadedBase + profile.frameHookRva),
+    };
+    for (size_t i = 0; i < sizeof(initRefs) / sizeof(initRefs[0]); ++i)
+    {
+        require(
+            ModuleWindowContainsU32(
+                module,
+                profile.initExportRva,
+                0x2200u,
+                initRefs[i]),
+            "init exact reference");
+    }
+    require(
+        !ModuleWindowContainsU32(
+            module,
+            profile.initExportRva,
+            0x2200u,
+            0x00401642u),
+        "init must not claim persistent 0x401642 hook");
+
+    static const uint8_t kFrameHookPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x53, 0x31, 0xDB,
+        0x81, 0xEC, 0xF0, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kPerFrameTickPrefix[] = {
+        0x83, 0xEC, 0x28, 0xE8, 0x78, 0xCC, 0xFF, 0xFF,
+        0x8D, 0x44, 0x24, 0x0C, 0xC7, 0x44, 0x24, 0x0C,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kInputSwapPrefix[] = {
+        0xA1, 0x00, 0x00, 0x00, 0x00, 0xA8, 0x1F, 0x74,
+        0x0F, 0x83, 0xC0, 0x01, 0xA3, 0x00, 0x00, 0x00,
+        0x00, 0xC3, 0x8D, 0xB6, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kStartInitPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x8D, 0x85, 0xF0,
+        0xFE, 0xFF, 0xFF, 0x53, 0x89, 0xCB, 0x81, 0xEC,
+        0x38, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kSetTextPrefix[] = {
+        0x83, 0xEC, 0x04, 0x0F, 0xB6, 0x44, 0x24, 0x08,
+        0x89, 0x04, 0x24, 0xE8, 0xC0, 0x43, 0xFC, 0xFF,
+        0x83, 0xC4, 0x04, 0xC2, 0x04, 0x00,
+    };
+    static const uint8_t kClearTextPrefix[] = {
+        0xE9, 0x03, 0x41, 0xFC, 0xFF, 0x90, 0x90, 0x90,
+    };
+    static const char kInputSwapMask[] =
+        "x????xxxxxxxx????xxxxxxx";
+    require(
+        ModuleBytesMatchOrInstalledJmp(
+            module, profile.frameHookRva, kFrameHookPrefix,
+            sizeof(kFrameHookPrefix), 6),
+        "frameHook bytes");
+    require(
+        ModuleBytesMatchOrInstalledJmp(
+            module, profile.perFrameTickRva, kPerFrameTickPrefix,
+            sizeof(kPerFrameTickPrefix), 8),
+        "perFrameTick bytes");
+    require(
+        ModuleBytesMatchMasked(
+            module, profile.inputSwapPairRva, kInputSwapPrefix,
+            kInputSwapMask,
+            sizeof(kInputSwapPrefix)),
+        "inputSwap bytes");
+    require(ModuleBytesMatch(module, profile.startInitPlayerRva, kStartInitPrefix, sizeof(kStartInitPrefix)), "startInit bytes");
+    require(ModuleBytesMatch(module, profile.setTextEnabledRva, kSetTextPrefix, sizeof(kSetTextPrefix)), "setText bytes");
+    require(ModuleBytesMatch(module, profile.clearTextRva, kClearTextPrefix, sizeof(kClearTextPrefix)), "clearText bytes");
+    require(
+        ModuleDirectCallCountEquals(
+            module, 0x00055BD0u, 0x800u,
+            profile.inputSwapPairRva, 1),
+        "inputSwap rollback call count");
+    require(
+        ModuleWindowContainsU32(
+            module, profile.inputSwapPairRva, 0x80u,
+            static_cast<uint32_t>(profile.sessionOffsetActivePlayer)),
+        "inputSwap activePlayer offset ref");
+    static const uint32_t kInstallExeHookTargets[] = {
+        0x00776053u, 0x0040D131u, 0x007656A7u, 0x00401642u,
+        0x0076479Cu, 0x00777D61u, 0x00406020u, 0x00405FB0u,
+        0x00405F00u, 0x00405E90u, 0x00405F50u, 0x0040DE98u,
+        0x0040DE80u, 0x007668E5u, 0x0040DE56u, 0x0040DE40u,
+        0x0040E5E0u, 0x0040E5D0u,
+    };
+    for (size_t i = 0; i < sizeof(kInstallExeHookTargets) / sizeof(kInstallExeHookTargets[0]); ++i)
+    {
+        require(
+            ModuleWindowContainsU32(
+                module, profile.frameHookRva, 0x800u,
+                kInstallExeHookTargets[i]),
+            "install_exe_hooks target ref");
+    }
+
+    static const uintptr_t kCompactVtableSlots[] = {
+        0x000495F0u, 0x00049490u, 0x000476B0u, 0x00047700u,
+        0x00046830u, 0x00046FA0u, 0x00047520u, 0x00065510u,
+        0x00065530u, 0x00065560u,
+    };
+    static const uintptr_t kRollbackVtableSlots[] = {
+        0x000594A0u, 0x00059480u, 0x000542B0u, 0x00055BD0u,
+        0x00051EF0u, 0x00053640u, 0x00053700u, 0x0004F8E0u,
+        0x0004FCE0u, 0x00052980u,
+    };
+    static const uintptr_t kSpectatorVtableSlots[] = {
+        0x00063820u, 0x00063800u, 0x0005F540u, 0x00060690u,
+        0x0005E620u, 0x0005F280u, 0x0005F2E0u, 0x0005D300u,
+        0x0005D3E0u, 0x0005ED40u,
+    };
+    static const uintptr_t kReplayVtableSlots[] = {
+        0x00076B90u, 0x00076B70u, 0x00075340u, 0x000757C0u,
+        0x00074030u, 0x00074F30u, 0x00075080u, 0x00073E20u,
+        0x00073F00u, 0x00074DE0u,
+    };
+    static const uintptr_t kPracticeVtableSlots[] = {
+        0x00081890u, 0x00081870u, 0x0007F080u, 0x0007F380u,
+        0x0007E1A0u, 0x0007EE00u, 0x00065580u, 0x0007DCD0u,
+        0x0007DEB0u, 0x0007E9C0u,
+    };
+    require(ModuleVtableSlotsMatch(module, profile.tournamentSessionVtableRva, kCompactVtableSlots, 10), "compact vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.onlineSessionVtableRva, kRollbackVtableSlots, 10), "rollback vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.spectatorSessionVtableRva, kSpectatorVtableSlots, 10), "spectator vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.replaySessionVtableRva, kReplayVtableSlots, 10), "replay vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.practiceSessionVtableRva, kPracticeVtableSlots, 10), "practice vtable slots");
+    require(kCompactVtableSlots[1] == profile.tournamentDeletingDtorRva, "compact deleting-dtor profile link");
+    require(kRollbackVtableSlots[1] == profile.onlineDeletingDtorRva, "rollback deleting-dtor profile link");
+    require(kSpectatorVtableSlots[1] == profile.spectatorDeletingDtorRva, "spectator deleting-dtor profile link");
+    require(kReplayVtableSlots[1] == profile.replayDeletingDtorRva, "replay deleting-dtor profile link");
+    require(kPracticeVtableSlots[1] == profile.practiceDeletingDtorRva, "practice deleting-dtor profile link");
+    require(kRollbackVtableSlots[5] == profile.rollbackReadInputRva, "rollback read-input profile link");
+    require(kSpectatorVtableSlots[2] == profile.spectatorPostInitRva, "spectator post-init profile link");
+    require(kPracticeVtableSlots[2] == profile.practicePostInitRva, "practice post-init profile link");
+
+    static const uint8_t kNativeGuard[] = {0x74, 0x7A};
+    static const uint8_t kOwnedGuard[] = {0x90, 0x90};
+    require(
+        ModuleBytesMatch(module, profile.tournamentExitGuardRva, kNativeGuard, 2)
+            || ModuleBytesMatch(module, profile.tournamentExitGuardRva, kOwnedGuard, 2),
+        "tournamentExitGuard bytes");
+    static const uint8_t kSpectatorStoreHelperHandle[] = {0x89, 0x43, 0x64};
+    require(ModuleBytesMatch(module, 0x0005F6A0u, kSpectatorStoreHelperHandle, 3), "spectator helper-handle store");
+    require(ModuleWindowContainsU32(module, profile.spectatorPostInitRva, 0x1000u, 0x000002E0u), "spectator helper-pid offset");
+    require(ModuleWindowContainsU32(module, profile.spectatorPostInitRva, 0x1000u, 0x00000588u), "spectator control offset");
+
+    static const uint8_t kCompactDequeInitPrefix[] = {
+        0xC7, 0x83, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x48, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x4C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x50, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x54, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x58, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    require(ModuleBytesMatch(module, 0x00048AE8u, kCompactDequeInitPrefix, sizeof(kCompactDequeInitPrefix)), "compact deque init bytes");
+    require(ModuleDirectCallCountEquals(module, 0x000488F0u, 0xA00u, 0x001023E0u, 22), "compact deque push count");
+    require(profile.tournamentInputQueueOffset == 0x340u, "compact deque profile offset");
+    static const uint32_t kCompactExePatchTargets[] = {
+        0x00763F04u, 0x00763E50u, 0x00754C1Au, 0x007599EDu,
+    };
+    for (size_t i = 0; i < sizeof(kCompactExePatchTargets) / sizeof(kCompactExePatchTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(module, 0x000488F0u, 0xA00u, kCompactExePatchTargets[i]), "compact EXE patch target ref");
+    }
+
+    if (ok)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j/20260802 binary verification OK loadedBase=%p size=0x%08lX",
+            static_cast<void*>(module),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
+    }
+    return ok;
+}
+
 static const RevivalAddressProfile* FindLoadedRevivalProfile(
     HMODULE module,
     uint32_t timestamp)
@@ -875,6 +1101,12 @@ static const RevivalAddressProfile* FindLoadedRevivalProfile(
     if (timestamp == kRevival_1_02j.peTimestamp)
     {
         return VerifyRevival102jBinary(module) ? &kRevival_1_02j : nullptr;
+    }
+    if (timestamp == kRevival_1_02j_20260802.peTimestamp)
+    {
+        return VerifyRevival102j20260802Binary(module)
+            ? &kRevival_1_02j_20260802
+            : nullptr;
     }
 
     if (timestamp != kRevival_1_02f.peTimestamp)
@@ -5733,12 +5965,24 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (revival != nullptr)
         {
             const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
-            const uint16_t guardVal = *reinterpret_cast<const volatile uint16_t*>(
-                base + g_activeRevival->initOnceGuardOffset);
-            const uintptr_t timerPtr = *reinterpret_cast<const volatile uintptr_t*>(
-                base + g_activeRevival->timerPtrOffset);
-            const uintptr_t renderCtx = *reinterpret_cast<const volatile uintptr_t*>(
-                base + g_activeRevival->renderContextGlobalOffset);
+            uint16_t guardVal = 0;
+            uintptr_t timerPtr = 0;
+            uintptr_t renderCtx = 0;
+            if (g_activeRevival->initOnceGuardOffset != 0)
+            {
+                guardVal = *reinterpret_cast<const volatile uint16_t*>(
+                    base + g_activeRevival->initOnceGuardOffset);
+            }
+            if (g_activeRevival->timerPtrOffset != 0)
+            {
+                timerPtr = *reinterpret_cast<const volatile uintptr_t*>(
+                    base + g_activeRevival->timerPtrOffset);
+            }
+            if (g_activeRevival->renderContextGlobalOffset != 0)
+            {
+                renderCtx = *reinterpret_cast<const volatile uintptr_t*>(
+                    base + g_activeRevival->renderContextGlobalOffset);
+            }
             mod::Log(
                 "CancelSession: DLL globals guard=0x%04X timer=0x%08lX renderCtx=0x%08lX",
                 static_cast<unsigned>(guardVal),
