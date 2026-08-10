@@ -241,10 +241,26 @@ Supported `EfzRevival.dll` versions:
 - `1.02g`
 - `1.02h!!!`
 - `1.02i!!!`
+- `1.02j`
 
 Notes:
 - `1.02h!!!` and `1.02i!!!` are the most tested versions.
+- `1.02j` uses its own MinGW-specific object, vtable, and lifecycle profile.
 - Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
+
+## Online Simulation Cadence
+
+EFZ's native battle update, character-select update, render/present sequence,
+effect-ring walk, and RNG rules are left unchanged. Before an online handoff,
+the mod verifies that its ImGui/EndScene and loading/battle/result update hooks
+are removed and that live-memory state export is quiescent. Host-side Revival
+log IAT capture is disabled; the injected helper owns console parsing and must
+acknowledge that its worker is ready before the helper is resumed.
+
+Diagnostic disk flushing and post-join lobby keepalive/public-IP work run below
+the normal-priority EFZ simulation thread. Their queueing, polling intervals,
+and server-visible behavior are unchanged. The `xp-native-tick` preset is the
+strict A/B arm: it also leaves Revival's native per-frame tick target untouched.
 
 ## Shared Netplay Exports
 
@@ -255,7 +271,7 @@ Public interface:
 - Header: `include/efz_netplay_state.h`
 - Named shared memory block: `EFZNetplay_State`
 - DLL export: `EFZNetplay_GetState()`
-- Current ABI version: `6`
+- Current ABI version: `7`
 
 Consumer expectations:
 - Validate `magic == EFZ_NETPLAY_STATE_MAGIC`
@@ -275,8 +291,12 @@ Exported state currently includes:
 - match context such as stage, round index, and timer
 - async hosting state (listener active, minimized, peer found, timed out, host port)
 
-The shared state is refreshed continuously while the mod is active, which makes
-it suitable for rich presence, overlays, stream tooling, and companion mods.
+The shared state is published from safe control-plane activity. Immediately
+before online handoff, the final accepted menu-side request is drained and the
+export worker is suspended. It is intentionally not refreshed from the active
+rollback-frame hook, so battle metrics can remain at that last pre-handoff
+value until control returns to the menu. Consumers should use `stateSeq` and
+`lastUpdateTick` to judge freshness.
 
 ## Runtime Assets
 
@@ -308,6 +328,15 @@ Linux / Wine / Proton notes:
 
 ## Build
 
+Initialize the tracked mbedTLS dependency after cloning:
+
+```powershell
+git submodule update --init --recursive
+```
+
+MinHook must be available at `third_party/minhook` or in the sibling
+`../InGameControlsRebind/third_party/minhook` checkout.
+
 Configure and build:
 
 ```powershell
@@ -320,6 +349,13 @@ XP-compatible build:
 ```powershell
 cmake --preset xp-release
 cmake --build --preset build-xp-release
+```
+
+Strict native-tick parity build:
+
+```powershell
+cmake --preset xp-native-tick
+cmake --build --preset build-xp-native-tick
 ```
 
 Result:

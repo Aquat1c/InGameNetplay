@@ -116,6 +116,8 @@ volatile LONG g_updateRequestPending = 0;
 volatile LONG g_updateWorkerStop = 0;
 volatile LONG g_updateWorkerReady = 0;
 volatile LONG g_updatePublishDropped = 0;
+volatile LONG g_updateInFlight = 0;
+volatile LONG g_updatesSuspended = 0;
 
 // Previous-tick flag values for transition logging.
 uint8_t g_prevInNetplayMenu = 0;
@@ -200,13 +202,19 @@ void ExportWorkerMain()
 
         for (;;)
         {
+            // Bracket request consumption as well as UpdateNow so the online
+            // handoff can prove that no worker can begin a live-memory walk
+            // after its suspension barrier returns.
+            InterlockedIncrement(&g_updateInFlight);
             if (InterlockedExchange(&g_updateRequestPending, 0) == 0)
             {
+                InterlockedDecrement(&g_updateInFlight);
                 break;
             }
 
             if (!g_updateRequestLockInitialized)
             {
+                InterlockedDecrement(&g_updateInFlight);
                 break;
             }
 
@@ -216,6 +224,7 @@ void ExportWorkerMain()
             LeaveCriticalSection(&g_updateRequestLock);
 
             UpdateNow(snapshot);
+            InterlockedDecrement(&g_updateInFlight);
 
             if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
             {
@@ -229,11 +238,25 @@ void ExportWorkerMain()
 
 void QueueUpdate(const NetbridgeStatus& status)
 {
+    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    {
+        return;
+    }
+    InterlockedIncrement(&g_updateInFlight);
+    // Close the check/increment race with suspension. A producer that loses
+    // this second check publishes nothing; one that wins is visible to the
+    // barrier through g_updateInFlight until its request is complete.
+    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    {
+        InterlockedDecrement(&g_updateInFlight);
+        return;
+    }
     if (InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) == 0
         || g_updateEvent == nullptr
         || !g_updateRequestLockInitialized)
     {
         UpdateNow(status);
+        InterlockedDecrement(&g_updateInFlight);
         return;
     }
 
@@ -246,13 +269,18 @@ void QueueUpdate(const NetbridgeStatus& status)
                 "StateExport: async queue skipped due contention dropCount=%ld",
                 static_cast<long>(dropCount));
         }
+        InterlockedDecrement(&g_updateInFlight);
         return;
     }
 
     g_pendingStatus = status;
-    LeaveCriticalSection(&g_updateRequestLock);
-
+    // Publish the request while still owning the lock. The online-suspension
+    // barrier crosses this same lock, so no producer can expose a late pending
+    // bit after the barrier has already observed an idle worker.
     InterlockedExchange(&g_updateRequestPending, 1);
+    LeaveCriticalSection(&g_updateRequestLock);
+    InterlockedDecrement(&g_updateInFlight);
+
     (void)SetEvent(g_updateEvent);
 }
 
@@ -614,6 +642,8 @@ void Initialize()
     InterlockedExchange(&g_updateWorkerStop, 0);
     InterlockedExchange(&g_updateWorkerReady, 0);
     InterlockedExchange(&g_updatePublishDropped, 0);
+    InterlockedExchange(&g_updateInFlight, 0);
+    InterlockedExchange(&g_updatesSuspended, 0);
 
     g_updateEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (g_updateEvent != nullptr)
@@ -655,6 +685,7 @@ void Shutdown()
     }
     InterlockedExchange(&g_updateRequestPending, 0);
     InterlockedExchange(&g_updatePublishDropped, 0);
+    InterlockedExchange(&g_updatesSuspended, 1);
     g_pendingStatus = {};
     if (g_updateRequestLockInitialized)
     {
@@ -1321,6 +1352,63 @@ void UpdateNow(const NetbridgeStatus& status)
 void Update(const NetbridgeStatus& status)
 {
     QueueUpdate(status);
+}
+
+bool SuspendForOnlineSimulation()
+{
+    // Stop new producers, then cross the request lock once. A producer that
+    // observed the old state either finishes publishing its request before
+    // this lock handoff or fails its non-blocking lock attempt. The worker is
+    // still allowed to drain requests accepted before suspension.
+    InterlockedExchange(&g_updatesSuspended, 1);
+    if (g_updateRequestLockInitialized)
+    {
+        EnterCriticalSection(&g_updateRequestLock);
+        LeaveCriticalSection(&g_updateRequestLock);
+    }
+    if (g_updateEvent != nullptr
+        && InterlockedCompareExchange(&g_updateRequestPending, 0, 0) != 0)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+
+    const DWORD startTick = GetTickCount();
+    for (;;)
+    {
+        // Read the two-phase worker state twice. A single split observation
+        // can see inFlight=0 before the worker increments and pending=0 after
+        // it consumes the request, falsely returning during UpdateNow.
+        const LONG inFlightBefore =
+            InterlockedCompareExchange(&g_updateInFlight, 0, 0);
+        const LONG pendingBefore =
+            InterlockedCompareExchange(&g_updateRequestPending, 0, 0);
+        const LONG inFlightAfter =
+            InterlockedCompareExchange(&g_updateInFlight, 0, 0);
+        const LONG pendingAfter =
+            InterlockedCompareExchange(&g_updateRequestPending, 0, 0);
+        if (inFlightBefore == 0
+            && pendingBefore == 0
+            && inFlightAfter == 0
+            && pendingAfter == 0)
+        {
+            break;
+        }
+
+        if (GetTickCount() - startTick >= 2000u)
+        {
+            mod::Log(
+                "StateExport: online suspension timed out with worker in flight");
+            return false;
+        }
+        Sleep(0);
+    }
+
+    return true;
+}
+
+void ResumeControlPlaneUpdates()
+{
+    InterlockedExchange(&g_updatesSuspended, 0);
 }
 
 const EFZNetplayState* GetExportedState()

@@ -79,6 +79,45 @@ bool ReadRemoteString(HANDLE process, uintptr_t address, char* out, size_t outSi
     {
         return false;
     }
+
+    if (outSize == 1)
+    {
+        out[0] = '\0';
+        return true;
+    }
+
+    // Import names are short and normally reside wholly within a readable PE
+    // page. Read the complete bounded span with one syscall first; late IAT
+    // retries otherwise perform one cross-process syscall for every character
+    // of every DLL and import name. Preserve the byte-loop as the exact
+    // fallback for page boundaries or partially readable memory.
+    char bulk[128] = {};
+    const size_t bulkSize = outSize - 1;
+    if (bulkSize <= sizeof(bulk))
+    {
+        SIZE_T bulkRead = 0;
+        if (ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(address),
+                bulk,
+                bulkSize,
+                &bulkRead) != FALSE
+            && bulkRead == bulkSize)
+        {
+            const void* terminator = std::memchr(bulk, '\0', bulkSize);
+            if (terminator != nullptr)
+            {
+                const size_t length =
+                    static_cast<const char*>(terminator) - bulk + 1;
+                std::memcpy(out, bulk, length);
+                return true;
+            }
+            std::memcpy(out, bulk, bulkSize);
+            out[outSize - 1] = '\0';
+            return true;
+        }
+    }
+
     size_t index = 0;
     while (index + 1 < outSize)
     {
@@ -359,9 +398,6 @@ bool PatchIatModule(
             }
 
             const uintptr_t ftAddress = imageBase + ftRva + static_cast<uintptr_t>(thunk) * sizeof(uint32_t);
-            DWORD oldProtect = 0;
-            (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), PAGE_READWRITE, &oldProtect);
-
             uint32_t oldAddress = 0;
             SIZE_T oldRead = 0;
             (void)ReadProcessMemory(process, reinterpret_cast<LPCVOID>(ftAddress), &oldAddress, sizeof(oldAddress), &oldRead);
@@ -369,14 +405,21 @@ bool PatchIatModule(
             const uint32_t newAddress = it->second;
             if (oldAddress != newAddress)
             {
+                // Late startup retries revisit every imported function. Most
+                // slots are already correct, so do not make their pages
+                // writable on every 500 ms scan. The compare is read-only and
+                // leaves the actual patch path and retry semantics unchanged.
+                DWORD oldProtect = 0;
+                (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), PAGE_READWRITE, &oldProtect);
+
                 SIZE_T written = 0;
                 if (WriteProcessMemory(process, reinterpret_cast<LPVOID>(ftAddress), &newAddress, sizeof(newAddress), &written) == FALSE || written != sizeof(newAddress))
                 {
                     return false;
                 }
+                DWORD ignored = 0;
+                (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), oldProtect, &ignored);
             }
-            DWORD ignored = 0;
-            (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), oldProtect, &ignored);
 
             ++patched;
             auto shouldLogPatchedImport = [](const char* name) -> bool {
@@ -815,7 +858,17 @@ bool EnsureInjectedContextFast()
         g_injectedConsoleEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kConsoleReadyEventName);
     }
 
-    g_injectedReady = (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr);
+    const bool ipcReady =
+        g_injectedBlock != nullptr
+        && g_injectedInitEvent != nullptr
+        && g_injectedConsoleEvent != nullptr;
+    g_injectedReady = ipcReady && StartConsoleCaptureWorker(true);
+    if (g_injectedBlock != nullptr)
+    {
+        InterlockedExchange(
+            &g_injectedBlock->helperCaptureReady,
+            g_injectedReady ? 1 : 0);
+    }
     if (g_injectedReady && !g_injectedLazyBound)
     {
         g_injectedLazyBound = true;

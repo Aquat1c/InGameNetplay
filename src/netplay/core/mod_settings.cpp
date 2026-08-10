@@ -173,32 +173,14 @@ void Reload()
             iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
-    // Production-safe timing mitigation and console parsing remain ordinary
-    // runtime settings in both build flavors.
-    loaded.deferredConsoleParse =
-        ReadBoolValue(L"Others", L"DeferredConsoleParse", true, iniPath);
-    {
-        const int workKb = static_cast<int>(GetPrivateProfileIntW(
-            L"Others", L"BatchStabilizerWorkKB", 64, iniPath.c_str()));
-        loaded.batchStabilizerWorkKb =
-            (workKb < 0) ? 0 : (workKb > 1024 ? 1024 : workKb);
-    }
+    // Console capture is unconditionally deferred by its fixed ingress ring.
+    // Rollback-batch timing injection was retired entirely: changing the batch
+    // decision's wall-clock position is not a safe synchronization mechanism.
 
-    // The zero-frame behavior experiment remains trace-build-only. The former
-    // invasive observer and all of its hook settings were removed entirely
-    // after the 1.02j on/off A/B implicated the observer itself.
-#if MOD_LIFECYCLE_TRACE_COMPILED
-    loaded.eagerZeroFrameGraphicsRestore =
-        ReadBoolValue(
-            L"Others",
-            L"ExperimentalEagerZeroFrameGraphicsRestore",
-            false,
-            iniPath);
-#else
+#if !MOD_LIFECYCLE_TRACE_COMPILED
     loaded.verboseBridgePatchLogging = false;
     loaded.verboseSyncDiagnostics = false;
     loaded.verboseRevival102jLifecycleLogging = false;
-    loaded.eagerZeroFrameGraphicsRestore = false;
 #endif
     loaded.menuTtfText =
         ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
@@ -268,16 +250,6 @@ bool IsDebugMenuEnabled()
     return g_settings.enableDebugMenu;
 }
 
-int BatchStabilizerWorkKb()
-{
-    return g_settings.batchStabilizerWorkKb;
-}
-
-bool IsDeferredConsoleParseEnabled()
-{
-    return g_settings.deferredConsoleParse;
-}
-
 bool IsVerboseBridgePatchLoggingEnabled()
 {
     return g_settings.verboseBridgePatchLogging;
@@ -303,11 +275,6 @@ bool AreAllVerboseLogsEnabled()
 bool HideEmptySetsInBattleLogByDefault()
 {
     return g_settings.hideEmptySetsInBattleLog;
-}
-
-bool IsEagerZeroFrameGraphicsRestoreEnabled()
-{
-    return g_settings.eagerZeroFrameGraphicsRestore;
 }
 
 bool IsMenuTtfTextEnabled()

@@ -3,6 +3,7 @@
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
+#include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
@@ -11,6 +12,7 @@
 #include "netplay/core/network_capability.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
+#include "netplay/hooks/debug_overlay.h"
 
 #include "logger.h"
 
@@ -88,7 +90,6 @@ constexpr uint8_t kSecondaryModeFlagVsHuman = 4;
 constexpr uint8_t kReplaySessionFlagCleared = 0;
 constexpr int kRoleFlagSpectate = 1;            // matches kLocalRoleSpectate in takeover_internal.h
 constexpr int kScreenIndexCharSelect = 1;       // EFZ screen table index for character select
-constexpr int kScreenIndexReplay = 8;           // EFZ screen table index for replay (used by spectate)
 constexpr int8_t kMenuSelectionReplay = 4;      // title menu "Replay" entry index
 constexpr unsigned short kInvalidSoundBufferIndex = 150;
 constexpr int kMenuInputFirstOffset = 12;
@@ -210,6 +211,12 @@ struct HostDiscoveryThreadContext
 
 DWORD WINAPI HostDiscoveryThreadMain(void* rawContext)
 {
+    // Public-address discovery is control-plane work. It may outlive the menu
+    // frame that scheduled it, so always yield to EFZ's normal-priority game
+    // thread without changing discovery timeouts or result ordering.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     auto* context =
         static_cast<HostDiscoveryThreadContext*>(rawContext);
     HMODULE moduleReference =
@@ -271,6 +278,11 @@ struct LocalNetworkCapabilityThreadContext
 
 DWORD WINAPI LocalNetworkCapabilityThreadMain(void* rawContext)
 {
+    // This advisory scan must never compete at equal priority with EFZ's game
+    // thread if it remains in flight across a menu or simulation transition.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     auto* context =
         static_cast<LocalNetworkCapabilityThreadContext*>(rawContext);
     HMODULE moduleReference =
@@ -3797,7 +3809,6 @@ void CancelPendingSpectateConfirmSession(const char* reasonTag)
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     ClearPendingLobbySpectateWait(reasonTag);
-    DisarmSpectateReplayBypass();
     netplay::bridge::CancelSession("user_cancel");
     mod::Log(
         "SpectateConfirmOverlay: canceled pending spectate reason='%s' -> SessionBridge user_cancel",
@@ -3820,7 +3831,6 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     ClearPendingLobbySpectateWait("spectate_prompt_join");
-    DisarmSpectateReplayBypass();
     netplay::bridge::CancelSession("user_cancel");
 
     const bool writeNicknameToIni = ShouldWriteNicknameToRevivalIniForSessionStart();
@@ -4585,6 +4595,71 @@ bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason)
 // directly to charselect allows the client session's input replay to drive
 // the character selection from the host's captured inputs.
 // ---------------------------------------------------------------------------
+static bool SuspendUiHooksForOnlineSimulation(
+    uint32_t screenContext,
+    const char* reason)
+{
+    // Request one final pre-handoff control-plane snapshot and complete any
+    // temporary Host Protocol acknowledgement while still safely in the menu.
+    // The barrier drains that accepted request, then proves that no exporter
+    // is reading live game memory when online simulation begins. The snapshot
+    // intentionally describes the last menu state, not a live battle feed.
+    netplay::bridge::TickExportOnly(true);
+    if (!netplay::bridge::state_export::SuspendForOnlineSimulation())
+    {
+        mod::Log(
+            "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=%s component=state_export",
+            reason != nullptr ? reason : "unknown");
+        netplay::bridge::state_export::ResumeControlPlaneUpdates();
+        return false;
+    }
+
+    // Remove UI/render/update interpositions and verify each teardown. The
+    // WndProc remover handles both legal DebugWndProc/NetplayWindowProc chain
+    // orders without overwriting the live top-level proc.
+    const bool windowRemoved = RemoveNetplayWindowHook();
+    const bool imguiOk =
+        netplay::debug_overlay::SuspendForOnlineSimulation();
+    const bool renderOk = netplay::battle_log::ShutdownRenderOverlay();
+    const bool frontendOk =
+        netplay::bridge::frontend_return::SuspendUpdateHooksForOnlineSimulation();
+    bool windowOk = windowRemoved;
+#if !defined(EFZ_NATIVE_TICK_PASSTHROUGH)
+    if (windowRemoved && imguiOk && renderOk && frontendOk)
+    {
+        // Shipping builds retain only the lightweight NetplayWindowProc close
+        // path so WM_CLOSE can broadcast MessageQuit before process teardown.
+        // With menu state inactive it otherwise immediately forwards to EFZ's
+        // stock proc. The diagnostic native-tick arm leaves no WndProc detour.
+        windowOk = InstallNetplayWindowHook(screenContext);
+    }
+#endif
+    if (windowOk && imguiOk && renderOk && frontendOk)
+    {
+        return true;
+    }
+
+    mod::Log(
+        "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=%s window=%d imgui=%d endScene=%d screenUpdates=%d",
+        reason != nullptr ? reason : "unknown",
+        windowOk ? 1 : 0,
+        imguiOk ? 1 : 0,
+        renderOk ? 1 : 0,
+        frontendOk ? 1 : 0);
+
+    // The transition has not begun, so restore menu/control-plane ownership
+    // and let a later frame retry the handoff after the failed component is
+    // recoverable.
+    netplay::bridge::state_export::ResumeControlPlaneUpdates();
+    InstallNetplayWindowHook(screenContext);
+    if (netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        (void)netplay::battle_log::EnsureGameplayOverlayHook();
+    }
+    netplay::bridge::frontend_return::EnsureFrontendReturnUpdateHooks();
+    return false;
+}
+
 void HandoffSpectateSession(uint32_t screenContext)
 {
     const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
@@ -4598,6 +4673,18 @@ void HandoffSpectateSession(uint32_t screenContext)
         status.syncGlobalFlag4964,
         status.syncGlobalFlag4965,
         status.roleFlag);
+
+    if (!prepared)
+    {
+        mod::Log(
+            "HandoffSpectateSession: aborted because spectator handoff is not ready");
+        return;
+    }
+    if (!SuspendUiHooksForOnlineSimulation(
+            screenContext, "spectator_handoff"))
+    {
+        return;
+    }
 
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareSpectateReplayState(screenContext);
@@ -4679,10 +4766,6 @@ void HandoffSpectateSession(uint32_t screenContext)
     ResetSpectateHandoffWarmup(nullptr);
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
 
-    // Immediately publish the post-handoff state so inNetplayMenu=0 is visible
-    // to export consumers before the next frame hook fires.
-    netplay::bridge::TickExportOnly(true);
-
     mod::Log(
         "HandoffSpectateSession: queued global transition nextState=%d returnToNetplay=%d",
         g_pendingGlobalStateTransition,
@@ -4691,6 +4774,7 @@ void HandoffSpectateSession(uint32_t screenContext)
 
 void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
 {
+    netplay::bridge::state_export::ResumeControlPlaneUpdates();
     mod::Log("EnterNetplayMenu: request active=%d skipFadeOut=%d", g_netplayMenuState.active, skipFadeOut ? 1 : 0);
     if (g_netplayMenuState.active)
     {
@@ -5011,7 +5095,6 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
     g_returnToNetplayAfterMatch = false;
     ResetVsHumanHandoffWarmup("leave_netplay_menu");
     ResetSpectateHandoffWarmup("leave_netplay_menu");
-    DisarmSpectateReplayBypass();
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
     if (!keepHost)
@@ -5090,6 +5173,11 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
             "HandoffConnectedSessionToVsHumanState: aborted because VS-human handoff is not ready");
         return;
     }
+    if (!SuspendUiHooksForOnlineSimulation(
+            screenContext, "connected_player_handoff"))
+    {
+        return;
+    }
 
     RunTransitionFadeOut(screenContext, 0, 0);
     PrepareVsHumanGameState(screenContext);
@@ -5124,11 +5212,6 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     ResetVsHumanHandoffWarmup(nullptr);
     g_returnToNetplayAfterMatch = true;
     g_pendingGlobalStateTransition = kScreenIndexCharSelect;
-
-    // Immediately publish the post-handoff state so that inNetplayMenu=0 and
-    // activityPhase=InMatch are visible to export consumers before the next
-    // frame hook fires (avoids a stale "menu=1" window during the fade-out).
-    netplay::bridge::TickExportOnly(true);
 
     // Post-handoff diagnostic: read charselect screen object state AFTER
     // PrepareVsHumanGameState to verify flags were set correctly.
@@ -6431,7 +6514,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             hadHostingOverlay ? 1 : 0,
             g_joiningOverlay.errorText);
     };
-    auto abortPendingTransitionIfSessionLost = [&](int nextState, const char* abortReason, bool disarmSpectateReplayBypass) {
+    auto abortPendingTransitionIfSessionLost = [&](int nextState, const char* abortReason) {
         const netplay::bridge::NetbridgeStatus latestStatus = netplay::bridge::GetStatus();
         const NetbridgePhase latestPhase = static_cast<NetbridgePhase>(latestStatus.phase);
         if (latestPhase == NetbridgePhase::Failed || latestPhase == NetbridgePhase::SessionEnded)
@@ -6441,10 +6524,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 netplay::bridge::PhaseToString(latestPhase),
                 nextState,
                 latestStatus.errorMsg[0] != '\0' ? latestStatus.errorMsg : "");
-            if (disarmSpectateReplayBypass)
-            {
-                DisarmSpectateReplayBypass();
-            }
             netplay::bridge::CancelSession(abortReason);
             notifyLobbySessionEndedForCurrentBridgeRole(true);
             ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
@@ -6455,10 +6534,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
             mod::Log(
                 "NetplayTransition: ABORT - peer exited before state=%d, re-entering netplay menu",
                 nextState);
-            if (disarmSpectateReplayBypass)
-            {
-                DisarmSpectateReplayBypass();
-            }
             netplay::bridge::CancelSession(abortReason);
             notifyLobbySessionEndedForCurrentBridgeRole(true);
             ReenterNetplayMenuAfterSessionAbort(screenContext, abortReason);
@@ -6619,7 +6694,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
         ResetSpectateConfirmOverlayState();
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
-        DisarmSpectateReplayBypass();
         netplay::bridge::CancelSession("spectate_pair_left_lobby_playing");
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP1) = 0;
         *reinterpret_cast<uint8_t*>(screenContext + kOffsetInputLatchP2) = 0;
@@ -6656,7 +6730,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             // state-1 init calls the DLL rollback tick immediately, which can
             // fire ExitProcess on the main game thread where no setjmp recovery
             // point is active.
-            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition"))
             {
                 return 0;
             }
@@ -6827,7 +6901,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition", true))
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition"))
             {
                 return 0;
             }
@@ -6935,7 +7009,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 const int nextState = g_pendingGlobalStateTransition;
                 g_pendingGlobalStateTransition = -1;
-                if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
+                if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition"))
                 {
                     return 0;
                 }
@@ -6954,7 +7028,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition"))
             {
                 return 0;
             }
@@ -6985,7 +7059,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         {
             const int nextState = g_pendingGlobalStateTransition;
             g_pendingGlobalStateTransition = -1;
-            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition", false))
+            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_transition"))
             {
                 return 0;
             }
@@ -7070,7 +7144,6 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ResetHostingOverlayState();
             ResetJoiningOverlayState();
             ClearPendingLobbySpectateWait("session_ended");
-            DisarmSpectateReplayBypass();
             if (bridgeStatus.errorMsg[0] != '\0')
             {
                 SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);

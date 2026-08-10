@@ -4,7 +4,10 @@
 #include "netplay/core/mod_settings.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -740,24 +743,6 @@ void NoteConsolePromptLine(
         return;
     }
 
-    // "Desync detected" is Revival's one-shot Sync-record inequality warning.
-    // Stock Revival keeps the match running after printing it (the comparator
-    // continues and later frames can log "Checked N" again). RNG-only state
-    // inequality is real, but neither duration nor later compensation says
-    // whether gameplay will diverge. Publish only the broad warning on the
-    // provisional channel so the causal monitor can record it without
-    // altering session flow. The specific CRC/unrecoverable forms above stay
-    // fatal even when their text also contains the broad phrase.
-    // See docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md.
-    if (ContainsCaseInsensitive(text, "desync detected"))
-    {
-        mod::Log(
-            "Takeover: console desync warning (provisional, non-fatal) text='%s'",
-            text.c_str());
-        PublishConsoleDesyncWarning("Desync warning from Revival (provisional).");
-        return;
-    }
-
     const bool isJoinAsSpectatorPrompt =
         ContainsCaseInsensitive(text, "Host already playing, join as a spectator");
     if (isJoinAsSpectatorPrompt)
@@ -927,74 +912,6 @@ bool IsLikelyRevivalDiskLogPath(const std::string& path)
     return looksRevivalOwned || looksTextFile;
 }
 
-bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath)
-{
-    if (outPath == nullptr || hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    SetLastError(NO_ERROR);
-    const DWORD fileType = GetFileType(hFile);
-    if (fileType != FILE_TYPE_DISK)
-    {
-        return false;
-    }
-
-    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleA)(HANDLE, LPSTR, DWORD, DWORD);
-    static PFN_GetFinalPathNameByHandleA s_pfnGetFinalPath = []() -> PFN_GetFinalPathNameByHandleA {
-        HMODULE kernel = GetModuleHandleA("kernel32.dll");
-        return kernel
-            ? reinterpret_cast<PFN_GetFinalPathNameByHandleA>(GetProcAddress(kernel, "GetFinalPathNameByHandleA"))
-            : nullptr;
-    }();
-
-    if (s_pfnGetFinalPath == nullptr)
-    {
-        return false;
-    }
-
-    char path[1024] = {};
-    const DWORD pathLen = s_pfnGetFinalPath(
-        hFile,
-        path,
-        static_cast<DWORD>(sizeof(path)),
-        FILE_NAME_NORMALIZED);
-    if (pathLen == 0 || pathLen >= sizeof(path))
-    {
-        return false;
-    }
-
-    *outPath = std::string(path, pathLen);
-    return true;
-}
-
-bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath)
-{
-    std::string pathText;
-    if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
-    {
-        return false;
-    }
-
-    std::string lowerPath = pathText;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    const size_t slash = lowerPath.find_last_of("\\/");
-    const std::string baseName = (slash == std::string::npos) ? lowerPath : lowerPath.substr(slash + 1);
-    if (baseName != "logefz.txt")
-    {
-        return false;
-    }
-
-    if (outPath != nullptr)
-    {
-        *outPath = pathText;
-    }
-    return true;
-}
-
 static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line);
 static bool EnqueueConsoleParseChunk(
     const char* sourceTag,
@@ -1034,17 +951,15 @@ static LONG CaptureControlWakeRequestSerialSnapshot()
     return capture(g_hostBlock);
 }
 
-// Public seam for every console/log write interception. Revival calls the
-// intercepted write APIs from its SIMULATION (rollback) thread, and the parse
-// below (line assembly + keyword scans + prompt/error detection) used to run
-// synchronously inside that call - a per-write perturbation of the very
-// timing the desync investigation chases (the vanilla capture proved stock's
-// re-execution stays idempotent; the mod's rollback-thread load is the prime
-// suspect). With DeferredConsoleParse (default on) the raw chunk is copied
-// onto the managed-log worker's FIFO queue and parsed there; ordering with
-// mirror writes and session close boundaries is preserved by the single
-// queue. Falls back to the old synchronous parse whenever the worker is
-// unavailable (early startup, teardown, overflow), so detection never drops.
+// Public seam for every console/log write interception in the injected
+// EfzRevival helper. The host EFZ process is deliberately not IAT-patched.
+// Helper writes can still occur on timing-sensitive rollback/network paths, so
+// the producer stays bounded and non-blocking: it only reserves a preallocated
+// ingress slot, copies raw bytes, and publishes with atomics. The managed-log
+// worker owns text validation, conversion, line assembly, prompt detection,
+// and mirror logging. A full/unavailable ingress drops the whole write; the
+// worker reports the loss and discards pending fragments so text on opposite
+// sides of a drop can never be joined into a synthetic line.
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
 {
     if (sourceTag == nullptr)
@@ -1055,26 +970,13 @@ void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length)
     {
         return;
     }
-    if (!IsLikelyTextChunk(text, length))
-    {
-        return;
-    }
     const LONG controlWakeRequestSerialSnapshot =
         CaptureControlWakeRequestSerialSnapshot();
-    if (netplay::mod_settings::IsDeferredConsoleParseEnabled()
-        && EnqueueConsoleParseChunk(
-            sourceTag,
-            text,
-            length,
-            /*wide=*/false,
-            controlWakeRequestSerialSnapshot))
-    {
-        return;
-    }
-    ProcessConsoleTextChunk(
+    (void)EnqueueConsoleParseChunk(
         sourceTag,
         text,
         length,
+        /*wide=*/false,
         controlWakeRequestSerialSnapshot);
 }
 
@@ -1123,25 +1025,16 @@ static void LogConsoleWideTextChunk(
     }
     const LONG controlWakeRequestSerialSnapshot =
         CaptureControlWakeRequestSerialSnapshot();
-    if (netplay::mod_settings::IsDeferredConsoleParseEnabled()
-        && EnqueueConsoleParseChunk(
-               sourceTag,
-               wideText,
-               static_cast<size_t>(wideLen) * sizeof(wchar_t),
-               /*wide=*/true,
-               controlWakeRequestSerialSnapshot))
-    {
-        return;
-    }
-    const std::string utf8 = ConvertConsoleWideToUtf8(wideText, wideLen);
-    if (!utf8.empty() && IsLikelyTextChunk(utf8.c_str(), utf8.size()))
-    {
-        ProcessConsoleTextChunk(
-            sourceTag,
-            utf8.c_str(),
-            utf8.size(),
-            controlWakeRequestSerialSnapshot);
-    }
+    const size_t wideChars = static_cast<size_t>(wideLen);
+    const size_t bytes = wideChars > (std::numeric_limits<size_t>::max)() / sizeof(wchar_t)
+        ? (std::numeric_limits<size_t>::max)()
+        : wideChars * sizeof(wchar_t);
+    (void)EnqueueConsoleParseChunk(
+        sourceTag,
+        wideText,
+        bytes,
+        /*wide=*/true,
+        controlWakeRequestSerialSnapshot);
 }
 
 static void ProcessConsoleTextChunk(
@@ -1242,7 +1135,6 @@ static void ProcessConsoleTextChunk(
     if (line != nullptr && !line->empty() && line->size() >= 12)
     {
         static const char* kImmediateFlushKeywords[] = {
-            "desync detected",
             "header crc mismatch",
             "state not recoverable",
             "Recv quit from:",
@@ -1317,11 +1209,9 @@ void FlushPendingConsoleOutput(const char* /*reason*/)
     // NOTE: CaptureRevivalNativeLogsEnabled() gate intentionally removed.
     // Flushing must always happen so NoteConsolePromptLine can detect
     // workflow signals (errors, delay prompts, spectate confirms).
-    // Deferred: the flush rides the same FIFO queue as the chunks it flushes,
-    // so it can never overtake a pending chunk; synchronous fallback when the
-    // worker is unavailable.
-    if (netplay::mod_settings::IsDeferredConsoleParseEnabled()
-        && EnqueueConsoleParseFlush())
+    // The flush carries a snapshot of the ingress write position, so the
+    // worker drains all chunks accepted before this call before flushing.
+    if (EnqueueConsoleParseFlush())
     {
         return;
     }
@@ -1353,10 +1243,10 @@ static bool g_ownedLogEfzOpenedThisProcess = false;
 // Mirroring that line to the mod-owned log on the same thread used to add a
 // second synchronous disk write to Revival's simulation path, and the parse
 // itself (line assembly + keyword scans) was still synchronous per write.
-// Both now ride this FIFO worker: ParseChunk entries carry the raw captured
-// bytes and are parsed on the worker (which mirror-writes directly, keeping
-// order); Line entries remain for parses that ran on a non-worker thread
-// (synchronous fallback). Session close is a drain barrier, so lines cannot
+// Both now ride this worker: raw captured bytes enter through the preallocated
+// ring and are parsed on the worker (which mirror-writes directly, keeping
+// order); Line entries remain only for lifecycle-side flushes when the worker
+// is unavailable. Session close is a ring-watermark barrier, so lines cannot
 // cross SESSION headers.
 struct OwnedLogEfzEntry
 {
@@ -1364,20 +1254,60 @@ struct OwnedLogEfzEntry
     {
         Line,
         CloseBoundary,
-        ParseChunk,
         ParseFlush,
     } kind = Kind::Line;
     std::string sourceTag;
-    std::string line; // Line: mirror text; ParseChunk: raw payload bytes
-    bool wide = false; // ParseChunk payload is UTF-16 needing conversion
-    // Snapshot at the intercepted native write. Deferred parsing may execute
-    // after a later WCI transition; preserving this value keeps causal order.
-    LONG controlWakeRequestSerialSnapshot = -1;
+    std::string line;
     SYSTEMTIME timestamp = {};
     unsigned long long sequence = 0;
+    // The worker must consume every raw ingress reservation below this
+    // position before executing the queue record. This keeps flush/close
+    // controls ordered with the otherwise lock-free producer stream.
+    size_t ingressBoundary = 0;
+    unsigned long ingressLossGeneration = 0;
 };
 
 constexpr size_t kOwnedLogEfzQueueLimit = 8192;
+
+// Raw intercepted writes use a separate, fully preallocated ingress. Keeping
+// the previous 16 KiB per-write bound avoids fragmenting a single native write
+// across records; 256 slots cost 4 MiB in the 32-bit process and absorb bursts
+// while the worker performs a managed-log disk append.
+constexpr size_t kConsoleIngressCapacity = 256;
+constexpr size_t kConsoleIngressPayloadBytes = 16384;
+constexpr size_t kConsoleIngressSourceTagBytes = 40;
+static_assert(
+    (kConsoleIngressCapacity & (kConsoleIngressCapacity - 1)) == 0,
+    "console ingress capacity must be a power of two");
+
+struct ConsoleIngressSlot
+{
+    std::atomic<size_t> sequence;
+    char sourceTag[kConsoleIngressSourceTagBytes] = {};
+    alignas(wchar_t) unsigned char payload[kConsoleIngressPayloadBytes] = {};
+    size_t bytes = 0;
+    bool wide = false;
+    // Snapshot at the intercepted native write. Deferred parsing may execute
+    // after a later WCI transition; preserving this value keeps causal order.
+    LONG controlWakeRequestSerialSnapshot = -1;
+    unsigned long lossGeneration = 0;
+};
+
+static std::array<ConsoleIngressSlot, kConsoleIngressCapacity> g_consoleIngress;
+static std::atomic<size_t> g_consoleIngressEnqueuePosition{0};
+// Single-consumer state. Only the managed-log worker mutates this value.
+static size_t g_consoleIngressDequeuePosition = 0;
+static std::atomic<bool> g_consoleIngressAccepting{false};
+static std::atomic<bool> g_consoleIngressPollingEnabled{false};
+static std::atomic<unsigned long> g_consoleIngressActiveProducers{0};
+static std::atomic<unsigned long> g_consoleIngressFullDrops{0};
+static std::atomic<unsigned long> g_consoleIngressContentionDrops{0};
+static std::atomic<unsigned long> g_consoleIngressOversizeDrops{0};
+static std::atomic<unsigned long> g_consoleIngressUnavailableDrops{0};
+static std::atomic<unsigned long> g_consoleIngressLossGeneration{0};
+// Single-consumer state, updated only by the managed-log worker.
+static unsigned long g_consoleIngressConsumedLossGeneration = 0;
+
 static std::mutex g_ownedLogEfzQueueMutex;
 static std::condition_variable g_ownedLogEfzQueueCv;
 static std::condition_variable g_ownedLogEfzDrainCv;
@@ -1390,18 +1320,133 @@ static volatile LONG g_ownedLogEfzEmergencyStop = 0;
 static unsigned long long g_ownedLogEfzEnqueuedSequence = 0;
 static unsigned long long g_ownedLogEfzProcessedSequence = 0;
 static unsigned long g_ownedLogEfzDroppedLines = 0;
-// Times a parse chunk could not be deferred (queue full) and fell back to a
-// synchronous parse on the writing thread. Should stay 0; nonzero = the
-// deferred-parse protection was briefly lost (see EnqueueConsoleParseChunk).
-static volatile LONG g_ownedLogEfzParseOverflowCount = 0;
 // Worker thread id: lets AppendOwnedLogEfzLine mirror-write DIRECTLY when the
 // parse itself is running on the worker (deferred path), preserving strict
 // FIFO order with session close boundaries instead of re-enqueueing behind
 // them.
 static volatile DWORD g_ownedLogEfzWorkerThreadId = 0;
 
-static void StartManagedLogEfzWorker();
+bool StartConsoleCaptureWorker(bool enableRawIngress);
 static void CloseOwnedLogEfzForBoundary();
+
+static void ResetConsoleIngress()
+{
+    g_consoleIngressAccepting.store(false, std::memory_order_release);
+    g_consoleIngressEnqueuePosition.store(0, std::memory_order_relaxed);
+    g_consoleIngressDequeuePosition = 0;
+    g_consoleIngressConsumedLossGeneration =
+        g_consoleIngressLossGeneration.load(std::memory_order_acquire);
+    for (size_t index = 0; index < kConsoleIngressCapacity; ++index)
+    {
+        g_consoleIngress[index].sequence.store(index, std::memory_order_relaxed);
+    }
+}
+
+static size_t CaptureConsoleIngressBoundary()
+{
+    return g_consoleIngressEnqueuePosition.load(std::memory_order_acquire);
+}
+
+static bool PauseConsoleIngress()
+{
+    const bool wasAccepting =
+        g_consoleIngressAccepting.exchange(false, std::memory_order_acq_rel);
+    while (g_consoleIngressActiveProducers.load(std::memory_order_acquire) != 0)
+    {
+        std::this_thread::yield();
+    }
+    return wasAccepting;
+}
+
+static bool ConsoleIngressHasReadyRecord()
+{
+    const size_t position = g_consoleIngressDequeuePosition;
+    const ConsoleIngressSlot& slot =
+        g_consoleIngress[position & (kConsoleIngressCapacity - 1)];
+    return slot.sequence.load(std::memory_order_acquire) == position + 1;
+}
+
+static ConsoleIngressSlot* TryAcquireConsoleIngressRecord(size_t* outPosition)
+{
+    const size_t position = g_consoleIngressDequeuePosition;
+    ConsoleIngressSlot& slot =
+        g_consoleIngress[position & (kConsoleIngressCapacity - 1)];
+    if (slot.sequence.load(std::memory_order_acquire) != position + 1)
+    {
+        return nullptr;
+    }
+    if (outPosition != nullptr)
+    {
+        *outPosition = position;
+    }
+    return &slot;
+}
+
+static void ReleaseConsoleIngressRecord(
+    ConsoleIngressSlot* slot,
+    size_t position)
+{
+    if (slot == nullptr)
+    {
+        return;
+    }
+    slot->sequence.store(
+        position + kConsoleIngressCapacity,
+        std::memory_order_release);
+    g_consoleIngressDequeuePosition = position + 1;
+}
+
+static void DiscardPendingConsoleFragmentsLocked()
+{
+    g_consolePendingWriteFile.clear();
+    g_consolePendingWriteFileDisk.clear();
+    g_consolePendingWriteConsoleA.clear();
+    g_consolePendingWriteConsoleW.clear();
+    g_consolePendingWriteConsoleOutputCharacterA.clear();
+    g_consolePendingWriteConsoleOutputCharacterW.clear();
+    g_consolePendingOutputDebugStringA.clear();
+    g_consolePendingOutputDebugStringW.clear();
+}
+
+static void ReportConsoleIngressDropsOnWorker()
+{
+    const unsigned long full =
+        g_consoleIngressFullDrops.exchange(0, std::memory_order_acq_rel);
+    const unsigned long contention =
+        g_consoleIngressContentionDrops.exchange(0, std::memory_order_acq_rel);
+    const unsigned long oversized =
+        g_consoleIngressOversizeDrops.exchange(0, std::memory_order_acq_rel);
+    const unsigned long unavailable =
+        g_consoleIngressUnavailableDrops.exchange(0, std::memory_order_acq_rel);
+    if (full == 0 && contention == 0 && oversized == 0 && unavailable == 0)
+    {
+        return;
+    }
+
+    mod::Log(
+        "CAPTURE_LOG: console ingress dropped writes full=%lu contention=%lu "
+        "oversized=%lu unavailable=%lu; no synchronous fallback",
+        full,
+        contention,
+        oversized,
+        unavailable);
+}
+
+static void ApplyConsoleIngressLossBoundary(unsigned long lossGeneration)
+{
+    if (lossGeneration == g_consoleIngressConsumedLossGeneration)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> parserLock(g_consoleLogMutex);
+        // Never splice text preceding a lost write to text following it. The
+        // generation is carried by the first later accepted record (or by a
+        // lifecycle watermark), so older queued records still drain in order.
+        DiscardPendingConsoleFragmentsLocked();
+    }
+    g_consoleIngressConsumedLossGeneration = lossGeneration;
+}
 
 static unsigned long long QueryExistingOwnedLogEfzSize(const std::string& path, bool* outExists)
 {
@@ -1790,80 +1835,139 @@ static void WriteOwnedLogEfzLine(
     }
 }
 
+static void ProcessConsoleIngressRecord(const ConsoleIngressSlot& slot)
+{
+    const char* sourceTag = slot.sourceTag[0] != '\0'
+        ? slot.sourceTag
+        : "unknown";
+    if (slot.wide)
+    {
+        const std::string utf8 = ConvertConsoleWideToUtf8(
+            reinterpret_cast<const wchar_t*>(slot.payload),
+            static_cast<int>(slot.bytes / sizeof(wchar_t)));
+        if (!utf8.empty() && IsLikelyTextChunk(utf8.c_str(), utf8.size()))
+        {
+            ProcessConsoleTextChunk(
+                sourceTag,
+                utf8.c_str(),
+                utf8.size(),
+                slot.controlWakeRequestSerialSnapshot);
+        }
+        return;
+    }
+
+    const char* text = reinterpret_cast<const char*>(slot.payload);
+    if (IsLikelyTextChunk(text, slot.bytes))
+    {
+        ProcessConsoleTextChunk(
+            sourceTag,
+            text,
+            slot.bytes,
+            slot.controlWakeRequestSerialSnapshot);
+    }
+}
+
 static void ManagedLogEfzWorkerMain()
 {
     g_ownedLogEfzWorkerThreadId = GetCurrentThreadId();
     for (;;)
     {
+        ReportConsoleIngressDropsOnWorker();
+
         OwnedLogEfzEntry entry;
+        bool haveQueueEntry = false;
+        ConsoleIngressSlot* ingressSlot = nullptr;
+        size_t ingressPosition = 0;
         unsigned long droppedLines = 0;
         {
             std::unique_lock<std::mutex> lock(g_ownedLogEfzQueueMutex);
-            g_ownedLogEfzQueueCv.wait(lock, [] {
-                return g_ownedLogEfzWorkerStopping
-                    || InterlockedCompareExchange(
-                           &g_ownedLogEfzEmergencyStop, 0, 0) != 0
-                    || !g_ownedLogEfzQueue.empty();
-            });
+            // Raw producers deliberately do not signal a kernel primitive.
+            // Polling at a short cadence keeps their hot path to copies and
+            // atomics while control records can still wake us immediately.
+            const auto wakePredicate = [] {
+                    return g_ownedLogEfzWorkerStopping
+                        || InterlockedCompareExchange(
+                               &g_ownedLogEfzEmergencyStop, 0, 0) != 0
+                        || (!g_ownedLogEfzQueue.empty()
+                            && g_consoleIngressDequeuePosition
+                                >= g_ownedLogEfzQueue.front().ingressBoundary)
+                        || (g_consoleIngressPollingEnabled.load(
+                                std::memory_order_acquire)
+                            && ConsoleIngressHasReadyRecord());
+                };
+            if (g_consoleIngressPollingEnabled.load(std::memory_order_acquire))
+            {
+                g_ownedLogEfzQueueCv.wait_for(
+                    lock, std::chrono::milliseconds(1), wakePredicate);
+            }
+            else
+            {
+                // The EFZ host has no raw IAT producers. Sleep until an actual
+                // mirror/control record arrives instead of waking at 1 kHz in
+                // the simulation process.
+                g_ownedLogEfzQueueCv.wait(lock, wakePredicate);
+            }
             if (InterlockedCompareExchange(
                     &g_ownedLogEfzEmergencyStop, 0, 0) != 0)
             {
                 break;
             }
-            if (g_ownedLogEfzQueue.empty())
-            {
-                if (g_ownedLogEfzWorkerStopping)
-                {
-                    break;
-                }
-                continue;
-            }
 
-            entry = std::move(g_ownedLogEfzQueue.front());
-            g_ownedLogEfzQueue.pop_front();
-            droppedLines = g_ownedLogEfzDroppedLines;
-            g_ownedLogEfzDroppedLines = 0;
+            // A queued lifecycle record owns a ring watermark. Drain only the
+            // reservations preceding it; later writes stay behind the control
+            // record and therefore belong to the next lifecycle interval.
+            if (!g_ownedLogEfzQueue.empty()
+                && g_consoleIngressDequeuePosition
+                    >= g_ownedLogEfzQueue.front().ingressBoundary)
+            {
+                entry = std::move(g_ownedLogEfzQueue.front());
+                g_ownedLogEfzQueue.pop_front();
+                droppedLines = g_ownedLogEfzDroppedLines;
+                g_ownedLogEfzDroppedLines = 0;
+                haveQueueEntry = true;
+            }
+            else
+            {
+                ingressSlot =
+                    TryAcquireConsoleIngressRecord(&ingressPosition);
+                if (ingressSlot == nullptr)
+                {
+                    if (g_ownedLogEfzWorkerStopping
+                        && g_ownedLogEfzQueue.empty()
+                        && g_consoleIngressDequeuePosition
+                            >= CaptureConsoleIngressBoundary())
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
+
+        if (ingressSlot != nullptr)
+        {
+            ApplyConsoleIngressLossBoundary(ingressSlot->lossGeneration);
+            ProcessConsoleIngressRecord(*ingressSlot);
+            ReleaseConsoleIngressRecord(ingressSlot, ingressPosition);
+            continue;
+        }
+        if (!haveQueueEntry)
+        {
+            continue;
+        }
+
+        ApplyConsoleIngressLossBoundary(entry.ingressLossGeneration);
 
         if (droppedLines != 0)
         {
             mod::Log(
-                "CAPTURE_LOG: managed logEfz queue overflow dropped=%lu "
-                "(workflow parsing remained synchronous)",
+                "CAPTURE_LOG: managed logEfz mirror queue overflow "
+                "dropped=%lu",
                 droppedLines);
         }
         if (entry.kind == OwnedLogEfzEntry::Kind::CloseBoundary)
         {
             CloseOwnedLogEfzForBoundary();
-        }
-        else if (entry.kind == OwnedLogEfzEntry::Kind::ParseChunk)
-        {
-            // Deferred capture parse. Runs the exact synchronous logic the
-            // writing thread used to run, including prompt/error publication;
-            // any mirror write it produces goes DIRECT (worker thread id
-            // check in AppendOwnedLogEfzLine), preserving FIFO order.
-            if (entry.wide)
-            {
-                const std::string utf8 = ConvertConsoleWideToUtf8(
-                    reinterpret_cast<const wchar_t*>(entry.line.data()),
-                    static_cast<int>(entry.line.size() / sizeof(wchar_t)));
-                if (!utf8.empty() && IsLikelyTextChunk(utf8.c_str(), utf8.size()))
-                {
-                    ProcessConsoleTextChunk(
-                        entry.sourceTag.c_str(),
-                        utf8.c_str(),
-                        utf8.size(),
-                        entry.controlWakeRequestSerialSnapshot);
-                }
-            }
-            else
-            {
-                ProcessConsoleTextChunk(
-                    entry.sourceTag.c_str(),
-                    entry.line.data(),
-                    entry.line.size(),
-                    entry.controlWakeRequestSerialSnapshot);
-            }
         }
         else if (entry.kind == OwnedLogEfzEntry::Kind::ParseFlush)
         {
@@ -1885,32 +1989,44 @@ static void ManagedLogEfzWorkerMain()
         g_ownedLogEfzDrainCv.notify_all();
     }
 
+    ReportConsoleIngressDropsOnWorker();
     g_ownedLogEfzDrainCv.notify_all();
 }
 
-static void StartManagedLogEfzWorker()
+bool StartConsoleCaptureWorker(bool enableRawIngress)
 {
     std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
     if (g_ownedLogEfzWorkerStarted)
     {
-        return;
+        return !enableRawIngress
+            || g_consoleIngressAccepting.load(std::memory_order_acquire);
     }
 
+    g_consoleIngressPollingEnabled.store(
+        enableRawIngress, std::memory_order_release);
+    ResetConsoleIngress();
     g_ownedLogEfzWorkerStopping = false;
-    g_ownedLogEfzAccepting = true;
+    g_ownedLogEfzAccepting = false;
     InterlockedExchange(&g_ownedLogEfzEmergencyStop, 0);
     try
     {
         g_ownedLogEfzWorker = std::thread(ManagedLogEfzWorkerMain);
         g_ownedLogEfzWorkerStarted = true;
+        g_ownedLogEfzAccepting = true;
+        g_consoleIngressAccepting.store(
+            enableRawIngress, std::memory_order_release);
+        return true;
     }
     catch (...)
     {
         g_ownedLogEfzWorkerStarted = false;
         g_ownedLogEfzAccepting = false;
+        g_consoleIngressAccepting.store(false, std::memory_order_release);
+        g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         mod::Log(
             "CAPTURE_LOG: failed to start managed logEfz worker; "
             "mirror disabled to keep disk I/O off the simulation thread");
+        return false;
     }
 }
 
@@ -1958,15 +2074,37 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
             return;
         }
         entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
+        entry.ingressBoundary = CaptureConsoleIngressBoundary();
+        entry.ingressLossGeneration =
+            g_consoleIngressLossGeneration.load(std::memory_order_acquire);
         g_ownedLogEfzQueue.push_back(std::move(entry));
     }
     g_ownedLogEfzQueueCv.notify_one();
 }
 
-// Enqueue a raw captured chunk for deferred parsing on the worker. Returns
-// false whenever the caller must fall back to the synchronous parse (worker
-// not started / stopping / teardown / queue overflow) so prompt and error
-// detection never silently drops.
+static void CopyConsoleIngressSourceTag(char* destination, const char* sourceTag)
+{
+    if (sourceTag == nullptr)
+    {
+        sourceTag = "unknown";
+    }
+    size_t length = 0;
+    while (length + 1 < kConsoleIngressSourceTagBytes
+        && sourceTag[length] != '\0')
+    {
+        ++length;
+    }
+    if (length != 0)
+    {
+        std::memcpy(destination, sourceTag, length);
+    }
+    destination[length] = '\0';
+}
+
+// Wait-free, fixed-capacity raw ingress. There is deliberately no allocation,
+// mutex, notification, logging, retry loop, or synchronous parse here. A
+// producer losing the single reservation CAS drops its complete write rather
+// than contending with another intercepted thread.
 static bool EnqueueConsoleParseChunk(
     const char* sourceTag,
     const void* data,
@@ -1978,53 +2116,57 @@ static bool EnqueueConsoleParseChunk(
     {
         return true; // nothing to parse
     }
-    constexpr size_t kMaxChunkCopy = 16384;
-    if (bytes > kMaxChunkCopy)
+
+    g_consoleIngressActiveProducers.fetch_add(1, std::memory_order_acquire);
+    if (!g_consoleIngressAccepting.load(std::memory_order_acquire))
     {
-        bytes = kMaxChunkCopy; // parse only needs the text head
+        g_consoleIngressUnavailableDrops.fetch_add(1, std::memory_order_relaxed);
+        g_consoleIngressLossGeneration.fetch_add(1, std::memory_order_release);
+        g_consoleIngressActiveProducers.fetch_sub(1, std::memory_order_release);
+        return false;
+    }
+    if (bytes > kConsoleIngressPayloadBytes
+        || (wide && (bytes % sizeof(wchar_t)) != 0))
+    {
+        g_consoleIngressOversizeDrops.fetch_add(1, std::memory_order_relaxed);
+        g_consoleIngressLossGeneration.fetch_add(1, std::memory_order_release);
+        g_consoleIngressActiveProducers.fetch_sub(1, std::memory_order_release);
+        return false;
     }
 
-    OwnedLogEfzEntry entry;
-    entry.kind = OwnedLogEfzEntry::Kind::ParseChunk;
-    entry.sourceTag = sourceTag != nullptr ? sourceTag : "unknown";
-    entry.line.assign(static_cast<const char*>(data), bytes);
-    entry.wide = wide;
-    entry.controlWakeRequestSerialSnapshot =
+    size_t position =
+        g_consoleIngressEnqueuePosition.load(std::memory_order_relaxed);
+    ConsoleIngressSlot& slot =
+        g_consoleIngress[position & (kConsoleIngressCapacity - 1)];
+    if (slot.sequence.load(std::memory_order_acquire) != position)
+    {
+        g_consoleIngressFullDrops.fetch_add(1, std::memory_order_relaxed);
+        g_consoleIngressLossGeneration.fetch_add(1, std::memory_order_release);
+        g_consoleIngressActiveProducers.fetch_sub(1, std::memory_order_release);
+        return false;
+    }
+    if (!g_consoleIngressEnqueuePosition.compare_exchange_strong(
+            position,
+            position + 1,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed))
+    {
+        g_consoleIngressContentionDrops.fetch_add(1, std::memory_order_relaxed);
+        g_consoleIngressLossGeneration.fetch_add(1, std::memory_order_release);
+        g_consoleIngressActiveProducers.fetch_sub(1, std::memory_order_release);
+        return false;
+    }
+
+    CopyConsoleIngressSourceTag(slot.sourceTag, sourceTag);
+    std::memcpy(slot.payload, data, bytes);
+    slot.bytes = bytes;
+    slot.wide = wide;
+    slot.controlWakeRequestSerialSnapshot =
         controlWakeRequestSerialSnapshot;
-
-    {
-        std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (!g_ownedLogEfzWorkerStarted || g_ownedLogEfzWorkerStopping
-            || !g_ownedLogEfzAccepting
-            || InterlockedCompareExchange(
-                   &g_ownedLogEfzEmergencyStop, 0, 0) != 0)
-        {
-            return false;
-        }
-        if (g_ownedLogEfzQueue.size() >= kOwnedLogEfzQueueLimit)
-        {
-            // Queue full: caller falls back to a SYNCHRONOUS parse on the
-            // writing (during battle, rollback) thread - the exact per-tick
-            // perturbation DeferredConsoleParse exists to remove. This should
-            // never happen in practice (the worker drains far faster than
-            // Revival writes), so make it loud rather than silent: the
-            // 2026-07-20 desync-surface audit flagged this reversion as the
-            // one path that could reintroduce the timing cost mid-battle.
-            const unsigned long n = ++g_ownedLogEfzParseOverflowCount;
-            if (n == 1 || (n % 256) == 0)
-            {
-                mod::Log(
-                    "CAPTURE_LOG: deferred parse queue full (limit=%zu, "
-                    "overflow #%lu) - parsing SYNCHRONOUSLY on the writing "
-                    "thread; deferred-parse protection temporarily lost",
-                    kOwnedLogEfzQueueLimit, n);
-            }
-            return false;
-        }
-        entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
-        g_ownedLogEfzQueue.push_back(std::move(entry));
-    }
-    g_ownedLogEfzQueueCv.notify_one();
+    slot.lossGeneration =
+        g_consoleIngressLossGeneration.load(std::memory_order_acquire);
+    slot.sequence.store(position + 1, std::memory_order_release);
+    g_consoleIngressActiveProducers.fetch_sub(1, std::memory_order_release);
     return true;
 }
 
@@ -2042,12 +2184,29 @@ static bool EnqueueConsoleParseFlush()
         {
             return false;
         }
-        if (g_ownedLogEfzQueue.size() >= kOwnedLogEfzQueueLimit)
+
+        const bool resumeIngress = PauseConsoleIngress();
+        entry.ingressBoundary = CaptureConsoleIngressBoundary();
+        entry.ingressLossGeneration =
+            g_consoleIngressLossGeneration.load(std::memory_order_acquire);
+        entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
+        try
         {
+            // Control records are not subject to the mirror-line limit.
+            g_ownedLogEfzQueue.push_back(std::move(entry));
+        }
+        catch (...)
+        {
+            if (resumeIngress)
+            {
+                g_consoleIngressAccepting.store(true, std::memory_order_release);
+            }
             return false;
         }
-        entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
-        g_ownedLogEfzQueue.push_back(std::move(entry));
+        if (resumeIngress)
+        {
+            g_consoleIngressAccepting.store(true, std::memory_order_release);
+        }
     }
     g_ownedLogEfzQueueCv.notify_one();
     return true;
@@ -2059,6 +2218,8 @@ void StopManagedLogEfzWorker(bool waitForDrain)
     {
         // Loader-lock/process-termination path. Do not acquire a mutex that a
         // suspended thread could own, and do not wait for disk I/O.
+        g_consoleIngressAccepting.store(false, std::memory_order_release);
+        g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         InterlockedExchange(&g_ownedLogEfzEmergencyStop, 1);
         g_ownedLogEfzQueueCv.notify_all();
         g_ownedLogEfzDrainCv.notify_all();
@@ -2075,13 +2236,18 @@ void StopManagedLogEfzWorker(bool waitForDrain)
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
         if (!g_ownedLogEfzWorkerStarted)
         {
+            g_consoleIngressAccepting.store(false, std::memory_order_release);
             return;
         }
         // Stop accepting before the final FIFO close marker. Nothing can
         // reopen the file between this boundary and worker termination.
         g_ownedLogEfzAccepting = false;
+        (void)PauseConsoleIngress();
         OwnedLogEfzEntry closeEntry;
         closeEntry.kind = OwnedLogEfzEntry::Kind::CloseBoundary;
+        closeEntry.ingressBoundary = CaptureConsoleIngressBoundary();
+        closeEntry.ingressLossGeneration =
+            g_consoleIngressLossGeneration.load(std::memory_order_acquire);
         closeEntry.sequence = ++g_ownedLogEfzEnqueuedSequence;
         closeSequence = closeEntry.sequence;
         g_ownedLogEfzQueue.push_back(std::move(closeEntry));
@@ -2108,6 +2274,8 @@ void StopManagedLogEfzWorker(bool waitForDrain)
         g_ownedLogEfzWorkerStarted = false;
         g_ownedLogEfzWorkerStopping = false;
         g_ownedLogEfzAccepting = false;
+        g_consoleIngressAccepting.store(false, std::memory_order_release);
+        g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         g_ownedLogEfzQueue.clear();
         // Clear the worker id so a recycled OS thread id can't satisfy the
         // direct-mirror-write check between worker generations.
@@ -2136,13 +2304,10 @@ void CloseMirrorLogFiles()
 {
     unsigned long long closeSequence = 0;
     {
-        // Serialize against the complete parse-and-enqueue operation. A
-        // native write that entered before this boundary must either finish
-        // enqueueing first or wait and become part of the next session.
-        // With deferred parsing, pending chunks already sit in the same FIFO
-        // queue: a ParseFlush control record enqueued immediately before the
-        // close boundary drains any partial lines those chunks assembled,
-        // strictly before the boundary runs.
+        // Pause new reservations and wait only for bounded in-flight copies.
+        // Both controls use the resulting ring watermark; writes accepted
+        // after ingress resumes remain behind the close and therefore cannot
+        // leak into the prior session's managed log.
         std::lock_guard<std::mutex> parserLock(g_consoleLogMutex);
         std::lock_guard<std::mutex> queueLock(g_ownedLogEfzQueueMutex);
         if (g_ownedLogEfzWorkerStarted
@@ -2150,23 +2315,37 @@ void CloseMirrorLogFiles()
             && InterlockedCompareExchange(
                    &g_ownedLogEfzEmergencyStop, 0, 0) == 0)
         {
+            const bool resumeIngress = PauseConsoleIngress();
+            const size_t ingressBoundary = CaptureConsoleIngressBoundary();
+            const unsigned long ingressLossGeneration =
+                g_consoleIngressLossGeneration.load(std::memory_order_acquire);
+
             OwnedLogEfzEntry flushEntry;
             flushEntry.kind = OwnedLogEfzEntry::Kind::ParseFlush;
+            flushEntry.ingressBoundary = ingressBoundary;
+            flushEntry.ingressLossGeneration = ingressLossGeneration;
             flushEntry.sequence = ++g_ownedLogEfzEnqueuedSequence;
             // Control records are never dropped, even at the line limit.
             g_ownedLogEfzQueue.push_back(std::move(flushEntry));
 
             OwnedLogEfzEntry closeEntry;
             closeEntry.kind = OwnedLogEfzEntry::Kind::CloseBoundary;
+            closeEntry.ingressBoundary = ingressBoundary;
+            closeEntry.ingressLossGeneration = ingressLossGeneration;
             closeEntry.sequence = ++g_ownedLogEfzEnqueuedSequence;
             closeSequence = closeEntry.sequence;
             g_ownedLogEfzQueue.push_back(std::move(closeEntry));
+
+            if (resumeIngress)
+            {
+                g_consoleIngressAccepting.store(true, std::memory_order_release);
+            }
         }
         else
         {
-            // Worker unavailable: flush synchronously under the parser lock
-            // (the old behavior; parse chunks also fall back to synchronous
-            // in this state, so ordering stays coherent).
+            // Worker unavailable: no raw producer ever parses synchronously.
+            // Flush only fragments assembled earlier by the worker.
+            g_consoleIngressAccepting.store(false, std::memory_order_release);
             FlushPendingConsoleOutputLocked();
         }
     }
@@ -2189,7 +2368,7 @@ void PrimeManagedLogEfzHistory()
     // Append-only writing keeps no history; opening the file up front still
     // matters so the fresh-launch truncation (and its log line) happens at
     // startup rather than at the first captured write.
-    StartManagedLogEfzWorker();
+    (void)StartConsoleCaptureWorker(false);
     std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
     (void)EnsureOwnedLogEfzFilesOpenLocked();
 }
@@ -2207,18 +2386,86 @@ bool IsManagedLogEfzWriteActive()
     return false;
 }
 
-// --- Handle cache for logEfz disk writes --------------------------------
-// GetFileType + TryGetDiskFilePathFromHandle are expensive to call on every
-// WriteFile invocation.  Once we've identified a handle as the logEfz disk
-// file, cache it and skip the path resolution on subsequent calls.  Reset
-// when the managed log session is closed (file handle may change).
-static HANDLE g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
-static HANDLE g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
+// --- Preclassified WriteFile handles --------------------------------------
+// StubCreateFileA/W performs path classification next to the inherently
+// blocking native open and publishes positive text-log classifications here.
+// StubWriteFile can then make a single bounded lookup without file APIs,
+// strings, locks, or logging. Unknown handles (including non-text files and
+// stdout/stderr pipes inherited before our IAT hook) are still handed to the
+// worker and filtered there. Never cache an "ignore" classification: a closed
+// numeric handle can be reused without passing through our CreateFile stub.
+enum : LONG
+{
+    kConsoleFileUnknown = 0,
+    kConsoleFileIgnore = 1,
+    kConsoleFileTextLog = 2,
+};
+
+constexpr size_t kConsoleFileRegistryCapacity = 256;
+
+struct ConsoleFileRegistryEntry
+{
+    std::atomic<uintptr_t> handle{0};
+    std::atomic<LONG> kind{kConsoleFileUnknown};
+};
+
+static std::array<ConsoleFileRegistryEntry, kConsoleFileRegistryCapacity>
+    g_consoleFileRegistry;
+
+static size_t ConsoleFileRegistryIndex(HANDLE hFile)
+{
+    const uintptr_t value = reinterpret_cast<uintptr_t>(hFile);
+    return ((value >> 2u) ^ (value >> 10u))
+        & (kConsoleFileRegistryCapacity - 1u);
+}
+
+void RegisterConsoleCaptureFileHandle(HANDLE hFile, bool captureAsTextLog)
+{
+    if (!captureAsTextLog
+        || hFile == nullptr
+        || hFile == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    ConsoleFileRegistryEntry& entry =
+        g_consoleFileRegistry[ConsoleFileRegistryIndex(hFile)];
+    entry.handle.store(0, std::memory_order_release);
+    entry.kind.store(kConsoleFileTextLog, std::memory_order_relaxed);
+    entry.handle.store(
+        reinterpret_cast<uintptr_t>(hFile),
+        std::memory_order_release);
+}
+
+static LONG ClassifyRegisteredConsoleFileHandle(HANDLE hFile)
+{
+    if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE)
+    {
+        return kConsoleFileIgnore;
+    }
+
+    const ConsoleFileRegistryEntry& entry =
+        g_consoleFileRegistry[ConsoleFileRegistryIndex(hFile)];
+    const uintptr_t expectedHandle = reinterpret_cast<uintptr_t>(hFile);
+    const uintptr_t handleBefore =
+        entry.handle.load(std::memory_order_acquire);
+    if (handleBefore != expectedHandle)
+    {
+        return kConsoleFileUnknown;
+    }
+    const LONG kind = entry.kind.load(std::memory_order_relaxed);
+    const uintptr_t handleAfter =
+        entry.handle.load(std::memory_order_acquire);
+    return handleAfter == handleBefore ? kind : kConsoleFileUnknown;
+}
 
 static void ResetLogEfzDiskHandleCache()
 {
-    g_cachedLogEfzDiskHandle = INVALID_HANDLE_VALUE;
-    g_cachedNonLogDiskHandle = INVALID_HANDLE_VALUE;
+    for (auto& entry : g_consoleFileRegistry)
+    {
+        entry.handle.store(0, std::memory_order_release);
+        entry.kind.store(kConsoleFileUnknown, std::memory_order_relaxed);
+    }
 }
 
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
@@ -2228,76 +2475,16 @@ void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes)
         return;
     }
 
-    const char* text = reinterpret_cast<const char*>(lpBuffer);
-    const size_t textLen = static_cast<size_t>(nBytes);
-    if (!IsLikelyTextChunk(text, textLen))
+    const LONG fileKind = ClassifyRegisteredConsoleFileHandle(hFile);
+    if (fileKind == kConsoleFileIgnore)
     {
         return;
     }
 
-    // Fast path: if we already identified this handle, skip expensive checks.
-    if (hFile == g_cachedLogEfzDiskHandle)
-    {
-        LogConsoleTextChunk("WriteFileDisk", text, textLen);
-        return;
-    }
-    if (hFile == g_cachedNonLogDiskHandle)
-    {
-        return; // Known non-logEfz disk handle, skip entirely.
-    }
-
-    // Console output can flow through redirected handles (pipes/unknown).
-    // Keep console/pipe traffic visible, and selectively forward disk-backed
-    // Revival text logs without enabling noisy binary file dumps.
-    SetLastError(NO_ERROR);
-    const DWORD fileType = GetFileType(hFile);
-    if (fileType == FILE_TYPE_DISK)
-    {
-        std::string pathText;
-        if (!TryGetDiskFilePathFromHandle(hFile, &pathText))
-        {
-            g_cachedNonLogDiskHandle = hFile;
-            return;
-        }
-        if (!IsLikelyRevivalDiskLogPath(pathText))
-        {
-            g_cachedNonLogDiskHandle = hFile;
-            return;
-        }
-
-        // Cache this as the logEfz handle for fast-path on subsequent calls.
-        g_cachedLogEfzDiskHandle = hFile;
-
-        bool announcePath = false;
-        LONG pathHitCount = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_consoleLogMutex);
-            LONG& hitRef = g_diskCapturePathHits[pathText];
-            ++hitRef;
-            pathHitCount = hitRef;
-            announcePath = (hitRef == 1);
-        }
-        (void)announcePath;
-        if (pathHitCount == 1)
-        {
-            std::string logEfzPath;
-            if (TryGetLogEfzDiskPath(hFile, &logEfzPath))
-            {
-                mod::Log(
-                    "CAPTURE_LOG: observed native logEfz WriteFile path='%s'",
-                    logEfzPath.c_str());
-            }
-        }
-
-        LogConsoleTextChunk("WriteFileDisk", text, textLen);
-        return;
-    }
-    if (fileType == FILE_TYPE_UNKNOWN && GetLastError() != NO_ERROR)
-    {
-        return;
-    }
-
-    LogConsoleTextChunk("WriteFile", text, textLen);
+    LogConsoleTextChunk(
+        fileKind == kConsoleFileTextLog ? "WriteFileDisk" : "WriteFile",
+        reinterpret_cast<const char*>(lpBuffer),
+        static_cast<size_t>(nBytes));
 }
 
 void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars)
@@ -2318,7 +2505,11 @@ void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars)
     }
 
     const wchar_t* wideText = reinterpret_cast<const wchar_t*>(lpBuffer);
-    const int wideLen = (std::min)(static_cast<int>(nChars), 0x4000);
+    constexpr size_t kMaxIngressWideChars =
+        kConsoleIngressPayloadBytes / sizeof(wchar_t);
+    const int wideLen = static_cast<int>((std::min)(
+        static_cast<size_t>(nChars),
+        kMaxIngressWideChars + 1));
     if (wideLen <= 0)
     {
         return;
@@ -2337,12 +2528,12 @@ void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, CO
     // Inject synthetic newline when cursor Y changes.  Revival uses cursor
     // moves for newlines - actual '\n' characters are never written via
     // WriteConsoleOutputCharacterA.
-    static SHORT s_lastY = -1;
-    if (s_lastY >= 0 && writeCoord.Y != s_lastY)
+    static std::atomic<SHORT> s_lastY{-1};
+    const SHORT lastY = s_lastY.exchange(writeCoord.Y, std::memory_order_relaxed);
+    if (lastY >= 0 && writeCoord.Y != lastY)
     {
         LogConsoleTextChunk("WriteConsoleOutputCharacterA", "\n", 1);
     }
-    s_lastY = writeCoord.Y;
 
     LogConsoleTextChunk("WriteConsoleOutputCharacterA", reinterpret_cast<const char*>(lpBuffer), static_cast<size_t>(nChars));
 }
@@ -2357,15 +2548,19 @@ void MaybeLogConsoleOutputCharacterWChunk(const VOID* lpBuffer, DWORD nChars, CO
     // Inject synthetic newline when cursor Y changes.  Revival uses cursor
     // moves for newlines - actual '\n' characters are never written via
     // WriteConsoleOutputCharacterW.
-    static SHORT s_lastY = -1;
-    if (s_lastY >= 0 && writeCoord.Y != s_lastY)
+    static std::atomic<SHORT> s_lastY{-1};
+    const SHORT lastY = s_lastY.exchange(writeCoord.Y, std::memory_order_relaxed);
+    if (lastY >= 0 && writeCoord.Y != lastY)
     {
         LogConsoleTextChunk("WriteConsoleOutputCharacterW", "\n", 1);
     }
-    s_lastY = writeCoord.Y;
 
     const wchar_t* wideText = reinterpret_cast<const wchar_t*>(lpBuffer);
-    const int wideLen = (std::min)(static_cast<int>(nChars), 0x4000);
+    constexpr size_t kMaxIngressWideChars =
+        kConsoleIngressPayloadBytes / sizeof(wchar_t);
+    const int wideLen = static_cast<int>((std::min)(
+        static_cast<size_t>(nChars),
+        kMaxIngressWideChars + 1));
     if (wideLen <= 0)
     {
         return;
@@ -2381,7 +2576,12 @@ void MaybeLogOutputDebugStringA(LPCSTR lpOutputString)
         return;
     }
 
-    const size_t len = std::strlen(lpOutputString);
+    size_t len = 0;
+    while (len <= kConsoleIngressPayloadBytes
+        && lpOutputString[len] != '\0')
+    {
+        ++len;
+    }
     if (len == 0)
     {
         return;
@@ -2397,8 +2597,15 @@ void MaybeLogOutputDebugStringW(LPCWSTR lpOutputString)
         return;
     }
 
-    const int wideLen =
-        (std::min)(static_cast<int>(wcslen(lpOutputString)), 0x4000);
+    size_t wideChars = 0;
+    constexpr size_t kMaxIngressWideChars =
+        kConsoleIngressPayloadBytes / sizeof(wchar_t);
+    while (wideChars <= kMaxIngressWideChars
+        && lpOutputString[wideChars] != L'\0')
+    {
+        ++wideChars;
+    }
+    const int wideLen = static_cast<int>(wideChars);
     if (wideLen <= 0)
     {
         return;

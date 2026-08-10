@@ -99,7 +99,10 @@ const netplay::menu::NetplayMenuSpec* GetMenuSpec();
 void ResetState();
 bool EnterMenu();
 void LeaveMenu();
-void ShutdownRenderOverlay();
+// Disables/removes the shared EndScene detour. Returns false if MinHook could
+// not verify that the interposition is inactive; callers entering online
+// simulation must treat failure as a blocked handoff.
+bool ShutdownRenderOverlay();
 // Ensures the shared Direct3D9 EndScene overlay hook is installed. Used by the
 // battle-log overlay, the async-host in-gameplay indicator, and the ImGui debug
 // overlay. Idempotent and cheap after the first successful install.

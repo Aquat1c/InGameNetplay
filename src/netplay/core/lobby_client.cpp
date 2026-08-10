@@ -2009,6 +2009,8 @@ bool TryDiscoverPublicIpForFamily(
 
     const DWORD familyDiscoveryStartTick = GetTickCount();
     std::thread apiThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         apiAttempt.resolved =
             useTlsForApi
                 ? TryTlsPublicIpSource(
@@ -2027,6 +2029,8 @@ bool TryDiscoverPublicIpForFamily(
                       &apiAttempt.publicIp);
     });
     std::thread identThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         identAttempt.resolved = TryWinInetPublicIpSource(
             identUrl,
             identLabel,
@@ -2036,6 +2040,8 @@ bool TryDiscoverPublicIpForFamily(
             &identAttempt.publicIp);
     });
     std::thread tnediThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         tnediAttempt.resolved = TryWinInetPublicIpSource(
             tnediUrl,
             tnediLabel,
@@ -3086,6 +3092,13 @@ void LobbySession::PollThreadEntry()
         m_joinedRoom.playerId,
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
+
+    // Joining remains normal-priority so the visible menu operation is not
+    // delayed.  Once joined, polling is keepalive/control-plane work and may
+    // coexist with EFZ battle simulation; give the normal-priority game thread
+    // precedence without changing the poll interval or server semantics.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
     // Discover public IP in the background after joining so lobby entry is not blocked.
     StartPublicIpDiscoveryAsync();
@@ -4297,6 +4310,8 @@ void LobbySession::StartPublicIpDiscoveryAsync()
     }
 
     m_publicIpThread = std::thread([this]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         DiscoverPublicIp();
     });
 }

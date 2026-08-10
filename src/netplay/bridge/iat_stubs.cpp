@@ -171,6 +171,46 @@ static bool HasLogNetBaseNameW(LPCWSTR path)
     return _wcsicmp(baseName, L"logNet.txt") == 0;
 }
 
+static HANDLE RegisterCreatedConsoleFileA(HANDLE handle, LPCSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != '\0')
+    {
+        captureAsTextLog = IsLikelyRevivalDiskLogPath(std::string(path));
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
+static HANDLE RegisterCreatedConsoleFileW(HANDLE handle, LPCWSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != L'\0')
+    {
+        const int utf8Bytes = WideCharToMultiByte(
+            CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Bytes > 1)
+        {
+            std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+            if (WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    path,
+                    -1,
+                    utf8.data(),
+                    utf8Bytes,
+                    nullptr,
+                    nullptr) > 0)
+            {
+                utf8.resize(static_cast<size_t>(utf8Bytes - 1));
+                captureAsTextLog = IsLikelyRevivalDiskLogPath(utf8);
+            }
+        }
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
 // The helper EXE opens logNet.txt with a truncating disposition at every
 // session start, so each session erases the previous one's network log.
 // Detect a truncating write open of logNet.txt and convert it to an
@@ -757,7 +797,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     // For online/spectate: if neither longjmp context is active, ExitProcess
     // was called from a DLL code path that isn't covered by any setjmp
     // (e.g. a direct vtable call from the EXE game loop during a state
-    // transition, BEFORE HookedCharSelectUpdateImpl runs for the first time).
+    // transition outside the title or active Revival-tick recovery scopes).
     //
     // All ExitProcess call sites in the DLL should be made unreachable by
     // SaveAndApplyDllExitProcessPatches.  If we reach here, there is an
@@ -3260,6 +3300,10 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
     const DWORD nativeError = GetLastError();
     DWORD capturedBytes = 0;
@@ -3300,14 +3344,16 @@ HANDLE StubCreateFileA(
                 "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
                 lpFileName,
                 redirectPath.c_str());
-            return CreateFileA(
-                redirectPath.c_str(),
-                dwDesiredAccess,
-                redirectShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile);
+            return RegisterCreatedConsoleFileA(
+                CreateFileA(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
         }
     }
 
@@ -3328,18 +3374,20 @@ HANDLE StubCreateFileA(
             mod::Log(
                 "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
                 lpFileName);
-            return handle;
+            return RegisterCreatedConsoleFileA(handle, lpFileName);
         }
     }
 
-    return CreateFileA(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    return RegisterCreatedConsoleFileA(
+        CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
 }
 
 HANDLE StubCreateFileW(
@@ -3365,14 +3413,16 @@ HANDLE StubCreateFileW(
                 "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' redirect='%s'",
                 originalUtf8,
                 redirectUtf8);
-            return CreateFileW(
-                redirectPath.c_str(),
-                dwDesiredAccess,
-                redirectShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile);
+            return RegisterCreatedConsoleFileW(
+                CreateFileW(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
         }
     }
 
@@ -3395,22 +3445,28 @@ HANDLE StubCreateFileW(
             mod::Log(
                 "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
                 originalUtf8);
-            return handle;
+            return RegisterCreatedConsoleFileW(handle, lpFileName);
         }
     }
 
-    return CreateFileW(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    return RegisterCreatedConsoleFileW(
+        CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
 }
 
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
     const DWORD nativeError = GetLastError();
     const DWORD capturedChars = result
@@ -3428,6 +3484,10 @@ BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumbe
 
 BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
     const DWORD nativeError = GetLastError();
     const DWORD capturedChars = result
@@ -3445,6 +3505,10 @@ BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumbe
 
 BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
     const DWORD nativeError = GetLastError();
     const DWORD capturedChars = result
@@ -3460,6 +3524,10 @@ BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter,
 
 BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
     const DWORD nativeError = GetLastError();
     const DWORD capturedChars = result
@@ -3475,12 +3543,20 @@ BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter
 
 VOID StubOutputDebugStringA(LPCSTR lpOutputString)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     OutputDebugStringA(lpOutputString);
     MaybeLogOutputDebugStringA(lpOutputString);
 }
 
 VOID StubOutputDebugStringW(LPCWSTR lpOutputString)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     OutputDebugStringW(lpOutputString);
     MaybeLogOutputDebugStringW(lpOutputString);
 }

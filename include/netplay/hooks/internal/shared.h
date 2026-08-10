@@ -250,7 +250,6 @@ extern bool g_pendingVsHumanAutoConfirm;
 extern DWORD g_pendingVsHumanAutoConfirmTick;
 extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
 extern bool g_returnToNetplayAfterMatch;
-extern bool g_charSelectEntryHoldArmed;
 extern int g_recoveryRenderTraceFramesRemaining;
 extern InputSnapshot g_lastInputSnapshot;
 extern DelaySetupOverlayState g_delaySetupOverlay;
@@ -308,16 +307,11 @@ void ActivateJoiningOverlay(const char* address, uint16_t port);
 void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port);
 void ResetJoiningOverlayState();
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage);
-void InstallNetplayWindowHook(uint32_t screenContext);
-void RemoveNetplayWindowHook();
+bool InstallNetplayWindowHook(uint32_t screenContext);
+bool RemoveNetplayWindowHook();
 bool IsWindowFocused(HWND hwnd);
 bool IsScreenWindowFocused(uint32_t screenContext);
 bool ConsumeNetplayEscapeEdge();
-bool EnsureCharSelectEntryHoldHook();
-void ArmCharSelectEntryHold();
-bool EnsureReplayScreenHook();
-void ArmSpectateReplayBypass();
-void DisarmSpectateReplayBypass();
 
 int GetCurrentMenuEntryCount();
 int ClampSelectionToCurrentMenu(int selection);
@@ -390,6 +384,5 @@ extern "C" void __cdecl ReplayCaseCompatImpl(uint32_t screenContext);
 extern "C" void ReplayCaseCompatThunk();
 extern "C" void HookedTitleUpdateThunk();
 extern "C" void HookedTitleRenderThunk();
-extern "C" void HookedReplayScreenUpdateThunk();
 #endif
 } // namespace netplay::hooks::internal

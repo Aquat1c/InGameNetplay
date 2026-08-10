@@ -756,17 +756,47 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
-void ShutdownImGui()
+bool ShutdownImGui()
 {
     if (!g_inited)
     {
-        return;
+        return true;
     }
-    if (g_prevWndProc != nullptr && g_hwnd != nullptr)
+    if (g_hwnd != nullptr && IsWindow(g_hwnd))
     {
-        SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_prevWndProc));
-        g_prevWndProc = nullptr;
+        SetLastError(NO_ERROR);
+        const LONG_PTR currentValue = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+        const DWORD readError = GetLastError();
+        if ((currentValue == 0 && readError != NO_ERROR)
+            || reinterpret_cast<WNDPROC>(currentValue) != &DebugWndProc
+            || g_prevWndProc == nullptr)
+        {
+            mod::Log(
+                "DebugOverlay: WndProc restore refused hwnd=%p current=%p hook=%p previous=%p err=%lu",
+                g_hwnd,
+                reinterpret_cast<void*>(currentValue),
+                reinterpret_cast<void*>(&DebugWndProc),
+                reinterpret_cast<void*>(g_prevWndProc),
+                static_cast<unsigned long>(readError));
+            return false;
+        }
+
+        SetLastError(NO_ERROR);
+        const LONG_PTR result = SetWindowLongPtrA(
+            g_hwnd,
+            GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(g_prevWndProc));
+        const DWORD restoreError = GetLastError();
+        if (result == 0 && restoreError != NO_ERROR)
+        {
+            mod::Log(
+                "DebugOverlay: WndProc restore failed hwnd=%p err=%lu",
+                g_hwnd,
+                static_cast<unsigned long>(restoreError));
+            return false;
+        }
     }
+    g_prevWndProc = nullptr;
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -781,6 +811,7 @@ void ShutdownImGui()
     InterlockedExchange(&g_rtFontRebuildRequested, 0);
     g_lastBackBufferW = 0;
     g_lastBackBufferH = 0;
+    return true;
 }
 
 // Returns the device's current RENDER TARGET size, or {0,0} on failure. During
@@ -831,8 +862,44 @@ bool EnsureInited(IDirect3DDevice9* device)
     }
     if (g_inited && g_device != device)
     {
-        // Device recreated (e.g. reset) - rebuild against the new one.
-        ShutdownImGui();
+        // A normal D3D9 recreation keeps the same focus window. Rebind only
+        // the DX9 backend so the existing WndProc chain stays intact even when
+        // NetplayWindowProc currently sits above DebugWndProc.
+        HWND replacementHwnd = nullptr;
+        D3DDEVICE_CREATION_PARAMETERS replacementCp = {};
+        if (SUCCEEDED(device->GetCreationParameters(&replacementCp)))
+        {
+            replacementHwnd = replacementCp.hFocusWindow;
+        }
+        if (replacementHwnd == nullptr)
+        {
+            replacementHwnd = GetActiveWindow();
+        }
+        if (replacementHwnd == g_hwnd)
+        {
+            ImGui_ImplDX9_Shutdown();
+            if (!ImGui_ImplDX9_Init(device))
+            {
+                mod::Log(
+                    "DebugOverlay: DX9 backend rebind failed device=%p",
+                    device);
+                return false;
+            }
+            g_device = device;
+            g_lastBackBufferW = 0;
+            g_lastBackBufferH = 0;
+            mod::Log(
+                "DebugOverlay: DX9 backend rebound device=%p hwnd=%p",
+                device,
+                replacementHwnd);
+            return true;
+        }
+
+        // A real window change needs a full ownership-checked teardown.
+        if (!ShutdownImGui())
+        {
+            return false;
+        }
     }
 
     HWND hwnd = nullptr;
@@ -1113,6 +1180,56 @@ void DrawDebugPanel()
     ImGui::End();
 }
 } // namespace
+
+bool SuspendForOnlineSimulation()
+{
+    ClearRtText();
+    g_panelOpen = false;
+    return ShutdownImGui();
+}
+
+bool ReplaceChainedWindowProc(
+    HWND hwnd,
+    WNDPROC expectedPrevious,
+    WNDPROC replacement)
+{
+    if (!g_inited
+        || hwnd == nullptr
+        || hwnd != g_hwnd
+        || expectedPrevious == nullptr
+        || replacement == nullptr
+        || g_prevWndProc != expectedPrevious)
+    {
+        return false;
+    }
+
+    g_prevWndProc = replacement;
+    mod::Log(
+        "DebugOverlay: spliced chained WndProc hwnd=%p removed=%p replacement=%p",
+        hwnd,
+        reinterpret_cast<void*>(expectedPrevious),
+        reinterpret_cast<void*>(replacement));
+    return true;
+}
+
+bool HasChainedWindowProc(HWND hwnd, WNDPROC expectedPrevious)
+{
+    if (!g_inited
+        || hwnd == nullptr
+        || hwnd != g_hwnd
+        || expectedPrevious == nullptr
+        || g_prevWndProc != expectedPrevious
+        || !IsWindow(hwnd))
+    {
+        return false;
+    }
+
+    SetLastError(NO_ERROR);
+    const LONG_PTR currentValue = GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+    const DWORD readError = GetLastError();
+    return !(currentValue == 0 && readError != NO_ERROR)
+        && reinterpret_cast<WNDPROC>(currentValue) == &DebugWndProc;
+}
 
 void Render(IDirect3DDevice9* device)
 {

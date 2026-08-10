@@ -62,7 +62,6 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/revival_takeover.cpp
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
-    src/netplay/bridge/batch_stabilizer.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/revival_j_diagnostics.cpp
     src/netplay/bridge/ipc_shared.cpp
@@ -175,11 +174,26 @@ set_target_properties(efz_netplay_mod PROPERTIES
 
 set(EFZ_REVIVAL_102J_VERIFY_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_revival_102j.py")
-if(Python3_Interpreter_FOUND AND EXISTS "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}")
-    add_custom_target(verify_revival_102j
-        COMMAND "${Python3_EXECUTABLE}" "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying EfzRevival 1.02j profile and hook contracts against raw binaries")
+if(Python3_Interpreter_FOUND)
+    if(EXISTS "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}")
+        add_custom_target(verify_revival_102j
+            COMMAND "${Python3_EXECUTABLE}" "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            COMMENT "Verifying EfzRevival 1.02j profile and hook contracts against raw binaries")
+    else()
+        message(WARNING
+            "EfzRevival 1.02j verifier source is absent: "
+            "${EFZ_REVIVAL_102J_VERIFY_SCRIPT}. The verify_revival_102j target "
+            "will not be available in this checkout.")
+    endif()
+endif()
+
+if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    add_test(
+        NAME simulation_parity_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_simulation_parity.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 if(BUILD_TESTING AND WIN32)

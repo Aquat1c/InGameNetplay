@@ -152,12 +152,9 @@ void EmergencyShutdown();
 void InitializeInjectedProcess();
 void ShutdownInjectedProcess();
 void Tick();
-// Lightweight per-frame export pulse - refreshes shared-memory state from
-// the current g_status snapshot without calling takeover::Tick().  Safe to
-// call from any game thread context (loading screen, battle, frame hook).
-// Publish a low-frequency runtime snapshot. The normal per-frame caller is
-// rate-limited; transition callers pass force=true for immediate publication.
-void TickExportOnly(bool force = false);
+// Publish a runtime snapshot without calling takeover::Tick(). Transition
+// owners use force=true; this must not be polled by the rollback-frame hook.
+void TickExportOnly(bool force);
 bool StartSession(
     NetbridgeRole role,
     uint16_t port,

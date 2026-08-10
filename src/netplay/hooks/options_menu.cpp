@@ -1441,8 +1441,7 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         // [Others] (mod-owned settings)
         {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
         {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey"}},
-        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging", "ExperimentalEagerZeroFrameGraphicsRestore"}},
-        {"Others", "TIMING", {"DeferredConsoleParse", "BatchStabilizerWorkKB"}},
+        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
     };
     return kGroups;
 }
@@ -1901,10 +1900,6 @@ void AppendSyntheticItems()
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
-    upsertBoolIntItem(
-        "ExperimentalEagerZeroFrameGraphicsRestore",
-        false,
-        "Experimental A/B only: re-enable Revival's graphics patch set after an ordinary zero-frame battle tick. Normal play keeps stock render-patch policy; terminal recovery restores remain active.");
     upsertBoolIntItem(
         "MenuTtfText",
         true,

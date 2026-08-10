@@ -359,6 +359,7 @@ void Tick()
     }
 
     if (!g_listenerAcknowledged
+        && !g_listenerStartupFailed
         && (phase == NetbridgePhase::Failed
             || phase == NetbridgePhase::SessionEnded))
     {

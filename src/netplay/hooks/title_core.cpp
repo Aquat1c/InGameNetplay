@@ -2,6 +2,7 @@
 
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/hooks/debug_overlay.h"
 #include "logger.h"
 #include "netplay/core/player_rooms_menu.h"
 
@@ -475,20 +476,43 @@ LRESULT CALLBACK NetplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     return DefWindowProcA(hwnd, message, wParam, lParam);
 }
 
-void InstallNetplayWindowHook(uint32_t screenContext)
+bool InstallNetplayWindowHook(uint32_t screenContext)
 {
     const HWND hwnd = reinterpret_cast<HWND>(*reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
     if (hwnd == nullptr || !IsWindow(hwnd))
     {
-        return;
+        return false;
     }
 
     if (g_hookedWindow == hwnd && g_originalWindowProc != nullptr)
     {
-        return;
+        SetLastError(NO_ERROR);
+        const LONG_PTR currentValue =
+            GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+        const DWORD readError = GetLastError();
+        if (!(currentValue == 0 && readError != NO_ERROR)
+            && (reinterpret_cast<WNDPROC>(currentValue)
+                    == &NetplayWindowProc
+                || netplay::debug_overlay::HasChainedWindowProc(
+                    hwnd, &NetplayWindowProc)))
+        {
+            return true;
+        }
+
+        mod::Log(
+            "InstallNetplayWindowHook: stale ownership hwnd=%p current=%p err=%lu",
+            hwnd,
+            reinterpret_cast<void*>(currentValue),
+            static_cast<unsigned long>(readError));
     }
 
-    RemoveNetplayWindowHook();
+    if (!RemoveNetplayWindowHook())
+    {
+        mod::Log(
+            "InstallNetplayWindowHook: existing WndProc hook is not safely removable");
+        return false;
+    }
+    SetLastError(NO_ERROR);
     LONG_PTR previousProc = SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&NetplayWindowProc));
     if (previousProc == 0)
     {
@@ -496,40 +520,94 @@ void InstallNetplayWindowHook(uint32_t screenContext)
         if (err != 0)
         {
             mod::Log("InstallNetplayWindowHook: SetWindowLongPtrA failed (err=%lu)", err);
-            return;
+            return false;
         }
     }
 
     g_originalWindowProc = reinterpret_cast<WNDPROC>(previousProc);
     g_hookedWindow = hwnd;
     mod::Log("InstallNetplayWindowHook: hwnd=0x%p originalProc=0x%p", hwnd, reinterpret_cast<void*>(previousProc));
+    return true;
 }
 
-void RemoveNetplayWindowHook()
+bool RemoveNetplayWindowHook()
 {
     if (g_hookedWindow == nullptr || g_originalWindowProc == nullptr)
     {
         g_hookedWindow = nullptr;
         g_originalWindowProc = nullptr;
-        return;
+        return true;
     }
 
-    if (IsWindow(g_hookedWindow))
+    if (!IsWindow(g_hookedWindow))
     {
-        LONG_PTR result = SetWindowLongPtrA(g_hookedWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWindowProc));
-        if (result == 0)
+        g_hookedWindow = nullptr;
+        g_originalWindowProc = nullptr;
+        return true;
+    }
+
+    SetLastError(NO_ERROR);
+    const LONG_PTR currentValue =
+        GetWindowLongPtrA(g_hookedWindow, GWLP_WNDPROC);
+    const DWORD readError = GetLastError();
+    if (currentValue == 0 && readError != NO_ERROR)
+    {
+        mod::Log(
+            "RemoveNetplayWindowHook: current WndProc read failed (err=%lu)",
+            static_cast<unsigned long>(readError));
+        return false;
+    }
+
+    const WNDPROC currentProc = reinterpret_cast<WNDPROC>(currentValue);
+    bool removed = false;
+    if (currentProc == &NetplayWindowProc)
+    {
+        SetLastError(NO_ERROR);
+        const LONG_PTR result = SetWindowLongPtrA(
+            g_hookedWindow,
+            GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(g_originalWindowProc));
+        const DWORD restoreError = GetLastError();
+        if (result == 0 && restoreError != NO_ERROR)
         {
-            const DWORD err = GetLastError();
-            if (err != 0)
-            {
-                mod::Log("RemoveNetplayWindowHook: restore failed (err=%lu)", err);
-            }
+            mod::Log(
+                "RemoveNetplayWindowHook: restore failed (err=%lu)",
+                static_cast<unsigned long>(restoreError));
+            return false;
         }
+        removed = true;
+    }
+    else if (currentProc == g_originalWindowProc)
+    {
+        removed = true;
+    }
+    else
+    {
+        // DebugWndProc may have been installed after this hook. Splice our
+        // thunk out of its predecessor link rather than clobbering the current
+        // top-level proc. This also remains safe if a third-party proc sits
+        // above DebugWndProc.
+        removed = netplay::debug_overlay::ReplaceChainedWindowProc(
+            g_hookedWindow,
+            &NetplayWindowProc,
+            g_originalWindowProc);
+    }
+
+    if (!removed)
+    {
+        mod::Log(
+            "RemoveNetplayWindowHook: ownership changed hwnd=%p current=%p hook=%p original=%p",
+            g_hookedWindow,
+            reinterpret_cast<void*>(currentProc),
+            reinterpret_cast<void*>(&NetplayWindowProc),
+            reinterpret_cast<void*>(g_originalWindowProc));
+        return false;
     }
 
     mod::Log("RemoveNetplayWindowHook: restored");
     g_hookedWindow = nullptr;
     g_originalWindowProc = nullptr;
+    return true;
 }
 
 bool IsWindowFocused(HWND hwnd)

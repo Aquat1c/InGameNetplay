@@ -22,8 +22,17 @@ void Initialize();
 void Shutdown();
 
 /// Populate the exported state from the current bridge status and live game
-/// memory.  Called each frame from session_bridge::Tick().
+/// memory. Called by control-plane ticks and explicit transition publishers,
+/// never by the active rollback-frame hook.
 void Update(const NetbridgeStatus& status);
+
+/// Stop accepting export requests, drain the last accepted control-plane
+/// snapshot, and wait until no export worker is reading live EFZ/Revival
+/// memory. Called before online simulation handoff. Returns false on timeout.
+bool SuspendForOnlineSimulation();
+
+/// Re-enable control-plane export requests after returning to menu/UI flow.
+void ResumeControlPlaneUpdates();
 
 /// Returns a pointer to the module-local copy of the exported state.
 /// Used by the EFZNetplay_GetState DLL-export function.

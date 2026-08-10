@@ -98,6 +98,10 @@ ReturnResult BeginReturnToFrontend(const ReturnRequest& request);
 // battle hook live during practice so its per-frame driver runs. Safe/idempotent
 // and a transparent passthrough while no return is pending.
 void EnsureFrontendReturnUpdateHooks();
+// Restore EFZ's native loading/battle/result vtable slots before an online
+// simulation handoff. Async hosting or a later recovery request reinstalls
+// them lazily when its out-of-match driver is needed again.
+bool SuspendUpdateHooksForOnlineSimulation();
 void TickFrontendReturn();
 bool HasPendingReturn();
 bool IsReturningToFrontend();

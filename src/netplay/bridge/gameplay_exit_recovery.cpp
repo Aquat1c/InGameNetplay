@@ -231,8 +231,6 @@ bool RunGameplayExitContinuation(const char* origin)
     {
         InterlockedExchange(&takeover::g_hostBlock->consoleErrorSerial, 0);
         takeover::g_hostBlock->consoleErrorText[0] = '\0';
-        InterlockedExchange(&takeover::g_hostBlock->consoleDesyncWarnSerial, 0);
-        takeover::g_hostBlock->consoleDesyncWarnText[0] = '\0';
     }
     InterlockedExchange(&takeover::g_revivalExitIntercepted, 0);
     InterlockedExchange(&takeover::g_revivalExitMode, -1);

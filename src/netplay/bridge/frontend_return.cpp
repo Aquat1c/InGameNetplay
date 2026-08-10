@@ -491,6 +491,110 @@ bool InstallScreenUpdateHook(
 #endif
 }
 
+bool RestoreScreenUpdateHook(
+    void* hookThunk,
+    uint32_t* slotAddress,
+    ScreenUpdateFn* originalUpdate,
+    const char* tag)
+{
+#if defined(_M_IX86)
+    if (hookThunk == nullptr || slotAddress == nullptr || originalUpdate == nullptr)
+    {
+        return false;
+    }
+    if (*slotAddress == 0)
+    {
+        return true;
+    }
+
+    auto* const updateSlot = reinterpret_cast<uint32_t*>(*slotAddress);
+    const uint32_t hookAddress =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hookThunk));
+    const uint32_t originalAddress =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(*originalUpdate));
+    uint32_t currentAddress = 0;
+    if (!ReadU32(reinterpret_cast<uintptr_t>(updateSlot), &currentAddress))
+    {
+        mod::Log(
+            "FRONTEND_RETURN_HOOK_RESTORE_FAILED tag=%s reason=unreadable slot=0x%08lX",
+            tag != nullptr ? tag : "unknown",
+            static_cast<unsigned long>(*slotAddress));
+        return false;
+    }
+
+    bool restored = true;
+    if (currentAddress == hookAddress && originalAddress == 0)
+    {
+        mod::Log(
+            "FRONTEND_RETURN_HOOK_RESTORE_FAILED tag=%s reason=missing_original slot=0x%08lX hook=0x%08lX",
+            tag != nullptr ? tag : "unknown",
+            static_cast<unsigned long>(*slotAddress),
+            static_cast<unsigned long>(hookAddress));
+        return false;
+    }
+    if (currentAddress == hookAddress && originalAddress != 0)
+    {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(
+                updateSlot,
+                sizeof(uint32_t),
+                PAGE_EXECUTE_READWRITE,
+                &oldProtect))
+        {
+            restored = false;
+        }
+        else
+        {
+            *updateSlot = originalAddress;
+            DWORD ignored = 0;
+            (void)VirtualProtect(
+                updateSlot, sizeof(uint32_t), oldProtect, &ignored);
+            FlushInstructionCache(
+                GetCurrentProcess(), updateSlot, sizeof(uint32_t));
+        }
+    }
+    else if (currentAddress != originalAddress)
+    {
+        // Another hook replaced the slot after us and may still chain through
+        // our thunk. Preserve its ownership, but do not claim simulation parity
+        // or discard the bookkeeping needed for a later safe retry.
+        mod::Log(
+            "FRONTEND_RETURN_HOOK_RESTORE_OWNERSHIP_CHANGED tag=%s slot=0x%08lX current=0x%08lX hook=0x%08lX original=0x%08lX",
+            tag != nullptr ? tag : "unknown",
+            static_cast<unsigned long>(*slotAddress),
+            static_cast<unsigned long>(currentAddress),
+            static_cast<unsigned long>(hookAddress),
+            static_cast<unsigned long>(originalAddress));
+        return false;
+    }
+
+    if (!restored)
+    {
+        mod::Log(
+            "FRONTEND_RETURN_HOOK_RESTORE_FAILED tag=%s reason=protect slot=0x%08lX err=%lu",
+            tag != nullptr ? tag : "unknown",
+            static_cast<unsigned long>(*slotAddress),
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    mod::Log(
+        "FRONTEND_RETURN_HOOK_RESTORED tag=%s slot=0x%08lX original=0x%08lX",
+        tag != nullptr ? tag : "unknown",
+        static_cast<unsigned long>(*slotAddress),
+        static_cast<unsigned long>(originalAddress));
+    *slotAddress = 0;
+    *originalUpdate = nullptr;
+    return true;
+#else
+    (void)hookThunk;
+    (void)slotAddress;
+    (void)originalUpdate;
+    (void)tag;
+    return true;
+#endif
+}
+
 void EnsureFrontendReturnUpdateHooksImpl()
 {
 #if defined(_M_IX86)
@@ -1066,6 +1170,34 @@ char HandleNativeUpdateReturn(ScreenId updateScreen, char nativeResult)
 void EnsureFrontendReturnUpdateHooks()
 {
     EnsureFrontendReturnUpdateHooksImpl();
+}
+
+bool SuspendUpdateHooksForOnlineSimulation()
+{
+    if (InterlockedCompareExchange(&g_active, 0, 0) != 0)
+    {
+        mod::Log(
+            "FRONTEND_RETURN_HOOK_SUSPEND_SKIPPED reason=return_active state=%s",
+            StateToString(g_state));
+        return false;
+    }
+
+    const bool loadingOk = RestoreScreenUpdateHook(
+        reinterpret_cast<void*>(&FrontendReturnLoadingUpdateThunk),
+        &g_loadingUpdateSlotAddress,
+        &g_originalLoadingUpdate,
+        "loading_online_handoff");
+    const bool battleOk = RestoreScreenUpdateHook(
+        reinterpret_cast<void*>(&FrontendReturnBattleUpdateThunk),
+        &g_battleUpdateSlotAddress,
+        &g_originalBattleUpdate,
+        "battle_online_handoff");
+    const bool resultOk = RestoreScreenUpdateHook(
+        reinterpret_cast<void*>(&FrontendReturnResultUpdateThunk),
+        &g_resultUpdateSlotAddress,
+        &g_originalResultUpdate,
+        "result_online_handoff");
+    return loadingOk && battleOk && resultOk;
 }
 
 FrontendContext CaptureFrontendContext()

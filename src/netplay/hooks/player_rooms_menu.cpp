@@ -10,8 +10,9 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <new>
 #include <utility>
 
 namespace netplay::player_rooms
@@ -82,6 +83,224 @@ std::string g_roomActionResultError;
 bool g_lobbySessionShutdownInFlight = false;
 bool g_refreshAfterLobbySessionShutdown = false;
 std::array<int8_t, 2> g_lastHorizontalInput = {};
+
+enum class RoomWorkerKind : uint8_t
+{
+    Refresh = 0,
+    Join,
+    Create,
+};
+
+struct RoomWorkerContext
+{
+    RoomWorkerKind kind = RoomWorkerKind::Refresh;
+    uint32_t generation = 0;
+    bool showStatusMessage = false;
+    std::string nickname;
+    std::string roomArgument;
+    uint16_t hostPort = 0;
+    HMODULE moduleReference = nullptr;
+};
+
+void PublishRefreshWorkerResult(
+    bool showStatusMessage,
+    uint32_t generation,
+    bool ok,
+    std::vector<netplay::lobby::PublicRoomSummary> rooms,
+    std::string error)
+{
+    std::lock_guard<std::mutex> lock(g_refreshMutex);
+    g_refreshResultReady = true;
+    g_refreshResultShowStatus = showStatusMessage;
+    g_refreshResultOk = ok;
+    g_refreshResultGeneration = generation;
+    g_refreshResultRooms = std::move(rooms);
+    g_refreshResultError = std::move(error);
+}
+
+void PublishRoomActionWorkerResult(
+    AsyncRoomActionKind kind,
+    uint32_t generation,
+    bool ok,
+    netplay::lobby::LobbyJoinedRoom joinedRoom,
+    std::string error)
+{
+    std::lock_guard<std::mutex> lock(g_roomActionMutex);
+    g_roomActionResultReady = true;
+    g_roomActionResultOk = ok;
+    g_roomActionResultGeneration = generation;
+    g_roomActionResultKind = kind;
+    g_roomActionResultJoinedRoom = std::move(joinedRoom);
+    g_roomActionResultError = std::move(error);
+}
+
+DWORD WINAPI RoomWorkerThreadMain(void* rawContext)
+{
+    auto* raw = static_cast<RoomWorkerContext*>(rawContext);
+    const HMODULE moduleReference =
+        raw != nullptr ? raw->moduleReference : nullptr;
+    const bool isBackgroundRefresh =
+        raw != nullptr && raw->kind == RoomWorkerKind::Refresh;
+
+    // Refresh is advisory background work and can remain alive after its menu
+    // has been left. Join/Create are visible foreground operations and retain
+    // normal priority, matching LobbySession's initial-join policy.
+    if (isBackgroundRefresh)
+    {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
+    {
+        // Destroy the heap context, captured strings, and every result object
+        // before releasing the module that owns their code and static state.
+        std::unique_ptr<RoomWorkerContext> context(raw);
+        if (context != nullptr)
+        {
+            switch (context->kind)
+            {
+            case RoomWorkerKind::Refresh:
+            {
+                std::vector<netplay::lobby::PublicRoomSummary> rooms;
+                std::string error;
+                bool ok = false;
+                try
+                {
+                    ok = netplay::lobby::ListPublicRooms(&rooms, &error);
+                }
+                catch (...)
+                {
+                    error = "Public room list request failed";
+                    mod::Log("PlayerRooms::RefreshWorker: unhandled exception");
+                }
+                PublishRefreshWorkerResult(
+                    context->showStatusMessage,
+                    context->generation,
+                    ok,
+                    std::move(rooms),
+                    std::move(error));
+                break;
+            }
+            case RoomWorkerKind::Join:
+            {
+                netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+                std::string error;
+                bool ok = false;
+                try
+                {
+                    ok = netplay::lobby::JoinRoom(
+                        context->nickname,
+                        context->roomArgument,
+                        context->hostPort,
+                        netplay::lobby::RoomOrigin::PlayerRooms,
+                        &joinedRoom,
+                        &error);
+                }
+                catch (...)
+                {
+                    error = "Join request failed";
+                    mod::Log("PlayerRooms::JoinWorker: unhandled exception");
+                }
+                PublishRoomActionWorkerResult(
+                    AsyncRoomActionKind::Join,
+                    context->generation,
+                    ok,
+                    std::move(joinedRoom),
+                    std::move(error));
+                break;
+            }
+            case RoomWorkerKind::Create:
+            {
+                netplay::lobby::LobbyJoinedRoom joinedRoom = {};
+                std::string error;
+                bool ok = false;
+                try
+                {
+                    ok = netplay::lobby::CreateRoom(
+                        context->nickname,
+                        context->roomArgument,
+                        context->hostPort,
+                        netplay::lobby::RoomOrigin::PlayerRooms,
+                        &joinedRoom,
+                        &error);
+                }
+                catch (...)
+                {
+                    error = "Create room request failed";
+                    mod::Log("PlayerRooms::CreateWorker: unhandled exception");
+                }
+                PublishRoomActionWorkerResult(
+                    AsyncRoomActionKind::Create,
+                    context->generation,
+                    ok,
+                    std::move(joinedRoom),
+                    std::move(error));
+                break;
+            }
+            }
+        }
+    }
+
+    // Release the reference atomically with thread exit. A normal FreeLibrary
+    // followed by return could resume through code that has just been unmapped.
+    if (moduleReference != nullptr)
+    {
+        FreeLibraryAndExitThread(moduleReference, 0);
+    }
+    return 0;
+}
+
+bool LaunchRoomWorker(
+    std::unique_ptr<RoomWorkerContext> context,
+    const char* operation)
+{
+    if (context == nullptr)
+    {
+        mod::Log(
+            "PlayerRooms::%sWorker: launch failed reason=allocation",
+            operation != nullptr ? operation : "Unknown");
+        return false;
+    }
+
+    HMODULE moduleReference = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCSTR>(&RoomWorkerThreadMain),
+            &moduleReference)
+        || moduleReference == nullptr)
+    {
+        mod::Log(
+            "PlayerRooms::%sWorker: launch failed reason=module_reference error=%lu",
+            operation != nullptr ? operation : "Unknown",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    context->moduleReference = moduleReference;
+    RoomWorkerContext* const rawContext = context.release();
+    HANDLE worker = CreateThread(
+        nullptr,
+        0,
+        &RoomWorkerThreadMain,
+        rawContext,
+        0,
+        nullptr);
+    if (worker == nullptr)
+    {
+        const DWORD error = GetLastError();
+        std::unique_ptr<RoomWorkerContext> restoreOwnership(rawContext);
+        restoreOwnership->moduleReference = nullptr;
+        FreeLibrary(moduleReference);
+        mod::Log(
+            "PlayerRooms::%sWorker: launch failed reason=CreateThread error=%lu",
+            operation != nullptr ? operation : "Unknown",
+            static_cast<unsigned long>(error));
+        return false;
+    }
+
+    CloseHandle(worker);
+    return true;
+}
 
 bool StartAsyncRefresh(bool showStatusMessage);
 bool StartAsyncJoinRoom(const std::string& roomCode);
@@ -482,20 +701,23 @@ bool StartAsyncRefresh(bool showStatusMessage)
         SetStatusMessage("Refreshing public room list...");
     }
 
-    std::thread([showStatusMessage, generation]() {
-        std::vector<netplay::lobby::PublicRoomSummary> rooms;
-        std::string error;
-        const bool ok = netplay::lobby::ListPublicRooms(&rooms, &error);
+    auto context = std::unique_ptr<RoomWorkerContext>(
+        new (std::nothrow) RoomWorkerContext());
+    if (context != nullptr)
+    {
+        context->kind = RoomWorkerKind::Refresh;
+        context->generation = generation;
+        context->showStatusMessage = showStatusMessage;
+    }
+    if (!LaunchRoomWorker(std::move(context), "Refresh"))
+    {
+        g_refreshInFlight.store(false, std::memory_order_release);
+        if (showStatusMessage)
         {
-            std::lock_guard<std::mutex> lock(g_refreshMutex);
-            g_refreshResultReady = true;
-            g_refreshResultShowStatus = showStatusMessage;
-            g_refreshResultOk = ok;
-            g_refreshResultGeneration = generation;
-            g_refreshResultRooms = std::move(rooms);
-            g_refreshResultError = std::move(error);
+            SetStatusMessage("Public room list request failed.");
         }
-    }).detach();
+        return false;
+    }
 
     return true;
 }
@@ -583,26 +805,22 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
 
     const std::string nickname = hooks::g_netplayMenuState.nickname;
     const uint16_t hostPort = hooks::g_netplayMenuState.hostPort;
-    std::thread([generation, nickname, roomCode, hostPort]() {
-        netplay::lobby::LobbyJoinedRoom joinedRoom = {};
-        std::string error;
-        const bool ok = netplay::lobby::JoinRoom(
-            nickname,
-            roomCode,
-            hostPort,
-            netplay::lobby::RoomOrigin::PlayerRooms,
-            &joinedRoom,
-            &error);
-        {
-            std::lock_guard<std::mutex> lock(g_roomActionMutex);
-            g_roomActionResultReady = true;
-            g_roomActionResultOk = ok;
-            g_roomActionResultGeneration = generation;
-            g_roomActionResultKind = AsyncRoomActionKind::Join;
-            g_roomActionResultJoinedRoom = std::move(joinedRoom);
-            g_roomActionResultError = std::move(error);
-        }
-    }).detach();
+    auto context = std::unique_ptr<RoomWorkerContext>(
+        new (std::nothrow) RoomWorkerContext());
+    if (context != nullptr)
+    {
+        context->kind = RoomWorkerKind::Join;
+        context->generation = generation;
+        context->nickname = nickname;
+        context->roomArgument = roomCode;
+        context->hostPort = hostPort;
+    }
+    if (!LaunchRoomWorker(std::move(context), "Join"))
+    {
+        g_roomActionInFlight.store(false, std::memory_order_release);
+        SetStatusMessage("Join request failed.");
+        return false;
+    }
 
     return true;
 }
@@ -632,26 +850,22 @@ bool StartAsyncCreateRoom()
     const std::string nickname = hooks::g_netplayMenuState.nickname;
     const std::string roomType = GetRoomTypeLabel();
     const uint16_t hostPort = hooks::g_netplayMenuState.hostPort;
-    std::thread([generation, nickname, roomType, hostPort]() {
-        netplay::lobby::LobbyJoinedRoom joinedRoom = {};
-        std::string error;
-        const bool ok = netplay::lobby::CreateRoom(
-            nickname,
-            roomType,
-            hostPort,
-            netplay::lobby::RoomOrigin::PlayerRooms,
-            &joinedRoom,
-            &error);
-        {
-            std::lock_guard<std::mutex> lock(g_roomActionMutex);
-            g_roomActionResultReady = true;
-            g_roomActionResultOk = ok;
-            g_roomActionResultGeneration = generation;
-            g_roomActionResultKind = AsyncRoomActionKind::Create;
-            g_roomActionResultJoinedRoom = std::move(joinedRoom);
-            g_roomActionResultError = std::move(error);
-        }
-    }).detach();
+    auto context = std::unique_ptr<RoomWorkerContext>(
+        new (std::nothrow) RoomWorkerContext());
+    if (context != nullptr)
+    {
+        context->kind = RoomWorkerKind::Create;
+        context->generation = generation;
+        context->nickname = nickname;
+        context->roomArgument = roomType;
+        context->hostPort = hostPort;
+    }
+    if (!LaunchRoomWorker(std::move(context), "Create"))
+    {
+        g_roomActionInFlight.store(false, std::memory_order_release);
+        SetStatusMessage("Create room request failed.");
+        return false;
+    }
 
     return true;
 }

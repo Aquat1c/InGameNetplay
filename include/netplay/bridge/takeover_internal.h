@@ -22,11 +22,12 @@ namespace netplay::bridge::takeover
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kIpcMagic = 0x4E425247;
-constexpr uint32_t kIpcVersion = 5;
+constexpr uint32_t kIpcVersion = 6;
 constexpr char kSharedBlockName[] = "EFZNetbridge_Shared";
 constexpr char kInitReadyEventName[] = "EFZNetbridge_InitReady";
 constexpr char kConsoleReadyEventName[] = "EFZNetbridge_ConsoleReady";
 constexpr DWORD kStartTimeoutMs = 15000;
+constexpr DWORD kInjectedCaptureReadyTimeoutMs = 3000;
 constexpr DWORD kLatePatchRetryLogIntervalMs = 3000;
 constexpr DWORD kPromptSpectateConfirmWaitTimeoutMs = 30000;
 
@@ -97,16 +98,6 @@ struct SharedBlock
     char consoleErrorText[128] = {};
     volatile LONG peerQuitDiagnosticSerial = 0;
     char peerQuitDiagnosticText[8192] = {};
-    // Provisional desync warning channel.  Revival's "Desync detected"
-    // console line is a one-shot Sync-record inequality warning that stock
-    // Revival treats as non-fatal (it keeps comparing and the match keeps
-    // running).  It must NOT flow through consoleErrorSerial, which the
-    // tick hook treats as an immediate disconnect. RNG-only inequality is a
-    // real deterministic fault, but duration/reconvergence cannot classify
-    // it and stock Revival keeps comparing after this warning. See
-    // docs/NAYUKI_AWAKE_AIR_THROW_RNG_DESYNC.md.
-    volatile LONG consoleDesyncWarnSerial = 0;
-    char consoleDesyncWarnText[128] = {};
     // Native listener acknowledgement. The serial is a seqlock: odd while a
     // writer is updating and even for a completed record. The publisher PID
     // prevents a delayed line from a retiring helper being accepted as the
@@ -129,6 +120,9 @@ struct SharedBlock
     // until this generation has actually been returned by ReadConsole.
     volatile LONG nativeDelayTimeoutRequiredWakeSerial = 0;
     volatile LONG nativeDelayTimeoutHandledSerial = 0;
+    // Helper-local raw console consumer is running. Host waits for this before
+    // resuming the helper main thread, so startup prompts cannot outrun it.
+    volatile LONG helperCaptureReady = 0;
 };
 #pragma pack(pop)
 
@@ -271,7 +265,6 @@ extern std::string g_consolePendingWriteConsoleOutputCharacterA;
 extern std::string g_consolePendingWriteConsoleOutputCharacterW;
 extern std::string g_consolePendingOutputDebugStringA;
 extern std::string g_consolePendingOutputDebugStringW;
-extern std::unordered_map<std::string, LONG> g_diskCapturePathHits;
 extern bool g_captureRevivalNativeLogsConfigured;
 extern bool g_captureRevivalNativeLogs;
 extern bool g_revivalErrorCodeNullGuardPatched;
@@ -306,9 +299,11 @@ bool ExtractDelayRange(const std::string& text, int* outMin, int* outMax);
 void EnsureHostLogEfzIatPatched(bool verboseLogs);
 DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool* outHasMetrics);
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
-bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
-bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath);
 void PrimeManagedLogEfzHistory();
+// Starts the process-local capture/control worker. The EFZ host uses
+// enableRawIngress=false (event-driven mirror controls only); the injected
+// EfzRevival helper uses true to drain its IAT capture ring.
+bool StartConsoleCaptureWorker(bool enableRawIngress);
 void BeginManagedLogEfzWrite();
 void EndManagedLogEfzWrite();
 bool IsManagedLogEfzWriteActive();
@@ -318,6 +313,7 @@ void NoteConsolePromptLine(
     LONG controlWakeRequestSerialSnapshot = -1);
 std::string* SelectPendingConsoleLine(const char* sourceTag);
 bool IsLikelyRevivalDiskLogPath(const std::string& path);
+void RegisterConsoleCaptureFileHandle(HANDLE hFile, bool captureAsTextLog);
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length);
 void FlushPendingConsoleOutput(const char* reason);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
@@ -356,6 +352,7 @@ bool NeutralizeTournamentAutoNav();
 bool SaveTournamentExePatches();
 bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
+void PrimeGracefulQuitRingForSession();
 bool RestoreDllExitProcessPatches();
 bool AreDllExitPatchesSaved();
 bool DestroyCurrentSession(const char* caller);
@@ -394,7 +391,6 @@ void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);
 void StabilizeOnlineSessionBindingAfterInit(int initMode);
 void RepairRollbackHistoryBindingsIfNeeded();
-bool InstallRevival102jSafeInputReadPatch(const char* caller);
 void MarkRevivalSyncDiagnosticsSessionStart(const char* context);
 bool InstallNetplayFrameHook();
 // Force the game mode index to 0 (title screen).
@@ -516,10 +512,6 @@ void RequestDeferredCancelCleanup(const char* reason = nullptr);
 void ArmOnlineMatchEscGracefulQuit();
 bool ConsumeOnlineMatchEscGracefulQuit();
 void ResetOnlineMatchEscGracefulQuit();
-// A fresh ESC from character select is a real session exit, not the held
-// battle-return ESC. Do not let the short battle Quit-ring suppression window
-// consume the new menu-exit signal.
-void ConfirmCharacterSelectEscToMenu();
 
 // Ask the injected EfzRevival.exe helper to broadcast its native MessageQuit
 // packet to connected peers before the host tears the helper down locally.
@@ -543,6 +535,9 @@ bool TryClassifyRevivalQuitEndpoint(
 
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
+bool StartPeerProcessExitWatch();
+void StopPeerProcessExitWatch(bool waitForExit = true);
+bool HasPeerProcessExitSignal();
 
 // setjmp buffer and active flag used by the netplay frame-hook recovery
 // mechanism.  Defined in revival_memory.cpp; read by iat_stubs.cpp.
@@ -575,8 +570,6 @@ bool TryPublishHeldHostDelayTimeout(
     LONG controlWakeRequestSerialSnapshot = -1);
 bool HasPendingHeldHostDelayTimeout();
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
-void PublishConsoleDesyncWarning(const char* warnText);
-void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize);
 void PublishHostListenerObservation(
     network::NetworkFamily family,
     uint16_t port);
@@ -588,6 +581,12 @@ bool ReadHostListenerObservation(
     DWORD* outProcessId);
 void HandleTemporaryHostProtocolListenerAck();
 void HandleTemporaryHostProtocolListenerAck(
+    DWORD expectedProcessId,
+    uint16_t expectedPort);
+// Connected-handoff confirmation: the bridge has already committed the exact
+// helper PID/port and may accept a matching listener observation immediately,
+// without depending on a later gameplay tick to finish the normal debounce.
+void ConfirmTemporaryHostProtocolListenerAckAtHandoff(
     DWORD expectedProcessId,
     uint16_t expectedPort);
 bool RecoverTemporaryHostProtocolOverride(const char* reason);
@@ -612,7 +611,9 @@ std::string GameDirectory();
 std::wstring GameDirectoryWide();
 bool TryWriteClipboardAscii(const char* text);
 void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error);
-void CloseProcessHandle(NetbridgeStatus* status);
+void CloseProcessHandle(
+    NetbridgeStatus* status,
+    bool waitForPeerWatcher = true);
 bool ProcessAlive(NetbridgeStatus* status);
 bool IsSyncReadyForVsHuman(const NetbridgeStatus* status);
 bool RequiresNativeVsHumanSyncForHandoff(const NetbridgeStatus* status);

@@ -455,7 +455,7 @@ void PrimeRenderAssetDiagnostics();
 bool EnsureGdiplusStarted();
 bool EnsureRenderAssetsLoaded(uint32_t screenContext);
 bool EnsureD3d9OverlayHookInstalled();
-void ShutdownD3d9OverlayHook();
+bool ShutdownD3d9OverlayHook();
 void ResetRenderAssetFrameState();
 void ReleaseRenderAssets();
 void ReleaseD3dTextures();
@@ -2668,17 +2668,48 @@ bool EnsureD3d9OverlayHookInstalled()
     return true;
 }
 
-void ShutdownD3d9OverlayHook()
+bool ShutdownD3d9OverlayHook()
 {
     ReleaseD3dTextures();
 
     if (g_d3dOverlay.hookInstalled && g_d3dOverlay.endSceneTarget != nullptr)
     {
-        (void)MH_DisableHook(g_d3dOverlay.endSceneTarget);
-        (void)MH_RemoveHook(g_d3dOverlay.endSceneTarget);
+        const MH_STATUS disableStatus =
+            MH_DisableHook(g_d3dOverlay.endSceneTarget);
+        if (disableStatus != MH_OK && disableStatus != MH_ERROR_DISABLED)
+        {
+            mod::Log(
+                "BattleLog::ShutdownD3d9OverlayHook: MH_DisableHook failed status=%d target=%p",
+                static_cast<int>(disableStatus),
+                g_d3dOverlay.endSceneTarget);
+            return false;
+        }
+
+        const MH_STATUS removeStatus =
+            MH_RemoveHook(g_d3dOverlay.endSceneTarget);
+        if (removeStatus != MH_OK && removeStatus != MH_ERROR_NOT_CREATED)
+        {
+            // Keep the target/original bookkeeping so a later control-plane
+            // attempt can retry removal. Restore the hook before returning:
+            // the online handoff will be aborted and the menu must remain
+            // functional rather than retaining a disabled hook that the
+            // idempotent installer would mistake for active.
+            const MH_STATUS reenableStatus =
+                MH_EnableHook(g_d3dOverlay.endSceneTarget);
+            mod::Log(
+                "BattleLog::ShutdownD3d9OverlayHook: MH_RemoveHook failed status=%d target=%p reenableStatus=%d",
+                static_cast<int>(removeStatus),
+                g_d3dOverlay.endSceneTarget,
+                static_cast<int>(reenableStatus));
+            g_d3dOverlay.hookInstalled =
+                reenableStatus == MH_OK
+                || reenableStatus == MH_ERROR_ENABLED;
+            return false;
+        }
     }
 
     g_d3dOverlay = {};
+    return true;
 }
 
 bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
@@ -6259,9 +6290,9 @@ void DrawDetailRows(
 }
 } // namespace
 
-void ShutdownRenderOverlay()
+bool ShutdownRenderOverlay()
 {
-    ShutdownD3d9OverlayHook();
+    return ShutdownD3d9OverlayHook();
 }
 
 bool EnsureGameplayOverlayHook()

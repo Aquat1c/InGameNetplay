@@ -4,8 +4,11 @@
 //
 // Shared between efz_netplay_mod and consumer mods (e.g., EFZRichPresence).
 //
-// In-game Netplay creates a named shared memory block and populates it each
-// frame.  Consumer mods open the same block to read the latest state.
+// In-game Netplay creates a named shared memory block and publishes snapshots
+// from control-plane/session transitions. Consumer mods open the same block to
+// read the latest state. During active rollback simulation, volatile fields may
+// remain unchanged until the next safe transition; use stateSeq and
+// lastUpdateTick to judge freshness.
 //
 // Access methods (both operate in-process - all DLLs live inside EFZ.exe):
 //
@@ -175,8 +178,10 @@ enum EFZNetplayMenuDetail
 // Fixed-layout C struct for inter-mod state sharing.
 // All integers are naturally aligned; char arrays are ASCII / UTF-8.
 //
-// The struct is written atomically (memcpy under lock) by In-game Netplay
-// and read by consumer mods via the shared memory mapping.
+// A single export worker publishes the struct with memcpy. The mapping is not
+// an atomic C++ object and exposes no cross-module lock; consumers that require
+// a coherent copy should sample into private storage until two consecutive
+// reads match, then validate magic/version/structSize and stateSeq.
 // ---------------------------------------------------------------------------
 struct EFZNetplayState
 {
@@ -216,9 +221,9 @@ struct EFZNetplayState
     uint8_t  _pad0;              // Alignment padding - reserved, must be 0
 
     // --- EfzRevival version (v2) -------------------------------------------
-    // Null-terminated version tag (e.g. "1.02e", "1.02i").
+    // Null-terminated version tag (e.g. "1.02e", "1.02j").
     // Empty string if EfzRevival.dll is not loaded or unrecognised.
-    // Supported versions: 1.02e, 1.02f, 1.02g, 1.02h, 1.02i
+    // Supported versions: 1.02e, 1.02f, 1.02g, 1.02h, 1.02i, 1.02j
     char     revivalVersion[16];
 
     // --- Game-flow flags (v3) ----------------------------------------------

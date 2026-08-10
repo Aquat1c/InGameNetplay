@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "netplay/assets/assets.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/hooks/debug_overlay.h"
 
 namespace netplay
 {
@@ -201,8 +202,17 @@ void RemoveHooks()
     g_replaySelectionGuardFramesRemaining = 0;
     g_replaySelectionRestoreTarget = -1;
     g_replayCaseDispatchAddress = 0;
-    netplay::battle_log::ShutdownRenderOverlay();
-    RemoveNetplayWindowHook();
+    const bool windowOk = RemoveNetplayWindowHook();
+    const bool imguiOk = netplay::debug_overlay::SuspendForOnlineSimulation();
+    const bool overlayOk = netplay::battle_log::ShutdownRenderOverlay();
+    if (!windowOk || !imguiOk || !overlayOk)
+    {
+        mod::Log(
+            "RemoveHooks: UI teardown incomplete window=%d imgui=%d overlay=%d",
+            windowOk ? 1 : 0,
+            imguiOk ? 1 : 0,
+            overlayOk ? 1 : 0);
+    }
     RestorePatches();
     g_hooksInstalled.store(false);
     mod::Log("RemoveHooks: restored original bytes");

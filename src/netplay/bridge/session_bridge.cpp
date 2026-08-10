@@ -28,6 +28,8 @@ uint32_t g_lastRejectedHostListenerSerial = 0;
 bool g_synchronousStartRejected = false;
 HANDLE g_peerProbeHandle = nullptr;
 DWORD g_peerProbeProcessId = 0;
+LARGE_INTEGER g_tickQpcFrequency = {};
+bool g_tickQpcFrequencyValid = false;
 
 std::thread g_startWorker;
 bool g_startWorkerRunning = false;
@@ -103,6 +105,12 @@ void JoinFinishedWorkerUnlocked()
 
 void InitializeHostUnlocked(const char* reason)
 {
+    if (!g_tickQpcFrequencyValid)
+    {
+        g_tickQpcFrequencyValid =
+            QueryPerformanceFrequency(&g_tickQpcFrequency) != FALSE
+            && g_tickQpcFrequency.QuadPart > 0;
+    }
     ClosePeerProbeHandleUnlocked();
     g_status = {};
     g_activeHostNetworkConfig = {};
@@ -264,14 +272,15 @@ void Tick()
     async_host::Tick();
 
     // --- Timing guard on full Tick (includes takeover::Tick + export enqueue) --
+    if (g_tickQpcFrequencyValid)
     {
         static uint32_t s_tickSlowCount = 0;
-        LARGE_INTEGER tickQpcPost = {}, freq = {};
+        LARGE_INTEGER tickQpcPost = {};
         QueryPerformanceCounter(&tickQpcPost);
-        QueryPerformanceFrequency(&freq);
         const double elapsedMs =
             static_cast<double>(tickQpcPost.QuadPart - tickQpcPre.QuadPart)
-            * 1000.0 / static_cast<double>(freq.QuadPart);
+            * 1000.0
+            / static_cast<double>(g_tickQpcFrequency.QuadPart);
         if (elapsedMs > 5.0)
         {
             ++s_tickSlowCount;
@@ -288,13 +297,12 @@ void Tick()
 
 void TickExportOnly(bool force)
 {
-    // Lightweight export pulse. Called every game frame from
-    // OurPerFrameTickHook (revival_memory.cpp), but rate-limited here so
-    // shared-state consumers remain current without performing session-memory
-    // reads and queue publication on every rollback tick.
+    // Lightweight transition export. Active rollback ticks deliberately do
+    // not call this function: session-memory reads and bridge locking belong
+    // outside the simulation cadence.
     //
-    // 125 ms is fast enough for UI/status consumers while moving this work
-    // from ~60 Hz to at most 8 Hz. Transition sites pass force=true.
+    // Retain a 125 ms guard for any future non-forced control-plane caller.
+    // Current handoff/transition sites pass force=true.
     static volatile LONG s_lastPublishTick = 0;
     const DWORD nowTick = GetTickCount();
     if (!force)
@@ -319,20 +327,12 @@ void TickExportOnly(bool force)
         InterlockedExchange(&s_lastPublishTick, static_cast<LONG>(nowTick));
     }
 
-    // Keep activityPhase,
-    // inNetplayMenu, stateSeq, scores, ping, delay, and all other exported
-    // fields remain current during loading screen and battle - screens that
-    // have no title/charselect hook calling the full Tick().
-    //
-    // Also called immediately after g_netplayMenuState.active is cleared in
-    // HandoffConnectedSessionToVsHumanState / HandoffSpectateSession so that
-    // the handoff is reflected in the export before the next frame hook fires.
-    //
-    // We call RefreshRuntimeStatus() here to re-read volatile session fields
-    // (wins, ping, delay, activePlayer, etc.) from Revival memory.  Without
-    // this, those fields stay stale at whatever value they had when the last
-    // full Tick() ran - typically during connection, before any match was
-    // played - so wins would read 0-0 even after a match ends.
+    // HandoffConnectedSessionToVsHumanState / HandoffSpectateSession force one
+    // final call while the netplay menu is still active, then drain and suspend
+    // the export worker before mutating game state. RefreshRuntimeStatus()
+    // re-reads volatile session fields for that pre-handoff snapshot. They can
+    // remain at this last safe control-plane value throughout rollback;
+    // consumers must use lastUpdateTick/stateSeq as their freshness boundary.
 
     NetbridgeStatus statusSnapshot = {};
     bool shouldHandleHostProtocolAck = false;
@@ -362,15 +362,24 @@ void TickExportOnly(bool force)
         shouldHandleHostProtocolAck = !g_startWorkerRunning;
     }
 
-    // Gameplay/loading screens call this lightweight path instead of the full
-    // takeover::Tick(). Pump the temporary Protocol restore here as well, but
-    // only after the worker has committed the matching PID/status snapshot and
-    // after releasing the bridge mutex (the Protocol mutex is a leaf lock).
+    // Pump the temporary Protocol restore from this explicit control-plane
+    // publication, after the worker has committed the matching PID/status
+    // snapshot and after releasing the bridge mutex (the Protocol mutex is a
+    // leaf lock).
     if (shouldHandleHostProtocolAck)
     {
-        takeover::HandleTemporaryHostProtocolListenerAck(
-            static_cast<DWORD>(statusSnapshot.processId),
-            statusSnapshot.port);
+        if (force)
+        {
+            takeover::ConfirmTemporaryHostProtocolListenerAckAtHandoff(
+                static_cast<DWORD>(statusSnapshot.processId),
+                statusSnapshot.port);
+        }
+        else
+        {
+            takeover::HandleTemporaryHostProtocolListenerAck(
+                static_cast<DWORD>(statusSnapshot.processId),
+                statusSnapshot.port);
+        }
     }
 
     state_export::Update(statusSnapshot);

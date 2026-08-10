@@ -1,7 +1,6 @@
 // IPC shared memory, config loading, module resolution, and session status helpers.
 
 #include "netplay/bridge/takeover_internal.h"
-#include "netplay/bridge/batch_stabilizer.h"
 #include "netplay/bridge/console_handoff_policy.h"
 #include <array>
 #include <cstddef>
@@ -16,6 +15,38 @@ namespace netplay::bridge::takeover
 
 namespace
 {
+std::mutex g_peerProcessExitWatchMutex;
+HANDLE g_peerProcessExitWatchThread = nullptr;
+HANDLE g_peerProcessExitWatchStopEvent = nullptr;
+HANDLE g_peerProcessExitWatchHandle = nullptr;
+volatile LONG g_peerProcessExitSignaled = 0;
+
+struct PeerProcessExitWatchContext
+{
+    HANDLE stopEvent = nullptr;
+    HANDLE processHandle = nullptr;
+};
+
+PeerProcessExitWatchContext g_peerProcessExitWatchContext = {};
+
+DWORD WINAPI PeerProcessExitWatchMain(LPVOID rawContext)
+{
+    const auto context =
+        *static_cast<const PeerProcessExitWatchContext*>(rawContext);
+    const HANDLE stopEvent = context.stopEvent;
+    const HANDLE processHandle = context.processHandle;
+    const HANDLE handles[] = {stopEvent, processHandle};
+    const DWORD waitResult =
+        WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    if (waitResult == WAIT_OBJECT_0 + 1)
+    {
+        // The active tick consumes only this atomic edge. No process API,
+        // allocation, logging, or lock is needed on its steady-state path.
+        InterlockedExchange(&g_peerProcessExitSignaled, 1);
+    }
+    return 0;
+}
+
 constexpr DWORD kProtocolRecoveryMarkerMagic = 0x50524645u; // "EFRP"
 constexpr DWORD kProtocolRecoveryMarkerVersion = 1u;
 constexpr size_t kProtocolRecoveryExpectedCapacity = 16u;
@@ -1221,61 +1252,6 @@ void PublishConsoleError(const char* errorText)
     CloseTempIpcContext(&temp);
 }
 
-void PublishConsoleDesyncWarning(const char* warnText)
-{
-    if (warnText == nullptr || warnText[0] == '\0')
-    {
-        return;
-    }
-
-    auto writeWarning = [&](SharedBlock* block)
-    {
-        CopyString(
-            block->consoleDesyncWarnText,
-            sizeof(block->consoleDesyncWarnText),
-            warnText);
-        InterlockedIncrement(&block->consoleDesyncWarnSerial);
-    };
-
-    if (g_injectedBlock != nullptr)
-    {
-        writeWarning(g_injectedBlock);
-        return;
-    }
-
-    TempIpcContext temp = {};
-    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
-    {
-        writeWarning(temp.block);
-    }
-    CloseTempIpcContext(&temp);
-}
-
-void ReadConsoleDesyncWarning(LONG* outSerial, char* outText, int outTextSize)
-{
-    LONG serial = 0;
-    const char* text = nullptr;
-
-    if (g_hostBlock != nullptr)
-    {
-        serial = InterlockedCompareExchange(&g_hostBlock->consoleDesyncWarnSerial, 0, 0);
-        text = g_hostBlock->consoleDesyncWarnText;
-    }
-
-    if (outSerial != nullptr)
-    {
-        *outSerial = serial;
-    }
-    if (outText != nullptr && outTextSize > 0 && text != nullptr && serial > 0)
-    {
-        CopyString(outText, outTextSize, text);
-    }
-    else if (outText != nullptr && outTextSize > 0)
-    {
-        outText[0] = '\0';
-    }
-}
-
 void PublishHostListenerObservation(
     network::NetworkFamily family,
     uint16_t port)
@@ -1760,8 +1736,11 @@ void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error)
     }
 }
 
-void CloseProcessHandle(NetbridgeStatus* status)
+void CloseProcessHandle(
+    NetbridgeStatus* status,
+    bool waitForPeerWatcher)
 {
+    StopPeerProcessExitWatch(waitForPeerWatcher);
     ResetInjectedPeerQuitBroadcastState();
     if (g_revivalProcess != nullptr)
     {
@@ -2120,11 +2099,6 @@ bool EnsureLocalRevivalLoaded()
     DetectRevivalVersion();
 
     PublishHostRevivalBase();
-    // Install the empirically useful batch stabilizer once Revival is known
-    // and profiled. The per-frame hook continues to self-repair it in normal
-    // builds; the native-tick A/B build deliberately has no such hook, so this
-    // startup installation preserves the same mitigation in both arms.
-    netplay::bridge::batch_stabilizer::EnsurePerTick();
     if (!PatchRevivalErrorCodeNullGuard())
     {
         mod::Log("Takeover: warning failed to patch EfzRevival null-guard");
@@ -2137,10 +2111,10 @@ bool EnsureLocalRevivalLoaded()
         return false;
     }
 
-    // Patch logEfz interception before the first Revival init() call.
-    // All supported Revival versions open logEfz.txt inside init(), so any
-    // later patch point leaves behind a real-file handle we can no longer
-    // safely take away from native code.
+    // Host log interception is deliberately disabled: Revival's game-process
+    // init and simulation paths keep their native IAT/cadence. The helper
+    // process owns raw console/log capture instead. EnsureHostLogEfzIatPatched
+    // remains as an explicit no-op contract at this legacy call site.
     EnsureHostLogEfzIatPatched(true);
     // Each Revival init() should start a fresh logical session section in
     // the managed root logEfz.txt. Closing here lets the first native log
@@ -2569,9 +2543,10 @@ void HandleTemporaryHostProtocolListenerAck()
             : 0);
 }
 
-void HandleTemporaryHostProtocolListenerAck(
+static void HandleTemporaryHostProtocolListenerAckImpl(
     DWORD expectedProcessId,
-    uint16_t expectedPort)
+    uint16_t expectedPort,
+    bool allowImmediateHandoffAck)
 {
     std::lock_guard<std::recursive_mutex> overrideLock(
         g_temporaryHostProtocolMutex);
@@ -2668,10 +2643,14 @@ void HandleTemporaryHostProtocolListenerAck(
             network::FamilyName(observedFamily),
             static_cast<unsigned>(observedPort),
             static_cast<unsigned long>(observedProcessId));
-        return;
+        if (!allowImmediateHandoffAck)
+        {
+            return;
+        }
     }
 
-    if (nowTick
+    if (!allowImmediateHandoffAck
+        && nowTick
             - g_temporaryHostProtocolOverride
                   .listenerCandidateFirstTick
         < 100u)
@@ -2681,13 +2660,163 @@ void HandleTemporaryHostProtocolListenerAck(
 
     mod::Log(
         "Takeover: Revival netplay session listener Protocol ack accepted "
-        "serial=%ld family=%s port=%u pid=%lu",
+        "serial=%ld family=%s port=%u pid=%lu handoff=%d",
         static_cast<long>(serial),
         network::FamilyName(observedFamily),
         static_cast<unsigned>(observedPort),
-        static_cast<unsigned long>(observedProcessId));
+        static_cast<unsigned long>(observedProcessId),
+        allowImmediateHandoffAck ? 1 : 0);
     RestoreTemporaryHostProtocolOverride(
         "stable matching Revival netplay session listener acknowledgement");
+}
+
+void StopPeerProcessExitWatch(bool waitForExit)
+{
+    HANDLE watcherThread = nullptr;
+    HANDLE stopEvent = nullptr;
+    HANDLE processHandle = nullptr;
+    std::unique_lock<std::mutex> lock(
+        g_peerProcessExitWatchMutex, std::defer_lock);
+    if (waitForExit)
+    {
+        lock.lock();
+    }
+    else if (!lock.try_lock())
+    {
+        // Process-termination detach runs under loader lock. Never block on a
+        // mutex another suspended thread may own; signal the current wait as a
+        // best effort and let process teardown reclaim its HANDLEs.
+        HANDLE observedStopEvent = g_peerProcessExitWatchStopEvent;
+        if (observedStopEvent != nullptr)
+        {
+            (void)SetEvent(observedStopEvent);
+        }
+        InterlockedExchange(&g_peerProcessExitSignaled, 0);
+        return;
+    }
+
+    watcherThread = g_peerProcessExitWatchThread;
+    stopEvent = g_peerProcessExitWatchStopEvent;
+    processHandle = g_peerProcessExitWatchHandle;
+    if (stopEvent != nullptr)
+    {
+        (void)SetEvent(stopEvent);
+    }
+    g_peerProcessExitWatchThread = nullptr;
+    g_peerProcessExitWatchStopEvent = nullptr;
+    g_peerProcessExitWatchHandle = nullptr;
+    lock.unlock();
+
+    if (watcherThread != nullptr && waitForExit)
+    {
+        (void)WaitForSingleObject(watcherThread, INFINITE);
+    }
+    if (watcherThread != nullptr)
+    {
+        CloseHandle(watcherThread);
+    }
+    if (waitForExit)
+    {
+        if (processHandle != nullptr)
+        {
+            CloseHandle(processHandle);
+        }
+        if (stopEvent != nullptr)
+        {
+            CloseHandle(stopEvent);
+        }
+    }
+    InterlockedExchange(&g_peerProcessExitSignaled, 0);
+}
+
+bool StartPeerProcessExitWatch()
+{
+    StopPeerProcessExitWatch(true);
+    if (g_revivalProcess == nullptr)
+    {
+        return false;
+    }
+
+    HANDLE processHandle = nullptr;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            g_revivalProcess,
+            GetCurrentProcess(),
+            &processHandle,
+            SYNCHRONIZE,
+            FALSE,
+            0))
+    {
+        mod::Log(
+            "Takeover: helper process-exit watch duplicate failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    HANDLE stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (stopEvent == nullptr)
+    {
+        const DWORD error = GetLastError();
+        CloseHandle(processHandle);
+        mod::Log(
+            "Takeover: helper process-exit watch event failed err=%lu",
+            static_cast<unsigned long>(error));
+        return false;
+    }
+
+    // Clear before launching: an already-terminated process can wake the new
+    // thread immediately, and clearing afterward would erase that edge.
+    InterlockedExchange(&g_peerProcessExitSignaled, 0);
+    HANDLE watcherThread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_peerProcessExitWatchMutex);
+        g_peerProcessExitWatchContext.stopEvent = stopEvent;
+        g_peerProcessExitWatchContext.processHandle = processHandle;
+        watcherThread = CreateThread(
+            nullptr,
+            0,
+            PeerProcessExitWatchMain,
+            &g_peerProcessExitWatchContext,
+            0,
+            nullptr);
+        if (watcherThread == nullptr)
+        {
+            const DWORD error = GetLastError();
+            CloseHandle(processHandle);
+            CloseHandle(stopEvent);
+            mod::Log(
+                "Takeover: helper process-exit watch thread creation failed err=%lu",
+                static_cast<unsigned long>(error));
+            return false;
+        }
+        g_peerProcessExitWatchThread = watcherThread;
+        g_peerProcessExitWatchStopEvent = stopEvent;
+        g_peerProcessExitWatchHandle = processHandle;
+    }
+
+    return true;
+}
+
+bool HasPeerProcessExitSignal()
+{
+    return InterlockedCompareExchange(
+               &g_peerProcessExitSignaled, 0, 0) != 0;
+}
+
+void HandleTemporaryHostProtocolListenerAck(
+    DWORD expectedProcessId,
+    uint16_t expectedPort)
+{
+    HandleTemporaryHostProtocolListenerAckImpl(
+        expectedProcessId, expectedPort, false);
+}
+
+void ConfirmTemporaryHostProtocolListenerAckAtHandoff(
+    DWORD expectedProcessId,
+    uint16_t expectedPort)
+{
+    HandleTemporaryHostProtocolListenerAckImpl(
+        expectedProcessId, expectedPort, true);
 }
 
 bool GetHostProtocolOverrideState(
@@ -2986,16 +3115,35 @@ void InitializeInjected()
     ClearFakeThreads();
     ClearRedirectAllocations();
     g_redirectWriteBlockedHits = 0;
-    g_injectedReady = (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr);
-    if (g_injectedReady)
+    const bool ipcReady =
+        g_injectedBlock != nullptr
+        && g_injectedInitEvent != nullptr
+        && g_injectedConsoleEvent != nullptr;
+    g_injectedReady = false;
+    if (ipcReady)
     {
-        DetectRevivalVersion();
-        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
-        if (revival != nullptr)
+        // IAT capture lives in this helper process. Its globals are not shared
+        // with the host DLL, so start the local ring consumer before Revival
+        // can publish listener, prompt, or error text through the stubs.
+        g_injectedReady = StartConsoleCaptureWorker(true);
+        if (g_injectedReady)
         {
-            const FARPROC initProc = GetProcAddress(revival, "init");
-            g_injectedInitAddress = reinterpret_cast<uintptr_t>(initProc);
+            DetectRevivalVersion();
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            if (revival != nullptr)
+            {
+                const FARPROC initProc = GetProcAddress(revival, "init");
+                g_injectedInitAddress = reinterpret_cast<uintptr_t>(initProc);
+            }
         }
+        else
+        {
+            mod::Log(
+                "Takeover: injected capture worker unavailable; helper context remains unready");
+        }
+        InterlockedExchange(
+            &g_injectedBlock->helperCaptureReady,
+            g_injectedReady ? 1 : 0);
     }
     mod::Log(
         "Takeover: injected initialized ready=%d block=0x%p init=0x%p console=0x%p initAddr=0x%p hostRevivalBase=0x%08lX hostRevivalTimestamp=0x%08X version=%s",
@@ -3015,6 +3163,9 @@ void InitializeInjected()
 
 void ShutdownInjected()
 {
+    // DllMain/process-detach path: stop new ring reservations and request an
+    // emergency worker exit without waiting under loader lock.
+    StopManagedLogEfzWorker(false);
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepStep("HelperIpc.shutdown_begin");
     ClearFakeThreads();
@@ -3022,6 +3173,7 @@ void ShutdownInjected()
 
     if (g_injectedBlock != nullptr)
     {
+        InterlockedExchange(&g_injectedBlock->helperCaptureReady, 0);
         UnmapViewOfFile(g_injectedBlock);
         g_injectedBlock = nullptr;
     }

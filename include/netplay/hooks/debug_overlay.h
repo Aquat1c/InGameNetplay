@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <windows.h>
 
 struct IDirect3DDevice9;
 
@@ -19,6 +20,23 @@ namespace netplay::debug_overlay
 // initialises ImGui (DX9 + Win32 + a chained wndproc hook) and renders whatever
 // is active. Cheap no-op when nothing needs drawing.
 void Render(IDirect3DDevice9* device);
+
+// Tear down ImGui's DX9/Win32 backends and restore the original window proc
+// before online simulation. Menu entry lazily initializes them again.
+bool SuspendForOnlineSimulation();
+
+// Remove a known lower hook from DebugWndProc's predecessor link without
+// overwriting the live top-level WndProc. Used to unwind either legal install
+// order of the menu and ImGui hooks.
+bool ReplaceChainedWindowProc(
+    HWND hwnd,
+    WNDPROC expectedPrevious,
+    WNDPROC replacement);
+
+// True when DebugWndProc currently owns the given predecessor link. This lets
+// another owned hook validate idempotent installation without trusting stale
+// process-local bookkeeping after an external WndProc replacement.
+bool HasChainedWindowProc(HWND hwnd, WNDPROC expectedPrevious);
 
 // Toggle the debug panel (also bound to the DELETE key via the wndproc hook).
 void ToggleDebugPanel();

@@ -202,6 +202,12 @@ void CloseLogFileUnlocked()
 
 void WriterThreadEntry()
 {
+    // EFZ's game thread is paced by a time-critical event source but runs at
+    // normal priority.  Log flushing is diagnostic I/O and must always yield
+    // to the game when both become runnable at once.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     std::vector<std::string> batch;
     batch.reserve(64);
 

@@ -23,31 +23,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <windows.h>
 
-extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
-    LPCSTR,
-    DWORD,
-    DWORD,
-    LPSECURITY_ATTRIBUTES,
-    DWORD,
-    DWORD,
-    HANDLE);
-extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
-    LPCWSTR,
-    DWORD,
-    DWORD,
-    LPSECURITY_ATTRIBUTES,
-    DWORD,
-    DWORD,
-    HANDLE);
-extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(
-    HANDLE,
-    LPCVOID,
-    DWORD,
-    LPDWORD,
-    LPOVERLAPPED);
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_RequestPeerQuitBroadcast(
     LPVOID);
 
@@ -198,6 +177,7 @@ bool g_spectatorPostInitSucceededForSession = false;
 volatile LONG g_deferredLifecycleWorkRequested = 0;
 volatile LONG g_deferredTitleSelection = -1;
 uintptr_t g_remoteInjectedSelfBase = 0;
+std::unordered_map<std::string, uint32_t> g_remoteInjectedPatchMap;
 DWORD g_lastLatePatchRetryTick = 0;
 DWORD g_lastLatePatchRetryLogTick = 0;
 DWORD g_latePatchRetryAttempts = 0;
@@ -221,7 +201,6 @@ std::string g_consolePendingWriteConsoleOutputCharacterA;
 std::string g_consolePendingWriteConsoleOutputCharacterW;
 std::string g_consolePendingOutputDebugStringA;
 std::string g_consolePendingOutputDebugStringW;
-std::unordered_map<std::string, LONG> g_diskCapturePathHits;
 bool g_captureRevivalNativeLogsConfigured = false;
 bool g_captureRevivalNativeLogs = false;
 bool g_revivalErrorCodeNullGuardPatched = false;
@@ -250,7 +229,6 @@ static HANDLE g_childJobObject = nullptr;
 
 namespace
 {
-bool g_hostLogEfzIatPatched = false;
 
 std::string TrimAsciiCopy(const std::string& text)
 {
@@ -327,32 +305,10 @@ void LogPendingSpectateConsoleSnapshot()
 
 void EnsureHostLogEfzIatPatched(bool verboseLogs)
 {
-    if (g_hostLogEfzIatPatched)
-    {
-        return;
-    }
-
-    std::unordered_map<std::string, uint32_t> hostLogPatches;
-    hostLogPatches.emplace(
-        "WriteFile",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)));
-    hostLogPatches.emplace(
-        "CreateFileA",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)));
-    hostLogPatches.emplace(
-        "CreateFileW",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)));
-
-    const bool patchedHostLogIat =
-        PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, verboseLogs);
+    (void)verboseLogs;
     mod::Log(
-        "Takeover: host logEfz IAT patch result=%d patchCount=%lu stage=pre_init",
-        patchedHostLogIat ? 1 : 0,
-        static_cast<unsigned long>(hostLogPatches.size()));
-    if (patchedHostLogIat)
-    {
-        g_hostLogEfzIatPatched = true;
-    }
+        "Takeover: host logEfz IAT capture disabled (simulation parity); "
+        "helper-process console capture remains active");
 }
 
 // ---------------------------------------------------------------------------
@@ -3358,6 +3314,7 @@ void ShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_remoteInjectedPatchMap.clear();
     mod::Log("Takeover: host shutdown");
     LogRevival102jDeepStep("ShutdownHost.99.complete");
 }
@@ -3374,7 +3331,7 @@ void EmergencyShutdownHost()
     {
         TerminateProcess(g_revivalProcess, 0);
     }
-    CloseProcessHandle(nullptr);
+    CloseProcessHandle(nullptr, false);
     CloseChildJobObject();
     CloseHostIpc();
     CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
@@ -3396,6 +3353,7 @@ void EmergencyShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_remoteInjectedPatchMap.clear();
 }
 
 void RequestAbortStart()
@@ -4089,7 +4047,6 @@ bool StartSession(
         g_consolePendingWriteConsoleOutputCharacterW.clear();
         g_consolePendingOutputDebugStringA.clear();
         g_consolePendingOutputDebugStringW.clear();
-        g_diskCapturePathHits.clear();
     }
     CloseMirrorLogFiles();
     InterlockedIncrement(&g_hostBlock->initSerial);
@@ -4308,19 +4265,68 @@ bool StartSession(
     }
     LogRevival102jDeepSnapshot("StartSession.15.prelaunch_rings_flushed", ioStatus);
 
+    // The helper's DllMain bootstrap is asynchronous. Do not let its main
+    // thread emit one-shot listener/prompt text until the helper-local raw
+    // ingress worker has positively acknowledged readiness through IPC.
+    const DWORD captureReadyStart = GetTickCount();
+    while (InterlockedCompareExchange(
+               &g_hostBlock->helperCaptureReady, 0, 0) == 0
+        && GetTickCount() - captureReadyStart
+            < kInjectedCaptureReadyTimeoutMs)
+    {
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0)
+        {
+            break;
+        }
+        Sleep(1);
+    }
+    if (InterlockedCompareExchange(
+            &g_hostBlock->helperCaptureReady, 0, 0) == 0)
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Helper console capture worker unavailable");
+        (void)TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+
     // Both Wine and native: the process was created suspended, resume it
     // now that injection and IAT patching are complete.
+    const DWORD resumeResult = ResumeThread(pi.hThread);
+    mod::Log("Takeover: resumed main thread result=%lu%s",
+             static_cast<unsigned long>(resumeResult),
+             useWinePath ? " [Wine]" : "");
+    if (resumeResult == static_cast<DWORD>(-1))
     {
-        const DWORD resumeResult = ResumeThread(pi.hThread);
-        mod::Log("Takeover: resumed main thread result=%lu%s",
-                 static_cast<unsigned long>(resumeResult),
-                 useWinePath ? " [Wine]" : "");
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Failed to resume EfzRevival helper main thread");
+        (void)TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
     }
     LogRevival102jDeepStep("StartSession.16.helper_resumed", ioStatus);
 
     g_revivalProcess = pi.hProcess;
     g_revivalProcessId = pi.dwProcessId;
+    if (!StartPeerProcessExitWatch())
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Helper process-exit watcher unavailable");
+        (void)TerminateProcess(g_revivalProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseProcessHandle(ioStatus);
+        return false;
+    }
     g_remoteInjectedSelfBase = remoteBase;
+    g_remoteInjectedPatchMap = std::move(patches);
     g_lastLatePatchRetryTick = GetTickCount();
     g_lastLatePatchRetryLogTick = 0;
     g_latePatchRetryAttempts = 0;
@@ -4848,8 +4854,16 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             && g_remoteInjectedSelfBase != 0
             && (g_lastLatePatchRetryTick == 0 || now - g_lastLatePatchRetryTick >= 500))
         {
-            const std::unordered_map<std::string, uint32_t> patches = BuildPatchMap(g_remoteInjectedSelfBase);
-            const bool patchedLate = PatchIat(g_revivalProcess, g_revivalProcessId, patches, false);
+            if (g_remoteInjectedPatchMap.empty())
+            {
+                g_remoteInjectedPatchMap =
+                    BuildPatchMap(g_remoteInjectedSelfBase);
+            }
+            const bool patchedLate = PatchIat(
+                g_revivalProcess,
+                g_revivalProcessId,
+                g_remoteInjectedPatchMap,
+                false);
             ++g_latePatchRetryAttempts;
             if (patchedLate)
             {
@@ -5214,15 +5228,6 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             LogInitWriteSnapshot("Tick_startInitPlayer_post");
             LogRevival102jDeepSnapshot("Tick.37.start_init_player_returned", ioStatus);
 
-            if (initParams[0] == kLocalRoleOnline && IsActiveRevival102jProfile())
-            {
-                const bool safeInputOk =
-                    InstallRevival102jSafeInputReadPatch("Tick_startInitPlayer_post");
-                mod::Log(
-                    "Takeover: 1.02j safe input read patch result=%d",
-                    safeInputOk ? 1 : 0);
-            }
-
             mod::Log(
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
@@ -5262,7 +5267,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 "Takeover: init snapshot step SaveAndApplyDllExitProcessPatches "
                 "for mode=%d (to be reversed by RestoreDllExitProcessPatches on exit)",
                 initParams[0]);
-            (void)SaveAndApplyDllExitProcessPatches();
+            const bool exitGuardsApplied = SaveAndApplyDllExitProcessPatches();
+            if (exitGuardsApplied
+                && (initParams[0] == kLocalRoleOnline
+                    || initParams[0] == kLocalRoleSpectate))
+            {
+                PrimeGracefulQuitRingForSession();
+            }
             LogRevival102jDeepSnapshot("Tick.38.exit_guards_applied", ioStatus);
             mod::Log(
                 "Takeover: init snapshot complete for mode=%d",
@@ -5881,8 +5892,6 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_hostBlock->spectateConfirmInputValue = 0;
         InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
         g_hostBlock->consoleErrorText[0] = '\0';
-        InterlockedExchange(&g_hostBlock->consoleDesyncWarnSerial, 0);
-        g_hostBlock->consoleDesyncWarnText[0] = '\0';
     }
     LogRevival102jDeepStep("CancelSession.30.per_session_state_cleared", ioStatus);
     ResetNativeWorkflowFlags();
@@ -5904,7 +5913,6 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_consolePendingWriteConsoleOutputCharacterW.clear();
         g_consolePendingOutputDebugStringA.clear();
         g_consolePendingOutputDebugStringW.clear();
-        g_diskCapturePathHits.clear();
     }
     CloseMirrorLogFiles();
 
