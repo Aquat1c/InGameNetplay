@@ -576,6 +576,58 @@ void ResetNativeWorkflowFlags()
     g_delayMetricsAccumulator.clear();
 }
 
+// Revival's low-level socket wrappers print "Socket error: <op>, <code>" for
+// EVERY failed WinSock call. For the in-match UDP data-path operations
+// (recv/recvfrom/sendto/select) the wrapper only logs the failure and then
+// CONTINUES: stock Revival tolerates ~8 s of continuous peer silence and
+// resumes the instant packets return, and if the outage is permanent its own
+// peer-silence timeout ("Remote timed out" / "Source quit or timed out") ends
+// the session - which NoteConsolePromptLine already treats as fatal below. So a
+// transient data-path socket error - the classic faulty-cable case
+// (WSAECONNRESET from a bounced datagram, WSAENETUNREACH from a briefly
+// unplugged cable) - must NOT be promoted to a latching fatal, or we tear down
+// a session that stock Revival would have transparently recovered.
+//
+// Setup / control-channel ops (socket/bind/connect/setsockopt, and the TCP
+// relay-channel send) are intentionally absent here: those failures mean the
+// session genuinely could not start, so they retain the fatal treatment.
+//
+// Decomp-verified log-and-continue sites (1.02i EfzRevival.exe): recv
+// :11295-11304, select :11311-11316, sendto :10582-10595.
+bool SocketErrorNamesTransientDataPathOp(const std::string& text)
+{
+    const std::string lowered = ToLowerAscii(text);
+    const size_t errorPos = lowered.find("socket error");
+    if (errorPos == std::string::npos)
+    {
+        return false;
+    }
+    const size_t colonPos = lowered.find(':', errorPos);
+    if (colonPos == std::string::npos)
+    {
+        return false;
+    }
+    const size_t commaPos = lowered.find(',', colonPos + 1);
+    const std::string op = TrimAscii(
+        commaPos == std::string::npos
+            ? lowered.substr(colonPos + 1)
+            : lowered.substr(colonPos + 1, commaPos - (colonPos + 1)));
+    static const char* const kTransientDataPathOps[] = {
+        "recv",
+        "recvfrom",
+        "sendto",
+        "select",
+    };
+    for (const char* candidate : kTransientDataPathOps)
+    {
+        if (op == candidate)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void NoteConsolePromptLine(
     const std::string& text,
     LONG controlWakeRequestSerialSnapshot)
@@ -732,6 +784,33 @@ void NoteConsolePromptLine(
     }
     if (ContainsCaseInsensitive(text, "Socket error"))
     {
+        // A transient in-match UDP data-path socket error (recv/sendto/select)
+        // is logged-and-ignored by Revival itself; promoting it to a latching
+        // fatal here would kill a session Revival recovers within its ~8 s
+        // peer-silence window. Defer to Revival's own timeout instead - its
+        // terminal "Remote timed out" / "Source quit or timed out" line is
+        // mapped to a fatal above, so a genuinely dead link still tears down.
+        if (SocketErrorNamesTransientDataPathOp(text))
+        {
+            // A flapping link can emit these every poll; rate-limit the
+            // breadcrumb so a sustained outage does not flood the log.
+            static volatile LONG s_lastTransientSocketErrorLogTick = 0;
+            const DWORD nowTick = GetTickCount();
+            const LONG previous = InterlockedCompareExchange(
+                &s_lastTransientSocketErrorLogTick, 0, 0);
+            if (previous == 0
+                || static_cast<DWORD>(nowTick - static_cast<DWORD>(previous)) >= 1000u)
+            {
+                InterlockedExchange(
+                    &s_lastTransientSocketErrorLogTick,
+                    static_cast<LONG>(nowTick));
+                mod::Log(
+                    "Takeover: transient data-path socket error ignored "
+                    "(Revival self-recovers or times out on its own) text='%s'",
+                    text.c_str());
+            }
+            return;
+        }
         mod::Log("Takeover: console error detected='Socket error' text='%s'", text.c_str());
         // Use the full text since it includes the socket error details
         std::string errorMsg = text;
