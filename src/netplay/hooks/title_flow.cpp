@@ -66,6 +66,35 @@ constexpr int kDelaySelectionMax = 20;
 // Maybe some potato PC can produce this issue but at this point we can't do anything about it, got 17 frames even in 600 ping
 // Pretty sure it's tied to the clock and not internal frames so we don't really care
 constexpr int kVsHumanTitleWarmupFrames = 17;
+// Safety net for the connected-session handoff. If SuspendUiHooksForOnlineSimulation
+// keeps failing (a UI/render/window hook will not suspend),
+// HandoffConnectedSessionToVsHumanState returns without queuing a transition and
+// WITHOUT resetting the warmup, so it re-fires every frame. Re-running that
+// expensive suspend path each frame is what pinned the game at ~10fps until the
+// peer quit ("dropped connection on sync"). Throttle the retries so the game
+// keeps running, and give up after a bounded window instead of freezing the
+// loop; after giving up, back off before re-arming so a persistent block stays
+// responsive and can still self-heal if the component recovers.
+constexpr int kVsHumanHandoffRetryStride = 8;          // attempt only every N frames past target
+constexpr int kVsHumanHandoffMaxBlockedFrames = 60;    // ~1s @ 60fps, well under peer ~8s timeout
+constexpr uint32_t kVsHumanHandoffBlockedCooldownMs = 750;
+// Gate-level fail-fast, complementing the per-warmup bounds above: after a
+// failed SuspendUiHooksForOnlineSimulation, further handoff attempts return
+// immediately (one tick compare) for this window instead of re-entering the
+// expensive suspend path. This covers EVERY caller -- including the FastHandoff
+// and no-delay-prompt auto-handoff sites, which retry each frame from
+// persistent bridge state without a warmup counter -- and caps how often the
+// state-export drain barrier (worst case ~2s of game-thread spin) can run.
+constexpr uint32_t kOnlineSimSuspendFailFastMs = 250;
+// GetTickCount() with 0 biased to 1 so 0 can serve as the "timer inactive"
+// sentinel (the 1ms bias is harmless). Windows are measured with the
+// wrap-safe elapsed idiom (GetTickCount() - startTick < windowMs) rather than
+// an absolute deadline, which would invert across the 49.7-day tick wrap.
+inline uint32_t TimerArmTickNonZero()
+{
+    const uint32_t now = static_cast<uint32_t>(GetTickCount());
+    return now != 0u ? now : 1u;
+}
 constexpr int kSpectateTitleWarmupFrames = 17;
 int g_pendingGlobalStateTransition = -1;
 bool g_charSelectResetPending = false;
@@ -122,9 +151,26 @@ constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
 bool g_spectateHandoffWarmupActive = false;
 int g_spectateHandoffWarmupFrames = 0;
 uint32_t g_spectateHandoffWarmupStartTick = 0;
+// Spectate counterpart of g_vsHumanHandoffBlocked* (reuses the shared
+// kVsHumanHandoff* bounds) so a blocked spectate handoff cannot re-fire every
+// frame either.
+int g_spectateHandoffBlockedFrames = 0;
+uint32_t g_spectateHandoffBlockedCooldownStartTick = 0;
+// Nonzero while suspend-gate failures are being fail-fasted (see
+// kOnlineSimSuspendFailFastMs; 0 = inactive, measured wrap-safe via elapsed
+// ticks). Armed by SuspendUiHooksForOnlineSimulation on failure, cleared on
+// its next success; consulted by the handoff entry points so blocked retries
+// cost one tick compare instead of the full suspend path.
+uint32_t g_onlineSimSuspendFailFastStartTick = 0;
 bool g_vsHumanHandoffWarmupActive = false;
 int g_vsHumanHandoffWarmupFrames = 0;
 uint32_t g_vsHumanHandoffWarmupStartTick = 0;
+// Consecutive frames the completed warmup has attempted the handoff without it
+// queuing a state transition, plus the back-off window start after we give up
+// (0 = no cooldown; measured wrap-safe via elapsed ticks). See the
+// kVsHumanHandoff* constants above.
+int g_vsHumanHandoffBlockedFrames = 0;
+uint32_t g_vsHumanHandoffBlockedCooldownStartTick = 0;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -1918,6 +1964,8 @@ void ResetSpectateHandoffWarmup(const char* reason)
     g_spectateHandoffWarmupActive = false;
     g_spectateHandoffWarmupFrames = 0;
     g_spectateHandoffWarmupStartTick = 0;
+    g_spectateHandoffBlockedFrames = 0;
+    g_spectateHandoffBlockedCooldownStartTick = 0;
 }
 
 void ResetVsHumanHandoffWarmup(const char* reason)
@@ -1933,6 +1981,8 @@ void ResetVsHumanHandoffWarmup(const char* reason)
     g_vsHumanHandoffWarmupActive = false;
     g_vsHumanHandoffWarmupFrames = 0;
     g_vsHumanHandoffWarmupStartTick = 0;
+    g_vsHumanHandoffBlockedFrames = 0;
+    g_vsHumanHandoffBlockedCooldownStartTick = 0;
 }
 
 bool AdvanceVsHumanHandoffWarmup(
@@ -1942,11 +1992,32 @@ bool AdvanceVsHumanHandoffWarmup(
     const char* source,
     uint32_t* inactivityCounter)
 {
+    // Post-give-up cooldown: a prior completion stayed blocked long enough that
+    // we released the game loop (see the bounded-retry tail below). Do not
+    // immediately re-arm -- that would just repeat the blocked warmup and keep
+    // the game hitching. Wait out the cooldown (keeping local menu control
+    // inert), then retry in case the blocking UI hook has since recovered.
+    if (g_vsHumanHandoffBlockedCooldownStartTick != 0)
+    {
+        if (GetTickCount() - g_vsHumanHandoffBlockedCooldownStartTick
+            < kVsHumanHandoffBlockedCooldownMs)
+        {
+            ClearLocalMenuControlState(screenContext);
+            if (inactivityCounter != nullptr)
+            {
+                ++(*inactivityCounter);
+            }
+            return false;
+        }
+        g_vsHumanHandoffBlockedCooldownStartTick = 0;
+    }
+
     if (!g_vsHumanHandoffWarmupActive)
     {
         g_vsHumanHandoffWarmupActive = true;
         g_vsHumanHandoffWarmupFrames = 0;
         g_vsHumanHandoffWarmupStartTick = GetTickCount();
+        g_vsHumanHandoffBlockedFrames = 0;
         mod::Log(
             "VsHumanHandoffWarmup: armed targetFrames=%d source=%s role=%d roleFlag=%d init=%d phase=%s "
             "sync(mode=%d flag1084=%d session=%d flags=%d/%d) screen=%d menuSel=%d peerAlive=%d",
@@ -1977,20 +2048,66 @@ bool AdvanceVsHumanHandoffWarmup(
         return false;
     }
 
-    const uint32_t elapsedMs =
-        g_vsHumanHandoffWarmupStartTick != 0
-            ? GetTickCount() - g_vsHumanHandoffWarmupStartTick
-            : 0;
-    mod::Log(
-        "VsHumanHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
-        "screen=%d menuSel=%d",
-        g_vsHumanHandoffWarmupFrames,
-        kVsHumanTitleWarmupFrames,
-        static_cast<unsigned long>(elapsedMs),
-        *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
-        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
-    HandoffConnectedSessionToVsHumanState(screenContext);
-    return g_pendingGlobalStateTransition >= 0;
+    // Warmup has reached its target. On the happy path the first attempt queues
+    // the transition and the handoff itself resets the warmup, so we return true
+    // immediately. If the handoff is blocked it returns without queuing a
+    // transition and without resetting the warmup, so control returns here every
+    // frame -- throttle the (expensive) retries and give up after a bounded
+    // window instead of holding the game loop hostage until the peer times out.
+    const int framesPastTarget =
+        g_vsHumanHandoffWarmupFrames - kVsHumanTitleWarmupFrames;   // 0 first time
+    const bool attemptThisFrame =
+        framesPastTarget == 0
+        || (framesPastTarget % kVsHumanHandoffRetryStride) == 0;
+
+    if (attemptThisFrame)
+    {
+        const uint32_t elapsedMs =
+            g_vsHumanHandoffWarmupStartTick != 0
+                ? GetTickCount() - g_vsHumanHandoffWarmupStartTick
+                : 0;
+        mod::Log(
+            "VsHumanHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
+            "pastTarget=%d screen=%d menuSel=%d",
+            g_vsHumanHandoffWarmupFrames,
+            kVsHumanTitleWarmupFrames,
+            static_cast<unsigned long>(elapsedMs),
+            framesPastTarget,
+            *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+        HandoffConnectedSessionToVsHumanState(screenContext);
+        if (g_pendingGlobalStateTransition >= 0)
+        {
+            return true;   // handoff queued; the warmup was reset inside it
+        }
+    }
+    else
+    {
+        // Between throttled retries, keep the local menu inert like a normal
+        // warmup frame so stale input cannot leak into the pending handoff.
+        ClearLocalMenuControlState(screenContext);
+        if (inactivityCounter != nullptr)
+        {
+            ++(*inactivityCounter);
+        }
+    }
+
+    // Still blocked. Bail out after a bounded window so a component that will not
+    // suspend degrades to "the match does not start" rather than "the game
+    // freezes at ~10fps until the peer quits". Back off before re-arming.
+    if (++g_vsHumanHandoffBlockedFrames >= kVsHumanHandoffMaxBlockedFrames)
+    {
+        mod::Log(
+            "VsHumanHandoffWarmup: ABORT handoff blocked for %d frames "
+            "(warmupFrames=%d) - releasing the game loop and backing off %ums; "
+            "SuspendUiHooksForOnlineSimulation never succeeded",
+            g_vsHumanHandoffBlockedFrames,
+            g_vsHumanHandoffWarmupFrames,
+            static_cast<unsigned>(kVsHumanHandoffBlockedCooldownMs));
+        ResetVsHumanHandoffWarmup("handoff_blocked_timeout");
+        g_vsHumanHandoffBlockedCooldownStartTick = TimerArmTickNonZero();
+    }
+    return false;
 }
 
 bool HasRecoveryMenuActionInput(const uint8_t* inputBytes)
@@ -4635,6 +4752,24 @@ static bool SuspendUiHooksForOnlineSimulation(
     uint32_t screenContext,
     const char* reason)
 {
+    // Fail-fast window: a suspend attempt just failed, so skip the expensive
+    // barrier/teardown work until the window lapses. The arming failure was
+    // already logged, so this path is deliberately silent. The external
+    // launcher adoption is exempt: it is a one-shot attempt whose failure
+    // degrades the attachment rather than retrying, so it must always run for
+    // real even if a stale window happens to be armed.
+    if (g_onlineSimSuspendFailFastStartTick != 0
+        && (reason == nullptr
+            || strcmp(reason, "external_launcher_adoption") != 0))
+    {
+        if (GetTickCount() - g_onlineSimSuspendFailFastStartTick
+            < kOnlineSimSuspendFailFastMs)
+        {
+            return false;
+        }
+        g_onlineSimSuspendFailFastStartTick = 0;
+    }
+
     // Request one final pre-handoff control-plane snapshot and complete any
     // temporary Host Protocol acknowledgement while still safely in the menu.
     // The barrier drains that accepted request, then proves that no exporter
@@ -4647,6 +4782,7 @@ static bool SuspendUiHooksForOnlineSimulation(
             "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=%s component=state_export",
             reason != nullptr ? reason : "unknown");
         netplay::bridge::state_export::ResumeControlPlaneUpdates();
+        g_onlineSimSuspendFailFastStartTick = TimerArmTickNonZero();
         return false;
     }
 
@@ -4672,6 +4808,7 @@ static bool SuspendUiHooksForOnlineSimulation(
 #endif
     if (windowOk && imguiOk && renderOk && frontendOk)
     {
+        g_onlineSimSuspendFailFastStartTick = 0;
         g_onlineSimulationUiSuspended.store(
             true,
             std::memory_order_release);
@@ -4688,7 +4825,9 @@ static bool SuspendUiHooksForOnlineSimulation(
 
     // The transition has not begun, so restore menu/control-plane ownership
     // and let a later frame retry the handoff after the failed component is
-    // recoverable.
+    // recoverable. Arm the fail-fast window so per-frame retriers skip the
+    // expensive path until then.
+    g_onlineSimSuspendFailFastStartTick = TimerArmTickNonZero();
     g_onlineSimulationUiSuspended.store(
         false,
         std::memory_order_release);
@@ -4741,6 +4880,15 @@ bool PrepareExternalLauncherSimulationHandoffImpl()
 
 void HandoffSpectateSession(uint32_t screenContext)
 {
+    // Same fail-fast skip as HandoffConnectedSessionToVsHumanState: while the
+    // suspend gate is cooling down from a failure, retries are near-free.
+    if (g_onlineSimSuspendFailFastStartTick != 0
+        && GetTickCount() - g_onlineSimSuspendFailFastStartTick
+            < kOnlineSimSuspendFailFastMs)
+    {
+        return;
+    }
+
     const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
     const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
     mod::Log(
@@ -5200,6 +5348,17 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
 
 void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
 {
+    // While the suspend gate is fail-fasting a recent failure, skip the whole
+    // attempt (including PrepareVsHumanHandoff and the diagnostic logging):
+    // the FastHandoff / no-delay-prompt callers re-enter every frame from
+    // persistent bridge state, and this keeps those retries near-free.
+    if (g_onlineSimSuspendFailFastStartTick != 0
+        && GetTickCount() - g_onlineSimSuspendFailFastStartTick
+            < kOnlineSimSuspendFailFastMs)
+    {
+        return;
+    }
+
     const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
     const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
 
@@ -6936,11 +7095,24 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
     if (spectateHandoffReady)
     {
+        if (g_spectateHandoffBlockedCooldownStartTick != 0)
+        {
+            if (GetTickCount() - g_spectateHandoffBlockedCooldownStartTick
+                < kVsHumanHandoffBlockedCooldownMs)
+            {
+                ClearLocalMenuControlState(screenContext);
+                ++(*inactivityCounter);
+                return 0;
+            }
+            g_spectateHandoffBlockedCooldownStartTick = 0;
+        }
+
         if (!g_spectateHandoffWarmupActive)
         {
             g_spectateHandoffWarmupActive = true;
             g_spectateHandoffWarmupFrames = 0;
             g_spectateHandoffWarmupStartTick = GetTickCount();
+            g_spectateHandoffBlockedFrames = 0;
             ClearPendingLobbySpectateWait("spectate_handoff_warmup");
             ResetDelaySetupOverlayState();
             ResetSpectateConfirmOverlayState();
@@ -6972,34 +7144,68 @@ char UpdateNetplayMenu(uint32_t screenContext)
             return 0;
         }
 
-        const uint32_t elapsedMs =
-            g_spectateHandoffWarmupStartTick != 0
-                ? GetTickCount() - g_spectateHandoffWarmupStartTick
-                : 0;
-        mod::Log(
-            "SpectateHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
-            "screen=%d menuSel=%d",
-            g_spectateHandoffWarmupFrames,
-            kSpectateTitleWarmupFrames,
-            static_cast<unsigned long>(elapsedMs),
-            *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
-            static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
-        HandoffSpectateSession(screenContext);
-        if (g_pendingGlobalStateTransition >= 0)
+        // Bounded-retry safety net, mirroring AdvanceVsHumanHandoffWarmup: if
+        // HandoffSpectateSession is blocked (SuspendUiHooksForOnlineSimulation
+        // fails) it returns without queuing a transition or resetting this
+        // warmup, so control returns here every frame. Throttle the expensive
+        // retries and give up after a bounded window so a component that will
+        // not suspend cannot pin the spectator at ~10fps until the peer quits.
+        const int framesPastTarget =
+            g_spectateHandoffWarmupFrames - kSpectateTitleWarmupFrames;   // 0 first time
+        const bool attemptThisFrame =
+            framesPastTarget == 0
+            || (framesPastTarget % kVsHumanHandoffRetryStride) == 0;
+
+        if (attemptThisFrame)
         {
-            const int nextState = g_pendingGlobalStateTransition;
-            g_pendingGlobalStateTransition = -1;
-            if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition"))
-            {
-                return 0;
-            }
+            const uint32_t elapsedMs =
+                g_spectateHandoffWarmupStartTick != 0
+                    ? GetTickCount() - g_spectateHandoffWarmupStartTick
+                    : 0;
             mod::Log(
-                "NetplayTransition: returning spectate state=%d from netplay menu "
-                "menuSel=%d screen=%d",
-                nextState,
-                static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
-                *reinterpret_cast<const int*>(kVaCurrentScreenIndex));
-            return static_cast<char>(nextState);
+                "SpectateHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
+                "pastTarget=%d screen=%d menuSel=%d",
+                g_spectateHandoffWarmupFrames,
+                kSpectateTitleWarmupFrames,
+                static_cast<unsigned long>(elapsedMs),
+                framesPastTarget,
+                *reinterpret_cast<const int*>(kVaCurrentScreenIndex),
+                static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+            HandoffSpectateSession(screenContext);
+            if (g_pendingGlobalStateTransition >= 0)
+            {
+                const int nextState = g_pendingGlobalStateTransition;
+                g_pendingGlobalStateTransition = -1;
+                if (abortPendingTransitionIfSessionLost(nextState, "peer_died_before_spectate_transition"))
+                {
+                    return 0;
+                }
+                mod::Log(
+                    "NetplayTransition: returning spectate state=%d from netplay menu "
+                    "menuSel=%d screen=%d",
+                    nextState,
+                    static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)),
+                    *reinterpret_cast<const int*>(kVaCurrentScreenIndex));
+                return static_cast<char>(nextState);
+            }
+        }
+        else
+        {
+            ClearLocalMenuControlState(screenContext);
+            ++(*inactivityCounter);
+        }
+
+        if (++g_spectateHandoffBlockedFrames >= kVsHumanHandoffMaxBlockedFrames)
+        {
+            mod::Log(
+                "SpectateHandoffWarmup: ABORT handoff blocked for %d frames "
+                "(warmupFrames=%d) - releasing the game loop and backing off %ums; "
+                "SuspendUiHooksForOnlineSimulation never succeeded",
+                g_spectateHandoffBlockedFrames,
+                g_spectateHandoffWarmupFrames,
+                static_cast<unsigned>(kVsHumanHandoffBlockedCooldownMs));
+            ResetSpectateHandoffWarmup("handoff_blocked_timeout");
+            g_spectateHandoffBlockedCooldownStartTick = TimerArmTickNonZero();
         }
         return 0;
     }

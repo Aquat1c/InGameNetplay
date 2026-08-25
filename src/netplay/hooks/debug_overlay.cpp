@@ -762,41 +762,68 @@ bool ShutdownImGui()
     {
         return true;
     }
+    // Restore our WndProc only when DebugWndProc is still the *live* top-level
+    // proc and we know what preceded it. If another proc now owns the top --
+    // most commonly because RemoveNetplayWindowHook() ran just before this
+    // during the online-simulation suspend and already restored the stock proc,
+    // unchaining us -- then rewriting GWLP_WNDPROC would clobber a proc we do
+    // not own, so we leave it alone.
+    //
+    // Being unchained is the SUCCESS state, not a failure. Once g_inited is
+    // cleared below, DebugWndProc early-outs on its g_inited guard and simply
+    // forwards, never touching the destroyed ImGui context, so it is inert
+    // whether or not it is still somewhere in the chain. Teardown must
+    // therefore NEVER return false: returning false made
+    // SuspendUiHooksForOnlineSimulation report imgui=0, which made the
+    // connected-session handoff retry every frame indefinitely -- pinning the
+    // game near ~10fps until the remote peer timed out ("dropped connection on
+    // sync").
+    bool detachedFromChain = false;
     if (g_hwnd != nullptr && IsWindow(g_hwnd))
     {
         SetLastError(NO_ERROR);
         const LONG_PTR currentValue = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
         const DWORD readError = GetLastError();
-        if ((currentValue == 0 && readError != NO_ERROR)
-            || reinterpret_cast<WNDPROC>(currentValue) != &DebugWndProc
-            || g_prevWndProc == nullptr)
+        const bool readOk =
+            !(currentValue == 0 && readError != NO_ERROR);
+        const bool weOwnTop = readOk
+            && reinterpret_cast<WNDPROC>(currentValue) == &DebugWndProc;
+
+        if (weOwnTop && g_prevWndProc != nullptr)
+        {
+            SetLastError(NO_ERROR);
+            const LONG_PTR result = SetWindowLongPtrA(
+                g_hwnd,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(g_prevWndProc));
+            const DWORD restoreError = GetLastError();
+            if (result != 0 || restoreError == NO_ERROR)
+            {
+                detachedFromChain = true;
+            }
+            else
+            {
+                mod::Log(
+                    "DebugOverlay: WndProc restore failed hwnd=%p err=%lu "
+                    "(deinitialising anyway; detour degrades to pass-through)",
+                    g_hwnd,
+                    static_cast<unsigned long>(restoreError));
+            }
+        }
+        else
         {
             mod::Log(
-                "DebugOverlay: WndProc restore refused hwnd=%p current=%p hook=%p previous=%p err=%lu",
+                "DebugOverlay: WndProc restore skipped, detour not top-level "
+                "hwnd=%p current=%p hook=%p previous=%p readErr=%lu "
+                "(deinitialising; detour is inert once g_inited clears)",
                 g_hwnd,
                 reinterpret_cast<void*>(currentValue),
                 reinterpret_cast<void*>(&DebugWndProc),
                 reinterpret_cast<void*>(g_prevWndProc),
                 static_cast<unsigned long>(readError));
-            return false;
-        }
-
-        SetLastError(NO_ERROR);
-        const LONG_PTR result = SetWindowLongPtrA(
-            g_hwnd,
-            GWLP_WNDPROC,
-            reinterpret_cast<LONG_PTR>(g_prevWndProc));
-        const DWORD restoreError = GetLastError();
-        if (result == 0 && restoreError != NO_ERROR)
-        {
-            mod::Log(
-                "DebugOverlay: WndProc restore failed hwnd=%p err=%lu",
-                g_hwnd,
-                static_cast<unsigned long>(restoreError));
-            return false;
         }
     }
-    g_prevWndProc = nullptr;
+
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -811,6 +838,15 @@ bool ShutdownImGui()
     InterlockedExchange(&g_rtFontRebuildRequested, 0);
     g_lastBackBufferW = 0;
     g_lastBackBufferH = 0;
+
+    // Only forget our predecessor once we actually detached from the chain. If
+    // DebugWndProc might still be chained below another proc (we did not own the
+    // top), keep g_prevWndProc so its forwarding path still reaches the real
+    // proc beneath it.
+    if (detachedFromChain)
+    {
+        g_prevWndProc = nullptr;
+    }
     return true;
 }
 
