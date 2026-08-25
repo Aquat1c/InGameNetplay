@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace netplay::mod_settings
@@ -35,6 +36,28 @@ struct Settings
     // Keyboard binding (DIK_* form) for the async-hosting "return / rehost"
     // hotkey used while the hosting overlay is minimized in-game.
     std::string asyncHostReturnKey = "DIK_F1";
+    // Master switch for the mod-interop overlay channel (peer<->peer cosmetic
+    // side data over EfzRevival's own UDP; first payload = online char-select
+    // portrait palettes). Default OFF: the feature piggybacks the live netcode
+    // socket and is not yet live-proven, so it stays opt-in until validated and
+    // wired into the debug settings UI. Disabling this gates the entire
+    // subsystem (channel + palettes) at every entry point.
+    bool modInteropChannel = false;
+    // Dev-only loopback for the overlay channel (Stage-1 test): drives the
+    // palette chain with a local echo sink instead of the network, so a SOLO
+    // local-play session mirrors P1's chosen palette onto the P2 portrait. Has
+    // no effect unless modInteropChannel is also on. Never ship enabled.
+    bool modInteropLoopback = false;
+    // Stage-2 test transport: a side-channel UDP socket (this is the interim
+    // direct/LAN transport; the production path piggybacks Revival's own socket).
+    // modInteropPeer = the OTHER client's IP; modInteropPort = the shared side
+    // port both clients bind. Used only when modInteropChannel is on and
+    // loopback is off. Empty peer disables the socket transport.
+    std::string modInteropPeer = "";
+    uint16_t modInteropPort = 10801;
+    // Which side this client controls (0=P1/host, 1=P2/join). We broadcast this
+    // side's palette and apply the peer's. Loopback ignores it (uses side 0).
+    int modInteropSide = 0;
 };
 
 void Reload();
@@ -56,4 +79,18 @@ const std::string& MenuTtfFontFace();
 const std::string& HostingTipFontFace();
 // Async-hosting return/rehost hotkey as a DIK_* binding value (e.g. "DIK_F1").
 const std::string& AsyncHostReturnKeyBinding();
+// Master gate for the mod-interop overlay channel + online palettes. When
+// false, the whole subsystem is inert (no socket interposition, no handshake,
+// no palette exchange). See Settings::modInteropChannel.
+bool IsModInteropChannelEnabled();
+// Runtime override of the master gate (for the debug settings toggle). Does not
+// persist to the ini; a Reload() re-reads the stored value.
+void SetModInteropChannelEnabled(bool enabled);
+// Dev-only overlay-channel loopback (Stage-1 solo palette test). Requires the
+// master gate to also be on. See Settings::modInteropLoopback.
+bool IsModInteropLoopbackEnabled();
+// Stage-2 side-socket transport config. Empty peer = disabled.
+const std::string& ModInteropPeer();
+uint16_t ModInteropPort();
+int ModInteropSide();
 } // namespace netplay::mod_settings

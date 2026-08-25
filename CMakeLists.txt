@@ -70,6 +70,14 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/process_inject.cpp
     src/netplay/bridge/iat_stubs.cpp
     src/netplay/core/inline_edit.cpp
+    src/netplay/interop/overlay_protocol.cpp
+    src/netplay/interop/palette_store.cpp
+    src/netplay/interop/palette_source.cpp
+    src/netplay/interop/palette_remap.cpp
+    src/netplay/interop/palette_apply.cpp
+    src/netplay/interop/palette_socket.cpp
+    src/netplay/interop/palette_charselect.cpp
+    src/netplay/interop/overlay_channel.cpp
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
@@ -258,6 +266,45 @@ if(BUILD_TESTING)
     add_test(
         NAME revival_launch_policy_tests
         COMMAND revival_launch_policy_tests)
+endif()
+
+if(BUILD_TESTING)
+    # Overlay-channel unit tests. The test file stubs mod::Log and
+    # mod_settings::IsModInteropChannelEnabled, so only the interop sources are
+    # linked (no ini/logging layers). GetTickCount pulls in kernel32 only.
+    add_executable(interop_tests
+        tests/interop_tests.cpp
+        src/netplay/interop/overlay_protocol.cpp
+        src/netplay/interop/palette_store.cpp
+        src/netplay/interop/palette_source.cpp
+        src/netplay/interop/palette_remap.cpp
+        src/netplay/interop/overlay_channel.cpp)
+    target_include_directories(interop_tests PRIVATE include)
+    target_compile_features(interop_tests PRIVATE cxx_std_17)
+    # The test writes temp .pal fixtures with the CRT (fopen); production code
+    # uses the Win32 API. Suppress the CRT-deprecation warning for the test only.
+    target_compile_definitions(interop_tests PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+
+    if(MSVC)
+        if(EFZ_XP_COMPAT)
+            target_compile_options(interop_tests PRIVATE /W4 /EHsc)
+            target_compile_definitions(interop_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(interop_tests PRIVATE
+                /Zc:threadSafeInit-)
+        else()
+            target_compile_options(interop_tests PRIVATE
+                /W4 /permissive- /EHsc)
+        endif()
+
+        if(EFZ_STATIC_RUNTIME)
+            set_property(TARGET interop_tests PROPERTY
+                MSVC_RUNTIME_LIBRARY
+                "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endif()
+
+    add_test(NAME interop_tests COMMAND interop_tests)
 endif()
 
 if(BUILD_TESTING AND WIN32)

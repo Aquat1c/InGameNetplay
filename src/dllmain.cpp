@@ -10,6 +10,7 @@
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
+#include "netplay/interop/palette_charselect.h"
 
 namespace
 {
@@ -53,6 +54,10 @@ DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
             mod::Log(
                 "Launcher UI attachment boundary completion failed");
         }
+        // Mod-interop overlay palettes (gated by ModInteropChannel; Stage-1
+        // loopback additionally gated by ModInteropLoopback). Inert no-op when
+        // the flags are off.
+        (void)netplay::interop::charselect::Install();
         startupCompleted = true;
     }
     __finally

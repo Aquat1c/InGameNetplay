@@ -117,6 +117,29 @@ bool TryReadBoolValue(
     *outValue = ReadBoolValue(sectionName, keyName, false, iniPath);
     return true;
 }
+
+// Write key=value only when the key is ABSENT, so the setting becomes visible
+// and editable in the ini on first run without clobbering a user's own value.
+void SeedIniKeyIfMissing(
+    const wchar_t* sectionName,
+    const wchar_t* keyName,
+    const wchar_t* defaultValue,
+    const std::wstring& iniPath)
+{
+    wchar_t buffer[16] = {};
+    static constexpr wchar_t kMissing[] = L"__missing__";
+    GetPrivateProfileStringW(
+        sectionName, keyName, kMissing, buffer,
+        static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])),
+        iniPath.c_str());
+    // A value longer than the buffer is truncated but still != kMissing, so a
+    // present key is correctly detected regardless of its length.
+    if (std::wcscmp(buffer, kMissing) == 0)
+    {
+        (void)WritePrivateProfileStringW(
+            sectionName, keyName, defaultValue, iniPath.c_str());
+    }
+}
 } // namespace
 
 void Reload()
@@ -202,6 +225,26 @@ void Reload()
     {
         loaded.asyncHostReturnKey = "DIK_F1";
     }
+    // Off by default: opt-in until the overlay channel is live-proven.
+    loaded.modInteropChannel =
+        ReadBoolValue(L"Others", L"ModInteropChannel", false, iniPath);
+    loaded.modInteropLoopback =
+        ReadBoolValue(L"Others", L"ModInteropLoopback", false, iniPath);
+    loaded.modInteropPeer =
+        ReadStringValue(L"Others", L"ModInteropPeer", L"", iniPath);
+    loaded.modInteropPort = static_cast<uint16_t>(
+        GetPrivateProfileIntW(
+            L"Others", L"ModInteropPort", 10801, iniPath.c_str()));
+    loaded.modInteropSide = (GetPrivateProfileIntW(
+        L"Others", L"ModInteropSide", 0, iniPath.c_str()) != 0) ? 1 : 0;
+
+    // Seed the mod-interop keys into the ini (only if absent) so they are
+    // discoverable and editable. Safe defaults: the whole subsystem off.
+    SeedIniKeyIfMissing(L"Others", L"ModInteropChannel", L"0", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"ModInteropLoopback", L"0", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"ModInteropPeer", L"", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"ModInteropPort", L"10801", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"ModInteropSide", L"0", iniPath);
 
     g_settings = loaded;
 
@@ -248,6 +291,36 @@ bool IsConsoleEnabled()
 bool IsDebugMenuEnabled()
 {
     return g_settings.enableDebugMenu;
+}
+
+bool IsModInteropChannelEnabled()
+{
+    return g_settings.modInteropChannel;
+}
+
+void SetModInteropChannelEnabled(bool enabled)
+{
+    g_settings.modInteropChannel = enabled;
+}
+
+bool IsModInteropLoopbackEnabled()
+{
+    return g_settings.modInteropLoopback;
+}
+
+const std::string& ModInteropPeer()
+{
+    return g_settings.modInteropPeer;
+}
+
+uint16_t ModInteropPort()
+{
+    return g_settings.modInteropPort;
+}
+
+int ModInteropSide()
+{
+    return g_settings.modInteropSide;
 }
 
 bool IsVerboseBridgePatchLoggingEnabled()
