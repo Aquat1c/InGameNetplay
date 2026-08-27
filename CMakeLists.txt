@@ -78,6 +78,8 @@ add_library(efz_netplay_mod SHARED
     src/netplay/interop/palette_socket.cpp
     src/netplay/interop/palette_charselect.cpp
     src/netplay/interop/overlay_channel.cpp
+    src/netplay/interop/overlay_ipc.cpp
+    src/netplay/interop/overlay_helper_hooks.cpp
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
@@ -278,7 +280,8 @@ if(BUILD_TESTING)
         src/netplay/interop/palette_store.cpp
         src/netplay/interop/palette_source.cpp
         src/netplay/interop/palette_remap.cpp
-        src/netplay/interop/overlay_channel.cpp)
+        src/netplay/interop/overlay_channel.cpp
+        src/netplay/interop/overlay_ipc.cpp)
     target_include_directories(interop_tests PRIVATE include)
     target_compile_features(interop_tests PRIVATE cxx_std_17)
     # The test writes temp .pal fixtures with the CRT (fopen); production code

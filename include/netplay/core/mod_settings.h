@@ -38,11 +38,12 @@ struct Settings
     std::string asyncHostReturnKey = "DIK_F1";
     // Master switch for the mod-interop overlay channel (peer<->peer cosmetic
     // side data over EfzRevival's own UDP; first payload = online char-select
-    // portrait palettes). Default OFF: the feature piggybacks the live netcode
-    // socket and is not yet live-proven, so it stays opt-in until validated and
-    // wired into the debug settings UI. Disabling this gates the entire
-    // subsystem (channel + palettes) at every entry point.
-    bool modInteropChannel = false;
+    // portrait palettes). Default ON: live-proven online, it piggybacks Revival's
+    // own socket so it needs no extra port/config and vanilla peers are unaffected
+    // (they drop the reserved typeId). The end-user gate is the ini key
+    // "OnlineCustomColors" and the debug-menu toggle; disabling it makes the
+    // entire subsystem (channel + palettes) inert at every entry point.
+    bool onlineCustomColors = true;
     // Dev-only loopback for the overlay channel (Stage-1 test): drives the
     // palette chain with a local echo sink instead of the network, so a SOLO
     // local-play session mirrors P1's chosen palette onto the P2 portrait. Has
@@ -79,13 +80,14 @@ const std::string& MenuTtfFontFace();
 const std::string& HostingTipFontFace();
 // Async-hosting return/rehost hotkey as a DIK_* binding value (e.g. "DIK_F1").
 const std::string& AsyncHostReturnKeyBinding();
-// Master gate for the mod-interop overlay channel + online palettes. When
-// false, the whole subsystem is inert (no socket interposition, no handshake,
-// no palette exchange). See Settings::modInteropChannel.
-bool IsModInteropChannelEnabled();
-// Runtime override of the master gate (for the debug settings toggle). Does not
-// persist to the ini; a Reload() re-reads the stored value.
-void SetModInteropChannelEnabled(bool enabled);
+// End-user gate (ini key "OnlineCustomColors") for online custom portrait
+// colors + the mod-interop overlay channel. When false, the whole subsystem is
+// inert (no socket interposition, no handshake, no palette exchange). Default
+// ON. See Settings::onlineCustomColors.
+bool AreOnlineCustomColorsEnabled();
+// Runtime override of the gate (for the debug-menu toggle). Does not persist to
+// the ini; a Reload() re-reads the stored value.
+void SetOnlineCustomColorsEnabled(bool enabled);
 // Dev-only overlay-channel loopback (Stage-1 solo palette test). Requires the
 // master gate to also be on. See Settings::modInteropLoopback.
 bool IsModInteropLoopbackEnabled();

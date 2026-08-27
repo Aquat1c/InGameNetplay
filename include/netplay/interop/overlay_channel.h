@@ -11,7 +11,7 @@
 // unit-tested and shipped inert behind the master flag.
 //
 // EVERY public entry point is a no-op unless the master flag
-// (mod_settings::IsModInteropChannelEnabled) is set AND Begin() has armed a
+// (mod_settings::AreOnlineCustomColorsEnabled) is set AND Begin() has armed a
 // session. So compiling/linking this in is safe with the feature off.
 
 #include <cstddef>

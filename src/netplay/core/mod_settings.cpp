@@ -225,9 +225,9 @@ void Reload()
     {
         loaded.asyncHostReturnKey = "DIK_F1";
     }
-    // Off by default: opt-in until the overlay channel is live-proven.
-    loaded.modInteropChannel =
-        ReadBoolValue(L"Others", L"ModInteropChannel", false, iniPath);
+    // On by default: live-proven; piggybacks Revival's own socket, vanilla-safe.
+    loaded.onlineCustomColors =
+        ReadBoolValue(L"Others", L"OnlineCustomColors", true, iniPath);
     loaded.modInteropLoopback =
         ReadBoolValue(L"Others", L"ModInteropLoopback", false, iniPath);
     loaded.modInteropPeer =
@@ -238,13 +238,10 @@ void Reload()
     loaded.modInteropSide = (GetPrivateProfileIntW(
         L"Others", L"ModInteropSide", 0, iniPath.c_str()) != 0) ? 1 : 0;
 
-    // Seed the mod-interop keys into the ini (only if absent) so they are
-    // discoverable and editable. Safe defaults: the whole subsystem off.
-    SeedIniKeyIfMissing(L"Others", L"ModInteropChannel", L"0", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ModInteropLoopback", L"0", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ModInteropPeer", L"", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ModInteropPort", L"10801", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ModInteropSide", L"0", iniPath);
+    // Seed only the single user-facing gate (default ON). Everything else
+    // (piggyback transport, side derived from the session role) is automatic, so
+    // the ModInterop* keys are hidden dev overrides - read if present, never seeded.
+    SeedIniKeyIfMissing(L"Others", L"OnlineCustomColors", L"1", iniPath);
 
     g_settings = loaded;
 
@@ -293,14 +290,14 @@ bool IsDebugMenuEnabled()
     return g_settings.enableDebugMenu;
 }
 
-bool IsModInteropChannelEnabled()
+bool AreOnlineCustomColorsEnabled()
 {
-    return g_settings.modInteropChannel;
+    return g_settings.onlineCustomColors;
 }
 
-void SetModInteropChannelEnabled(bool enabled)
+void SetOnlineCustomColorsEnabled(bool enabled)
 {
-    g_settings.modInteropChannel = enabled;
+    g_settings.onlineCustomColors = enabled;
 }
 
 bool IsModInteropLoopbackEnabled()

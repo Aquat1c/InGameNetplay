@@ -11,6 +11,7 @@
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/interop/palette_charselect.h"
+#include "netplay/interop/overlay_helper_hooks.h"
 
 namespace
 {
@@ -54,7 +55,7 @@ DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
             mod::Log(
                 "Launcher UI attachment boundary completion failed");
         }
-        // Mod-interop overlay palettes (gated by ModInteropChannel; Stage-1
+        // Mod-interop overlay palettes (gated by OnlineCustomColors; Stage-1
         // loopback additionally gated by ModInteropLoopback). Inert no-op when
         // the flags are off.
         (void)netplay::interop::charselect::Install();
@@ -85,6 +86,9 @@ DWORD WINAPI InitializeInjectedThread(LPVOID moduleHandleRaw)
     mod::InstallCrashHandlers(moduleHandle, true);
     mod::Log("Module attached in EfzRevival.exe (injected takeover mode)");
     netplay::bridge::InitializeInjectedProcess();
+    // Helper-side piggyback for the mod-interop overlay channel. Gated by
+    // OnlineCustomColors; observe-only on RX so it cannot disturb Revival's netcode.
+    (void)netplay::interop::helper_hooks::Install();
     return 0;
 }
 

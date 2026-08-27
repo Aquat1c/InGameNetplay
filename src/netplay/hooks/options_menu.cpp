@@ -1440,7 +1440,7 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         {"Global", "SYSTEM", {"SoftwareRendering", "Debug"}},
         // [Others] (mod-owned settings)
         {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
-        {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey"}},
+        {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
         {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
     };
     return kGroups;
@@ -1900,6 +1900,12 @@ void AppendSyntheticItems()
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
+    upsertBoolIntItem(
+        "OnlineCustomColors",
+        true,
+        "Show your custom EDIT COLOR palette to your opponent in online matches, "
+        "and see theirs, on the character-select and win screens. Rides the "
+        "existing netplay connection; players without the mod are unaffected.");
     upsertBoolIntItem(
         "MenuTtfText",
         true,

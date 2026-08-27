@@ -8,7 +8,7 @@
 // Stage 1 (this build) runs in LOCAL PLAY with a LOOPBACK sink: no network, no
 // rollback involvement. Char-select is outside the parity island, so the live
 // palette writes are determinism-neutral. Entirely gated by the master flag
-// (mod_settings::IsModInteropChannelEnabled); the loopback wiring additionally
+// (mod_settings::AreOnlineCustomColorsEnabled); the loopback wiring additionally
 // requires IsModInteropLoopbackEnabled.
 
 namespace netplay::interop::charselect

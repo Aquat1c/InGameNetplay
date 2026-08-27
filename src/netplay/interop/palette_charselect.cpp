@@ -10,8 +10,10 @@
 #include <thread>
 
 #include "logger.h"
+#include "netplay/bridge/session_bridge.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/interop/overlay_channel.h"
+#include "netplay/interop/overlay_ipc.h"
 #include "netplay/interop/overlay_protocol.h"
 #include "netplay/interop/palette_apply.h"
 #include "netplay/interop/palette_socket.h"
@@ -40,9 +42,45 @@ constexpr std::uint32_t kCharIdBase = 1340u;   // + side  (P1 1340, P2 1341)
 constexpr std::uint32_t kColorBase = 1342u;    // + side  (P1 1342, P2 1343)
 
 // Side this client controls (broadcasts) and applies the peer's onto. 0=P1 for
-// loopback; the socket transport uses the configured ModInteropSide.
+// loopback; socket/piggyback use the configured ModInteropSide.
 int g_localSide = 0;
-bool g_useSocket = false;   // true = socket transport, false = loopback
+
+// Transport backing the channel's send/receive:
+//   Loopback  - solo test, echoes locally (ModInteropLoopback=1)
+//   Socket    - interim UDP side-socket to an explicit peer (ModInteropPeer set)
+//   Piggyback - production default: frames ride EfzRevival's own UDP socket via
+//               the helper hooks + the overlay IPC ring (no port, no peer IP)
+enum class Transport { Loopback, Socket, Piggyback };
+Transport g_transport = Transport::Loopback;
+
+const char* TransportName(Transport t)
+{
+    switch (t)
+    {
+    case Transport::Socket: return "socket";
+    case Transport::Piggyback: return "piggyback";
+    default: return "loopback";
+    }
+}
+
+// Derive our palette side from the live session role: Host=P1=side 0, Join=P2=
+// side 1, spectators=-1 (receive both, never advertise a local row). Read fresh
+// at char-select entry, when the session is fully up. Falls back to the Revival
+// session object's activePlayer, then to host side, if the role is not yet set.
+int DeriveLocalSide()
+{
+    const netplay::bridge::NetbridgeStatus st = netplay::bridge::GetStatus();
+    switch (static_cast<netplay::bridge::NetbridgeRole>(st.role))
+    {
+    case netplay::bridge::NetbridgeRole::Host:         return 0;
+    case netplay::bridge::NetbridgeRole::Join:         return 1;
+    case netplay::bridge::NetbridgeRole::Spectate:
+    case netplay::bridge::NetbridgeRole::JoinSpectate: return -1;
+    default:
+        if (st.activePlayer == 0 || st.activePlayer == 1) return st.activePlayer;
+        return 0;
+    }
+}
 
 // Polling thread (matches the original mod): reloadCharacterPalette does NOT
 // fire while EDIT COLOR is active, so a 60Hz thread drives the exchange + apply
@@ -94,6 +132,34 @@ bool LoopbackSink(const std::uint8_t* datagram, std::size_t len, void*)
     // row on the remote side; the apply path is identical.)
     OverlayChannel::Instance().OnInboundDatagram(copy, len);
     return true;
+}
+
+// Piggyback send sink: hand the outbound frame to the game->helper ring. The
+// helper's WSASendTo hook flushes it on Revival's own socket + peer.
+bool PiggybackSink(const std::uint8_t* datagram, std::size_t len, void*)
+{
+    ipc::OverlayIpcBlock* b = ipc::Block();
+    if (b == nullptr || datagram == nullptr || len == 0
+        || len > ipc::kSlotBytes)
+    {
+        return false;
+    }
+    return ipc::Push(b->toHelper, datagram, static_cast<std::uint32_t>(len));
+}
+
+// Drain the helper->game ring (RX frames the helper observed on the socket) into
+// the channel. Bounded per call so a flood cannot stall the poll thread.
+void PiggybackPoll(OverlayChannel& ch)
+{
+    ipc::OverlayIpcBlock* b = ipc::Block();
+    if (b == nullptr) return;
+    std::uint8_t frame[P::kMaxFrameBytes];
+    for (int i = 0; i < 32; ++i)
+    {
+        const std::uint32_t n = ipc::Pop(b->toGame, frame, sizeof(frame));
+        if (n == 0u) break;
+        ch.OnInboundDatagram(frame, static_cast<std::size_t>(n));
+    }
 }
 
 bool ReadCharAndColor(std::uint32_t csObj, int side,
@@ -336,15 +402,40 @@ void PollThreadMain()
     mod::Log("PaletteCharSelect: poll thread started");
     while (!g_pollStop.load(std::memory_order_acquire))
     {
+        // Helper-hook visibility (~2 Hz), independent of screen, so we can see
+        // whether the helper hooks installed and stayed transparent even while a
+        // session is stuck pre-char-select. The helper cannot write the game-held
+        // log, so this IPC-block readback is our only window into it.
+        if (g_transport == Transport::Piggyback)
+        {
+            static unsigned s_hdiag = 0;
+            if ((++s_hdiag % 125u) == 1u)
+            {
+                if (ipc::OverlayIpcBlock* b = ipc::Block())
+                {
+                    mod::Log("OverlayHelperDiag: installed=%u iatMask=0x%X "
+                             "sendToSeen=%u recvCompletions=%u rxObserved=%u "
+                             "txFlushed=%u peerValid=%u",
+                             b->helperInstalled, b->helperIatMask, b->sendToSeen,
+                             b->recvCompletions, b->rxObserved, b->txFlushed,
+                             b->socketValid);
+                }
+            }
+        }
+
         const std::uint32_t csObj = g_csObj.load(std::memory_order_acquire);
         if (csObj != 0 && ReadCurrentScreen() == kScreenCharSelect
             && OverlayChannel::Instance().IsActive())
         {
             std::lock_guard<std::mutex> lock(g_paletteMutex);
             OverlayChannel& ch = OverlayChannel::Instance();
-            if (g_useSocket)
+            if (g_transport == Transport::Socket)
             {
                 socket_transport::Poll(ch);
+            }
+            else if (g_transport == Transport::Piggyback)
+            {
+                PiggybackPoll(ch);
             }
             ch.Tick(static_cast<std::uint32_t>(GetTickCount()));
 
@@ -378,13 +469,19 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     std::lock_guard<std::mutex> lock(g_paletteMutex);
     OverlayChannel& ch = OverlayChannel::Instance();
     ch.End();                       // fresh session per char-select entry
-    if (g_useSocket)
+    switch (g_transport)
     {
+    case Transport::Socket:
         ch.SetSendSink(&socket_transport::SendSink, nullptr);
-    }
-    else
-    {
+        break;
+    case Transport::Piggyback:
+        ch.SetSendSink(&PiggybackSink, nullptr);
+        // The session is up by char-select, so derive our side from its role.
+        g_localSide = DeriveLocalSide();
+        break;
+    default:
         ch.SetSendSink(&LoopbackSink, nullptr);
+        break;
     }
     ch.Begin(g_localSide);          // no-op unless the master flag is on
     ch.ResetPaletteExchangeForRematch();
@@ -397,10 +494,9 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     g_csObj.store(reinterpret_cast<std::uint32_t>(screenContext),
                   std::memory_order_release);
     mod::Log("PaletteCharSelect: char-select init, armed active=%d side=%d "
-             "transport=%s socketUp=%d",
-             ch.IsActive() ? 1 : 0, g_localSide,
-             g_useSocket ? "socket" : "loopback",
-             socket_transport::IsRunning() ? 1 : 0);
+             "transport=%s ipcAttached=%d",
+             ch.IsActive() ? 1 : 0, g_localSide, TransportName(g_transport),
+             ipc::IsAttached() ? 1 : 0);
     return result;
 }
 
@@ -472,37 +568,30 @@ bool Install()
     {
         return true;
     }
-    if (!netplay::mod_settings::IsModInteropChannelEnabled())
+    if (!netplay::mod_settings::AreOnlineCustomColorsEnabled())
     {
         return false;   // master flag off: do not touch the game
     }
-    // Pick a transport: loopback (Stage-1 solo) OR the side-socket (Stage-2,
-    // when a peer IP is configured). With neither there is no sink and the
-    // channel could never confirm, so skip the install entirely.
-    const bool loopback = netplay::mod_settings::IsModInteropLoopbackEnabled();
-    const std::string& peer = netplay::mod_settings::ModInteropPeer();
-    if (loopback)
+    // Transport: piggyback by default (frames ride EfzRevival's own socket via
+    // the helper hooks + the overlay IPC ring - no port, no peer IP, side is
+    // auto-derived from the session role at char-select). ModInteropLoopback=1 is
+    // a hidden dev override for solo testing. The old explicit-peer side-socket
+    // (ModInteropPeer/Port/Side) is retired from the config path.
+    if (netplay::mod_settings::IsModInteropLoopbackEnabled())
     {
-        g_useSocket = false;
+        g_transport = Transport::Loopback;
         g_localSide = 0;
-    }
-    else if (!peer.empty())
-    {
-        g_localSide = netplay::mod_settings::ModInteropSide();
-        if (!socket_transport::Start(peer.c_str(),
-                                     netplay::mod_settings::ModInteropPort()))
-        {
-            mod::Log("PaletteCharSelect: socket transport failed to start "
-                     "(peer=%s) - install skipped", peer.c_str());
-            return false;
-        }
-        g_useSocket = true;
     }
     else
     {
-        mod::Log("PaletteCharSelect: interop on but no transport "
-                 "(loopback off, no ModInteropPeer) - install skipped");
-        return false;
+        g_transport = Transport::Piggyback;
+        g_localSide = 0;   // provisional; DeriveLocalSide() runs at char-select
+        if (!ipc::Attach(/*asHelper=*/false))
+        {
+            mod::Log("PaletteCharSelect: overlay IPC attach failed - "
+                     "install skipped");
+            return false;
+        }
     }
 
     if (!g_minhookReady)
@@ -549,7 +638,7 @@ bool Install()
 
     g_installed = true;
     mod::Log("PaletteCharSelect: hooks installed transport=%s side=%d "
-             "reload=%p init=%p result=%p", g_useSocket ? "socket" : "loopback",
+             "reload=%p init=%p result=%p", TransportName(g_transport),
              g_localSide, g_reloadTarget, g_initTarget, g_resultTarget);
     return true;
 }
@@ -568,6 +657,10 @@ void Uninstall()
     }
     OverlayChannel::Instance().End();
     socket_transport::Stop();
+    if (g_transport == Transport::Piggyback && ipc::IsAttached())
+    {
+        ipc::Detach(/*asHelper=*/false);
+    }
     if (!g_installed)
     {
         return;

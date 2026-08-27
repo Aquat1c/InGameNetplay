@@ -15,7 +15,7 @@ OverlayChannel& OverlayChannel::Instance()
 
 void OverlayChannel::Begin(int localSide)
 {
-    if (!netplay::mod_settings::IsModInteropChannelEnabled())
+    if (!netplay::mod_settings::AreOnlineCustomColorsEnabled())
     {
         // Master flag off: whole subsystem inert. Also disarm defensively so a
         // flag toggled off mid-life followed by a re-Begin cannot leave a stale
@@ -106,7 +106,7 @@ void OverlayChannel::Tick(std::uint32_t nowMs)
     {
         return;
     }
-    if (!netplay::mod_settings::IsModInteropChannelEnabled())
+    if (!netplay::mod_settings::AreOnlineCustomColorsEnabled())
     {
         // Master flag flipped off mid-session (e.g. via the debug settings):
         // quiesce the whole subsystem now rather than at the next session.

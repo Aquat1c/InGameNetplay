@@ -4,7 +4,7 @@
 //
 // The channel depends on two symbols we stub here so the test does not pull in
 // the ini/Windows-logging layers: mod::Log (no-op) and
-// mod_settings::IsModInteropChannelEnabled (test-controlled). GetTickCount is
+// mod_settings::AreOnlineCustomColorsEnabled (test-controlled). GetTickCount is
 // the only real OS dependency, hence WIN32.
 
 #include "netplay/interop/overlay_protocol.h"
@@ -12,12 +12,14 @@
 #include "netplay/interop/overlay_channel.h"
 #include "netplay/interop/palette_source.h"
 #include "netplay/interop/palette_remap.h"
+#include "netplay/interop/overlay_ipc.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <direct.h>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,7 +32,7 @@ void Log(const char*, ...) {}
 namespace netplay::mod_settings
 {
 static bool g_testFlag = false;
-bool IsModInteropChannelEnabled() { return g_testFlag; }
+bool AreOnlineCustomColorsEnabled() { return g_testFlag; }
 }
 
 namespace
@@ -678,6 +680,74 @@ void TestRemap()
                "HSL round-trip within tolerance");
     }
 }
+// Exercises the cross-process SPSC ring in isolation (no shared mapping needed -
+// Push/Pop operate on a caller-owned Ring). Covers round-trip, FIFO order, full
+// (one slot reserved), wrap-around past the mask, oversize reject, empty, and a
+// corrupt slot length being skipped.
+void TestIpcRing()
+{
+    namespace R = netplay::interop::ipc;
+    auto ring = std::make_unique<R::Ring>();
+    std::memset(ring.get(), 0, sizeof(R::Ring));
+
+    std::uint8_t out[R::kSlotBytes];
+
+    // Empty pop.
+    Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: pop empty -> 0");
+
+    // Round-trip one frame.
+    const std::uint8_t f1[] = {1, 2, 3, 4, 5};
+    Expect(R::Push(*ring, f1, sizeof(f1)), "ipc: push ok");
+    const std::uint32_t n1 = R::Pop(*ring, out, sizeof(out));
+    Expect(n1 == sizeof(f1) && std::memcmp(out, f1, n1) == 0,
+           "ipc: round-trip content");
+    Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: drained -> empty");
+
+    // Bad args.
+    Expect(!R::Push(*ring, nullptr, 4), "ipc: push null -> false");
+    Expect(!R::Push(*ring, f1, 0), "ipc: push zero-len -> false");
+    std::uint8_t big[R::kSlotBytes + 1] = {};
+    Expect(!R::Push(*ring, big, sizeof(big)), "ipc: push oversize -> false");
+
+    // Fill to capacity: kRingSlots-1 usable (one reserved to disambiguate full).
+    std::memset(ring.get(), 0, sizeof(R::Ring));
+    std::uint32_t pushed = 0;
+    for (std::uint32_t i = 0; i < R::kRingSlots + 4u; ++i)
+    {
+        const std::uint8_t b = static_cast<std::uint8_t>(i);
+        if (R::Push(*ring, &b, 1)) ++pushed;
+    }
+    Expect(pushed == R::kRingSlots - 1u, "ipc: capacity is slots-1");
+
+    // FIFO drain of the filled ring.
+    bool order = true;
+    for (std::uint32_t i = 0; i < pushed; ++i)
+    {
+        const std::uint32_t n = R::Pop(*ring, out, sizeof(out));
+        if (n != 1 || out[0] != static_cast<std::uint8_t>(i)) order = false;
+    }
+    Expect(order, "ipc: FIFO order preserved");
+    Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: empty after drain");
+
+    // Wrap-around: many push/pop cycles exceed kRingSlots, exercising the mask.
+    std::memset(ring.get(), 0, sizeof(R::Ring));
+    bool wrapOk = true;
+    for (std::uint32_t i = 0; i < R::kRingSlots * 8u; ++i)
+    {
+        const std::uint8_t b = static_cast<std::uint8_t>(i * 7u + 1u);
+        if (!R::Push(*ring, &b, 1)) { wrapOk = false; break; }
+        std::uint8_t got = 0;
+        if (R::Pop(*ring, &got, 1) != 1 || got != b) { wrapOk = false; break; }
+    }
+    Expect(wrapOk, "ipc: wrap-around round-trips");
+
+    // Corrupt slot length is skipped (defends against a torn cross-process write).
+    std::memset(ring.get(), 0, sizeof(R::Ring));
+    Expect(R::Push(*ring, f1, sizeof(f1)), "ipc: push before corrupt");
+    ring->slots[ring->tail & R::kRingMask].len = R::kSlotBytes + 99u;  // corrupt
+    Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: corrupt len -> skipped");
+    Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: nothing left after skip");
+}
 } // namespace
 
 int main()
@@ -687,6 +757,7 @@ int main()
     TestSource();
     TestRemap();
     TestChannel();
+    TestIpcRing();
     if (g_failures != 0)
     {
         std::cerr << g_failures << " interop test(s) failed\n";
