@@ -92,6 +92,18 @@ DWORD WINAPI InitializeInjectedThread(LPVOID moduleHandleRaw)
     return 0;
 }
 
+// External-launcher guard process = EfzRevival.exe (it owns the netcode socket),
+// but it takes the guard path in DllMain and skips InitializeInjectedThread - so
+// the online-custom-colors piggyback hooks would never install there (spectators
+// and any externally-launched player). Load settings + install off the loader
+// lock. helper_hooks::Install() self-gates on OnlineCustomColors + IsRevival.
+DWORD WINAPI GuardHelperInstallThread(LPVOID /*moduleHandleRaw*/)
+{
+    netplay::mod_settings::Reload();
+    (void)netplay::interop::helper_hooks::Install();
+    return 0;
+}
+
 netplay::bridge::NetbridgeRole ToBridgeRole(int role)
 {
     switch (role)
@@ -120,6 +132,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
         // patch or the ordinary injected-helper bootstrap can run.
         if (netplay::bridge::takeover::TryStartExternalLauncherGuardProcess())
         {
+            // This guard process is EfzRevival.exe (the netcode socket owner). The
+            // normal injected-helper path is skipped here, so install the online-
+            // custom-colors piggyback hooks on a worker thread (never in DllMain).
+            HANDLE guardInstall = CreateThread(
+                nullptr, 0, GuardHelperInstallThread, hModule, 0, nullptr);
+            if (guardInstall != nullptr)
+            {
+                CloseHandle(guardInstall);
+            }
             break;
         }
 

@@ -33,12 +33,20 @@ constexpr std::uint32_t kSlotBytes = 160u;
 constexpr std::uint32_t kRingSlots = 64u;   // power of two for cheap masking
 constexpr std::uint32_t kRingMask  = kRingSlots - 1u;
 constexpr std::uint32_t kBlockMagic = 0x4F49504Fu;   // 'OIPO'
-constexpr std::uint32_t kBlockVersion = 2u;
+constexpr std::uint32_t kBlockVersion = 3u;
 
 // helperIatMask bits (which imports the helper actually patched).
 constexpr std::uint32_t kIatWSARecvFrom = 1u << 0;
 constexpr std::uint32_t kIatWSASendTo   = 1u << 1;
 constexpr std::uint32_t kIatGQCS        = 1u << 2;
+
+// helperInstallReason: only the helper writes it, and only AFTER a successful
+// ipc::Attach (pre-attach failures can't reach the shared block, so they surface
+// as the game's default 0). Lets us tell "Install never ran / attach failed" (0)
+// apart from "ran + attached but IAT patch found nothing" (2).
+constexpr std::uint32_t kReasonUnknown      = 0u;   // helper never wrote (didn't run / attach failed)
+constexpr std::uint32_t kReasonInstalledOk  = 1u;
+constexpr std::uint32_t kReasonNoImports    = 2u;   // attached, but 0 IAT slots patched
 
 struct Slot
 {
@@ -78,6 +86,7 @@ struct OverlayIpcBlock
     volatile std::uint32_t txFlushed;         // overlay frames sent on TX
     volatile std::uint32_t sendToSeen;        // Revival WSASendTo calls observed
     volatile std::uint32_t recvCompletions;   // recv completions observed via GQCS
+    volatile std::uint32_t helperInstallReason;  // kReason* (helper writes)
 
     Ring toGame;     // helper -> game (RX)
     Ring toHelper;   // game -> helper (TX)

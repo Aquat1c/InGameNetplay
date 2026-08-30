@@ -70,16 +70,38 @@ bool Attach(bool asHelper)
     }
     else if (g_block->magic != kBlockMagic || g_block->version != kBlockVersion)
     {
-        // A stale/foreign block under the same name: refuse to use it rather
-        // than scribble. (Name is versioned, so this is defensive only.)
-        mod::Log("OverlayIpc: block magic/version mismatch (0x%08lX v%lu) - detaching",
-                 static_cast<unsigned long>(g_block->magic),
-                 static_cast<unsigned long>(g_block->version));
-        UnmapViewOfFile(g_block);
-        g_block = nullptr;
-        CloseHandle(g_mapHandle);
-        g_mapHandle = nullptr;
-        return false;
+        // Two outcomes share this branch:
+        //  (a) create/stamp RACE - the process that won CreateFileMapping has not
+        //      finished memset+stamp yet, so magic is still 0. Spin briefly for
+        //      the stamp so an attacher that lost the create race still joins
+        //      (matters for the guard-process install, which can beat the game).
+        //  (b) a genuinely stale/foreign block (non-zero, wrong magic). Bail.
+        bool valid = false;
+        for (int i = 0; i < 200; ++i)   // up to ~100 ms
+        {
+            const std::uint32_t m = g_block->magic;
+            if (m == kBlockMagic && g_block->version == kBlockVersion)
+            {
+                valid = true;
+                break;
+            }
+            if (m != 0u)
+            {
+                break;   // non-zero + not ours: foreign/stale, don't wait
+            }
+            Sleep(1);
+        }
+        if (!valid)
+        {
+            mod::Log("OverlayIpc: block magic/version mismatch (0x%08lX v%lu) - detaching",
+                     static_cast<unsigned long>(g_block->magic),
+                     static_cast<unsigned long>(g_block->version));
+            UnmapViewOfFile(g_block);
+            g_block = nullptr;
+            CloseHandle(g_mapHandle);
+            g_mapHandle = nullptr;
+            return false;
+        }
     }
 
     if (asHelper) g_block->helperAttached = 1u;

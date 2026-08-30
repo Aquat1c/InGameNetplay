@@ -419,6 +419,27 @@ void WriteBytes(const char* path, int count, int start, int step)
     std::fclose(f);
 }
 
+// Write a headered .pal fixture: [headerByte] + [120 body bytes 0..119] +
+// [trailer zero bytes]. Mirrors the real EFZ layout (1 header + 40-colour body,
+// optionally followed by stray trailing bytes, as in the 123-byte nanase3.pal).
+void WritePalWithHeader(const char* path, unsigned char headerByte, int trailer)
+{
+    std::FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) return;
+    std::fwrite(&headerByte, 1, 1, f);
+    for (int i = 0; i < 120; ++i)
+    {
+        unsigned char b = static_cast<unsigned char>(i & 0xFF);
+        std::fwrite(&b, 1, 1, f);
+    }
+    for (int i = 0; i < trailer; ++i)
+    {
+        unsigned char z = 0;
+        std::fwrite(&z, 1, 1, f);
+    }
+    std::fclose(f);
+}
+
 void TestSource()
 {
     namespace SRC = netplay::interop::source;
@@ -448,22 +469,39 @@ void TestSource()
     Expect(!SRC::BuildPalRelPath(99, 0, &p), "path unknown char -> false");
     Expect(!SRC::BuildPalRelPath(0, 0, nullptr), "path null out -> false");
 
-    // raw .pal file IO
+    // raw .pal file IO. The body is 120 bytes; a file LARGER than that has a
+    // single leading header byte, and the body is the 120 bytes immediately after
+    // it (anything past that is trailing junk).
     std::uint8_t raw[netplay::interop::protocol::kPaletteRawBytes];
-    WriteBytes("interop_tmp_pal.bin", 120, 0, 1);
-    Expect(SRC::LoadRawPalFile("interop_tmp_pal.bin", raw), "load 120-byte pal");
-    Expect(raw[0] == 0 && raw[119] == 119, "pal bytes correct");
+
+    // 120-byte raw (no header): read verbatim from offset 0.
+    WriteBytes("interop_tmp_120.bin", 120, 0, 1);
+    Expect(SRC::LoadRawPalFile("interop_tmp_120.bin", raw), "load 120-byte pal");
+    Expect(raw[0] == 0 && raw[119] == 119, "120-byte: read from offset 0");
+
+    // 121-byte (1 header 0xAA + body 0..119): header skipped, body from offset 1.
+    WritePalWithHeader("interop_tmp_121.bin", 0xAA, /*trailer=*/0);
+    Expect(SRC::LoadRawPalFile("interop_tmp_121.bin", raw)
+               && raw[0] == 0 && raw[119] == 119,
+           "121-byte: header skipped, body from offset 1");
+
+    // 123-byte (1 header + 120 body + 2 trailing zeros): THE nanase3 regression.
+    // 123 % 3 == 0 fooled the old size%3==1 test into skipping no header, which
+    // shifted every colour. Must now read the same body as the 121-byte file.
+    WritePalWithHeader("interop_tmp_123.bin", 0x00, /*trailer=*/2);
+    Expect(SRC::LoadRawPalFile("interop_tmp_123.bin", raw)
+               && raw[0] == 0 && raw[119] == 119,
+           "123-byte header+body+trailer: reads the body (nanase3 fix)");
+
     Expect(!SRC::LoadRawPalFile("interop_tmp_missing.bin", raw), "missing -> false");
     Expect(!SRC::LoadRawPalFile(nullptr, raw), "null path -> false");
-    Expect(!SRC::LoadRawPalFile("interop_tmp_pal.bin", nullptr), "null out -> false");
+    Expect(!SRC::LoadRawPalFile("interop_tmp_120.bin", nullptr), "null out -> false");
     WriteBytes("interop_tmp_short.bin", 50, 0, 1);
     Expect(!SRC::LoadRawPalFile("interop_tmp_short.bin", raw), "short (<120) -> false");
-    WriteBytes("interop_tmp_big.bin", 200, 0, 1);
-    Expect(SRC::LoadRawPalFile("interop_tmp_big.bin", raw) && raw[119] == 119,
-           "larger file reads first 120");
-    std::remove("interop_tmp_pal.bin");
+    std::remove("interop_tmp_120.bin");
+    std::remove("interop_tmp_121.bin");
+    std::remove("interop_tmp_123.bin");
     std::remove("interop_tmp_short.bin");
-    std::remove("interop_tmp_big.bin");
 
     // AssembleRow custom vs stock/CLEAR
     std::uint8_t body[120];

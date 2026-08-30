@@ -413,12 +413,12 @@ void PollThreadMain()
             {
                 if (ipc::OverlayIpcBlock* b = ipc::Block())
                 {
-                    mod::Log("OverlayHelperDiag: installed=%u iatMask=0x%X "
+                    mod::Log("OverlayHelperDiag: installed=%u reason=%u iatMask=0x%X "
                              "sendToSeen=%u recvCompletions=%u rxObserved=%u "
                              "txFlushed=%u peerValid=%u",
-                             b->helperInstalled, b->helperIatMask, b->sendToSeen,
-                             b->recvCompletions, b->rxObserved, b->txFlushed,
-                             b->socketValid);
+                             b->helperInstalled, b->helperInstallReason,
+                             b->helperIatMask, b->sendToSeen, b->recvCompletions,
+                             b->rxObserved, b->txFlushed, b->socketValid);
                 }
             }
         }

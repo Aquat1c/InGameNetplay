@@ -285,6 +285,10 @@ bool Install()
     if (!a && !b && !c)
     {
         mod::Log("OverlayHelper: no imports patched - install failed");
+        // Write the reason into the shared block (still mapped) before detaching,
+        // so the game can distinguish this from "Install never ran".
+        if (ipc::OverlayIpcBlock* blk = ipc::Block())
+            blk->helperInstallReason = ipc::kReasonNoImports;
         ipc::Detach(true);
         return false;
     }
@@ -294,6 +298,7 @@ bool Install()
         blk->helperIatMask = (a ? ipc::kIatWSARecvFrom : 0u)
                            | (b ? ipc::kIatWSASendTo : 0u)
                            | (c ? ipc::kIatGQCS : 0u);
+        blk->helperInstallReason = ipc::kReasonInstalledOk;
         blk->helperInstalled = 1u;   // published LAST so the game sees a full record
     }
 

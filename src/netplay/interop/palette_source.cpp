@@ -73,12 +73,22 @@ bool LoadRawPalFile(const char* absPath, std::uint8_t* out120)
     }
     // Win32 file API to match the codebase convention (no CRT fopen).
     //
-    // EFZ .pal files come in two shapes (parity with the offline mod's
-    // detection): raw BGR triplets (size % 3 == 0), or 1 padding byte followed
-    // by the triplets (size % 3 == 1, the palette-script output). Skipping the
-    // header matters: reading the first 120 bytes of a 121-byte file would
-    // shift every colour by one byte. After the optional header there must be
-    // at least the full 40-colour body.
+    // EFZ .pal files are the 40-colour (120-byte) BGR body, optionally preceded
+    // by exactly ONE header byte (the palette-script output). The body is always
+    // the 120 bytes immediately after that header; anything past it is trailing
+    // junk to ignore. So: a file bigger than the body has a 1-byte header, a file
+    // exactly the body size has none. Reading the header as colour data would
+    // shift every colour by one byte.
+    //
+    // NOTE: this deliberately replaces the older `size % 3 == 1` test, which only
+    // recognised the header when the TOTAL size happened to be 1-mod-3 (e.g. the
+    // canonical 121). A file that is "1 header + 120 data + N trailing bytes"
+    // defeats it: e.g. a 123-byte nanase3.pal (1 header + 120 data + 2 trailing
+    // zeros) is 0-mod-3, so the old test skipped no header and read `[00][119
+    // colour bytes]`, shifting every colour and corrupting the palette - while
+    // an identical-colour 121-byte nanase4.pal loaded fine. Re-exporting through
+    // a palette editor "fixed" nanase3 only because it rewrote the canonical
+    // 121-byte layout, dropping the 2 stray bytes.
     HANDLE h = CreateFileA(absPath, GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
@@ -86,9 +96,10 @@ bool LoadRawPalFile(const char* absPath, std::uint8_t* out120)
         return false;
     }
     const DWORD fileSize = GetFileSize(h, nullptr);
-    const DWORD headerSize = (fileSize != INVALID_FILE_SIZE && fileSize % 3u == 1u)
-        ? 1u
-        : 0u;
+    const DWORD headerSize =
+        (fileSize != INVALID_FILE_SIZE && fileSize > protocol::kPaletteRawBytes)
+            ? 1u
+            : 0u;
     bool ok = fileSize != INVALID_FILE_SIZE
         && fileSize >= headerSize + protocol::kPaletteRawBytes;
     if (ok && headerSize != 0)
