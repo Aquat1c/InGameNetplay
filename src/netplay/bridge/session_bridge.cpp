@@ -223,6 +223,10 @@ void EmergencyQuarantineLauncherUiAttachment()
 
 void Shutdown()
 {
+    // Stop the off-sim-thread spectator Esc watcher first so it cannot touch
+    // DLL state while the rest of teardown runs.
+    takeover::StopSpectatorEscWatcher();
+
     std::thread workerToJoin;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
