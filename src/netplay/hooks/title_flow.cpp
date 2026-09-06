@@ -12,6 +12,7 @@
 #include "netplay/core/network_capability.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
+#include "netplay/core/update_check.h"
 #include "netplay/hooks/debug_overlay.h"
 
 #include "logger.h"
@@ -5140,6 +5141,9 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     // eventual Host action does not wait for this scan and still performs just
     // its global public-address lookup.
     EnsureLocalNetworkCapabilityScanScheduled("enter_netplay_menu");
+    // Once per process: look up the newest GitHub release for the OPTIONS /
+    // About "[!]" badge on a background thread. Every later entry is a no-op.
+    netplay::update_check::Start();
     g_netplayMenuState.bgmActive = true;
     g_netplayMenuState.menuId = returnToLobby ? NetplayMenuId::Lobby : NetplayMenuId::Main;
     g_netplayMenuState.mainSelection = 0;

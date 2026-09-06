@@ -6,6 +6,7 @@
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/core/update_check.h"
 #include "netplay/core/options_keybinds.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
@@ -1442,6 +1443,7 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
         {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
         {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
+        {"Others", "MOD", {"CheckForUpdates", "About"}},
     };
     return kGroups;
 }
@@ -1924,6 +1926,11 @@ void AppendSyntheticItems()
         "AsyncHostReturnKey",
         "DIK_F1",
         "Hotkey to return to the netplay menu (or rehost) while the hosting overlay is minimized in-game.");
+    upsertBoolIntItem(
+        "CheckForUpdates",
+        true,
+        "Look up the newest mod release on GitHub once per launch (first netplay menu visit) "
+        "and mark OPTIONS / About with [!] while a newer version is out.");
     upsertActionItem(
         "About",
         "Show the mod version and build information.");
@@ -2246,7 +2253,18 @@ std::string BuildCategoryLabel(int categoryIndex)
 std::string BuildSettingLabel(const Item& item)
 {
     const std::string prefix = IsDirty(item) ? "* " : "";
-    return prefix + PrettyKeyLabel(item.keyName);
+    std::string label = prefix + PrettyKeyLabel(item.keyName);
+    if (item.kind == ItemKind::Action && item.keyName == "About")
+    {
+        // "[!]" while a newer mod release exists; opening About acknowledges it.
+        const char* badge = netplay::update_check::BadgeText();
+        if (badge[0] != 0)
+        {
+            label += ' ';
+            label += badge;
+        }
+    }
+    return label;
 }
 
 size_t GetStringEditLimit(const Item& item)
@@ -2960,6 +2978,11 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             *escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         }
 
+        // D opens the GitHub releases page in the default browser so the user
+        // can download the update. Edge-triggered on our own latch so a held
+        // button cannot spawn a browser tab per frame.
+        static bool s_openReleasesHeld = false;
+        bool openReleasesPressed = false;
         bool closeRequested = hooks::ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
@@ -2967,9 +2990,30 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             {
                 closeRequested = true;
             }
+            if (inputBytes[playerIndex + 22] == 1)
+            {
+                openReleasesPressed = true;
+            }
         }
+        const bool openReleasesEdge = openReleasesPressed && !s_openReleasesHeld;
+        s_openReleasesHeld = openReleasesPressed;
 
         ++(*inactivityCounter);
+        if (openReleasesEdge && !closeRequested)
+        {
+            *inactivityCounter = 0;
+            if (netplay::update_check::OpenReleasesPage())
+            {
+                hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
+                SetStatusMessage("Opened the GitHub releases page in your browser.");
+            }
+            else
+            {
+                hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
+                SetStatusMessage("Could not open a browser. See the log for the URL.");
+            }
+            return true;
+        }
         if (!closeRequested)
         {
             return true;
@@ -3256,6 +3300,10 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     }
     if (IsActionItem(item))
     {
+        if (item.keyName == "About" && netplay::update_check::IsUpdateAvailable())
+        {
+            help += " New release " + netplay::update_check::LatestVersion() + " is on GitHub.";
+        }
         return help + "\nA=Open C=Revert D=Save";
     }
     if (IsToggleEditable(item))
@@ -3482,6 +3530,9 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
     if (IsActionItem(item))
     {
+        // Visiting About counts as having seen the current latest release: the
+        // "[!]" badge stays hidden until an even newer one is published.
+        netplay::update_check::AcknowledgeLatest();
         OpenModal(ModalKind::About);
         return true;
     }
@@ -3530,7 +3581,8 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const bool isAboutModal = (g_state.modal.kind == ModalKind::About);
     const int optionCount = isExitModal ? 3 : 2;
     constexpr int panelW = 214;
-    const int panelH = isAboutModal ? 96 : (isRebindModal ? 92 : (isExitModal ? 100 : 84));
+    const bool aboutHasUpdate = isAboutModal && netplay::update_check::HasNewerRelease();
+    const int panelH = isAboutModal ? (aboutHasUpdate ? 112 : 96) : (isRebindModal ? 92 : (isExitModal ? 100 : 84));
     constexpr int panelX = (320 - panelW) / 2;
     const int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
@@ -3654,7 +3706,18 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             textRight,
             panelY + 54,
             dimColor);
-        drawModalText("A/B/Esc=Close", textLeft, textRight, panelY + 72, dimColor);
+        int closeY = panelY + 72;
+        if (aboutHasUpdate)
+        {
+            drawModalText(
+                "New release " + netplay::update_check::LatestVersion() + " on GitHub",
+                textLeft,
+                textRight,
+                panelY + 70,
+                titleColor);
+            closeY = panelY + 88;
+        }
+        drawModalText("A/B/Esc=Close  D=Open GitHub", textLeft, textRight, closeY, dimColor);
     }
     else if (isRebindModal)
     {

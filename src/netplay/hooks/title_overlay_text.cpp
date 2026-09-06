@@ -7,6 +7,7 @@
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
+#include "netplay/core/update_check.h"
 #include "netplay/render/draw_surface.h"
 #include "netplay/render/software_font.h"
 #include "logger.h"
@@ -68,7 +69,12 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     case NetplayMenuAction::OpenBattleLog:
         return "BATTLE LOG";
     case NetplayMenuAction::OpenOptions:
-        return "OPTIONS";
+    {
+        // Text-label paths carry the update badge inline; the sprite-sheet
+        // path draws it separately via BuildRowBadgeText.
+        const char* badge = netplay::update_check::BadgeText();
+        return (badge[0] != 0) ? std::string("OPTIONS ") + badge : std::string("OPTIONS");
+    }
     case NetplayMenuAction::PlayerRoomsRefresh:
     case NetplayMenuAction::PlayerRoomsJoin:
     case NetplayMenuAction::PlayerRoomsEditCode:
@@ -196,6 +202,19 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     }
 }
 
+std::string BuildRowBadgeText(const NetplayMenuEntry& entry)
+{
+    // Only the main menu carries a badge: "[!]" on OPTIONS while a newer mod
+    // release exists that the user has not looked at (opening About in the
+    // options menu acknowledges it until an even newer release appears).
+    if (g_netplayMenuState.menuId == NetplayMenuId::Main
+        && entry.action == NetplayMenuAction::OpenOptions)
+    {
+        return netplay::update_check::BadgeText();
+    }
+    return {};
+}
+
 std::string BuildRowPrimaryText(const NetplayMenuEntry& entry)
 {
     if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
@@ -270,6 +289,11 @@ std::string BuildActionTooltip(NetplayMenuAction action)
     case NetplayMenuAction::OpenBattleLog:
         return "Browse and search BattleLog.txt.";
     case NetplayMenuAction::OpenOptions:
+        if (netplay::update_check::IsUpdateAvailable())
+        {
+            return "Adjust netplay settings.\nNew release "
+                + netplay::update_check::LatestVersion() + " is on GitHub - see About.";
+        }
         return "Adjust netplay settings.\nSaved in EfzRevival.ini.";
     case NetplayMenuAction::PlayerRoomsRefresh:
         return "Refresh the public room list.";
@@ -777,6 +801,7 @@ const netplay::render::OverlayCallbacks& GetOverlayCallbacks()
             return g_netplayMenuState.menuId == NetplayMenuId::Options
                 && netplay::options::IsHeaderRowAction(entry.action);
         },
+        [](const NetplayMenuEntry& entry) -> std::string { return BuildRowBadgeText(entry); },
     };
     return callbacks;
 }

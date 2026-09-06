@@ -347,6 +347,7 @@ bool ShouldWriteNicknameToRevivalIni();
 
 std::string BuildMenuHeaderText();
 std::string BuildRowLabel(const netplay::menu::NetplayMenuEntry& entry);
+std::string BuildRowBadgeText(const netplay::menu::NetplayMenuEntry& entry);
 std::string BuildFooterText();
 HFONT GetMenuOverlayFont();
 const netplay::render::OverlayCallbacks& GetOverlayCallbacks();

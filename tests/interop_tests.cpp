@@ -13,6 +13,7 @@
 #include "netplay/interop/palette_source.h"
 #include "netplay/interop/palette_remap.h"
 #include "netplay/interop/overlay_ipc.h"
+#include "netplay/core/version_compare.h"
 
 #include <chrono>
 #include <cstdint>
@@ -842,6 +843,45 @@ void TestIpcRing()
     Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: corrupt len -> skipped");
     Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: nothing left after skip");
 }
+// --- version ordering (GitHub update check) ---------------------------------
+void TestVersionCompare()
+{
+    namespace V = netplay::version;
+    V::ParsedVersion p;
+    Expect(V::Parse("0.4.2_beta1", &p) && p.partCount == 3 && p.parts[0] == 0 && p.parts[1] == 4
+               && p.parts[2] == 2 && p.suffix == "_beta1",
+           "version: parse numeric tuple + suffix");
+    Expect(V::Parse("v1.2", &p) && p.partCount == 2 && p.parts[0] == 1 && p.parts[1] == 2
+               && p.suffix.empty(),
+           "version: leading v stripped");
+    Expect(!V::Parse("beta", &p), "version: no leading number -> invalid");
+    Expect(!V::Parse("", &p), "version: empty -> invalid");
+
+    Expect(V::Compare("0.3.5", "0.5.0") < 0, "version: 0.3.5 < 0.5.0");
+    Expect(V::Compare("0.5.0", "0.3.5") > 0, "version: 0.5.0 > 0.3.5");
+    Expect(V::Compare("0.5.0", "0.5.0") == 0, "version: equal");
+    Expect(V::Compare("0.5", "0.5.0") == 0, "version: missing component = 0");
+    Expect(V::Compare("0.10.0", "0.9.9") > 0, "version: numeric not lexicographic");
+    Expect(V::Compare("0.4.2_beta1", "0.4.2") < 0, "version: pre-release < final");
+    Expect(V::Compare("0.4.2", "0.4.2_beta1") > 0, "version: final > pre-release");
+    Expect(V::Compare("0.4.2_beta1", "0.4.2_beta2") < 0, "version: beta1 < beta2");
+    Expect(V::Compare("0.4.2_beta2", "0.4.2_beta10") < 0, "version: beta2 < beta10");
+    Expect(V::Compare("0.4.2_alpha3", "0.4.2_beta1") < 0, "version: alpha < beta");
+    Expect(V::Compare("0.4.2_beta1", "0.4.2-rc1") < 0, "version: beta < rc");
+    Expect(V::Compare("0.4.3", "0.4.2_beta1") > 0, "version: next patch > pre-release");
+    Expect(V::Compare("garbage", "0.1") < 0, "version: invalid ranks below valid");
+    Expect(V::Compare("garbage", "junk") == 0, "version: invalid == invalid");
+
+    // The badge rule: strictly newer only; a dev build ahead of the release
+    // page (0.5.0 vs published 0.3.5) must NOT flag an update.
+    Expect(V::IsNewer("0.6.0", "0.5.0"), "version: IsNewer newer");
+    Expect(!V::IsNewer("0.3.5", "0.5.0"), "version: IsNewer older");
+    Expect(!V::IsNewer("0.5.0", "0.5.0"), "version: IsNewer same");
+    Expect(!V::IsNewer("0.5.0_beta1", "0.5.0"), "version: IsNewer pre-release of current");
+    Expect(V::IsNewer("0.5.1_beta1", "0.5.0"), "version: IsNewer next pre-release");
+    Expect(!V::IsNewer("", "0.5.0"), "version: IsNewer empty candidate");
+    Expect(!V::IsNewer("latest", "0.5.0"), "version: IsNewer non-numeric candidate");
+}
 } // namespace
 
 int main()
@@ -852,6 +892,7 @@ int main()
     TestRemap();
     TestChannel();
     TestIpcRing();
+    TestVersionCompare();
     if (g_failures != 0)
     {
         std::cerr << g_failures << " interop test(s) failed\n";

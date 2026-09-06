@@ -90,7 +90,9 @@ add_library(efz_netplay_mod SHARED
     src/netplay/core/patch_utils.cpp
     src/netplay/core/tls_http_client.cpp
     src/netplay/core/text_utils.cpp
+    src/netplay/core/update_check.cpp
     src/netplay/core/validation.cpp
+    src/netplay/core/version_compare.cpp
     src/netplay/hooks/menu_hooks.cpp
     src/netplay/hooks/battle_log_menu.cpp
     src/netplay/hooks/options_menu.cpp
@@ -281,7 +283,8 @@ if(BUILD_TESTING)
         src/netplay/interop/palette_source.cpp
         src/netplay/interop/palette_remap.cpp
         src/netplay/interop/overlay_channel.cpp
-        src/netplay/interop/overlay_ipc.cpp)
+        src/netplay/interop/overlay_ipc.cpp
+        src/netplay/core/version_compare.cpp)
     target_include_directories(interop_tests PRIVATE include)
     target_compile_features(interop_tests PRIVATE cxx_std_17)
     # The test writes temp .pal fixtures with the CRT (fopen); production code

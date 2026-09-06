@@ -29,6 +29,10 @@ struct OverlayCallbacks
     // "Replay", ...). Header rows render small and tinted, with no value
     // column; any menu can opt in by returning true for its header rows.
     std::function<bool(const netplay::menu::NetplayMenuEntry&)> isHeaderRow;
+    // Optional: short badge drawn at the right edge of a row whose label is
+    // otherwise baked into the sprite sheet (e.g. "[!]" on OPTIONS while a
+    // newer mod release exists). Empty string = no badge.
+    std::function<std::string(const netplay::menu::NetplayMenuEntry&)> buildRowBadgeText;
 };
 
 struct RuntimeOverlayState

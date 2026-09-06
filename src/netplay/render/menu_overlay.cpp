@@ -387,8 +387,22 @@ bool DrawDynamicFieldValuesGdi(
         }
     }
     // Main menu labels (HOST, JOIN, LOBBY, etc.) are baked into the sprite sheet,
-    // so no dynamic text is needed there.
-    if (state.menuId == netplay::menu::NetplayMenuId::Main)
+    // so the only dynamic text there is an optional right-edge badge (the
+    // update-available "[!]" on OPTIONS).
+    bool mainHasBadge = false;
+    if (state.menuId == netplay::menu::NetplayMenuId::Main && callbacks.buildRowBadgeText
+        && entries != nullptr)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            if (!callbacks.buildRowBadgeText(entries[i]).empty())
+            {
+                mainHasBadge = true;
+                break;
+            }
+        }
+    }
+    if (state.menuId == netplay::menu::NetplayMenuId::Main && !mainHasBadge)
     {
         return true;
     }
@@ -396,7 +410,7 @@ bool DrawDynamicFieldValuesGdi(
     const bool isLobby = (state.menuId == netplay::menu::NetplayMenuId::Lobby);
     const bool isOptions = (state.menuId == netplay::menu::NetplayMenuId::Options);
     const bool isPlayerRooms = (state.menuId == netplay::menu::NetplayMenuId::PlayerRooms);
-    if (!hasDynamicField && !isLobby && !isOptions && !isPlayerRooms)
+    if (!hasDynamicField && !isLobby && !isOptions && !isPlayerRooms && !mainHasBadge)
     {
         return true;
     }
@@ -444,7 +458,22 @@ bool DrawDynamicFieldValuesGdi(
                 }
                 else
                 {
-                    if (entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
+                    if (state.menuId == netplay::menu::NetplayMenuId::Main)
+                    {
+                        // Sprite-sheet rows (labels baked in, LOBBY included):
+                        // only the optional badge is dynamic; it renders
+                        // right-aligned like the inline edit values.
+                        if (!callbacks.buildRowBadgeText)
+                        {
+                            continue;
+                        }
+                        value = callbacks.buildRowBadgeText(entries[i]);
+                        if (value.empty())
+                        {
+                            continue;
+                        }
+                    }
+                    else if (entries[i].action == netplay::menu::NetplayMenuAction::OpenLobby)
                     {
                         value = callbacks.buildRowLabel(entries[i]);
                         drawAsLabel = true;

@@ -269,8 +269,18 @@ void DrawRuntimeSpriteOverlay(uint32_t screenContext)
 
             // Main menu entries already have correct labels baked into the
             // sprite sheet; drawing sprite-font text on top would double-render.
+            // The one exception is the optional right-edge badge ("[!]" on
+            // OPTIONS while a newer mod release exists).
             if (g_netplayMenuState.menuId == NetplayMenuId::Main)
             {
+                const std::string badge = BuildRowBadgeText(entries[i]);
+                if (!badge.empty())
+                {
+                    const int badgeY =
+                        g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)]
+                        + rowTextOffsetY;
+                    DrawSpriteText(screenContext, panelRight - 30, badgeY, badge, 30, false);
+                }
                 continue;
             }
 

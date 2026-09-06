@@ -4536,4 +4536,9 @@ void LobbySession::ProcessPendingActions()
         }
     }
 }
+
+std::string HttpGetViaWinInet(const std::string& url, DWORD connectTimeoutMs, DWORD receiveTimeoutMs)
+{
+    return DoHttpGetViaWinInet(url, connectTimeoutMs, receiveTimeoutMs);
+}
 }

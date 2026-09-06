@@ -170,7 +170,8 @@ Options:
   - `VerboseRevival102jLifecycleLogging`
   - `HideEmptySetsInBattleLog`
   - `AsyncHostReturnKey` - hotkey to return to the HOST menu (or rehost) while async hosting is minimized (default: `F1`)
-- `About` modal with version/build information
+  - `CheckForUpdates` - once per launch (first netplay menu visit) look up the newest GitHub release in the background and show `[!]` next to `OPTIONS` and `About` while a newer version is out; opening `About` clears the badge until the next release (default: `1`)
+- `About` modal with version/build information (and the newest GitHub release when it is newer than the running build)
 
 Netplay menu theming:
 - The menu background theme is currently read from `EfzRevival.ini` under `[NetplayMenu]` with `Theme=scroll` or `Theme=classic`.

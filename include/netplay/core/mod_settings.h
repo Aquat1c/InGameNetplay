@@ -59,6 +59,10 @@ struct Settings
     // Which side this client controls (0=P1/host, 1=P2/join). We broadcast this
     // side's palette and apply the peer's. Loopback ignores it (uses side 0).
     int modInteropSide = 0;
+    // Once-per-launch GitHub "latest release" lookup (runs on the first netplay
+    // menu entry, background thread) that marks OPTIONS / About with "[!]" while
+    // a newer mod version is published. Ini key "CheckForUpdates" (seeded, ON).
+    bool checkForUpdates = true;
 };
 
 void Reload();
@@ -88,6 +92,9 @@ bool AreOnlineCustomColorsEnabled();
 // Runtime override of the gate (for the debug-menu toggle). Does not persist to
 // the ini; a Reload() re-reads the stored value.
 void SetOnlineCustomColorsEnabled(bool enabled);
+
+// [Others] CheckForUpdates - gate for the once-per-launch GitHub release check.
+bool IsUpdateCheckEnabled();
 // Dev-only overlay-channel loopback (Stage-1 solo palette test). Requires the
 // master gate to also be on. See Settings::modInteropLoopback.
 bool IsModInteropLoopbackEnabled();

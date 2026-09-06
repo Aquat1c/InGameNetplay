@@ -228,6 +228,8 @@ void Reload()
     // On by default: live-proven; piggybacks Revival's own socket, vanilla-safe.
     loaded.onlineCustomColors =
         ReadBoolValue(L"Others", L"OnlineCustomColors", true, iniPath);
+    loaded.checkForUpdates =
+        ReadBoolValue(L"Others", L"CheckForUpdates", true, iniPath);
     loaded.modInteropLoopback =
         ReadBoolValue(L"Others", L"ModInteropLoopback", false, iniPath);
     loaded.modInteropPeer =
@@ -242,6 +244,7 @@ void Reload()
     // (piggyback transport, side derived from the session role) is automatic, so
     // the ModInterop* keys are hidden dev overrides - read if present, never seeded.
     SeedIniKeyIfMissing(L"Others", L"OnlineCustomColors", L"1", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"CheckForUpdates", L"1", iniPath);
 
     g_settings = loaded;
 
@@ -298,6 +301,11 @@ bool AreOnlineCustomColorsEnabled()
 void SetOnlineCustomColorsEnabled(bool enabled)
 {
     g_settings.onlineCustomColors = enabled;
+}
+
+bool IsUpdateCheckEnabled()
+{
+    return g_settings.checkForUpdates;
 }
 
 bool IsModInteropLoopbackEnabled()

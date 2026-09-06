@@ -392,4 +392,8 @@ private:
     DWORD m_lastStatusResponseLogTick = 0;
 };
 
+// Generic WinINet GET of an absolute URL (any host); empty string on failure.
+// Fallback transport for the once-per-launch GitHub update check.
+std::string HttpGetViaWinInet(const std::string& url, DWORD connectTimeoutMs, DWORD receiveTimeoutMs);
+
 } // namespace netplay::lobby
