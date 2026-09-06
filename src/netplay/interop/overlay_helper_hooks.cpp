@@ -131,20 +131,95 @@ void ObserveRecvCompletion(LPOVERLAPPED ov, DWORD bytes)
     }
 }
 
-void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int tolen)
+// ---- Multi-peer TX (Gap B1) -----------------------------------------------
+// A host fans Revival's traffic out to the client + N spectators, so a queued
+// overlay frame must reach EVERY current peer, not just whichever peer the next
+// WSASendTo happens to target (which one it lands on is otherwise racy). Track
+// the recent distinct destinations Revival sends to (small LRU + last-seen tick)
+// and broadcast each drained frame to all FRESH peers. With a single peer (a
+// client, or a host with no spectators) the set is {that peer} -> byte-identical
+// to the old single-peer flush. Freshness drops departed peers + one-shot setup
+// endpoints (STUN); the reserved typeId makes a stray frame harmless anyway.
+struct PeerEndpoint
+{
+    std::uint32_t addrBE;
+    std::uint16_t portBE;      // 0 = empty slot
+    DWORD         lastSeenTick;
+};
+constexpr int   kMaxPeers    = 8;
+constexpr DWORD kPeerFreshMs  = 5000;   // exclude peers not sent to in this window
+PeerEndpoint    g_peers[kMaxPeers] = {};
+
+// Refresh an existing peer or insert it (empty slot, else evict the stalest).
+// Caller holds g_cs. Two passes so an empty slot never shadows a later match.
+void TouchPeerLocked(std::uint32_t addrBE, std::uint16_t portBE, DWORD now)
+{
+    for (int i = 0; i < kMaxPeers; ++i)
+    {
+        if (g_peers[i].portBE == portBE && g_peers[i].addrBE == addrBE)
+        {
+            g_peers[i].lastSeenTick = now;
+            return;
+        }
+    }
+    int evict = 0;
+    DWORD evictAge = 0;
+    for (int i = 0; i < kMaxPeers; ++i)
+    {
+        if (g_peers[i].portBE == 0)
+        {
+            g_peers[i] = PeerEndpoint{addrBE, portBE, now};
+            return;
+        }
+        const DWORD age = now - g_peers[i].lastSeenTick;
+        if (age >= evictAge) { evictAge = age; evict = i; }
+    }
+    g_peers[evict] = PeerEndpoint{addrBE, portBE, now};
+}
+
+// Copy the currently-fresh peers into out[] (capacity kMaxPeers). Caller holds
+// g_cs. Returns the count.
+int SnapshotFreshPeersLocked(PeerEndpoint* out, DWORD now)
+{
+    int n = 0;
+    for (int i = 0; i < kMaxPeers; ++i)
+    {
+        if (g_peers[i].portBE != 0
+            && (now - g_peers[i].lastSeenTick) <= kPeerFreshMs)
+        {
+            out[n++] = g_peers[i];
+        }
+    }
+    return n;
+}
+
+void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int /*tolen*/)
 {
     ipc::OverlayIpcBlock* b = ipc::Block();
     if (b == nullptr) return;
 
     Bump(&b->sendToSeen);
     g_capturedSocket = s;
-    b->peerAddrBE = sin->sin_addr.s_addr;
-    b->peerPortBE = sin->sin_port;
+    const std::uint32_t addrBE = sin->sin_addr.s_addr;
+    const std::uint16_t portBE = sin->sin_port;
+    // Keep the single-peer fields (most-recent peer) for the game's diagnostics.
+    b->peerAddrBE = addrBE;
+    b->peerPortBE = portBE;
     b->socketValid = 1u;
 
-    // Drain the game's outbound queue and send each frame on the same socket to
-    // the same peer Revival just used. Synchronous WSASendTo (non-overlapped) so
-    // it completes inline, exactly like Revival's own send at 0x59919.
+    const DWORD now = GetTickCount();
+    PeerEndpoint fresh[kMaxPeers];
+    int nFresh = 0;
+    EnterCriticalSection(&g_cs);
+    TouchPeerLocked(addrBE, portBE, now);
+    nFresh = SnapshotFreshPeersLocked(fresh, now);
+    LeaveCriticalSection(&g_cs);
+    if (nFresh <= 0) return;
+
+    // Drain the game's outbound queue; broadcast each frame to every fresh peer
+    // on the same socket Revival just used. Synchronous WSASendTo (non-overlapped)
+    // so it completes inline, exactly like Revival's own send at 0x59919.
+    int framesSent = 0;
     for (;;)
     {
         std::uint8_t frame[ipc::kSlotBytes];
@@ -157,12 +232,30 @@ void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int tolen)
         WSABUF wb;
         wb.buf = reinterpret_cast<char*>(frame);
         wb.len = len;
-        DWORD sent = 0;
-        const int rc = g_origWSASendTo(
-            s, &wb, 1, &sent, 0,
-            reinterpret_cast<const sockaddr*>(sin), tolen, nullptr, nullptr);
-        (void)rc;
-        Bump(&b->txFlushed);
+        for (int i = 0; i < nFresh; ++i)
+        {
+            sockaddr_in dst = {};
+            dst.sin_family = AF_INET;
+            dst.sin_addr.s_addr = fresh[i].addrBE;
+            dst.sin_port = fresh[i].portBE;
+            DWORD sent = 0;
+            (void)g_origWSASendTo(
+                s, &wb, 1, &sent, 0,
+                reinterpret_cast<const sockaddr*>(&dst),
+                static_cast<int>(sizeof(dst)), nullptr, nullptr);
+            Bump(&b->txFlushed);
+        }
+        ++framesSent;
+    }
+
+    if (framesSent > 0 && nFresh > 1)
+    {
+        static unsigned s_bc = 0;
+        if (++s_bc <= 3u || (s_bc % 60u) == 0u)
+        {
+            mod::Log("OverlayHelper: TX broadcast %d frame(s) x %d fresh peers",
+                     framesSent, nFresh);
+        }
     }
 }
 

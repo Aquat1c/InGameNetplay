@@ -41,9 +41,35 @@ constexpr std::uint32_t kWinnerIndexOffset = 4940u;   // 0 = P1 won, 1 = P2 won
 constexpr std::uint32_t kCharIdBase = 1340u;   // + side  (P1 1340, P2 1341)
 constexpr std::uint32_t kColorBase = 1342u;    // + side  (P1 1342, P2 1343)
 
-// Side this client controls (broadcasts) and applies the peer's onto. 0=P1 for
-// loopback; socket/piggyback use the configured ModInteropSide.
+// Side this client controls (broadcasts) and applies the peer's onto: 0=P1,
+// 1=P2, -1=spectator (controls neither). Set together with g_sideSource.
 int g_localSide = 0;
+
+// Where this char-select's two portrait sides get their colours from. Derived
+// ONCE per char-select entry from a SINGLE status snapshot, so the mode and the
+// side can never disagree.
+//
+// This was previously a pair of booleans derived from two separate GetStatus()
+// reads whose "unknown role" fallbacks contradicted each other: a spectator
+// whose role had not been published yet resolved to side 0 AND "offline", which
+// made BOTH portraits load OUR OWN .pal over characters we do not control.
+enum class SideSource
+{
+    OnlinePlayer,   // one side is ours; the other fills from the peer's row
+    Spectator,      // NEITHER side is ours - both fill from host/client, else stock
+    Offline,        // both players sit at this machine; both sides are local
+};
+SideSource g_sideSource = SideSource::OnlinePlayer;
+
+const char* SideSourceName(SideSource s)
+{
+    switch (s)
+    {
+    case SideSource::Spectator: return "spectator";
+    case SideSource::Offline:   return "offline";
+    default:                    return "online";
+    }
+}
 
 // Transport backing the channel's send/receive:
 //   Loopback  - solo test, echoes locally (ModInteropLoopback=1)
@@ -63,22 +89,65 @@ const char* TransportName(Transport t)
     }
 }
 
-// Derive our palette side from the live session role: Host=P1=side 0, Join=P2=
-// side 1, spectators=-1 (receive both, never advertise a local row). Read fresh
-// at char-select entry, when the session is fully up. Falls back to the Revival
-// session object's activePlayer, then to host side, if the role is not yet set.
-int DeriveLocalSide()
+// Classify this char-select from ONE status snapshot, setting g_sideSource and
+// g_localSide together: Host=P1=side 0, Join=P2=side 1, spectator=-1 (controls
+// neither side and never advertises a row), otherwise offline local play.
+//
+// Spectating is the only mode where guessing wrong is actively wrong ON SCREEN -
+// we would paint our own palettes onto characters we do not control - so ANY
+// spectate signal wins: the bridge role, OR the takeover role flag (mirrored
+// into the status as roleFlag), whichever has been published first. Ambiguity
+// therefore resolves toward "spectator", whose failure mode is merely stock
+// colours; a spectator misread as offline paints visibly wrong ones.
+void DeriveSideSource()
 {
+    // takeover_internal.h kLocalRoleSpectate, duplicated as a local constant so
+    // this interop TU does not pull in a bridge-internal header.
+    constexpr int kRoleFlagSpectate = 1;
+
     const netplay::bridge::NetbridgeStatus st = netplay::bridge::GetStatus();
-    switch (static_cast<netplay::bridge::NetbridgeRole>(st.role))
+    const auto role = static_cast<netplay::bridge::NetbridgeRole>(st.role);
+
+    if (role == netplay::bridge::NetbridgeRole::Spectate
+        || role == netplay::bridge::NetbridgeRole::JoinSpectate
+        || st.roleFlag == kRoleFlagSpectate)
     {
-    case netplay::bridge::NetbridgeRole::Host:         return 0;
-    case netplay::bridge::NetbridgeRole::Join:         return 1;
-    case netplay::bridge::NetbridgeRole::Spectate:
-    case netplay::bridge::NetbridgeRole::JoinSpectate: return -1;
-    default:
-        if (st.activePlayer == 0 || st.activePlayer == 1) return st.activePlayer;
-        return 0;
+        g_sideSource = SideSource::Spectator;
+        g_localSide = -1;
+        return;
+    }
+    if (role == netplay::bridge::NetbridgeRole::Host)
+    {
+        g_sideSource = SideSource::OnlinePlayer;
+        g_localSide = 0;
+        return;
+    }
+    if (role == netplay::bridge::NetbridgeRole::Join)
+    {
+        g_sideSource = SideSource::OnlinePlayer;
+        g_localSide = 1;
+        return;
+    }
+    // No online role at all: offline local play (arcade / VS / training), where
+    // both players sit at this machine and both sides load a local .pal.
+    g_sideSource = SideSource::Offline;
+    g_localSide = (st.activePlayer == 0 || st.activePlayer == 1)
+        ? st.activePlayer
+        : 0;
+}
+
+// Does this side load a LOCAL .pal, or fill from a received peer row?
+//   Spectator -> NEVER local. Both sides come from the host/client; when nothing
+//                has arrived for a side we apply nothing and it stays stock.
+//   Offline   -> BOTH sides are local (both players sit at this machine).
+//   Online    -> only the side we control; the other is the peer's.
+bool SideIsLocal(int side)
+{
+    switch (g_sideSource)
+    {
+    case SideSource::Spectator: return false;
+    case SideSource::Offline:   return true;
+    default:                    return side == g_localSide;
     }
 }
 
@@ -149,16 +218,48 @@ bool PiggybackSink(const std::uint8_t* datagram, std::size_t len, void*)
 
 // Drain the helper->game ring (RX frames the helper observed on the socket) into
 // the channel. Bounded per call so a flood cannot stall the poll thread.
+//
+// Gap B2 (host relay): the client's socket only reaches the host, so a modded
+// client's palette can only reach a spectator if the HOST re-emits it - exactly
+// as Revival already fans the client's Gekko inputs out to spectators. When an
+// online host receives a peer PaletteBlob (the client's side), it re-queues the
+// EXACT frame to the helper's TX ring; Gap B1's broadcast then delivers it to
+// every fresh peer (spectators + the client). Only the host relays (role-gated =>
+// no ring); the client drops its own echo via the per-side monotonic-seq guard.
 void PiggybackPoll(OverlayChannel& ch)
 {
     ipc::OverlayIpcBlock* b = ipc::Block();
     if (b == nullptr) return;
+    const bool hostHub = (g_sideSource == SideSource::OnlinePlayer
+                          && g_localSide == 0);
     std::uint8_t frame[P::kMaxFrameBytes];
     for (int i = 0; i < 32; ++i)
     {
         const std::uint32_t n = ipc::Pop(b->toGame, frame, sizeof(frame));
         if (n == 0u) break;
         ch.OnInboundDatagram(frame, static_cast<std::size_t>(n));
+
+        if (hostHub)
+        {
+            P::Kind k = P::Kind::Invalid;
+            P::PaletteBlobBody body{};
+            // Relay ONLY the client's palette rows (never Hello/Ack - those are
+            // the 1:1 host<->client handshake - and never our own side 0).
+            if (P::ParseKind(frame, static_cast<std::size_t>(n), &k)
+                && k == P::Kind::PaletteBlob
+                && P::ParsePaletteBlob(frame, static_cast<std::size_t>(n), &body)
+                && body.side != 0)
+            {
+                (void)ipc::Push(b->toHelper, frame, n);
+                static unsigned s_relay = 0;
+                if (++s_relay <= 3u || (s_relay % 60u) == 0u)
+                {
+                    mod::Log("PaletteCharSelect: host relay client row -> peers "
+                             "side=%u slot=%u seq=%u", body.side, body.slotByte,
+                             body.seq);
+                }
+            }
+        }
     }
 }
 
@@ -319,11 +420,11 @@ void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
     }
     P::PaletteBlobBody applyRow{};
     bool custom = false;
-    if (side == g_localSide)
+    if (SideIsLocal(side))
     {
-        // Our own selection: broadcast + apply a custom .pal ONLY while EDIT
-        // COLOR is active; otherwise a CLEAR row so both we and the peer fall
-        // back to stock. This is the original mod's flag gating.
+        // A locally-controlled player's selection: apply a custom .pal ONLY while
+        // EDIT COLOR is active; otherwise a CLEAR row so this side falls back to
+        // stock. Offline BOTH sides take this path; online only our own side does.
         const bool editColor = ReadEditColorFlag(csObj, side);
         std::uint8_t charId = 0xFF, colorSlot = 0xFF;
         if (ReadCharAndColor(csObj, side, &charId, &colorSlot)
@@ -341,15 +442,21 @@ void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
                 local = source::AssembleRow(static_cast<std::uint8_t>(side),
                                             charId, colorSlot, false, nullptr);
             }
-            ch.SubmitLocalPaletteRow(local);
+            // Broadcast ONLY our own online side to the peer; offline (and the
+            // second local side) has no peer to advertise a row to.
+            if (side == g_localSide)
+            {
+                ch.SubmitLocalPaletteRow(local);
+            }
             applyRow = local;
             custom = (local.slotByte != 0);
         }
     }
     else
     {
-        // Peer side: apply the received row; its custom-ness already encodes the
-        // peer's EDIT-COLOR gating (they only broadcast custom while editing).
+        // Network peer side: apply the received row (online remote, or either
+        // side while spectating). Its custom-ness already encodes the peer's
+        // EDIT-COLOR gating (they only broadcast custom while editing).
         custom = ch.GetPeerPaletteRow(side, &applyRow) && applyRow.slotByte != 0;
     }
 
@@ -448,10 +555,11 @@ void PollThreadMain()
                 const bool has0 = ch.GetPeerPaletteRow(0, &pr0);
                 const bool has1 = ch.GetPeerPaletteRow(1, &pr1);
                 mod::Log("PaletteDiag: state=[%u,%u] exit=%u stageGate=%d leaveGate=%d "
-                         "localSide=%d peer0(has=%d slot=%u) peer1(has=%d slot=%u)",
+                         "localSide=%d src=%s peer0(has=%d slot=%u) peer1(has=%d slot=%u)",
                          d.s0, d.s1, d.exitFlag,
                          InStageFlow(csObj) ? 1 : 0,
                          ScreenLeavingCharSelect(csObj) ? 1 : 0, g_localSide,
+                         SideSourceName(g_sideSource),
                          has0 ? 1 : 0, pr0.slotByte, has1 ? 1 : 0, pr1.slotByte);
             }
 
@@ -469,6 +577,11 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     std::lock_guard<std::mutex> lock(g_paletteMutex);
     OverlayChannel& ch = OverlayChannel::Instance();
     ch.End();                       // fresh session per char-select entry
+    // Loopback/socket are dev test paths that deliberately want the "one side is
+    // ours, the other is the peer's" split (loopback echoes our own row back as
+    // the peer's), so they stay OnlinePlayer. Only the production piggyback path
+    // classifies a real session, where spectator/offline actually occur.
+    g_sideSource = SideSource::OnlinePlayer;
     switch (g_transport)
     {
     case Transport::Socket:
@@ -476,8 +589,8 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
         break;
     case Transport::Piggyback:
         ch.SetSendSink(&PiggybackSink, nullptr);
-        // The session is up by char-select, so derive our side from its role.
-        g_localSide = DeriveLocalSide();
+        // The session is up by char-select, so classify it from the live role.
+        DeriveSideSource();
         break;
     default:
         ch.SetSendSink(&LoopbackSink, nullptr);
@@ -494,9 +607,10 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     g_csObj.store(reinterpret_cast<std::uint32_t>(screenContext),
                   std::memory_order_release);
     mod::Log("PaletteCharSelect: char-select init, armed active=%d side=%d "
-             "transport=%s ipcAttached=%d",
-             ch.IsActive() ? 1 : 0, g_localSide, TransportName(g_transport),
-             ipc::IsAttached() ? 1 : 0);
+             "src=%s transport=%s ipcAttached=%d",
+             ch.IsActive() ? 1 : 0, g_localSide,
+             SideSourceName(g_sideSource),
+             TransportName(g_transport), ipc::IsAttached() ? 1 : 0);
     return result;
 }
 
@@ -585,7 +699,7 @@ bool Install()
     else
     {
         g_transport = Transport::Piggyback;
-        g_localSide = 0;   // provisional; DeriveLocalSide() runs at char-select
+        g_localSide = 0;   // provisional; DeriveSideSource() runs at char-select
         if (!ipc::Attach(/*asHelper=*/false))
         {
             mod::Log("PaletteCharSelect: overlay IPC attach failed - "

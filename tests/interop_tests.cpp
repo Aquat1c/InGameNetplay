@@ -14,6 +14,7 @@
 #include "netplay/interop/palette_remap.h"
 #include "netplay/interop/overlay_ipc.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 // --- stubs for the channel's external symbols -------------------------------
@@ -323,10 +325,22 @@ void TestChannel()
     // Unchanged resubmit does not transmit.
     ch.SubmitLocalPaletteRow(local);
     Expect(g_sent.size() == 1, "unchanged palette: no re-transmit");
-    // Changed resubmit transmits with next seq.
+    // Changed resubmit INSIDE the rate-limit window is coalesced, not sent.
+    // Char-select colour navigation changes the row many times a second and each
+    // send injects a datagram into Revival's OWN netcode socket (unthrottled this
+    // emitted ~300 datagrams across one char-select), so it must be rate-limited.
     local.colorSlot = 5;
     ch.SubmitLocalPaletteRow(local);
-    Expect(g_sent.size() == 2, "changed palette: re-transmit");
+    Expect(g_sent.size() == 1, "changed palette inside interval: coalesced");
+    // Once the interval elapses the pending NEWEST row goes out.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(kPaletteSendMinIntervalMs + 40u));
+    ch.SubmitLocalPaletteRow(local);
+    Expect(g_sent.size() == 2, "pending row transmits after the interval");
+    P::PaletteBlobBody coalesced{};
+    Expect(P::ParsePaletteBlob(g_sent[1].data(), g_sent[1].size(), &coalesced)
+               && coalesced.colorSlot == 5,
+           "coalesced send carries the newest row");
 
     // Inbound peer palette is cached and retrievable.
     P::PaletteBlobBody peer = MakeRow(1, 11, 3, 7);
@@ -716,6 +730,48 @@ void TestRemap()
                    && std::abs(int(c[1]) - int(g2)) <= 2
                    && std::abs(int(c[2]) - int(b2)) <= 2,
                "HSL round-trip within tolerance");
+    }
+
+    // --- ff color-sharing fixes (parity with the .ps1 "portrait specific fixes") ---
+    // minagi_ff = { {9,11,0.8}, {10,9,0.6} } cascades: the 2nd reads the 1st's
+    // result. Verify the ratio (robust to the underlying area colors); the round
+    // matches the remap = floor(c*factor + 0.5), clamped to 255.
+    {
+        RM::PortraitColor mf[40];
+        const std::size_t nMf = RM::RemapSpriteToPortrait(pal, "minagi", mf, 40);
+        const RM::PortraitColor *m9 = nullptr, *m10 = nullptr, *m11 = nullptr;
+        for (std::size_t i = 0; i < nMf; ++i)
+        {
+            if (mf[i].portIdx == 9)  m9 = &mf[i];
+            if (mf[i].portIdx == 10) m10 = &mf[i];
+            if (mf[i].portIdx == 11) m11 = &mf[i];
+        }
+        auto scl = [](std::uint8_t c, float f) -> std::uint8_t {
+            float v = static_cast<float>(c) * f + 0.5f;
+            if (v > 255.0f) v = 255.0f;
+            return static_cast<std::uint8_t>(v);
+        };
+        Expect(m11 && m9
+                   && m9->r == scl(m11->r, 0.8f) && m9->g == scl(m11->g, 0.8f)
+                   && m9->b == scl(m11->b, 0.8f),
+               "ff: slot 9 = slot 11 * 0.8 (overwrote the area value)");
+        Expect(m10 && m9
+                   && m10->r == scl(m9->r, 0.6f) && m10->g == scl(m9->g, 0.6f)
+                   && m10->b == scl(m9->b, 0.6f),
+               "ff cascade: slot 10 = updated slot 9 * 0.6");
+    }
+
+    // Mio 'bow' area (user fix 2026-08-31): sprite [25,11] -> portrait [37,40],
+    // previously unmapped (the ribbon stayed stock). Now produces writes there.
+    {
+        RM::PortraitColor mio[40];
+        const std::size_t nMio = RM::RemapSpriteToPortrait(pal, "mio", mio, 40);
+        bool sawBow = false;
+        for (std::size_t i = 0; i < nMio; ++i)
+        {
+            if (mio[i].portIdx >= 37 && mio[i].portIdx <= 40) sawBow = true;
+        }
+        Expect(sawBow, "mio bow area produces portrait writes at 37-40");
     }
 }
 // Exercises the cross-process SPSC ring in isolation (no shared mapping needed -

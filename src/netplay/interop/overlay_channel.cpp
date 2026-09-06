@@ -30,6 +30,7 @@ void OverlayChannel::Begin(int localSide)
     m_lastHelloMs = 0;
     m_helloCount = 0;
     m_lastPaletteSendMs = 0;
+    m_localRowPending = false;
     m_palettes.Clear();
     mod::Log("OverlayChannel: begin localSide=%d nonce=0x%08lX",
              m_localSide, static_cast<unsigned long>(m_nonce));
@@ -134,8 +135,11 @@ void OverlayChannel::Tick(std::uint32_t nowMs)
             }
         }
     }
-    // Palette upload cadence is driven by SubmitLocalPaletteRow (change-driven);
-    // nowMs is retained here for a future keepalive/refresh if needed.
+    // Palette upload is change-driven (SubmitLocalPaletteRow). A spectator that is
+    // present through char-select receives each side's row as it is picked; one
+    // that only catches the LIVE game later gets its colors from Revival's own
+    // native palette sync (loading screen on) - we deliberately do NOT re-stream
+    // the char-select history to late joiners.
     (void)nowMs;
 }
 
@@ -214,20 +218,38 @@ void OverlayChannel::SubmitLocalPaletteRow(const protocol::PaletteBlobBody& row)
     }
     protocol::PaletteBlobBody body = row;
     body.side = static_cast<std::uint8_t>(m_localSide);
-    if (!m_palettes.SetLocalRow(&body))
+    // SetLocalRow stamps `body` with the current outbound seq either way, so the
+    // pending path can transmit the LATEST row without re-reading the store.
+    if (m_palettes.SetLocalRow(&body))
     {
-        return;   // unchanged - nothing to send
+        m_localRowPending = true;
+    }
+    if (!m_localRowPending)
+    {
+        return;   // unchanged and nothing pending - nothing to send
     }
     if (m_state != HandshakeState::Confirmed)
     {
         return;   // cache locally, but only transmit to a confirmed modded peer
     }
+    // Rate-limit. Char-select colour navigation changes the row many times a
+    // second and the 60Hz poll reports every one of them; each send injects a
+    // datagram into Revival's OWN netcode socket. Unthrottled this emitted ~300
+    // datagrams across a single char-select. Coalesce to at most one frame per
+    // kPaletteSendMinIntervalMs and transmit the newest row - the peer's
+    // per-side monotonic seq guard simply skips the elided intermediates.
+    const std::uint32_t now = static_cast<std::uint32_t>(GetTickCount());
+    if (m_lastPaletteSendMs != 0
+        && (now - m_lastPaletteSendMs) < kPaletteSendMinIntervalMs)
+    {
+        return;   // stays pending; goes out once the interval elapses
+    }
     const std::size_t n =
         protocol::BuildPaletteBlob(body, m_scratch, sizeof(m_scratch));
-    if (n != 0)
+    if (n != 0 && Enqueue(m_scratch, n))
     {
-        Enqueue(m_scratch, n);
-        m_lastPaletteSendMs = static_cast<std::uint32_t>(GetTickCount());
+        m_lastPaletteSendMs = (now != 0u) ? now : 1u;
+        m_localRowPending = false;
     }
 }
 

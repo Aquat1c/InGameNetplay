@@ -35,12 +35,26 @@ struct PortraitArea {
     int end;
 };
 
+// Manual color-sharing fix (parity with the .ps1 randomizer's per-character
+// `ff` calls under "portrait specific fixes"): AFTER the area remap, set
+// portrait[target] = portrait[source] * factor per channel (clamped 0..255).
+// Lets a portrait slot that shares a stock slot with another region be
+// decoupled - e.g. a sclera that reuses the shirt slot. `source` must resolve
+// to a slot the area remap already produced.
+struct FfFix {
+    int8_t target;   // 1-based portrait index written
+    int8_t source;   // 1-based portrait index read
+    float  factor;   // per-channel multiplier
+};
+
 struct CharacterMapping {
     const char* charName;
     const SpriteArea* spriteAreas;
     int spriteAreaCount;
     const PortraitArea* portraitAreas;
     int portraitAreaCount;
+    const FfFix* ffFixes;      // per-character color-sharing fixes (may be null)
+    int ffFixCount;
 };
 
 //=============================================================================
@@ -230,7 +244,7 @@ static const int8_t kano_spr_skin[] = {2,3,4,5};
 static const int8_t kano_spr_top[] = {10,11,12,13};
 static const int8_t kano_spr_bottom[] = {17,18,19,20};
 static const int8_t kano_spr_eyes[] = {23,24};
-static const int8_t kano_spr_acc[] = {14,15,16};
+static const int8_t kano_spr_acc[] = {26,27,28};   // armband: was {14,15,16} (user fix 2026-08-31)
 static const int8_t kano_spr_hair[] = {6,7,8,9};
 
 static const SpriteArea kano_sprite[] = {
@@ -283,21 +297,22 @@ static const PortraitArea kaori_portrait[] = {
 
 //=============================================================================
 // MAKOTO
-// $pals: skin:[2, 3, 4, 5], top:[16, 15, 14, 13], hair:[12, 11, 10, 9], top2:[8, 7, 6], acc:[23, 22, 21], bottom:[28, 27, 26, 25, 24]
+// $pals: skin:[2, 3, 4, 5], top:[8, 7, 6], hair:[12, 11, 10, 9], top2:[16, 15, 14, 13], acc:[23, 22, 21], bottom:[28, 27, 26, 25, 24]
 // $portraits: skin:[2, 7], top:[12, 8], hair:[22, 17], top2:[28, 23], acc:[31, 29], bottom:[36, 32]
+// (user fix 2026-08-31: sprite top <-> top2 were swapped; fixes the skirt/top mapping)
 //=============================================================================
 static const int8_t makoto_spr_skin[] = {2,3,4,5};
-static const int8_t makoto_spr_top[] = {16,15,14,13};
+static const int8_t makoto_spr_top[] = {8,7,6};
 static const int8_t makoto_spr_hair[] = {12,11,10,9};
-static const int8_t makoto_spr_top2[] = {8,7,6};
+static const int8_t makoto_spr_top2[] = {16,15,14,13};
 static const int8_t makoto_spr_acc[] = {23,22,21};
 static const int8_t makoto_spr_bottom[] = {28,27,26,25,24};
 
 static const SpriteArea makoto_sprite[] = {
     {"skin", makoto_spr_skin, 4},
-    {"top", makoto_spr_top, 4},
+    {"top", makoto_spr_top, 3},
     {"hair", makoto_spr_hair, 4},
-    {"top2", makoto_spr_top2, 3},
+    {"top2", makoto_spr_top2, 4},
     {"acc", makoto_spr_acc, 3},
     {"bottom", makoto_spr_bottom, 5},
 };
@@ -323,7 +338,7 @@ static const int8_t mai_spr_bottom[] = {11,12,13};
 static const int8_t mai_spr_mai[] = {23,24,25};
 static const int8_t mai_spr_acc[] = {9,10};
 static const int8_t mai_spr_eyes[] = {21,22};
-static const int8_t mai_spr_ears[] = {17,18};
+static const int8_t mai_spr_ears[] = {18,17};   // mini-Mai bunny ears: dark<->bright inverted (user fix 2026-08-31)
 
 static const SpriteArea mai_sprite[] = {
     {"skin", mai_spr_skin, 4},
@@ -377,24 +392,25 @@ static const PortraitArea mayu_portrait[] = {
 
 //=============================================================================
 // MINAGI
-// $pals: skin:[2, 3, 4, 5], hair:[13, 14, 15, 16], top:[10, 11, 12], bottom:[17, 18, 19, 20], hair2:[25, 26, 27, 32], acc:[21, 22, 23, 24], eyes2:[9, 7, 8]
+// $pals: skin:[2, 3, 4, 5], hair:[14, 15, 16], top:[10, 11, 12], bottom:[17, 18, 19, 20], hair2:[25, 26, 27, 32], acc:[22, 23, 24], eyes2:[9, 7, 8]
 // $portraits: skin:[2, 7], hair:[17, 22], top:[12, 16], bottom:[23, 28], hair2:[34, 38], acc:[29, 33], eyes2:[11, 9]
+// (user fix 2026-08-31: sprite hair [13,14,15,16]->[14,15,16], acc [21,22,23,24]->[22,23,24])
 //=============================================================================
 static const int8_t minagi_spr_skin[] = {2,3,4,5};
-static const int8_t minagi_spr_hair[] = {13,14,15,16};
+static const int8_t minagi_spr_hair[] = {14,15,16};
 static const int8_t minagi_spr_top[] = {10,11,12};
 static const int8_t minagi_spr_bottom[] = {17,18,19,20};
 static const int8_t minagi_spr_hair2[] = {25,26,27,32};
-static const int8_t minagi_spr_acc[] = {21,22,23,24};
+static const int8_t minagi_spr_acc[] = {22,23,24};
 static const int8_t minagi_spr_eyes2[] = {9,7,8};
 
 static const SpriteArea minagi_sprite[] = {
     {"skin", minagi_spr_skin, 4},
-    {"hair", minagi_spr_hair, 4},
+    {"hair", minagi_spr_hair, 3},
     {"top", minagi_spr_top, 3},
     {"bottom", minagi_spr_bottom, 4},
     {"hair2", minagi_spr_hair2, 4},
-    {"acc", minagi_spr_acc, 4},
+    {"acc", minagi_spr_acc, 3},
     {"eyes2", minagi_spr_eyes2, 3},
 };
 
@@ -419,6 +435,7 @@ static const int8_t mio_spr_top[] = {21,20,19,18};
 static const int8_t mio_spr_eyes[] = {22,23};
 static const int8_t mio_spr_book[] = {14,15};
 static const int8_t mio_spr_acc2[] = {31,24,25};
+static const int8_t mio_spr_bow[] = {25,11};   // ribbon (user fix 2026-08-31; replaces broken acc:[37,40] that had no sprite match)
 
 static const SpriteArea mio_sprite[] = {
     {"skin", mio_spr_skin, 4},
@@ -427,6 +444,7 @@ static const SpriteArea mio_sprite[] = {
     {"eyes", mio_spr_eyes, 2},
     {"book", mio_spr_book, 2},
     {"acc2", mio_spr_acc2, 3},
+    {"bow", mio_spr_bow, 2},
 };
 
 static const PortraitArea mio_portrait[] = {
@@ -436,6 +454,7 @@ static const PortraitArea mio_portrait[] = {
     {"eyes", 22, 25},
     {"book", 34, 36},
     {"acc2", 26, 29},
+    {"bow", 37, 40},
 };
 
 //=============================================================================
@@ -467,15 +486,15 @@ static const PortraitArea misaki_portrait[] = {
 
 //=============================================================================
 // MISHIO
-// $pals: skin:[2, 3, 4, 5], hair:[17, 18, 19, 20], eyes2:[40, 39, 38], boots:[14, 15, 16], bottom:[24, 25, 26], top:[6, 7, 8, 9, 10, 11], acc:[21, 22, 23], eyes:[31, 32]
+// $pals: skin:[2, 3, 4, 5], hair:[17, 18, 19, 20], eyes2:[40, 39, 38], boots:[8, 9, 10], bottom:[24, 25, 26], top:[6, 7, 8, 11], acc:[21, 22, 23], eyes:[31, 32]
 // $portraits: skin:[2, 6], hair:[17, 22], eyes2:[9, 12], boots:[14, 16], bottom:[23, 27], top:[32, 29], acc:[33, 36], eyes:[37, 40]
 //=============================================================================
 static const int8_t mishio_spr_skin[] = {2,3,4,5};
 static const int8_t mishio_spr_hair[] = {17,18,19,20};
 static const int8_t mishio_spr_eyes2[] = {40,39,38};
-static const int8_t mishio_spr_boots[] = {14,15,16};
+static const int8_t mishio_spr_boots[] = {8,9,10};   // spear: was {14,15,16} (user fix 2026-08-31)
 static const int8_t mishio_spr_bottom[] = {24,25,26};
-static const int8_t mishio_spr_top[] = {6,7,8,9,10,11};
+static const int8_t mishio_spr_top[] = {6,7,8,11};   // was {6,7,8,9,10,11} (user fix 2026-08-31)
 static const int8_t mishio_spr_acc[] = {21,22,23};
 static const int8_t mishio_spr_eyes[] = {31,32};
 
@@ -485,7 +504,7 @@ static const SpriteArea mishio_sprite[] = {
     {"eyes2", mishio_spr_eyes2, 3},
     {"boots", mishio_spr_boots, 3},
     {"bottom", mishio_spr_bottom, 3},
-    {"top", mishio_spr_top, 6},
+    {"top", mishio_spr_top, 4},
     {"acc", mishio_spr_acc, 3},
     {"eyes", mishio_spr_eyes, 2},
 };
@@ -765,11 +784,21 @@ static const PortraitArea unknown_portrait[] = {
 //=============================================================================
 
 #define CHAR_MAPPING(name, spr, port) \
-    {name, spr, sizeof(spr)/sizeof(spr[0]), port, sizeof(port)/sizeof(port[0])}
+    {name, spr, sizeof(spr)/sizeof(spr[0]), port, sizeof(port)/sizeof(port[0]), nullptr, 0}
+#define CHAR_MAPPING_FF(name, spr, port, ff) \
+    {name, spr, sizeof(spr)/sizeof(spr[0]), port, sizeof(port)/sizeof(port[0]), ff, sizeof(ff)/sizeof(ff[0])}
+
+// Per-character manual color-sharing fixes, ported verbatim from the .ps1
+// randomizer's "portrait specific fixes" block (Function ff: target=source*factor).
+static const FfFix akiko_ff[]   = { {14, 29, 0.75f} };                       // undershirt dark = eyeball dark
+static const FfFix minagi_ff[]  = { {9, 11, 0.80f}, {10, 9, 0.60f} };        // eyeballs get too dark otherwise
+static const FfFix mio_ff[]     = { {14, 13, 0.20f} };                       // darkest hair = eyebrows
+static const FfFix shiori_ff[]  = { {36, 8, 0.30f}, {37, 35, 1.10f} };       // hair->eyebrows, lightest eyes
+static const FfFix unknown_ff[] = { {26, 27, 0.70f}, {25, 26, 0.60f}, {24, 25, 0.50f} }; // eye fixes (cascade)
 
 static const CharacterMapping g_CharacterMappings[] = {
     CHAR_MAPPING("akane", akane_sprite, akane_portrait),
-    CHAR_MAPPING("akiko", akiko_sprite, akiko_portrait),
+    CHAR_MAPPING_FF("akiko", akiko_sprite, akiko_portrait, akiko_ff),
     CHAR_MAPPING("ayu", ayu_sprite, ayu_portrait),
     CHAR_MAPPING("doppel", doppel_sprite, doppel_portrait),
     CHAR_MAPPING("exnanase", doppel_sprite, doppel_portrait),
@@ -780,8 +809,8 @@ static const CharacterMapping g_CharacterMappings[] = {
     CHAR_MAPPING("makoto", makoto_sprite, makoto_portrait),
     CHAR_MAPPING("mai", mai_sprite, mai_portrait),
     CHAR_MAPPING("mayu", mayu_sprite, mayu_portrait),
-    CHAR_MAPPING("minagi", minagi_sprite, minagi_portrait),
-    CHAR_MAPPING("mio", mio_sprite, mio_portrait),
+    CHAR_MAPPING_FF("minagi", minagi_sprite, minagi_portrait, minagi_ff),
+    CHAR_MAPPING_FF("mio", mio_sprite, mio_portrait, mio_ff),
     CHAR_MAPPING("misaki", misaki_sprite, misaki_portrait),
     CHAR_MAPPING("mishio", mishio_sprite, mishio_portrait),
     CHAR_MAPPING("misuzu", misuzu_sprite, misuzu_portrait),
@@ -793,9 +822,9 @@ static const CharacterMapping g_CharacterMappings[] = {
     CHAR_MAPPING("rumi", rumi_sprite, rumi_portrait),
     CHAR_MAPPING("nanase", rumi_sprite, rumi_portrait),
     CHAR_MAPPING("sayuri", sayuri_sprite, sayuri_portrait),
-    CHAR_MAPPING("shiori", shiori_sprite, shiori_portrait),
-    CHAR_MAPPING("unknown", unknown_sprite, unknown_portrait),
-    CHAR_MAPPING("mizukab", unknown_sprite, unknown_portrait),
+    CHAR_MAPPING_FF("shiori", shiori_sprite, shiori_portrait, shiori_ff),
+    CHAR_MAPPING_FF("unknown", unknown_sprite, unknown_portrait, unknown_ff),
+    CHAR_MAPPING_FF("mizukab", unknown_sprite, unknown_portrait, unknown_ff),
 };
 
 static const int g_NumMappings = sizeof(g_CharacterMappings) / sizeof(g_CharacterMappings[0]);

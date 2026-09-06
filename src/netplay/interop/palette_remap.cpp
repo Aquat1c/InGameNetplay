@@ -250,6 +250,57 @@ std::size_t RemapSpriteToPortrait(const std::uint8_t* raw120,
         }
     }
 
+    // Manual color-sharing fixes (parity with the .ps1 "portrait specific
+    // fixes"): portrait[target] = portrait[source] * factor per channel, applied
+    // in order so a later fix can read an earlier one's result (matches the
+    // script's sequential ff calls). The source must be a slot the area remap
+    // produced; a target not already present is appended.
+    for (int ffIdx = 0; ffIdx < mapping->ffFixCount; ++ffIdx)
+    {
+        const FfFix& fix = mapping->ffFixes[ffIdx];
+        std::uint8_t sr = 0, sg = 0, sb = 0;
+        bool haveSource = false;
+        for (std::size_t i = 0; i < produced; ++i)
+        {
+            if (out[i].portIdx == static_cast<std::uint8_t>(fix.source))
+            {
+                sr = out[i].r; sg = out[i].g; sb = out[i].b;
+                haveSource = true;
+                break;
+            }
+        }
+        if (!haveSource)
+        {
+            continue;   // source not remapped: cannot replicate without stock
+        }
+        const float f = fix.factor;
+        const std::uint8_t nr =
+            static_cast<std::uint8_t>(ClampF(std::floor(sr * f + 0.5f), 0.0f, 255.0f));
+        const std::uint8_t ng =
+            static_cast<std::uint8_t>(ClampF(std::floor(sg * f + 0.5f), 0.0f, 255.0f));
+        const std::uint8_t nb =
+            static_cast<std::uint8_t>(ClampF(std::floor(sb * f + 0.5f), 0.0f, 255.0f));
+
+        bool wrote = false;
+        for (std::size_t i = 0; i < produced; ++i)
+        {
+            if (out[i].portIdx == static_cast<std::uint8_t>(fix.target))
+            {
+                out[i].r = nr; out[i].g = ng; out[i].b = nb;
+                wrote = true;
+                break;
+            }
+        }
+        if (!wrote && produced < cap)
+        {
+            out[produced].portIdx = static_cast<std::uint8_t>(fix.target);
+            out[produced].r = nr;
+            out[produced].g = ng;
+            out[produced].b = nb;
+            ++produced;
+        }
+    }
+
     return produced;
 }
 } // namespace netplay::interop::remap

@@ -87,6 +87,11 @@ private:
     std::uint32_t  m_lastHelloMs = 0;
     std::uint32_t  m_helloCount = 0;
     std::uint32_t  m_lastPaletteSendMs = 0;
+    // A local row changed but the send was throttled: keep it pending so the
+    // LATEST value still goes out once the interval elapses (the 60Hz poll only
+    // reports "changed" on the transition, so without this the coalesced row
+    // would never be transmitted).
+    bool           m_localRowPending = false;
 
     SendSink m_sink = nullptr;
     void*    m_sinkUser = nullptr;
