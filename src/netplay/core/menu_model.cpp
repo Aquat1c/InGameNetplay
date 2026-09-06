@@ -182,6 +182,8 @@ const char* MenuActionToString(NetplayMenuAction action)
         return "JoinEditAddress";
     case NetplayMenuAction::JoinEditPort:
         return "JoinEditPort";
+    case NetplayMenuAction::JoinSpectateIp:
+        return "JoinSpectateIp";
     case NetplayMenuAction::NicknameEdit:
         return "NicknameEdit";
     case NetplayMenuAction::PlayerRoomsOpenJoin:

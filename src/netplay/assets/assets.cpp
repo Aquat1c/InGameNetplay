@@ -54,6 +54,34 @@ struct RowRun
     int start = 0;
     int length = 0;
 };
+
+struct NetplayBackgroundChoice
+{
+    const char* period = "day";
+    const char* filename = "netplay_bgd.dat";
+    WORD hour = 0;
+    WORD minute = 0;
+};
+
+NetplayBackgroundChoice SelectLocalTimeNetplayBackground()
+{
+    constexpr WORD kDayStartHour = 9;
+    constexpr WORD kNightStartHour = 18;
+
+    SYSTEMTIME localTime = {};
+    GetLocalTime(&localTime);
+
+    const bool isDay =
+        localTime.wHour >= kDayStartHour
+        && localTime.wHour < kNightStartHour;
+
+    return {
+        isDay ? "day" : "night",
+        isDay ? "netplay_bgd.dat" : "netplay_bgn.dat",
+        localTime.wHour,
+        localTime.wMinute,
+    };
+}
 }
 
 namespace netplay::assets
@@ -111,7 +139,7 @@ std::string BuildModuleDirectory(HMODULE moduleHandle)
 // ---------------------------------------------------------------------------
 std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory)
 {
-    // Find the last path separator — that gives us the mod folder name.
+    // Find the last path separator - that gives us the mod folder name.
     const std::size_t sep = moduleDirectory.find_last_of("\\/");
     if (sep == std::string::npos || sep == 0)
     {
@@ -138,59 +166,147 @@ std::string DeriveModsRelativeDirectory(const std::string& moduleDirectory)
 
 std::string ResolveNetplayBackgroundPath(const std::string& moduleDirectory)
 {
-    mod::Log("ResolveNetplayBackgroundPath: searching for netplay_bg.dat");
-
-    // Asset filename variants to probe under each base directory.
-    const std::array<const char*, 2> assetCandidates = {
-        "assets\\netplay_bg.dat",
-        "netplay_bg.dat",
-    };
-
-    // --- Tier 1: DLL directory (GetModuleFileNameA-derived) -----------------
-    for (const char* candidate : assetCandidates)
-    {
-        const std::string path = JoinPath(moduleDirectory, candidate);
-        mod::Log("ResolveNetplayBackgroundPath: [DLL dir] probing '%s'", path.c_str());
-        if (FileExists(path))
-        {
-            mod::Log("ResolveNetplayBackgroundPath: using '%s'", path.c_str());
-            return path;
-        }
-    }
-
-    // --- Tier 2: mods\<modname>\ relative to working directory --------------
-    // Under Wine / Proton the modloader may not resolve the DLL's absolute
-    // path correctly, but the working directory is typically the game root.
+    const NetplayBackgroundChoice choice = SelectLocalTimeNetplayBackground();
+    const char* const alternatePeriod = std::strcmp(choice.period, "day") == 0
+        ? "night"
+        : "day";
+    const char* const alternateFilename = std::strcmp(choice.filename, "netplay_bgd.dat") == 0
+        ? "netplay_bgn.dat"
+        : "netplay_bgd.dat";
     const std::string modsRelDir = DeriveModsRelativeDirectory(moduleDirectory);
-    if (!modsRelDir.empty())
-    {
-        for (const char* candidate : assetCandidates)
+
+    mod::Log(
+        "ResolveNetplayBackgroundPath: local time %02u:%02u selects %s background '%s'",
+        static_cast<unsigned>(choice.hour),
+        static_cast<unsigned>(choice.minute),
+        choice.period,
+        choice.filename);
+
+    auto resolveCandidate = [&](const char* filename, const char* label) -> std::string {
+        if (filename == nullptr || filename[0] == '\0')
         {
-            const std::string path = JoinPath(modsRelDir, candidate);
-            mod::Log("ResolveNetplayBackgroundPath: [mods dir] probing '%s'", path.c_str());
+            return {};
+        }
+
+        const std::array<std::string, 2> assetCandidates = {
+            std::string("assets\\") + filename,
+            std::string(filename),
+        };
+
+        for (const std::string& candidate : assetCandidates)
+        {
+            const std::string path = JoinPath(moduleDirectory, candidate.c_str());
+            mod::Log(
+                "ResolveNetplayBackgroundPath: [%s][DLL dir] probing '%s'",
+                label,
+                path.c_str());
             if (FileExists(path))
             {
-                mod::Log("ResolveNetplayBackgroundPath: using '%s'", path.c_str());
+                mod::Log(
+                    "ResolveNetplayBackgroundPath: using '%s' for %s background",
+                    path.c_str(),
+                    label);
                 return path;
             }
         }
-    }
 
-    // --- Tier 3: working-directory loose file -------------------------------
-    if (FileExists("netplay_bg.dat"))
+        if (!modsRelDir.empty())
+        {
+            for (const std::string& candidate : assetCandidates)
+            {
+                const std::string path = JoinPath(modsRelDir, candidate.c_str());
+                mod::Log(
+                    "ResolveNetplayBackgroundPath: [%s][mods dir] probing '%s'",
+                    label,
+                    path.c_str());
+                if (FileExists(path))
+                {
+                    mod::Log(
+                        "ResolveNetplayBackgroundPath: using '%s' for %s background",
+                        path.c_str(),
+                        label);
+                    return path;
+                }
+            }
+        }
+
+        if (FileExists(filename))
+        {
+            mod::Log(
+                "ResolveNetplayBackgroundPath: using loose file '%s' for %s background",
+                filename,
+                label);
+            return filename;
+        }
+
+        const std::string systemCandidate = std::string("system\\") + filename;
+        if (FileExists(systemCandidate))
+        {
+            mod::Log(
+                "ResolveNetplayBackgroundPath: using system file '%s' for %s background",
+                systemCandidate.c_str(),
+                label);
+            return systemCandidate;
+        }
+
+        mod::Log(
+            "ResolveNetplayBackgroundPath: no %s background candidate found for '%s'",
+            label,
+            filename);
+        return {};
+    };
+
+    const std::string scheduledPath = resolveCandidate(choice.filename, choice.period);
+    const std::string alternatePath = resolveCandidate(alternateFilename, alternatePeriod);
+
+    if (!scheduledPath.empty() && !alternatePath.empty())
     {
-        mod::Log("ResolveNetplayBackgroundPath: fallback working-directory file 'netplay_bg.dat'");
-        return "netplay_bg.dat";
+        mod::Log(
+            "ResolveNetplayBackgroundPath: using scheduled %s background because both day/night variants are available",
+            choice.period);
+        return scheduledPath;
     }
 
-    // --- Tier 4: system\ directory (user manually placed the file) ----------
-    if (FileExists("system\\netplay_bg.dat"))
+    if (!scheduledPath.empty())
     {
-        mod::Log("ResolveNetplayBackgroundPath: fallback system dir 'system\\netplay_bg.dat'");
-        return "system\\netplay_bg.dat";
+        mod::Log(
+            "ResolveNetplayBackgroundPath: only %s variant is available, using '%s'",
+            choice.period,
+            scheduledPath.c_str());
+        return scheduledPath;
     }
 
-    mod::Log("ResolveNetplayBackgroundPath: no candidate found");
+    if (!alternatePath.empty())
+    {
+        mod::Log(
+            "ResolveNetplayBackgroundPath: scheduled %s variant missing, using available %s background '%s'",
+            choice.period,
+            alternatePeriod,
+            alternatePath.c_str());
+        return alternatePath;
+    }
+
+    const std::string genericPath = resolveCandidate("netplay_bg.dat", "generic");
+    if (!genericPath.empty())
+    {
+        mod::Log(
+            "ResolveNetplayBackgroundPath: falling back to generic netplay background '%s'",
+            genericPath.c_str());
+        return genericPath;
+    }
+
+    const char* const vanillaConfigPath = "system\\config_bg.dat";
+    if (FileExists(vanillaConfigPath))
+    {
+        mod::Log(
+            "ResolveNetplayBackgroundPath: falling back to vanilla background '%s'",
+            vanillaConfigPath);
+        return vanillaConfigPath;
+    }
+
+    mod::Log(
+        "ResolveNetplayBackgroundPath: no custom background found and vanilla fallback '%s' is missing",
+        vanillaConfigPath);
     return {};
 }
 
@@ -273,7 +389,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] FOUND — using base '%s'", moduleDirectory.c_str());
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] FOUND - using base '%s'", moduleDirectory.c_str());
             return moduleDirectory;
         }
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 1 DLL dir] not found");
@@ -295,7 +411,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] FOUND — using base '%s'", absoluteModsDir.c_str());
+            mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] FOUND - using base '%s'", absoluteModsDir.c_str());
             return absoluteModsDir;
         }
         mod::Log("ResolveNetplayBgmBaseDirectory: [Tier 2 mods dir] not found");
@@ -319,7 +435,7 @@ std::string ResolveNetplayBgmBaseDirectory(const std::string& moduleDirectory)
         if (FileExists(path))
         {
             mod::Log(
-                "ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] FOUND — using base '%s'",
+                "ResolveNetplayBgmBaseDirectory: [Tier 3 well-known] FOUND - using base '%s'",
                 absoluteWellKnownDir.c_str());
             return absoluteWellKnownDir;
         }
@@ -387,7 +503,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
     // This allows mods to replace the vanilla title menu sprite sheet.
 
     // --- Tier 1: DLL directory (e.g. mods\efz_netplay_mod\system\title_ob.dat)
-    // Skip when moduleDirectory is "." — under Wine / Proton the DLL path
+    // Skip when moduleDirectory is "." - under Wine / Proton the DLL path
     // is often unresolvable, leaving moduleDirectory as ".".  Probing
     // ".\system\title_ob.dat" would falsely match the *vanilla* file and
     // prevent the real mod override from being found.
@@ -397,14 +513,14 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] FOUND — using '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] FOUND - using '%s'", path.c_str());
             return path;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] not found");
     }
     else
     {
-        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.' — Wine/Proton fallback to avoid vanilla false positive)");
+        mod::Log("ResolveTitleObjectsPath: [Tier 1 DLL dir] SKIPPED (moduleDirectory is '.' - Wine/Proton fallback to avoid vanilla false positive)");
     }
 
     // --- Tier 2: mods\<modname>\ relative to working directory
@@ -415,7 +531,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] probing '%s'", path.c_str());
         if (FileExists(path))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] FOUND — using '%s'", path.c_str());
+            mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] FOUND - using '%s'", path.c_str());
             return path;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 2 mods dir] not found");
@@ -435,7 +551,7 @@ std::string ResolveTitleObjectsPath(const std::string& moduleDirectory)
         mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] probing '%s'", wellKnownPath);
         if (FileExists(wellKnownPath))
         {
-            mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] FOUND — using '%s'", wellKnownPath);
+            mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] FOUND - using '%s'", wellKnownPath);
             return wellKnownPath;
         }
         mod::Log("ResolveTitleObjectsPath: [Tier 3 well-known] not found");

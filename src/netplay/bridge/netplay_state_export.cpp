@@ -1,5 +1,5 @@
 // ===========================================================================
-// EFZ Netplay State Export — Implementation
+// EFZ Netplay State Export - Implementation
 // ===========================================================================
 //
 // Creates a named shared memory block ("EFZNetplay_State") and populates it
@@ -9,16 +9,20 @@
 // can use GetProcAddress instead of shared memory if preferred.
 //
 // This module is intentionally self-contained.  It reads the fields it needs
-// from the bridge status struct and raw EFZ game memory — no changes to
+// from the bridge status struct and raw EFZ game memory - no changes to
 // existing game logic or hook flow are required.
 // ===========================================================================
 #include "netplay/bridge/netplay_state_export.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <thread>
 
 #include "efz_netplay_state.h"
+#include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
@@ -30,6 +34,71 @@
 namespace netplay::bridge::state_export
 {
 
+void UpdateNow(const NetbridgeStatus& status);
+
+namespace
+{
+bool FormatConnectionEndpoint(
+    const NetbridgeStatus& status,
+    char* output,
+    size_t outputSize)
+{
+    if (output == nullptr || outputSize == 0)
+    {
+        return false;
+    }
+    output[0] = '\0';
+
+    // SessionBridge normalizes numeric addresses before storing them in
+    // NetbridgeStatus. Keep this export path allocation-free: it also runs
+    // from the gameplay export pulse, where address parsing or heap work
+    // would add avoidable timing work.
+    const size_t addressLength = std::strlen(status.address);
+    const bool ipv6 = std::strchr(status.address, ':') != nullptr;
+    char portText[6] = {};
+    const int portLength = std::snprintf(
+        portText,
+        sizeof(portText),
+        "%u",
+        static_cast<unsigned>(status.port));
+    if (portLength <= 0)
+    {
+        return false;
+    }
+
+    const size_t required =
+        addressLength
+        + static_cast<size_t>(portLength)
+        + 1 // ':'
+        + (ipv6 ? 2 : 0) // '[' and ']'
+        + 1; // NUL
+    if (required > outputSize)
+    {
+        return false;
+    }
+
+    char* cursor = output;
+    if (ipv6)
+    {
+        *cursor++ = '[';
+    }
+    std::memcpy(cursor, status.address, addressLength);
+    cursor += addressLength;
+    if (ipv6)
+    {
+        *cursor++ = ']';
+    }
+    *cursor++ = ':';
+    std::memcpy(
+        cursor,
+        portText,
+        static_cast<size_t>(portLength));
+    cursor += portLength;
+    *cursor = '\0';
+    return true;
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Module-local state
 // ---------------------------------------------------------------------------
@@ -38,6 +107,17 @@ namespace
 HANDLE g_shmHandle = nullptr;
 EFZNetplayState* g_shmView = nullptr;
 EFZNetplayState g_localCopy = {};   // returned via DLL export
+std::thread g_updateWorker;
+HANDLE g_updateEvent = nullptr;
+CRITICAL_SECTION g_updateRequestLock = {};
+bool g_updateRequestLockInitialized = false;
+NetbridgeStatus g_pendingStatus = {};
+volatile LONG g_updateRequestPending = 0;
+volatile LONG g_updateWorkerStop = 0;
+volatile LONG g_updateWorkerReady = 0;
+volatile LONG g_updatePublishDropped = 0;
+volatile LONG g_updateInFlight = 0;
+volatile LONG g_updatesSuspended = 0;
 
 // Previous-tick flag values for transition logging.
 uint8_t g_prevInNetplayMenu = 0;
@@ -55,7 +135,7 @@ uint32_t g_stateSeq = 0;
 uint32_t g_sessionId = 0;
 uint32_t g_setId = 0;
 
-// Latched end reason — persists until next session starts.
+// Latched end reason - persists until next session starts.
 uint8_t g_latchedEndReason = EFZ_END_NONE;
 
 // Last tick (GetTickCount) at which Update() completed a write.
@@ -99,6 +179,111 @@ static bool g_pingBaselineLocked = false;
 static uint32_t g_pingDriftWarnings = 0; // limit log spam
 static uint32_t g_lastPingDriftLogSeq = 0;
 
+void ExportWorkerMain()
+{
+    mod::Log("StateExport: async worker started");
+
+    while (g_updateEvent != nullptr)
+    {
+        const DWORD waitResult = WaitForSingleObject(g_updateEvent, INFINITE);
+        if (waitResult != WAIT_OBJECT_0)
+        {
+            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            {
+                break;
+            }
+            continue;
+        }
+
+        if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+        {
+            break;
+        }
+
+        for (;;)
+        {
+            // Bracket request consumption as well as UpdateNow so the online
+            // handoff can prove that no worker can begin a live-memory walk
+            // after its suspension barrier returns.
+            InterlockedIncrement(&g_updateInFlight);
+            if (InterlockedExchange(&g_updateRequestPending, 0) == 0)
+            {
+                InterlockedDecrement(&g_updateInFlight);
+                break;
+            }
+
+            if (!g_updateRequestLockInitialized)
+            {
+                InterlockedDecrement(&g_updateInFlight);
+                break;
+            }
+
+            NetbridgeStatus snapshot = {};
+            EnterCriticalSection(&g_updateRequestLock);
+            snapshot = g_pendingStatus;
+            LeaveCriticalSection(&g_updateRequestLock);
+
+            UpdateNow(snapshot);
+            InterlockedDecrement(&g_updateInFlight);
+
+            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            {
+                break;
+            }
+        }
+    }
+
+    mod::Log("StateExport: async worker stopped");
+}
+
+void QueueUpdate(const NetbridgeStatus& status)
+{
+    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    {
+        return;
+    }
+    InterlockedIncrement(&g_updateInFlight);
+    // Close the check/increment race with suspension. A producer that loses
+    // this second check publishes nothing; one that wins is visible to the
+    // barrier through g_updateInFlight until its request is complete.
+    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    {
+        InterlockedDecrement(&g_updateInFlight);
+        return;
+    }
+    if (InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) == 0
+        || g_updateEvent == nullptr
+        || !g_updateRequestLockInitialized)
+    {
+        UpdateNow(status);
+        InterlockedDecrement(&g_updateInFlight);
+        return;
+    }
+
+    if (!TryEnterCriticalSection(&g_updateRequestLock))
+    {
+        const LONG dropCount = InterlockedIncrement(&g_updatePublishDropped);
+        if (dropCount <= 10 || (dropCount % 300) == 0)
+        {
+            MOD_LIFECYCLE_TRACE(
+                "StateExport: async queue skipped due contention dropCount=%ld",
+                static_cast<long>(dropCount));
+        }
+        InterlockedDecrement(&g_updateInFlight);
+        return;
+    }
+
+    g_pendingStatus = status;
+    // Publish the request while still owning the lock. The online-suspension
+    // barrier crosses this same lock, so no producer can expose a late pending
+    // bit after the barrier has already observed an idle worker.
+    InterlockedExchange(&g_updateRequestPending, 1);
+    LeaveCriticalSection(&g_updateRequestLock);
+    InterlockedDecrement(&g_updateInFlight);
+
+    (void)SetEvent(g_updateEvent);
+}
+
 // Previous-tick charselect context for change detection.
 uint8_t g_prevP1CharId = 0xFF;
 uint8_t g_prevP2CharId = 0xFF;
@@ -114,7 +299,7 @@ constexpr uint32_t kGameSystemOffsetMatchCtr = 4952;
 // Character-select screen object offsets.
 constexpr uint32_t kCharSelectP1CharId = 1340;
 constexpr uint32_t kCharSelectP2CharId = 1341;
-constexpr uint32_t kCharSelectP1Timer  = 1344;  // uint16_t — non-zero = locked
+constexpr uint32_t kCharSelectP1Timer  = 1344;  // uint16_t - non-zero = locked
 constexpr uint32_t kCharSelectP2Timer  = 1346;
 constexpr uint32_t kCharSelectP1GridCol = 1336;
 constexpr uint32_t kCharSelectP1GridRow = 1338;
@@ -124,7 +309,7 @@ constexpr uint32_t kCharSelectGridMap   = 1209;  // charId = gridMap[row*3 + col
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Helpers — read game state from EFZ game memory (same process)
+// Helpers - read game state from EFZ game memory (same process)
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -175,7 +360,7 @@ static void ReadScores(int32_t& p1Wins, int32_t& p2Wins, int32_t& matchCtr)
     if (gameSys == 0)
         return;
 
-    // EFZ.exe does NOT have win counters — only Revival does.
+    // EFZ.exe does NOT have win counters - only Revival does.
     // We only read the match counter (round counter) from the game system.
     __try
     {
@@ -185,6 +370,22 @@ static void ReadScores(int32_t& p1Wins, int32_t& p2Wins, int32_t& matchCtr)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         matchCtr = 0;
+    }
+}
+
+// Log label for g_netplayRole.  Printed as text because the value clashes
+// with Revival's native J role global (dll+0x14EC40), where 1 means
+// spectate rather than host, and bridge-layer logs use that convention.
+static const char* NetplayRoleName(int netplayRole)
+{
+    using namespace netplay::bridge::takeover;
+    switch (netplayRole)
+    {
+    case kNetplayRoleNone:      return "none";
+    case kNetplayRoleHost:      return "host";
+    case kNetplayRoleClient:    return "client";
+    case kNetplayRoleSpectator: return "spectator";
+    default:                    return "unknown";
     }
 }
 
@@ -225,7 +426,7 @@ static int32_t ResolveSessionMode(int netplayRole, int localRoleFlag, int bridge
 }
 
 // Map local side.  Prefer the session object's activePlayer field (0=P1,
-// 1=P2) when available — it reflects the actual assignment after init.
+// 1=P2) when available - it reflects the actual assignment after init.
 // Fall back to role-based inference (host=P1, client=P2) during connecting.
 static int32_t ResolveLocalSide(int netplayRole, int activePlayer)
 {
@@ -420,6 +621,13 @@ void Initialize()
     init.localSide = -1;
     init.pingMs = -1;
     init.rollbackFrames = -1;
+    // v7 extended network metrics default to "unavailable".
+    init.avgPingMs = -1;
+    init.minPingMs = -1;
+    init.maxPingMs = -1;
+    init.recommendedDelay = -1;
+    init.minDelay = -1;
+    init.maxDelay = -1;
 
     if (g_shmView != nullptr)
     {
@@ -427,13 +635,64 @@ void Initialize()
     }
     g_localCopy = init;
 
-    mod::Log("StateExport: initialized (shm=%s, view=%p)",
+    InitializeCriticalSection(&g_updateRequestLock);
+    g_updateRequestLockInitialized = true;
+    g_pendingStatus = {};
+    InterlockedExchange(&g_updateRequestPending, 0);
+    InterlockedExchange(&g_updateWorkerStop, 0);
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updatePublishDropped, 0);
+    InterlockedExchange(&g_updateInFlight, 0);
+    InterlockedExchange(&g_updatesSuspended, 0);
+
+    g_updateEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (g_updateEvent != nullptr)
+    {
+        try
+        {
+            g_updateWorker = std::thread(ExportWorkerMain);
+            InterlockedExchange(&g_updateWorkerReady, 1);
+        }
+        catch (...)
+        {
+            CloseHandle(g_updateEvent);
+            g_updateEvent = nullptr;
+        }
+    }
+
+    mod::Log("StateExport: initialized (shm=%s, view=%p, async=%d)",
              g_shmHandle != nullptr ? "ok" : "FAIL",
-             static_cast<void*>(g_shmView));
+             static_cast<void*>(g_shmView),
+             InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) != 0 ? 1 : 0);
 }
 
 void Shutdown()
 {
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updateWorkerStop, 1);
+    if (g_updateEvent != nullptr)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+    if (g_updateWorker.joinable())
+    {
+        g_updateWorker.join();
+    }
+    if (g_updateEvent != nullptr)
+    {
+        CloseHandle(g_updateEvent);
+        g_updateEvent = nullptr;
+    }
+    InterlockedExchange(&g_updateRequestPending, 0);
+    InterlockedExchange(&g_updatePublishDropped, 0);
+    InterlockedExchange(&g_updatesSuspended, 1);
+    g_pendingStatus = {};
+    if (g_updateRequestLockInitialized)
+    {
+        DeleteCriticalSection(&g_updateRequestLock);
+        g_updateRequestLockInitialized = false;
+    }
+
     if (g_shmView != nullptr)
     {
         // Clear the magic so consumers know the data is stale.
@@ -451,7 +710,25 @@ void Shutdown()
     mod::Log("StateExport: shutdown");
 }
 
-void Update(const NetbridgeStatus& status)
+void EmergencyShutdown()
+{
+    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updateWorkerStop, 1);
+    if (g_updateEvent != nullptr)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+    if (g_updateWorker.joinable())
+    {
+        // DLL_PROCESS_DETACH(process termination) cannot wait for thread/CRT
+        // teardown while the loader lock is held.  Detaching prevents the
+        // static std::thread destructor from calling std::terminate; the OS is
+        // already reclaiming the process and all kernel objects.
+        g_updateWorker.detach();
+    }
+}
+
+void UpdateNow(const NetbridgeStatus& status)
 {
     // --- Timing guard: detect when Update() itself takes too long ----------
     LARGE_INTEGER updateQpcStart = {};
@@ -480,7 +757,7 @@ void Update(const NetbridgeStatus& status)
             if (elapsed > kExportStallWarningMs)
             {
                 mod::Log(
-                    "StateExport: STALL detected — %u ms since last update "
+                    "StateExport: STALL detected - %u ms since last update "
                     "(seq=%u phase=%d)",
                     static_cast<unsigned>(elapsed),
                     g_stateSeq,
@@ -498,14 +775,18 @@ void Update(const NetbridgeStatus& status)
     s.sessionPhase = status.phase;
     s.localSide = ResolveLocalSide(takeover::g_netplayRole, status.activePlayer);
 
-    // Detect session start: phase transitions from Idle to Connecting.
+    // Detect session start.  Retries normally begin from Failed or
+    // SessionEnded rather than returning through Idle, so restricting this
+    // to Idle -> Connecting re-used sessionId and stale score/name latches.
     {
         const auto curPhase = static_cast<NetbridgePhase>(status.phase);
         const auto prevPhase = static_cast<NetbridgePhase>(g_prevBridgePhase);
 
         // New session?
-        if (curPhase == NetbridgePhase::Connecting &&
-            prevPhase == NetbridgePhase::Idle)
+        if (curPhase == NetbridgePhase::Connecting
+            && (prevPhase == NetbridgePhase::Idle
+                || prevPhase == NetbridgePhase::Failed
+                || prevPhase == NetbridgePhase::SessionEnded))
         {
             ++g_sessionId;
             g_latchedEndReason = EFZ_END_NONE;
@@ -538,13 +819,13 @@ void Update(const NetbridgeStatus& status)
     s.sessionId = g_sessionId;
     s.endReason = g_latchedEndReason;
 
-    // Capability bits — filled in as each group is populated.
+    // Capability bits - filled in as each group is populated.
     uint32_t caps = 0;
 
     // Session identity is always available.
     caps |= EFZ_CAP_SESSION;
 
-    // Scores — Revival session is the sole authority for win counts.
+    // Scores - Revival session is the sole authority for win counts.
     // EFZ.exe does NOT track wins at all; only the Revival DLL does,
     // via the session object at the version-specific offsets.
     //
@@ -581,7 +862,7 @@ void Update(const NetbridgeStatus& status)
             s.p2Wins = liveP2;
         }
     }
-    if (s.p1Wins != 0 || s.p2Wins != 0 || s.matchCounter != 0)
+    if (status.sessionScoresValid != 0)
         caps |= EFZ_CAP_SCORES;
 
     // Detect set transition: scores reset to 0-0 from non-zero.
@@ -604,11 +885,11 @@ void Update(const NetbridgeStatus& status)
     g_prevP2Wins = s.p2Wins;
     s.setId = g_setId;
 
-    // Nicknames — copy from bridge status
+    // Nicknames - copy from bridge status
     std::memcpy(s.localNickname, status.nickname, sizeof(s.localNickname));
     std::memcpy(s.p1Name, status.p1Name, sizeof(s.p1Name));
     std::memcpy(s.p2Name, status.p2Name, sizeof(s.p2Name));
-    if (s.localNickname[0] != '\0' || s.p1Name[0] != '\0' || s.p2Name[0] != '\0')
+    if (status.sessionNamesValid != 0 || s.localNickname[0] != '\0')
         caps |= EFZ_CAP_NICKNAMES;
 
     // Log when any nickname changes.
@@ -722,7 +1003,7 @@ void Update(const NetbridgeStatus& status)
     if (s.inNetplayMenu && screenIdx != 0)
     {
         mod::Log(
-            "StateExport: reconcile — inNetplayMenu=1 but screenIdx=%u, clearing",
+            "StateExport: reconcile - inNetplayMenu=1 but screenIdx=%u, clearing",
             static_cast<unsigned>(screenIdx));
         s.inNetplayMenu = 0;
         s.netplayMenuScreen = 0;
@@ -746,7 +1027,7 @@ void Update(const NetbridgeStatus& status)
             caps |= EFZ_CAP_REVIVAL;
     }
 
-    // Game-flow flags (v3) — mutually exclusive with inNetplayMenu.
+    // Game-flow flags (v3) - mutually exclusive with inNetplayMenu.
     // When g_returnToNetplayAfterMatch is true we are inside an online
     // session flow (charselect → loading → match).  The EFZ screen index
     // tells us exactly which phase we are in:
@@ -874,9 +1155,82 @@ void Update(const NetbridgeStatus& status)
         }
     }
 
+    // --- Async hosting (v7) ------------------------------------------------
+    {
+        namespace ah = netplay::bridge::async_host;
+        const bool active = ah::IsActive();
+        s.asyncHostActive = active ? 1 : 0;
+        s.asyncHostMinimized = ah::IsMinimized() ? 1 : 0;
+        s.asyncHostPeerFound = ah::IsPeerFoundHeld() ? 1 : 0;
+        s.asyncHostTimedOut = ah::IsTimedOut() ? 1 : 0;
+        s.hostPort = active ? ah::HostPort() : 0;
+        if (active)
+        {
+            caps |= EFZ_CAP_ASYNC_HOST;
+            // Surface background hosting as HOST_IDLE + HOSTING so consumers know
+            // netplay is engaged (but NOT a live match) while the local player
+            // uses EFZ normally. Only override when not already in a live netplay
+            // match / charselect / menu flow.
+            if (ah::IsMinimized()
+                && !s.inNetplayMatch
+                && !s.inNetplayCharacterSelect
+                && !s.inNetplayMenu)
+            {
+                s.activityPhase = EFZ_ACTIVITY_HOST_IDLE;
+                s.sessionMode = EFZ_SESSION_HOSTING;
+                caps |= EFZ_CAP_ACTIVITY | EFZ_CAP_SESSION;
+            }
+        }
+    }
+
+    // --- Extended network metrics (v7) -------------------------------------
+    {
+        const DelayPromptMetrics m = netplay::bridge::GetDelayPromptMetrics();
+        s.avgPingMs = m.averagePingMs;
+        s.minPingMs = m.minPingMs;
+        s.maxPingMs = m.maxPingMs;
+        s.recommendedDelay = m.recommendedDelay;
+        s.minDelay = m.minDelay;
+        s.maxDelay = m.maxDelay;
+        if (m.serial != 0 && (m.averagePingMs >= 0 || m.recommendedDelay >= 0))
+        {
+            caps |= EFZ_CAP_NET_DETAIL;
+        }
+    }
+
+    // --- Connection endpoint (v7) ------------------------------------------
+    s.connectionAddress[0] = '\0';
+    if (status.address[0] != '\0')
+    {
+        bool connectionAddressComplete = false;
+        if (status.port != 0)
+        {
+            connectionAddressComplete = FormatConnectionEndpoint(
+                status,
+                s.connectionAddress,
+                sizeof(s.connectionAddress));
+        }
+        else
+        {
+            const size_t rawLength = std::strlen(status.address);
+            if (rawLength < sizeof(s.connectionAddress))
+            {
+                std::memcpy(
+                    s.connectionAddress,
+                    status.address,
+                    rawLength + 1);
+                connectionAddressComplete = true;
+            }
+        }
+        if (connectionAddressComplete)
+        {
+            caps |= EFZ_CAP_CONNECTION;
+        }
+    }
+
     s.capabilityFlags = caps;
 
-    // Transition logging (v3 + v4) — log when flags or activity phase change.
+    // Transition logging (v3 + v4) - log when flags or activity phase change.
     {
         if (s.inNetplayMenu != g_prevInNetplayMenu
             || s.inNetplayCharacterSelect != g_prevInNetplayCharacterSelect
@@ -884,7 +1238,7 @@ void Update(const NetbridgeStatus& status)
         {
             mod::Log(
                 "StateExport: flow menu=%u->%u charsel=%u->%u match=%u->%u "
-                "screen=%u mode=%d phase=%d role=%d p1Wins=%d p2Wins=%d",
+                "screen=%u mode=%d phase=%d netRole=%s p1Wins=%d p2Wins=%d",
                 static_cast<unsigned>(g_prevInNetplayMenu),
                 static_cast<unsigned>(s.inNetplayMenu),
                 static_cast<unsigned>(g_prevInNetplayCharacterSelect),
@@ -894,7 +1248,7 @@ void Update(const NetbridgeStatus& status)
                 static_cast<unsigned>(screenIdx),
                 s.sessionMode,
                 s.sessionPhase,
-                takeover::g_netplayRole,
+                NetplayRoleName(takeover::g_netplayRole),
                 s.p1Wins,
                 s.p2Wins);
             g_prevInNetplayMenu = s.inNetplayMenu;
@@ -905,14 +1259,14 @@ void Update(const NetbridgeStatus& status)
         if (s.activityPhase != g_prevActivityPhase)
         {
             mod::Log(
-                "StateExport: activity %u->%u screen=%u mode=%d phase=%d role=%d side=%d "
+                "StateExport: activity %u->%u screen=%u mode=%d phase=%d netRole=%s side=%d "
                 "p1='%s' p2='%s' caps=0x%X sessionId=%u setId=%u seq=%u",
                 static_cast<unsigned>(g_prevActivityPhase),
                 static_cast<unsigned>(s.activityPhase),
                 static_cast<unsigned>(screenIdx),
                 s.sessionMode,
                 s.sessionPhase,
-                takeover::g_netplayRole,
+                NetplayRoleName(takeover::g_netplayRole),
                 s.localSide,
                 s.p1Name,
                 s.p2Name,
@@ -947,14 +1301,16 @@ void Update(const NetbridgeStatus& status)
         }
     }
 
-    // Periodic heartbeat — every 600 ticks (~10s at 60fps) and on the very
-    // first tick — dump all key fields so we can verify the export without
-    // needing a phase transition to trigger the transition logs.
+    // Periodic heartbeat - every 600 ticks (~10s at 60fps) and on the very
+    // first tick - dump all key fields so we can verify the export without
+    // needing a phase transition to trigger the transition logs.  Trace builds
+    // only: this dumps player nicknames and internal state every ~10s, which a
+    // release build must not emit.
     if (g_stateSeq == 1 || (g_stateSeq % 600) == 0)
     {
-        mod::Log(
+        MOD_LIFECYCLE_TRACE(
             "StateExport: heartbeat seq=%u activity=%u menu=%u screen=%u "
-            "mode=%d phase=%d role=%d side=%d "
+            "mode=%d phase=%d netRole=%s side=%d "
             "p1Wins=%d p2Wins=%d ping=%d delay=%d "
             "local='%s' p1='%s' p2='%s' revival='%s' "
             "caps=0x%X sessionId=%u setId=%u endReason=%u",
@@ -964,7 +1320,7 @@ void Update(const NetbridgeStatus& status)
             static_cast<unsigned>(screenIdx),
             s.sessionMode,
             s.sessionPhase,
-            takeover::g_netplayRole,
+            NetplayRoleName(takeover::g_netplayRole),
             s.localSide,
             s.p1Wins,
             s.p2Wins,
@@ -1004,11 +1360,73 @@ void Update(const NetbridgeStatus& status)
             {
                 mod::Log(
                     "PERF_WARN: StateExport::Update took %.2fms "
-                    "(slowCount=%u seq=%u) — export path is slow",
+                    "(slowCount=%u seq=%u) - export path is slow",
                     elapsedMs, s_updateSlowCount, s.stateSeq);
             }
         }
     }
+}
+
+void Update(const NetbridgeStatus& status)
+{
+    QueueUpdate(status);
+}
+
+bool SuspendForOnlineSimulation()
+{
+    // Stop new producers, then cross the request lock once. A producer that
+    // observed the old state either finishes publishing its request before
+    // this lock handoff or fails its non-blocking lock attempt. The worker is
+    // still allowed to drain requests accepted before suspension.
+    InterlockedExchange(&g_updatesSuspended, 1);
+    if (g_updateRequestLockInitialized)
+    {
+        EnterCriticalSection(&g_updateRequestLock);
+        LeaveCriticalSection(&g_updateRequestLock);
+    }
+    if (g_updateEvent != nullptr
+        && InterlockedCompareExchange(&g_updateRequestPending, 0, 0) != 0)
+    {
+        (void)SetEvent(g_updateEvent);
+    }
+
+    const DWORD startTick = GetTickCount();
+    for (;;)
+    {
+        // Read the two-phase worker state twice. A single split observation
+        // can see inFlight=0 before the worker increments and pending=0 after
+        // it consumes the request, falsely returning during UpdateNow.
+        const LONG inFlightBefore =
+            InterlockedCompareExchange(&g_updateInFlight, 0, 0);
+        const LONG pendingBefore =
+            InterlockedCompareExchange(&g_updateRequestPending, 0, 0);
+        const LONG inFlightAfter =
+            InterlockedCompareExchange(&g_updateInFlight, 0, 0);
+        const LONG pendingAfter =
+            InterlockedCompareExchange(&g_updateRequestPending, 0, 0);
+        if (inFlightBefore == 0
+            && pendingBefore == 0
+            && inFlightAfter == 0
+            && pendingAfter == 0)
+        {
+            break;
+        }
+
+        if (GetTickCount() - startTick >= 2000u)
+        {
+            mod::Log(
+                "StateExport: online suspension timed out with worker in flight");
+            return false;
+        }
+        Sleep(0);
+    }
+
+    return true;
+}
+
+void ResumeControlPlaneUpdates()
+{
+    InterlockedExchange(&g_updatesSuspended, 0);
 }
 
 const EFZNetplayState* GetExportedState()

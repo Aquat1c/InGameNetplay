@@ -1,7 +1,14 @@
 // Session lifecycle: host/join/spectate management, tick loop, cancel, delay.
 // Internal helpers live in sister .cpp files; see takeover_internal.h.
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/external_launcher_guard.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
+#include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/options_menu.h"
 
@@ -9,6 +16,7 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -16,31 +24,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <windows.h>
 
-extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
-    LPCSTR,
-    DWORD,
-    DWORD,
-    LPSECURITY_ATTRIBUTES,
-    DWORD,
-    DWORD,
-    HANDLE);
-extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
-    LPCWSTR,
-    DWORD,
-    DWORD,
-    LPSECURITY_ATTRIBUTES,
-    DWORD,
-    DWORD,
-    HANDLE);
-extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(
-    HANDLE,
-    LPCVOID,
-    DWORD,
-    LPDWORD,
-    LPOVERLAPPED);
 extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_RequestPeerQuitBroadcast(
     LPVOID);
 
@@ -61,9 +48,20 @@ enum class RevivalProfileSource : uint8_t
     Default = 0,
     DllTimestamp,
     PublishedHostTimestamp,
+    ExternalLauncherGuard,
 };
 
 RevivalProfileSource g_activeRevivalSource = RevivalProfileSource::Default;
+
+bool ShouldCancelToIdle(const char* reason)
+{
+    return reason != nullptr
+        && (std::strcmp(reason, "user_cancel") == 0
+            || std::strcmp(reason, "leave_menu") == 0
+            || std::strcmp(reason, "external_cancel") == 0
+            || std::strcmp(reason, "dismissed_error") == 0
+            || std::strcmp(reason, "no_overlay_session_ended") == 0);
+}
 
 const char* RevivalProfileSourceToString(RevivalProfileSource source)
 {
@@ -73,17 +71,63 @@ const char* RevivalProfileSourceToString(RevivalProfileSource source)
         return "dll_timestamp";
     case RevivalProfileSource::PublishedHostTimestamp:
         return "published_host_timestamp";
+    case RevivalProfileSource::ExternalLauncherGuard:
+        return "external_launcher_guard";
     case RevivalProfileSource::Default:
     default:
         return "default";
     }
 }
+
+bool IsActiveRevival102jProfile()
+{
+    return g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
+}
 } // namespace
+
+const char* RevivalWireName(const char* legacyName)
+{
+    if (legacyName == nullptr || !IsActiveRevival102jProfile())
+    {
+        return legacyName;
+    }
+
+    struct WireNamePair
+    {
+        const char* legacy;
+        const char* revival102j;
+    };
+    static const WireNamePair kWireNames[] = {
+        {"Init",      "Init_Spec"},
+        {"Net",       "Net_Spec"},
+        {"Sync",      "Sync_Spec"},
+        {"Quit",      "Quit_Spec"},
+        {"LoadMatch", "LoadMatch_Spec"},
+        {"InputP1",   "InputP1_Spec"},
+        {"InputP2",   "InputP2_Spec"},
+        {"PaletteP1", "PaletteP1_Spec"},
+        {"PaletteP2", "PaletteP2_Spec"},
+    };
+
+    for (const auto& candidate : kWireNames)
+    {
+        if (std::strcmp(legacyName, candidate.legacy) == 0)
+        {
+            return candidate.revival102j;
+        }
+    }
+    return legacyName;
+}
 
 HMODULE g_localRevivalModule = nullptr;
 RevivalInitFn g_localInitFn = nullptr;
 HANDLE g_revivalProcess = nullptr;
 DWORD g_revivalProcessId = 0;
+PeerProcessOwnership g_peerProcessOwnership = PeerProcessOwnership::None;
+revival_launch::LaunchDisposition g_launchDisposition =
+    revival_launch::LaunchDisposition::DirectGameHost;
 int g_localRoleFlag = -1;
 int g_netplayRole = kNetplayRoleNone;
 uintptr_t g_hostRevivalBase = 0;
@@ -108,7 +152,6 @@ volatile LONG g_injectedTerminateUnknownPidHits = 0;
 volatile LONG g_injectedDelayPromptSerial = 0;
 volatile LONG g_injectedDelayPromptServedSerial = 0;
 volatile LONG g_injectedConnectedFromDelayPromptSerial = 0;
-DWORD g_injectedDelayPromptWaitStartTick = 0;
 volatile LONG g_injectedSpectateConfirmPromptSerial = 0;
 volatile LONG g_injectedSpectateConfirmPromptServedSerial = 0;
 DWORD g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -118,6 +161,11 @@ bool g_injectedLazyBound = false;
 volatile LONG g_injectedLazyBootstrapState = 0;
 volatile LONG g_remoteThreadCallIndex = 0;
 volatile LONG g_startAbortRequested = 0;
+// Successful explicit Quit sends are coalesced per helper process. Character
+// select and Quit-ring recovery can observe the same local exit on adjacent
+// frames; the remote peer must receive one native MessageQuit, not a burst.
+static volatile LONG g_peerQuitBroadcastHelperPid = 0;
+static volatile LONG g_peerQuitBroadcastState = 0; // 0=idle, 1=in flight, 2=sent
 HANDLE g_fakeProcessThreadHandle = nullptr;
 bool g_initCapturedFromWrite = false;
 DWORD g_lastConnectingDiagnosticTick = 0;
@@ -127,9 +175,17 @@ DWORD g_lastSessionPointerMismatchTick = 0;
 DWORD g_lastRuntimeReadyProbeLogTick = 0;
 uint32_t g_lastRuntimeReadyProbeMask = 0;
 bool g_lastRuntimeReadyProbeMaskValid = false;
+static LONG g_lastNativeDelayTimeoutTraceSerial = 0;
+static DWORD g_lastNativeDelayTimeoutTraceTick = 0;
 DWORD g_lastSpectateConsoleSnapshotTick = 0;
 bool g_localInitAppliedForSession = false;
+bool g_spectatorPostInitAttemptedForSession = false;
+bool g_spectatorPostInitSucceededForSession = false;
+volatile LONG g_deferredLifecycleWorkRequested = 0;
+volatile LONG g_deferredTitleSelection = -1;
 uintptr_t g_remoteInjectedSelfBase = 0;
+uintptr_t g_externalLauncherGuardRemoteBase = 0;
+std::unordered_map<std::string, uint32_t> g_remoteInjectedPatchMap;
 DWORD g_lastLatePatchRetryTick = 0;
 DWORD g_lastLatePatchRetryLogTick = 0;
 DWORD g_latePatchRetryAttempts = 0;
@@ -137,6 +193,10 @@ DWORD g_latePatchRetrySuccesses = 0;
 bool g_lastLatePatchRetryResultValid = false;
 bool g_lastLatePatchRetryResult = false;
 bool g_observedTakeoverCreatePath = false;
+bool g_tournamentReturnCleanupPending = false;
+volatile LONG g_externalTournamentInitialTitleLeft = 0;
+static volatile LONG g_tournamentReturnCleanupStage = 0;
+static volatile LONG g_tournamentReturnCleanupTerminalFailure = 0;
 std::mutex g_fakeThreadMutex;
 std::vector<FakeThreadInfo> g_fakeThreads;
 std::mutex g_redirectAllocMutex;
@@ -152,7 +212,6 @@ std::string g_consolePendingWriteConsoleOutputCharacterA;
 std::string g_consolePendingWriteConsoleOutputCharacterW;
 std::string g_consolePendingOutputDebugStringA;
 std::string g_consolePendingOutputDebugStringW;
-std::unordered_map<std::string, LONG> g_diskCapturePathHits;
 bool g_captureRevivalNativeLogsConfigured = false;
 bool g_captureRevivalNativeLogs = false;
 bool g_revivalErrorCodeNullGuardPatched = false;
@@ -175,13 +234,12 @@ std::string g_configuredHolePunchServer;
 
 // Job object for automatic child-process cleanup.  When the host process
 // terminates (even by crash), the kernel closes all handles to the job,
-// which kills every process assigned to it — ensuring EfzRevival.exe and
+// which kills every process assigned to it - ensuring EfzRevival.exe and
 // any grandchildren (cmd.exe / conhost.exe) never linger in the background.
 static HANDLE g_childJobObject = nullptr;
 
 namespace
 {
-bool g_hostLogEfzIatPatched = false;
 
 std::string TrimAsciiCopy(const std::string& text)
 {
@@ -258,32 +316,10 @@ void LogPendingSpectateConsoleSnapshot()
 
 void EnsureHostLogEfzIatPatched(bool verboseLogs)
 {
-    if (g_hostLogEfzIatPatched)
-    {
-        return;
-    }
-
-    std::unordered_map<std::string, uint32_t> hostLogPatches;
-    hostLogPatches.emplace(
-        "WriteFile",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)));
-    hostLogPatches.emplace(
-        "CreateFileA",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)));
-    hostLogPatches.emplace(
-        "CreateFileW",
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)));
-
-    const bool patchedHostLogIat =
-        PatchIat(GetCurrentProcess(), GetCurrentProcessId(), hostLogPatches, verboseLogs);
+    (void)verboseLogs;
     mod::Log(
-        "Takeover: host logEfz IAT patch result=%d patchCount=%lu stage=pre_init",
-        patchedHostLogIat ? 1 : 0,
-        static_cast<unsigned long>(hostLogPatches.size()));
-    if (patchedHostLogIat)
-    {
-        g_hostLogEfzIatPatched = true;
-    }
+        "Takeover: host logEfz IAT capture disabled (simulation parity); "
+        "helper-process console capture remains active");
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +335,815 @@ static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t times
             return kAllRevivalProfiles[i];
         }
     }
+    return nullptr;
+}
+
+static bool ModuleBytesMatch(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    size_t expectedSize)
+{
+    if (module == nullptr || expected == nullptr || expectedSize == 0)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        return std::memcmp(bytes, expected, expectedSize) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ModuleEntryLooksLikeInstalledJmp(HMODULE module, uintptr_t rva, size_t patchSize)
+{
+    if (module == nullptr || patchSize < 5)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        if (bytes[0] != 0xE9)
+        {
+            return false;
+        }
+        for (size_t i = 5; i < patchSize; ++i)
+        {
+            if (bytes[i] != 0x90)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ModuleBytesMatchOrInstalledJmp(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    size_t expectedSize,
+    size_t patchSize)
+{
+    return ModuleBytesMatch(module, rva, expected, expectedSize)
+        || ModuleEntryLooksLikeInstalledJmp(module, rva, patchSize);
+}
+
+static bool ModuleBytesMatchMasked(
+    HMODULE module,
+    uintptr_t rva,
+    const uint8_t* expected,
+    const char* mask,
+    size_t expectedSize)
+{
+    if (module == nullptr || expected == nullptr || mask == nullptr || expectedSize == 0)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        for (size_t i = 0; i < expectedSize; ++i)
+        {
+            if (mask[i] == 'x' && bytes[i] != expected[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ModuleWindowContainsU32(
+    HMODULE module,
+    uintptr_t rva,
+    size_t size,
+    uint32_t value)
+{
+    if (module == nullptr || size < sizeof(uint32_t))
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const bytes = reinterpret_cast<const uint8_t*>(module) + rva;
+        for (size_t i = 0; i + sizeof(uint32_t) <= size; ++i)
+        {
+            uint32_t current = 0;
+            std::memcpy(&current, bytes + i, sizeof(current));
+            if (current == value)
+            {
+                return true;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return false;
+}
+
+static bool ModuleDirectCallCountEquals(
+    HMODULE module,
+    uintptr_t windowRva,
+    size_t windowSize,
+    uintptr_t targetRva,
+    size_t expectedCount)
+{
+    if (module == nullptr || windowSize < 5)
+    {
+        return false;
+    }
+
+    size_t count = 0;
+    __try
+    {
+        const auto* const bytes =
+            reinterpret_cast<const uint8_t*>(module) + windowRva;
+        for (size_t i = 0; i + 5 <= windowSize; ++i)
+        {
+            if (bytes[i] != 0xE8)
+            {
+                continue;
+            }
+
+            int32_t disp = 0;
+            std::memcpy(&disp, bytes + i + 1, sizeof(disp));
+            const uintptr_t callTarget = windowRva + i + 5 + disp;
+            if (callTarget == targetRva)
+            {
+                ++count;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return count == expectedCount;
+}
+
+static bool ModuleVtableSlotsMatch(
+    HMODULE module,
+    uintptr_t vtableRva,
+    const uintptr_t* expectedTargetRvas,
+    size_t expectedCount)
+{
+    if (module == nullptr || expectedTargetRvas == nullptr || expectedCount == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    __try
+    {
+        const auto* const slots =
+            reinterpret_cast<const uintptr_t*>(base + vtableRva);
+        for (size_t i = 0; i < expectedCount; ++i)
+        {
+            if (slots[i] != base + expectedTargetRvas[i])
+            {
+                return false;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool SectionNameEquals(const IMAGE_SECTION_HEADER& section, const char* expected)
+{
+    char name[9] = {};
+    std::memcpy(name, section.Name, 8);
+    return std::strcmp(name, expected) == 0;
+}
+
+static bool ModuleRvaInNamedSection(
+    const IMAGE_NT_HEADERS32* nt,
+    const char* sectionName,
+    uintptr_t rva,
+    size_t size)
+{
+    if (nt == nullptr || sectionName == nullptr || size == 0)
+    {
+        return false;
+    }
+
+    const IMAGE_SECTION_HEADER* const sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const IMAGE_SECTION_HEADER& section = sections[i];
+        if (!SectionNameEquals(section, sectionName))
+        {
+            continue;
+        }
+
+        const uintptr_t sectionStart = section.VirtualAddress;
+        const uintptr_t rawSectionEnd =
+            sectionStart + std::max(section.Misc.VirtualSize, section.SizeOfRawData);
+        const uintptr_t sectionEnd = (rawSectionEnd > sectionStart) ? rawSectionEnd : sectionStart;
+        const uintptr_t rvaEnd = rva + size;
+        return rva >= sectionStart && rvaEnd >= rva && rvaEnd <= sectionEnd;
+    }
+
+    return false;
+}
+
+static bool TryGetModuleNtHeaders32(HMODULE module, const IMAGE_NT_HEADERS32** outNt)
+{
+    if (outNt != nullptr)
+    {
+        *outNt = nullptr;
+    }
+    if (module == nullptr)
+    {
+        return false;
+    }
+
+    __try
+    {
+        const auto* const base = reinterpret_cast<const uint8_t*>(module);
+        const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x1000)
+        {
+            return false;
+        }
+
+        const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE
+            || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        {
+            return false;
+        }
+
+        if (outNt != nullptr)
+        {
+            *outNt = nt;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool VerifyRevival102jBinary(HMODULE module)
+{
+    const IMAGE_NT_HEADERS32* nt = nullptr;
+    if (!TryGetModuleNtHeaders32(module, &nt))
+    {
+        mod::Log("DetectRevivalVersion: 1.02j binary verification failed (bad PE32 header)");
+        return false;
+    }
+
+    bool ok = true;
+    auto require = [&ok](bool condition, const char* label) {
+        if (!condition)
+        {
+            mod::Log("DetectRevivalVersion: 1.02j binary verification failed (%s)", label);
+            ok = false;
+        }
+    };
+
+    require(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386, "machine");
+    require(nt->FileHeader.NumberOfSections == 9, "section_count");
+    require(nt->OptionalHeader.SizeOfImage == 0x001D9000u, "size_of_image");
+    require(nt->OptionalHeader.AddressOfEntryPoint == 0x000011F0u, "entry_point");
+    if (nt->OptionalHeader.ImageBase != kRevival_1_02j.defaultImageBase)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j PE image base relocated in memory "
+            "header=0x%08lX expectedPreferred=0x%08lX loadedBase=%p",
+            static_cast<unsigned long>(nt->OptionalHeader.ImageBase),
+            static_cast<unsigned long>(kRevival_1_02j.defaultImageBase),
+            static_cast<void*>(module));
+    }
+
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.frameHookRva, 14), "frameHook section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.perFrameTickRva, 20), "perFrameTick section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.inputSwapPairRva, 24), "inputSwap section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.startInitPlayerRva, 20), "startInit section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.clearTextRva, 8), "clearText section");
+    require(ModuleRvaInNamedSection(nt, ".text", kRevival_1_02j.setTextEnabledRva, 17), "setText section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.sessionPtrOffsets[0], sizeof(uintptr_t)), "sessionPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.roleFlagOffsets[0], sizeof(int)), "roleFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.globalStatePtrOffset, sizeof(uintptr_t)), "globalState section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.initFlagOffset, sizeof(int)), "initFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.initByteOffset, sizeof(uint8_t)), "initByte section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.timerPtrOffset, sizeof(uintptr_t)), "timerPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.renderContextBaseOffset, sizeof(uintptr_t)), "renderContextBase section");
+    require(ModuleRvaInNamedSection(nt, ".data", kRevival_1_02j.renderContextGlobalOffset, sizeof(uintptr_t)), "renderContextGlobal section");
+
+    const uintptr_t loadedBase = reinterpret_cast<uintptr_t>(module);
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.roleFlagOffsets[0])),
+        "init roleFlag ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.sessionPtrOffsets[0])),
+        "init sessionPtr ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.initFlagOffset)),
+        "init initFlag ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.initByteOffset)),
+        "init initByte ref");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        0x00401582u),
+        "init frame EXE hook addr");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        static_cast<uint32_t>(loadedBase + kRevival_1_02j.frameHookRva)),
+        "init frame hook target");
+    require(!ModuleWindowContainsU32(
+        module,
+        0x0012E2B0u,
+        0x2200u,
+        0x00401642u),
+        "init must not claim persistent 0x401642 hook");
+
+    static const uint8_t kFrameHookPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x53, 0x31, 0xDB,
+        0x81, 0xEC, 0xF0, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kPerFrameTickPrefix[] = {
+        0x83, 0xEC, 0x28, 0xE8, 0x48, 0xE0, 0xFF, 0xFF,
+        0x8D, 0x44, 0x24, 0x0C, 0xC7, 0x44, 0x24, 0x0C,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kInputSwapPrefix[] = {
+        0xA1, 0x00, 0x00, 0x00, 0x00, 0xA8, 0x1F, 0x74,
+        0x0F, 0x83, 0xC0, 0x01, 0xA3, 0x00, 0x00, 0x00,
+        0x00, 0xC3, 0x8D, 0xB6, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kStartInitPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x8D, 0x85, 0xF0,
+        0xFE, 0xFF, 0xFF, 0x53, 0x89, 0xCB, 0x81, 0xEC,
+        0x38, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kSetTextPrefix[] = {
+        0x8B, 0x49, 0x18, 0x0F, 0xB6, 0x44, 0x24, 0x04,
+        0x89, 0x44, 0x24, 0x04, 0xE9, 0x2F, 0x96, 0x00,
+        0x00,
+    };
+    static const uint8_t kClearTextPrefix[] = {
+        0x8B, 0x49, 0x18, 0xE9, 0xF8, 0x94, 0x00, 0x00,
+    };
+    static const uint8_t kTournamentExitGuardPrefix[] = {
+        0x74, 0x7A,
+    };
+    static const uint8_t kTournamentExitGuardPatched[] = {
+        0x90, 0x90,
+    };
+    static const uint8_t kSpectatorStoreHelperHandle[] = {
+        0x89, 0x43, 0x64,
+    };
+    static const uint8_t kCompactDequeInitPrefix[] = {
+        0xC7, 0x83, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x48, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x4C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x50, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x54, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x58, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uintptr_t kCompactVtableSlots[] = {
+        0x000486B0u, 0x00048550u, 0x00046770u,
+        0x000467C0u, 0x000458F0u, 0x00046060u,
+        0x000465E0u, 0x00064610u, 0x00064630u,
+        0x00064660u,
+    };
+    static const uintptr_t kRollbackVtableSlots[] = {
+        0x000585A0u, 0x00058580u, 0x000533B0u,
+        0x00054CD0u, 0x00050FF0u, 0x00052740u,
+        0x00052800u, 0x0004E9E0u, 0x0004EDE0u,
+        0x00051A80u,
+    };
+    static const uintptr_t kSpectatorVtableSlots[] = {
+        0x00062920u, 0x00062900u, 0x0005E640u,
+        0x0005F790u, 0x0005D720u, 0x0005E380u,
+        0x0005E3E0u, 0x0005C400u, 0x0005C4E0u,
+        0x0005DE40u,
+    };
+    static const uintptr_t kReplayVtableSlots[] = {
+        0x00075CF0u, 0x00075CD0u, 0x000744A0u,
+        0x00074920u, 0x00073190u, 0x00074090u,
+        0x000741E0u, 0x00072F80u, 0x00073060u,
+        0x00073F40u,
+    };
+    static const uintptr_t kPracticeVtableSlots[] = {
+        0x00080650u, 0x00080630u, 0x0007DE40u,
+        0x0007E140u, 0x0007CF60u, 0x0007DBC0u,
+        0x00064680u, 0x0007CCC0u, 0x0007CDA0u,
+        0x0007D780u,
+    };
+
+    require(ModuleBytesMatchOrInstalledJmp(
+        module,
+        kRevival_1_02j.frameHookRva,
+        kFrameHookPrefix,
+        sizeof(kFrameHookPrefix),
+        6), "frameHook bytes");
+    require(ModuleBytesMatchOrInstalledJmp(
+        module,
+        kRevival_1_02j.perFrameTickRva,
+        kPerFrameTickPrefix,
+        sizeof(kPerFrameTickPrefix),
+        8), "perFrameTick bytes");
+    require(ModuleBytesMatchMasked(module, kRevival_1_02j.inputSwapPairRva, kInputSwapPrefix, "x????xxxxxxxx????xxxxxxx", sizeof(kInputSwapPrefix)), "inputSwap bytes");
+    require(ModuleWindowContainsU32(
+        module,
+        kRevival_1_02j.inputSwapPairRva,
+        0x80u,
+        static_cast<uint32_t>(kRevival_1_02j.sessionOffsetActivePlayer)),
+        "inputSwap activePlayer offset ref");
+    require(ModuleDirectCallCountEquals(
+        module,
+        0x00054CD0u,
+        0x800u,
+        kRevival_1_02j.inputSwapPairRva,
+        1), "inputSwap rollback call count");
+    require(ModuleBytesMatch(module, kRevival_1_02j.startInitPlayerRva, kStartInitPrefix, sizeof(kStartInitPrefix)), "startInit bytes");
+    require(ModuleBytesMatch(module, kRevival_1_02j.setTextEnabledRva, kSetTextPrefix, sizeof(kSetTextPrefix)), "setText bytes");
+    require(ModuleBytesMatch(module, kRevival_1_02j.clearTextRva, kClearTextPrefix, sizeof(kClearTextPrefix)), "clearText bytes");
+    static const uint32_t kInstallExeHookTargets[] = {
+        0x00776053u, 0x0040D131u, 0x007656A7u, 0x00401642u,
+        0x0076479Cu, 0x00777D61u, 0x00406020u, 0x00405FB0u,
+        0x00405F00u, 0x00405E90u, 0x00405F50u, 0x0040DE98u,
+        0x0040DE80u, 0x007668E5u, 0x0040DE56u, 0x0040DE40u,
+        0x0040E5E0u, 0x0040E5D0u,
+    };
+    for (size_t i = 0; i < sizeof(kInstallExeHookTargets) / sizeof(kInstallExeHookTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(
+            module,
+            kRevival_1_02j.frameHookRva,
+            0x800u,
+            kInstallExeHookTargets[i]),
+            "install_exe_hooks target ref");
+    }
+    require(
+        ModuleBytesMatch(module, 0x0004683Fu, kTournamentExitGuardPrefix, sizeof(kTournamentExitGuardPrefix))
+        || ModuleBytesMatch(module, 0x0004683Fu, kTournamentExitGuardPatched, sizeof(kTournamentExitGuardPatched)),
+        "tournamentExitGuard bytes");
+    require(ModuleVtableSlotsMatch(module, 0x0016FEB0u, kCompactVtableSlots, sizeof(kCompactVtableSlots) / sizeof(kCompactVtableSlots[0])), "compact vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FEF0u, kRollbackVtableSlots, sizeof(kRollbackVtableSlots) / sizeof(kRollbackVtableSlots[0])), "rollback vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF20u, kSpectatorVtableSlots, sizeof(kSpectatorVtableSlots) / sizeof(kSpectatorVtableSlots[0])), "spectator vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF50u, kReplayVtableSlots, sizeof(kReplayVtableSlots) / sizeof(kReplayVtableSlots[0])), "replay vtable slots");
+    require(ModuleVtableSlotsMatch(module, 0x0016FF80u, kPracticeVtableSlots, sizeof(kPracticeVtableSlots) / sizeof(kPracticeVtableSlots[0])), "practice vtable slots");
+    require(ModuleBytesMatch(
+        module,
+        0x0005E7A0u,
+        kSpectatorStoreHelperHandle,
+        sizeof(kSpectatorStoreHelperHandle)),
+        "spectator post-init helper handle offset");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0005E640u,
+        0x1000u,
+        0x000002E0u),
+        "spectator post-init helper pid offset");
+    require(ModuleWindowContainsU32(
+        module,
+        0x0005E640u,
+        0x1000u,
+        0x00000588u),
+        "spectator post-init netplay control offset");
+    require(ModuleBytesMatch(module, 0x00047BA8u, kCompactDequeInitPrefix, sizeof(kCompactDequeInitPrefix)), "compact deque init bytes");
+    require(ModuleDirectCallCountEquals(module, 0x000479B0u, 0xA00u, 0x00102A20u, 22), "compact deque push count");
+    require(kRevival_1_02j.tournamentInputQueueOffset == 0x340u, "compact deque profile offset");
+    static const uint32_t kCompactExePatchTargets[] = {
+        0x00763F04u, 0x00763E50u, 0x00754C1Au, 0x007599EDu,
+    };
+    for (size_t i = 0; i < sizeof(kCompactExePatchTargets) / sizeof(kCompactExePatchTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(module, 0x000479B0u, 0xA00u, kCompactExePatchTargets[i]), "compact EXE patch target ref");
+    }
+
+    if (ok)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j binary verification OK preferredImageBase=0x%08lX loadedBase=%p size=0x%08lX",
+            static_cast<unsigned long>(nt->OptionalHeader.ImageBase),
+            static_cast<void*>(module),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
+    }
+    return ok;
+}
+
+static bool VerifyRevival102j20260802Binary(HMODULE module)
+{
+    const RevivalAddressProfile& profile = kRevival_1_02j_20260802;
+    const IMAGE_NT_HEADERS32* nt = nullptr;
+    if (!TryGetModuleNtHeaders32(module, &nt))
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j/20260802 verification failed (bad PE32 header)");
+        return false;
+    }
+
+    bool ok = true;
+    auto require = [&ok](bool condition, const char* label) {
+        if (!condition)
+        {
+            mod::Log(
+                "DetectRevivalVersion: 1.02j/20260802 verification failed (%s)",
+                label);
+            ok = false;
+        }
+    };
+
+    require(nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386, "machine");
+    require(nt->FileHeader.NumberOfSections == 9, "section_count");
+    require(
+        nt->OptionalHeader.SizeOfImage == profile.revivalDllSizeOfImage,
+        "size_of_image");
+    require(
+        nt->OptionalHeader.AddressOfEntryPoint
+            == profile.revivalDllEntryPointRva,
+        "entry_point");
+
+    require(ModuleRvaInNamedSection(nt, ".text", profile.frameHookRva, 14), "frameHook section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.perFrameTickRva, 20), "perFrameTick section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.inputSwapPairRva, 24), "inputSwap section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.startInitPlayerRva, 20), "startInit section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.clearTextRva, 8), "clearText section");
+    require(ModuleRvaInNamedSection(nt, ".text", profile.setTextEnabledRva, 22), "setText section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.sessionPtrOffsets[0], sizeof(uintptr_t)), "sessionPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.roleFlagOffsets[0], sizeof(int)), "roleFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.globalStatePtrOffset, sizeof(uintptr_t)), "globalState section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.initFlagOffset, sizeof(int)), "initFlag section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.initByteOffset, sizeof(uint8_t)), "initByte section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.timerPtrOffset, sizeof(uintptr_t)), "timerPtr section");
+    require(ModuleRvaInNamedSection(nt, ".data", profile.renderContextBaseOffset, sizeof(uintptr_t)), "patchContext section");
+
+    const uintptr_t loadedBase = reinterpret_cast<uintptr_t>(module);
+    const uint32_t initRefs[] = {
+        static_cast<uint32_t>(loadedBase + profile.roleFlagOffsets[0]),
+        static_cast<uint32_t>(loadedBase + profile.sessionPtrOffsets[0]),
+        static_cast<uint32_t>(loadedBase + profile.initFlagOffset),
+        static_cast<uint32_t>(loadedBase + profile.initByteOffset),
+        0x00401582u,
+        static_cast<uint32_t>(loadedBase + profile.frameHookRva),
+    };
+    for (size_t i = 0; i < sizeof(initRefs) / sizeof(initRefs[0]); ++i)
+    {
+        require(
+            ModuleWindowContainsU32(
+                module,
+                profile.initExportRva,
+                0x2200u,
+                initRefs[i]),
+            "init exact reference");
+    }
+    require(
+        !ModuleWindowContainsU32(
+            module,
+            profile.initExportRva,
+            0x2200u,
+            0x00401642u),
+        "init must not claim persistent 0x401642 hook");
+
+    static const uint8_t kFrameHookPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x53, 0x31, 0xDB,
+        0x81, 0xEC, 0xF0, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kPerFrameTickPrefix[] = {
+        0x83, 0xEC, 0x28, 0xE8, 0x78, 0xCC, 0xFF, 0xFF,
+        0x8D, 0x44, 0x24, 0x0C, 0xC7, 0x44, 0x24, 0x0C,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kInputSwapPrefix[] = {
+        0xA1, 0x00, 0x00, 0x00, 0x00, 0xA8, 0x1F, 0x74,
+        0x0F, 0x83, 0xC0, 0x01, 0xA3, 0x00, 0x00, 0x00,
+        0x00, 0xC3, 0x8D, 0xB6, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t kStartInitPrefix[] = {
+        0x55, 0x89, 0xE5, 0x57, 0x56, 0x8D, 0x85, 0xF0,
+        0xFE, 0xFF, 0xFF, 0x53, 0x89, 0xCB, 0x81, 0xEC,
+        0x38, 0x02, 0x00, 0x00,
+    };
+    static const uint8_t kSetTextPrefix[] = {
+        0x83, 0xEC, 0x04, 0x0F, 0xB6, 0x44, 0x24, 0x08,
+        0x89, 0x04, 0x24, 0xE8, 0xC0, 0x43, 0xFC, 0xFF,
+        0x83, 0xC4, 0x04, 0xC2, 0x04, 0x00,
+    };
+    static const uint8_t kClearTextPrefix[] = {
+        0xE9, 0x03, 0x41, 0xFC, 0xFF, 0x90, 0x90, 0x90,
+    };
+    static const char kInputSwapMask[] =
+        "x????xxxxxxxx????xxxxxxx";
+    require(
+        ModuleBytesMatchOrInstalledJmp(
+            module, profile.frameHookRva, kFrameHookPrefix,
+            sizeof(kFrameHookPrefix), 6),
+        "frameHook bytes");
+    require(
+        ModuleBytesMatchOrInstalledJmp(
+            module, profile.perFrameTickRva, kPerFrameTickPrefix,
+            sizeof(kPerFrameTickPrefix), 8),
+        "perFrameTick bytes");
+    require(
+        ModuleBytesMatchMasked(
+            module, profile.inputSwapPairRva, kInputSwapPrefix,
+            kInputSwapMask,
+            sizeof(kInputSwapPrefix)),
+        "inputSwap bytes");
+    require(ModuleBytesMatch(module, profile.startInitPlayerRva, kStartInitPrefix, sizeof(kStartInitPrefix)), "startInit bytes");
+    require(ModuleBytesMatch(module, profile.setTextEnabledRva, kSetTextPrefix, sizeof(kSetTextPrefix)), "setText bytes");
+    require(ModuleBytesMatch(module, profile.clearTextRva, kClearTextPrefix, sizeof(kClearTextPrefix)), "clearText bytes");
+    require(
+        ModuleDirectCallCountEquals(
+            module, 0x00055BD0u, 0x800u,
+            profile.inputSwapPairRva, 1),
+        "inputSwap rollback call count");
+    require(
+        ModuleWindowContainsU32(
+            module, profile.inputSwapPairRva, 0x80u,
+            static_cast<uint32_t>(profile.sessionOffsetActivePlayer)),
+        "inputSwap activePlayer offset ref");
+    static const uint32_t kInstallExeHookTargets[] = {
+        0x00776053u, 0x0040D131u, 0x007656A7u, 0x00401642u,
+        0x0076479Cu, 0x00777D61u, 0x00406020u, 0x00405FB0u,
+        0x00405F00u, 0x00405E90u, 0x00405F50u, 0x0040DE98u,
+        0x0040DE80u, 0x007668E5u, 0x0040DE56u, 0x0040DE40u,
+        0x0040E5E0u, 0x0040E5D0u,
+    };
+    for (size_t i = 0; i < sizeof(kInstallExeHookTargets) / sizeof(kInstallExeHookTargets[0]); ++i)
+    {
+        require(
+            ModuleWindowContainsU32(
+                module, profile.frameHookRva, 0x800u,
+                kInstallExeHookTargets[i]),
+            "install_exe_hooks target ref");
+    }
+
+    static const uintptr_t kCompactVtableSlots[] = {
+        0x000495F0u, 0x00049490u, 0x000476B0u, 0x00047700u,
+        0x00046830u, 0x00046FA0u, 0x00047520u, 0x00065510u,
+        0x00065530u, 0x00065560u,
+    };
+    static const uintptr_t kRollbackVtableSlots[] = {
+        0x000594A0u, 0x00059480u, 0x000542B0u, 0x00055BD0u,
+        0x00051EF0u, 0x00053640u, 0x00053700u, 0x0004F8E0u,
+        0x0004FCE0u, 0x00052980u,
+    };
+    static const uintptr_t kSpectatorVtableSlots[] = {
+        0x00063820u, 0x00063800u, 0x0005F540u, 0x00060690u,
+        0x0005E620u, 0x0005F280u, 0x0005F2E0u, 0x0005D300u,
+        0x0005D3E0u, 0x0005ED40u,
+    };
+    static const uintptr_t kReplayVtableSlots[] = {
+        0x00076B90u, 0x00076B70u, 0x00075340u, 0x000757C0u,
+        0x00074030u, 0x00074F30u, 0x00075080u, 0x00073E20u,
+        0x00073F00u, 0x00074DE0u,
+    };
+    static const uintptr_t kPracticeVtableSlots[] = {
+        0x00081890u, 0x00081870u, 0x0007F080u, 0x0007F380u,
+        0x0007E1A0u, 0x0007EE00u, 0x00065580u, 0x0007DCD0u,
+        0x0007DEB0u, 0x0007E9C0u,
+    };
+    require(ModuleVtableSlotsMatch(module, profile.tournamentSessionVtableRva, kCompactVtableSlots, 10), "compact vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.onlineSessionVtableRva, kRollbackVtableSlots, 10), "rollback vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.spectatorSessionVtableRva, kSpectatorVtableSlots, 10), "spectator vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.replaySessionVtableRva, kReplayVtableSlots, 10), "replay vtable slots");
+    require(ModuleVtableSlotsMatch(module, profile.practiceSessionVtableRva, kPracticeVtableSlots, 10), "practice vtable slots");
+    require(kCompactVtableSlots[1] == profile.tournamentDeletingDtorRva, "compact deleting-dtor profile link");
+    require(kRollbackVtableSlots[1] == profile.onlineDeletingDtorRva, "rollback deleting-dtor profile link");
+    require(kSpectatorVtableSlots[1] == profile.spectatorDeletingDtorRva, "spectator deleting-dtor profile link");
+    require(kReplayVtableSlots[1] == profile.replayDeletingDtorRva, "replay deleting-dtor profile link");
+    require(kPracticeVtableSlots[1] == profile.practiceDeletingDtorRva, "practice deleting-dtor profile link");
+    require(kRollbackVtableSlots[5] == profile.rollbackReadInputRva, "rollback read-input profile link");
+    require(kSpectatorVtableSlots[2] == profile.spectatorPostInitRva, "spectator post-init profile link");
+    require(kPracticeVtableSlots[2] == profile.practicePostInitRva, "practice post-init profile link");
+
+    static const uint8_t kNativeGuard[] = {0x74, 0x7A};
+    static const uint8_t kOwnedGuard[] = {0x90, 0x90};
+    require(
+        ModuleBytesMatch(module, profile.tournamentExitGuardRva, kNativeGuard, 2)
+            || ModuleBytesMatch(module, profile.tournamentExitGuardRva, kOwnedGuard, 2),
+        "tournamentExitGuard bytes");
+    static const uint8_t kSpectatorStoreHelperHandle[] = {0x89, 0x43, 0x64};
+    require(ModuleBytesMatch(module, 0x0005F6A0u, kSpectatorStoreHelperHandle, 3), "spectator helper-handle store");
+    require(ModuleWindowContainsU32(module, profile.spectatorPostInitRva, 0x1000u, 0x000002E0u), "spectator helper-pid offset");
+    require(ModuleWindowContainsU32(module, profile.spectatorPostInitRva, 0x1000u, 0x00000588u), "spectator control offset");
+
+    static const uint8_t kCompactDequeInitPrefix[] = {
+        0xC7, 0x83, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x48, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x4C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x50, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x54, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC7, 0x83, 0x58, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    require(ModuleBytesMatch(module, 0x00048AE8u, kCompactDequeInitPrefix, sizeof(kCompactDequeInitPrefix)), "compact deque init bytes");
+    require(ModuleDirectCallCountEquals(module, 0x000488F0u, 0xA00u, 0x001023E0u, 22), "compact deque push count");
+    require(profile.tournamentInputQueueOffset == 0x340u, "compact deque profile offset");
+    static const uint32_t kCompactExePatchTargets[] = {
+        0x00763F04u, 0x00763E50u, 0x00754C1Au, 0x007599EDu,
+    };
+    for (size_t i = 0; i < sizeof(kCompactExePatchTargets) / sizeof(kCompactExePatchTargets[0]); ++i)
+    {
+        require(ModuleWindowContainsU32(module, 0x000488F0u, 0xA00u, kCompactExePatchTargets[i]), "compact EXE patch target ref");
+    }
+
+    if (ok)
+    {
+        mod::Log(
+            "DetectRevivalVersion: 1.02j/20260802 binary verification OK loadedBase=%p size=0x%08lX",
+            static_cast<void*>(module),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
+    }
+    return ok;
+}
+
+static const RevivalAddressProfile* FindLoadedRevivalProfile(
+    HMODULE module,
+    uint32_t timestamp)
+{
+    if (timestamp == kRevival_1_02j.peTimestamp)
+    {
+        return VerifyRevival102jBinary(module) ? &kRevival_1_02j : nullptr;
+    }
+    if (timestamp == kRevival_1_02j_20260802.peTimestamp)
+    {
+        return VerifyRevival102j20260802Binary(module)
+            ? &kRevival_1_02j_20260802
+            : nullptr;
+    }
+
+    if (timestamp != kRevival_1_02f.peTimestamp)
+    {
+        return FindRevivalProfileByTimestamp(timestamp);
+    }
+
+    // Modified 1.02f DLLs can preserve the stock PE timestamp.  Only accept
+    // the stock 1.02f profile when its key code anchors still match stock.
+    static const uint8_t kStockFrameHookPrefix[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xC0,
+    };
+    static const uint8_t kStockStartInitPlayerPrefix[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8,
+    };
+
+    const bool frameHookMatches = ModuleBytesMatch(
+        module,
+        kRevival_1_02f.frameHookRva,
+        kStockFrameHookPrefix,
+        sizeof(kStockFrameHookPrefix));
+    const bool startInitMatches = ModuleBytesMatch(
+        module,
+        kRevival_1_02f.startInitPlayerRva,
+        kStockStartInitPlayerPrefix,
+        sizeof(kStockStartInitPlayerPrefix));
+
+    if (frameHookMatches && startInitMatches)
+    {
+        return &kRevival_1_02f;
+    }
+
+    mod::Log(
+        "DetectRevivalVersion: timestamp 0x%08X matches 1.02f but stock byte verification failed frameHook=%d startInit=%d",
+        static_cast<unsigned>(timestamp),
+        frameHookMatches ? 1 : 0,
+        startInitMatches ? 1 : 0);
     return nullptr;
 }
 
@@ -361,6 +1206,12 @@ void EnsureActiveRevivalProfile()
             return;
         }
         break;
+    case RevivalProfileSource::ExternalLauncherGuard:
+        if (IsExternalLauncherGuardProcess())
+        {
+            return;
+        }
+        break;
     case RevivalProfileSource::Default:
     default:
         if (revival == nullptr && !hasPublishedTimestamp)
@@ -373,10 +1224,31 @@ void EnsureActiveRevivalProfile()
     DetectRevivalVersion();
 }
 
-/// Detect the loaded Revival DLL version by reading its PE TimeDateStamp
-/// and matching against known profiles.  Sets g_activeRevival to the
-/// matching profile (or leaves it at the default 1.02e if detection fails).
-/// Call this once early — before any profile-dependent code runs.
+bool ActiveRevivalProfileSupportsSessionStart()
+{
+    EnsureActiveRevivalProfile();
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return false;
+    }
+    if (std::strcmp(g_activeRevival->versionTag, "unsupported") == 0)
+    {
+        return false;
+    }
+
+    return g_activeRevival->roleFlagOffsetCount > 0
+        && g_activeRevival->roleFlagOffsets[0] != 0
+        && g_activeRevival->sessionPtrOffsetCount > 0
+        && g_activeRevival->sessionPtrOffsets[0] != 0
+        && g_activeRevival->startInitPlayerRva != 0
+        && g_activeRevival->frameHookRva != 0
+        && g_activeRevival->perFrameTickRva != 0;
+}
+
+/// Detect the loaded Revival DLL version by reading its PE TimeDateStamp and,
+/// for ambiguous 1.02f builds, verifying stock code bytes before accepting the
+/// stock profile. Unsupported builds switch to the zeroed unsupported profile
+/// so later hook installation fails closed.
 void DetectRevivalVersion()
 {
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
@@ -388,8 +1260,8 @@ void DetectRevivalVersion()
         uint32_t timestamp = 0;
         if (!TryReadModulePeTimestamp(revival, &timestamp))
         {
-            SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
-            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header — keeping default");
+            SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
+            mod::Log("DetectRevivalVersion: invalid EfzRevival.dll PE header - fail closed");
             return;
         }
 
@@ -401,7 +1273,7 @@ void DetectRevivalVersion()
                 static_cast<unsigned>(publishedTimestamp));
         }
 
-        if (const RevivalAddressProfile* const profile = FindRevivalProfileByTimestamp(timestamp))
+        if (const RevivalAddressProfile* const profile = FindLoadedRevivalProfile(revival, timestamp))
         {
             SetActiveRevivalProfile(profile, RevivalProfileSource::DllTimestamp);
             mod::Log("DetectRevivalVersion: matched timestamp 0x%08X → %s",
@@ -410,8 +1282,12 @@ void DetectRevivalVersion()
             return;
         }
 
-        mod::Log("DetectRevivalVersion: UNKNOWN timestamp 0x%08X from EfzRevival.dll — trying published host profile",
-                 static_cast<unsigned>(timestamp));
+        SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::DllTimestamp);
+        mod::Log(
+            "DetectRevivalVersion: unsupported or modified DLL build timestamp=0x%08X - fail closed as %s",
+            static_cast<unsigned>(timestamp),
+            g_activeRevival->versionTag);
+        return;
     }
 
     if (publishedTimestamp != 0)
@@ -426,24 +1302,24 @@ void DetectRevivalVersion()
             return;
         }
 
-        SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
+        SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::PublishedHostTimestamp);
         mod::Log(
-            "DetectRevivalVersion: published host timestamp 0x%08X unknown — keeping default %s. Addresses may be wrong!",
+            "DetectRevivalVersion: published host timestamp 0x%08X unknown - fail closed as %s",
             static_cast<unsigned>(publishedTimestamp),
             g_activeRevival->versionTag);
         return;
     }
 
-    SetActiveRevivalProfile(&kRevival_1_02e, RevivalProfileSource::Default);
+    SetActiveRevivalProfile(&kRevival_Unsupported, RevivalProfileSource::Default);
     if (revival == nullptr)
     {
         mod::Log(
-            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile — keeping default %s",
+            "DetectRevivalVersion: EfzRevival.dll not loaded and no published host profile - fail closed as %s",
             g_activeRevival->versionTag);
         return;
     }
 
-    mod::Log("DetectRevivalVersion: keeping default %s. Addresses may be wrong!",
+    mod::Log("DetectRevivalVersion: fail closed as %s",
              g_activeRevival->versionTag);
 }
 
@@ -452,8 +1328,8 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     EnsureActiveRevivalProfile();
 
     // Native helper routine that broadcasts EfzPackets::MessageQuit to every
-    // connected peer. RVAs were confirmed from the 1.02e/h/i decompilations
-    // and resolved for 1.02f/g by matching the helper EXE disassembly.
+    // connected peer. RVAs were confirmed from the versioned decompilations
+    // and, for 1.02j, by checking the helper EXE bytes at RVA 0x86390.
     if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
     {
         return 0;
@@ -464,7 +1340,8 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     {
         return 0x41150u;
     }
-    if (std::strcmp(tag, "1.02f") == 0)
+    if (std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0)
     {
         return 0x41190u;
     }
@@ -480,7 +1357,122 @@ static uintptr_t ResolveHelperSendQuitAllRva()
     {
         return 0x425C0u;
     }
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        return 0x86390u;
+    }
     return 0;
+}
+
+static uintptr_t ResolveHelperQuitRoleCheckRva()
+{
+    EnsureActiveRevivalProfile();
+
+    if (g_activeRevival == nullptr || g_activeRevival->versionTag == nullptr)
+    {
+        return 0;
+    }
+
+    const char* const tag = g_activeRevival->versionTag;
+    if (std::strcmp(tag, "1.02e") == 0 || std::strcmp(tag, "1.02h") == 0)
+    {
+        return 0x201B0u;
+    }
+    if (std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0)
+    {
+        return 0x20140u;
+    }
+    if (std::strcmp(tag, "1.02g") == 0)
+    {
+        return 0x20040u;
+    }
+    if (std::strcmp(tag, "1.02i") == 0)
+    {
+        return 0x20C80u;
+    }
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        return 0x81CF0u;
+    }
+    return 0;
+}
+
+struct RevivalQuitEndpointStorage
+{
+    uint16_t family = 0;
+    uint16_t reserved = 0;
+    uint32_t ipv4Address = 0;
+    uint8_t ipv6Address[16] = {};
+    uint32_t ipv6ScopeId = 0;
+};
+
+static_assert(
+    sizeof(RevivalQuitEndpointStorage) == 28,
+    "Revival quit endpoint storage must match the helper's 28-byte endpoint object");
+
+static bool TryBuildRevivalQuitEndpointFromText(
+    const char* endpointText,
+    RevivalQuitEndpointStorage* outEndpoint)
+{
+    if (outEndpoint != nullptr)
+    {
+        std::memset(outEndpoint, 0, sizeof(*outEndpoint));
+    }
+    if (endpointText == nullptr || endpointText[0] == '\0' || outEndpoint == nullptr)
+    {
+        return false;
+    }
+
+    const std::string trimmed = TrimAscii(endpointText);
+    if (trimmed.empty() || trimmed.size() >= 256)
+    {
+        return false;
+    }
+
+    char addressBuffer[256] = {};
+    std::memcpy(addressBuffer, trimmed.c_str(), trimmed.size());
+    addressBuffer[trimmed.size()] = '\0';
+
+    SOCKADDR_STORAGE storage = {};
+    int storageLen = sizeof(storage);
+    if (WSAStringToAddressA(
+            addressBuffer,
+            AF_INET,
+            nullptr,
+            reinterpret_cast<LPSOCKADDR>(&storage),
+            &storageLen)
+        == 0)
+    {
+        const sockaddr_in* const address =
+            reinterpret_cast<const sockaddr_in*>(&storage);
+        outEndpoint->family = AF_INET;
+        outEndpoint->ipv4Address = address->sin_addr.S_un.S_addr;
+        return true;
+    }
+
+    std::memset(&storage, 0, sizeof(storage));
+    storageLen = sizeof(storage);
+    if (WSAStringToAddressA(
+            addressBuffer,
+            AF_INET6,
+            nullptr,
+            reinterpret_cast<LPSOCKADDR>(&storage),
+            &storageLen)
+        != 0)
+    {
+        return false;
+    }
+
+    const sockaddr_in6* const address6 =
+        reinterpret_cast<const sockaddr_in6*>(&storage);
+    outEndpoint->family = AF_INET6;
+    std::memcpy(
+        outEndpoint->ipv6Address,
+        &address6->sin6_addr,
+        sizeof(outEndpoint->ipv6Address));
+    outEndpoint->ipv6ScopeId = address6->sin6_scope_id;
+    return true;
 }
 
 static bool IsWritableUserRegion(const MEMORY_BASIC_INFORMATION& mbi)
@@ -608,8 +1600,21 @@ static InjectedPeerManagerLayout ResolveInjectedPeerManagerLayout()
         return layout;
     }
 
+    if (std::strcmp(tag, "1.02j") == 0)
+    {
+        // 1.02j MinGW helper:
+        //   sendQuitAll uses this + 0x218 for the peer container.
+        //   ctor allocates 0x1488 bytes and initializes Quit_Spec at +0x1338.
+        layout.objectSize = 0x1488u;
+        layout.peerContainerOffset = 0x218u;
+        layout.peerBackingOffset = 0x300u;
+        layout.quitRingOffset = 0x1338u;
+        return layout;
+    }
+
     if (std::strcmp(tag, "1.02e") == 0
         || std::strcmp(tag, "1.02f") == 0
+        || std::strcmp(tag, "1.02f-framestepping") == 0
         || std::strcmp(tag, "1.02g") == 0
         || std::strcmp(tag, "1.02h") == 0)
     {
@@ -786,6 +1791,22 @@ static const char* DecodeInjectedExceptionDetail(DWORD detail)
     default:
         return "unknown_exception";
     }
+}
+
+static bool ConsoleErrorIndicatesDesync(const char* text)
+{
+    if (text == nullptr || text[0] == '\0')
+    {
+        return false;
+    }
+
+    std::string lowered(text);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return lowered.find("desync") != std::string::npos
+        || lowered.find("header crc mismatch") != std::string::npos
+        || lowered.find("state not recoverable") != std::string::npos;
 }
 
 static void LogInjectedPeerQuitDiagnosticLine(const char* fmt, ...)
@@ -1811,9 +2832,177 @@ enum InjectedPeerQuitBroadcastResult : DWORD
     kInjectedPeerQuitBroadcastResultManagerUnresolved = 4,
     kInjectedPeerQuitBroadcastResultHelperBaseUnresolved = 5,
     kInjectedPeerQuitBroadcastResultNativeCallCrashed = 6,
+    kInjectedPeerQuitBroadcastResultInvalidGuardContext = 7,
 };
 
 constexpr DWORD kInjectedPeerQuitBroadcastResultMask = 0xFFu;
+
+bool TryClassifyRevivalQuitEndpoint(
+    const char* endpointText,
+    bool* outIsActivePeer,
+    bool* outIsSpectator)
+{
+    if (outIsActivePeer != nullptr)
+    {
+        *outIsActivePeer = false;
+    }
+    if (outIsSpectator != nullptr)
+    {
+        *outIsSpectator = false;
+    }
+
+    if (!IsCurrentProcessRevival())
+    {
+        mod::Log(
+            "Takeover: native quit packet classification skipped endpoint='%s' (not in EfzRevival.exe)",
+            endpointText != nullptr ? endpointText : "");
+        return false;
+    }
+
+    EnsureActiveRevivalProfile();
+
+    RevivalQuitEndpointStorage endpoint = {};
+    if (!TryBuildRevivalQuitEndpointFromText(endpointText, &endpoint))
+    {
+        mod::Log(
+            "Takeover: native quit packet classification failed endpoint='%s' reason=parse_failed version=%s",
+            endpointText != nullptr ? endpointText : "",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown");
+        return false;
+    }
+
+    const uintptr_t roleCheckRva = ResolveHelperQuitRoleCheckRva();
+    const uintptr_t helperBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (roleCheckRva == 0 || helperBase == 0)
+    {
+        mod::Log(
+            "Takeover: native quit packet classification failed endpoint='%s' reason=helper_unresolved version=%s roleCheckRva=0x%08lX helperBase=0x%08lX",
+            endpointText != nullptr ? endpointText : "",
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "unknown",
+            static_cast<unsigned long>(roleCheckRva),
+            static_cast<unsigned long>(helperBase));
+        return false;
+    }
+
+    bool isActivePeer = false;
+    bool isSpectator = false;
+    DWORD exceptionCode = 0;
+    const char* const versionTag =
+        (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+            ? g_activeRevival->versionTag
+            : "unknown";
+
+    if (std::strcmp(versionTag, "1.02i") == 0
+        || std::strcmp(versionTag, "1.02j") == 0)
+    {
+        if (!HasInjectedContext())
+        {
+            (void)EnsureInjectedContextFast();
+        }
+
+        const DWORD hostPid =
+            (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
+        bool usedStrictHostMatch = false;
+        const uintptr_t managerPtr =
+            FindInjectedPeerManagerPointer(hostPid, &usedStrictHostMatch);
+        const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
+        if (managerPtr == 0 || layout.peerContainerOffset == 0)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=manager_unresolved version=%s hostPid=%lu manager=0x%08lX peerContainerOff=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(hostPid),
+                static_cast<unsigned long>(managerPtr),
+                static_cast<unsigned long>(layout.peerContainerOffset));
+            return false;
+        }
+
+        const uintptr_t peerContainerPtr = managerPtr + layout.peerContainerOffset;
+        typedef bool (__thiscall *RoleCheckFn)(void*, const void*, int);
+        const auto roleCheck =
+            reinterpret_cast<RoleCheckFn>(helperBase + roleCheckRva);
+        __try
+        {
+            isActivePeer = roleCheck(
+                reinterpret_cast<void*>(peerContainerPtr),
+                &endpoint,
+                2);
+            isSpectator = roleCheck(
+                reinterpret_cast<void*>(peerContainerPtr),
+                &endpoint,
+                3);
+        }
+        __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=exception version=%s helperBase=0x%08lX roleCheckRva=0x%08lX manager=0x%08lX peerContainer=0x%08lX exception=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(helperBase),
+                static_cast<unsigned long>(roleCheckRva),
+                static_cast<unsigned long>(managerPtr),
+                static_cast<unsigned long>(peerContainerPtr),
+                static_cast<unsigned long>(exceptionCode));
+            return false;
+        }
+
+        mod::Log(
+            "Takeover: native quit packet classified endpoint='%s' version=%s roleCheckRva=0x%08lX manager=0x%08lX peerContainer=0x%08lX strictHostMatch=%d activePeer=%d spectator=%d",
+            endpointText != nullptr ? endpointText : "",
+            versionTag,
+            static_cast<unsigned long>(roleCheckRva),
+            static_cast<unsigned long>(managerPtr),
+            static_cast<unsigned long>(peerContainerPtr),
+            usedStrictHostMatch ? 1 : 0,
+            isActivePeer ? 1 : 0,
+            isSpectator ? 1 : 0);
+    }
+    else
+    {
+        typedef bool (__stdcall *RoleCheckFn)(const void*, int);
+        const auto roleCheck =
+            reinterpret_cast<RoleCheckFn>(helperBase + roleCheckRva);
+        __try
+        {
+            isActivePeer = roleCheck(&endpoint, 2);
+            isSpectator = roleCheck(&endpoint, 3);
+        }
+        __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+        {
+            mod::Log(
+                "Takeover: native quit packet classification failed endpoint='%s' reason=exception version=%s helperBase=0x%08lX roleCheckRva=0x%08lX exception=0x%08lX",
+                endpointText != nullptr ? endpointText : "",
+                versionTag,
+                static_cast<unsigned long>(helperBase),
+                static_cast<unsigned long>(roleCheckRva),
+                static_cast<unsigned long>(exceptionCode));
+            return false;
+        }
+
+        mod::Log(
+            "Takeover: native quit packet classified endpoint='%s' version=%s roleCheckRva=0x%08lX activePeer=%d spectator=%d",
+            endpointText != nullptr ? endpointText : "",
+            versionTag,
+            static_cast<unsigned long>(roleCheckRva),
+            isActivePeer ? 1 : 0,
+            isSpectator ? 1 : 0);
+    }
+
+    if (outIsActivePeer != nullptr)
+    {
+        *outIsActivePeer = isActivePeer;
+    }
+    if (outIsSpectator != nullptr)
+    {
+        *outIsSpectator = isSpectator;
+    }
+    return true;
+}
 constexpr unsigned kInjectedPeerQuitBroadcastDetailShift = 8u;
 
 static DWORD EncodeInjectedPeerQuitBroadcastExitCode(
@@ -1850,6 +3039,8 @@ static const char* InjectedPeerQuitBroadcastResultToString(DWORD result)
         return "helper_base_unresolved";
     case kInjectedPeerQuitBroadcastResultNativeCallCrashed:
         return "native_call_crashed";
+    case kInjectedPeerQuitBroadcastResultInvalidGuardContext:
+        return "invalid_guard_context";
     default:
         return "unknown";
     }
@@ -1872,26 +3063,59 @@ DWORD RunInjectedPeerQuitBroadcast()
 {
     g_injectedPeerQuitLastDetail = 0;
     ClearPeerQuitDiagnostic();
-    if (!IsCurrentProcessRevival())
+    const bool narrowExternalGuard = IsExternalLauncherGuardProcess();
+    if (!IsCurrentProcessRevival() && !narrowExternalGuard)
     {
         LogInjectedPeerQuitDiagnosticLine("Takeover: injected peer-quit broadcast skipped (not in EfzRevival.exe)");
         return FinishInjectedPeerQuitBroadcast(kInjectedPeerQuitBroadcastResultNotRevival);
     }
 
-    if (!HasInjectedContext())
+    if (!narrowExternalGuard && !HasInjectedContext())
     {
         (void)EnsureInjectedContextFast();
     }
 
-    DetectRevivalVersion();
-
-    const DWORD hostPid =
-        (g_injectedBlock != nullptr) ? static_cast<DWORD>(g_injectedBlock->hostPid) : 0;
+    DWORD hostPid = 0;
+    uint32_t guardRevivalTimestamp = 0;
+    if (narrowExternalGuard)
+    {
+        if (!GetExternalLauncherGuardChildProcessId(
+                &hostPid,
+                &guardRevivalTimestamp)
+            || hostPid == 0)
+        {
+            LogInjectedPeerQuitDiagnosticLine(
+                "Takeover: injected peer-quit broadcast refused (external guard child identity unavailable)");
+            return FinishInjectedPeerQuitBroadcast(
+                kInjectedPeerQuitBroadcastResultInvalidGuardContext);
+        }
+        const RevivalAddressProfile* const guardProfile =
+            FindRevivalProfileByTimestamp(guardRevivalTimestamp);
+        if (guardProfile == nullptr)
+        {
+            LogInjectedPeerQuitDiagnosticLine(
+                "Takeover: injected peer-quit broadcast refused (external guard profile unavailable timestamp=0x%08lX)",
+                static_cast<unsigned long>(guardRevivalTimestamp));
+            return FinishInjectedPeerQuitBroadcast(
+                kInjectedPeerQuitBroadcastResultInvalidGuardContext);
+        }
+        SetActiveRevivalProfile(
+            guardProfile,
+            RevivalProfileSource::ExternalLauncherGuard);
+    }
+    else
+    {
+        DetectRevivalVersion();
+        if (g_injectedBlock != nullptr)
+        {
+            hostPid = static_cast<DWORD>(g_injectedBlock->hostPid);
+        }
+    }
     const uintptr_t sendQuitAllRva = ResolveHelperSendQuitAllRva();
     const InjectedPeerManagerLayout layout = ResolveInjectedPeerManagerLayout();
     LogInjectedPeerQuitDiagnosticLine(
         "Takeover: injected peer-quit broadcast begin ready=%d hostPid=%lu version=%s sendQuitAllRva=0x%08lX layoutObj=0x%08lX peerContainerOff=0x%08lX peerBackingOff=0x%08lX quitRingOff=0x%08lX cachedManager=0x%08lX cachedHostPid=%lu cachedStrict=%d",
-        HasInjectedContext() ? 1 : 0,
+        (HasInjectedContext() || narrowExternalGuard) ? 1 : 0,
         static_cast<unsigned long>(hostPid),
         (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
             ? g_activeRevival->versionTag
@@ -2159,6 +3383,11 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         remoteSelfBase = g_remoteInjectedSelfBase;
+        if (g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent)
+        {
+            remoteSelfBase = g_externalLauncherGuardRemoteBase;
+        }
         helperPid = g_revivalProcessId;
         sourceHelperProcess = g_revivalProcess;
         if (g_revivalProcess != nullptr)
@@ -2188,12 +3417,79 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
         g_localRoleFlag,
         g_netplayRole);
 
-    return RequestInjectedPeerQuitBroadcastImpl(
+    if (helperPid != 0)
+    {
+        const LONG trackedPid = InterlockedCompareExchange(
+            &g_peerQuitBroadcastHelperPid, 0, 0);
+        if (trackedPid != static_cast<LONG>(helperPid))
+        {
+            InterlockedExchange(&g_peerQuitBroadcastState, 0);
+            InterlockedExchange(
+                &g_peerQuitBroadcastHelperPid,
+                static_cast<LONG>(helperPid));
+        }
+
+        LONG state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
+        if (state == 2)
+        {
+            if (helperProcess != nullptr)
+            {
+                CloseHandle(helperProcess);
+            }
+            mod::Log(
+                "Takeover: peer-quit broadcast coalesced reason='%s' helperPid=%lu state=already_sent",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(helperPid));
+            return true;
+        }
+
+        if (InterlockedCompareExchange(&g_peerQuitBroadcastState, 1, 0) != 0)
+        {
+            if (helperProcess != nullptr)
+            {
+                CloseHandle(helperProcess);
+            }
+
+            const DWORD waitStart = GetTickCount();
+            do
+            {
+                state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
+                if (state != 1)
+                {
+                    break;
+                }
+                Sleep(1u);
+            }
+            while (GetTickCount() - waitStart < waitMs);
+
+            const bool priorSucceeded =
+                InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0) == 2;
+            mod::Log(
+                "Takeover: peer-quit broadcast coalesced reason='%s' helperPid=%lu state=%s",
+                reason != nullptr ? reason : "",
+                static_cast<unsigned long>(helperPid),
+                priorSucceeded ? "prior_success" : "prior_incomplete");
+            return priorSucceeded;
+        }
+    }
+
+    const bool sent = RequestInjectedPeerQuitBroadcastImpl(
         helperProcess,
         remoteSelfBase,
         helperPid,
         reason,
         waitMs);
+    if (helperPid != 0)
+    {
+        InterlockedExchange(&g_peerQuitBroadcastState, sent ? 2 : 0);
+    }
+    return sent;
+}
+
+void ResetInjectedPeerQuitBroadcastState()
+{
+    InterlockedExchange(&g_peerQuitBroadcastState, 0);
+    InterlockedExchange(&g_peerQuitBroadcastHelperPid, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,42 +3544,103 @@ static void CloseChildJobObject()
 // Session lifecycle functions (public API from revival_takeover.h).
 // ---------------------------------------------------------------------------
 
-void InitializeHost()
+uint32_t BeginManagedSessionBoundary(const char* reason)
+{
+    // This authority owns only mod-side latches shared by direct sessions and
+    // exact launcher-first adoption. Call it exactly once for a committed
+    // session generation. Native object/input/INI work remains at the direct
+    // StartSession call site.
+    ResetForceLocalPlayInitCount();
+    ResetGameModeValidation();
+    ClearLocalProcessCloseForGameplayStall();
+    netplay::bridge::recovery::ResetGameplayExitRecoveryCompletion();
+    return netplay::bridge::session_lifecycle::BeginSessionBoundary(reason);
+}
+
+bool InitializeHost()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    CleanupNativeHostShadowLogDirectory("startup");
-    PrimeManagedLogEfzHistory();
-    (void)EnsureHostIpc();
+    // Resolve launcher-first ownership before opening/truncating logEfz,
+    // creating ordinary host IPC, or touching any saved host override.
+    // Launcher-owned Tournament is attached without a second init; resolving
+    // that ownership first prevents ordinary host setup from replacing role 3.
     if (!EnsureLocalRevivalLoaded())
     {
         mod::Log("Takeover: host local revival load failed");
+        return false;
     }
-    else
+
+    if (g_launchDisposition
+        == revival_launch::LaunchDisposition::AttachExistingTournament)
     {
-        // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
-        // before any profile-dependent operations (frame hook, etc.).
+        // The launcher already owns the role-3 object and native navigation.
+        // EnsureLocalRevivalLoaded performed the exact attach transaction;
+        // ordinary host log/Protocol/IPC recovery has no role in Tournament
+        // and would only add side effects before the parked UI commit.
+        mod::Log(
+            "Takeover: launcher-owned Tournament initialized without ordinary host control-plane startup");
+        return true;
+    }
+
+    if (!RecoverTemporaryHostProtocolOverride(
+            "mod startup"))
+    {
+        mod::Log(
+            "Takeover: Host Protocol crash recovery remains pending; "
+            "new Host attempts will stay blocked until it can be resolved");
+    }
+    CleanupNativeHostShadowLogDirectory("startup");
+    PrimeManagedLogEfzHistory();
+    (void)EnsureHostIpc();
+
+    // DetectRevivalVersion() is now called inside EnsureLocalRevivalLoaded()
+    // before any profile-dependent operations (frame hook, etc.).
+    if (g_launchDisposition
+            != revival_launch::LaunchDisposition::AdoptExternalOnline
+        && g_launchDisposition
+            != revival_launch::LaunchDisposition::AdoptExternalSpectator
+        && g_launchDisposition
+            != revival_launch::LaunchDisposition::AttachExistingTournament)
+    {
         (void)SetLocalRoleFlag(kLocalRoleLocalPlay, "host_initialize");
     }
 
     mod::Log("Takeover: host initialized");
+    return true;
 }
 
 void ShutdownHost()
 {
+    CloseMirrorLogFiles();
+    StopManagedLogEfzWorker(true);
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepSnapshot("ShutdownHost.01.entry");
+    RestoreTemporaryHostProtocolOverride(
+        "Revival netplay session host shutdown");
+    BOOL terminateOk = TRUE;
     if (g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(0, "shutdown_host");
     }
-    CloseProcessHandle(nullptr);
+    const bool processReleased =
+        ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, nullptr, "shutdown_host");
     CloseChildJobObject();
     CloseHostIpc();
+    if (processReleased)
+    {
+        CleanupExternalLauncherGuard();
+    }
     CleanupNativeHostShadowLogDirectory("host_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
-    g_injectedDelayPromptWaitStartTick = 0;
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
@@ -2295,26 +3652,48 @@ void ShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_externalLauncherGuardRemoteBase = 0;
+    g_remoteInjectedPatchMap.clear();
     mod::Log("Takeover: host shutdown");
+    LogRevival102jDeepStep("ShutdownHost.99.complete");
 }
 
 void EmergencyShutdownHost()
 {
+    StopManagedLogEfzWorker(false);
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepSnapshot("EmergencyShutdownHost.01.entry");
+    RestoreTemporaryHostProtocolOverride(
+        "Revival netplay session emergency host shutdown");
     InterlockedExchange(&g_startAbortRequested, 1);
+    BOOL terminateOk = TRUE;
     if (g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(
+            0, "emergency_shutdown_host", false);
     }
-    CloseProcessHandle(nullptr);
+    const bool processReleased =
+        ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk,
+            nullptr,
+            "emergency_shutdown_host",
+            false);
     CloseChildJobObject();
     CloseHostIpc();
+    if (processReleased)
+    {
+        CleanupExternalLauncherGuard();
+    }
     CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     g_delayPromptMetrics = {};
     ResetNativeWorkflowFlags();
-    g_injectedDelayPromptWaitStartTick = 0;
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
     g_lastValidatedSessionPtr = 0;
@@ -2325,6 +3704,8 @@ void EmergencyShutdownHost()
     g_lastLatePatchRetryTick = 0;
     g_observedTakeoverCreatePath = false;
     g_remoteInjectedSelfBase = 0;
+    g_externalLauncherGuardRemoteBase = 0;
+    g_remoteInjectedPatchMap.clear();
 }
 
 void RequestAbortStart()
@@ -2335,6 +3716,33 @@ void RequestAbortStart()
 void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("TitleSelection.01.entry", ioStatus);
+
+    if (g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && g_localRoleFlag == kLocalRoleTournament)
+    {
+        // Every title confirmation during this exact launcher-owned role-3
+        // generation belongs to Revival's native queued navigation. The
+        // original title update has already handled it; the observer must not
+        // defer lifecycle work, destroy the object, or invoke init again.
+        mod::Log(
+            "Takeover: preserved launcher-owned Tournament title confirmation selection=%d (initCalls=0)",
+            selection);
+        return;
+    }
+
+    if (IsInsideFrameTick())
+    {
+        InterlockedExchange(&g_deferredTitleSelection, selection);
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        mod::Log(
+            "Takeover: deferred title selection=%d until the active Revival "
+            "frame tick returns",
+            selection);
+        LogRevival102jDeepSnapshot("TitleSelection.02.deferred", ioStatus);
+        return;
+    }
 
     if (!EnsureLocalRevivalLoaded())
     {
@@ -2350,7 +3758,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     // If we're currently in tournament mode, perform full cleanup before
     // doing anything else.  The DLL call-site patches make ExitProcess
     // unreachable, so the old ConsumeRevivalExitInterception path never
-    // fires — we must clean up here instead.
+    // fires - we must clean up here instead.
     //
     // This also handles tournament re-entry (selection == 2 a second
     // time): without cleanup the EXE patches would be saved in their
@@ -2359,13 +3767,18 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     // kLocalRoleLocalPlay lets SetLocalRoleFlag call init(3,102) again.
     if (g_localRoleFlag == kLocalRoleTournament)
     {
-        RestoreDllExitProcessPatches();
-        RestoreTournamentExePatches();
-        ForceLocalPlayInit();
-        ClearRevivalText();
-        DisableRevivalTextRendering();
-        g_localRoleFlag = kLocalRoleLocalPlay;
-        mod::Log("Takeover: tournament cleanup before selection=%d", selection);
+        LogRevival102jDeepSnapshot("TitleSelection.10.tournament_cleanup_pre", ioStatus);
+        if (!g_tournamentReturnCleanupPending)
+        {
+            ArmTournamentReturnCleanup("title_selection_while_tournament_active");
+        }
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        mod::Log(
+            "Takeover: title selection=%d held until transactional Tournament cleanup completes",
+            selection);
+        LogRevival102jDeepSnapshot(
+            "TitleSelection.11.tournament_cleanup_deferred", ioStatus);
+        return;
     }
 
     if (selection == 2)
@@ -2384,11 +3797,98 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
             // returns, because the tournament session's tick function runs
             // on the very next frame and would call ExitProcess immediately
             // (mode is still 0 = title screen).
-            (void)SaveRenderContext();
-            (void)SaveTournamentExePatches();
-            (void)SaveAndApplyDllExitProcessPatches();
-            (void)SetLocalRoleFlag(kLocalRoleTournament, "title_vs_human_tournament");
-            (void)NeutralizeTournamentAutoNav();
+            const bool renderSavedBefore = SaveRenderContext();
+            LogRevival102jDeepSnapshot("TitleSelection.20.tournament_init_pre", ioStatus);
+            mod::Log(
+                "Takeover: tournament pre-init SaveRenderContext=%d",
+                renderSavedBefore ? 1 : 0);
+            const bool exeJournalReady = SaveTournamentExePatches();
+            const bool exitGuardsReady = exeJournalReady
+                && SaveAndApplyDllExitProcessPatches();
+            if (!exeJournalReady || !exitGuardsReady)
+            {
+                const bool exeRestoreOk = !exeJournalReady
+                    || RestoreTournamentExePatches();
+                const bool dllRestoreOk = !AreDllExitPatchesSaved()
+                    || RestoreDllExitProcessPatches();
+                mod::Log(
+                    "Takeover: direct Tournament pre-init rejected exeJournal=%d guards=%d exeRestore=%d dllRestore=%d",
+                    exeJournalReady ? 1 : 0,
+                    exitGuardsReady ? 1 : 0,
+                    exeRestoreOk ? 1 : 0,
+                    dllRestoreOk ? 1 : 0);
+                if (!exeRestoreOk || !dllRestoreOk)
+                {
+                    ArmTournamentReturnCleanup(
+                        "direct_tournament_preinit_guard_failure");
+                    InterlockedExchange(
+                        &g_revivalExitMode,
+                        static_cast<LONG>(kLocalRoleTournament));
+                    InterlockedExchange(&g_revivalExitIntercepted, 1);
+                    InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+                }
+                return;
+            }
+
+            const bool roleSwitchReported = SetLocalRoleFlag(
+                kLocalRoleTournament,
+                "title_vs_human_tournament");
+            const int nativeRole = ReadRoleFlagFromRevival();
+            const uintptr_t tournamentSession =
+                ReadSessionPointerFromRevival();
+            uintptr_t tournamentVtable = 0;
+            const bool exactTournamentObject =
+                roleSwitchReported
+                && nativeRole == kLocalRoleTournament
+                && tournamentSession != 0
+                && g_activeRevival != nullptr
+                && g_activeRevival->tournamentSessionVtableRva != 0
+                && SafeReadPtr(
+                    reinterpret_cast<const void*>(tournamentSession),
+                    &tournamentVtable)
+                && tournamentVtable
+                    == reinterpret_cast<uintptr_t>(g_localRevivalModule)
+                        + g_activeRevival->tournamentSessionVtableRva;
+            const bool queueNeutralized = exactTournamentObject
+                && NeutralizeTournamentAutoNav();
+            if (!exactTournamentObject || !queueNeutralized)
+            {
+                mod::Log(
+                    "Takeover: direct Tournament commit rejected roleSwitch=%d nativeRole=%d session=0x%08lX vtable=0x%08lX queue=%d",
+                    roleSwitchReported ? 1 : 0,
+                    nativeRole,
+                    static_cast<unsigned long>(tournamentSession),
+                    static_cast<unsigned long>(tournamentVtable),
+                    queueNeutralized ? 1 : 0);
+                ArmTournamentReturnCleanup(
+                    "direct_tournament_commit_validation_failure");
+                InterlockedExchange(
+                    &g_revivalExitMode,
+                    static_cast<LONG>(kLocalRoleTournament));
+                InterlockedExchange(&g_revivalExitIntercepted, 1);
+                InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+                return;
+            }
+            if (!renderSavedBefore)
+            {
+                const bool renderSavedAfter = SaveRenderContext();
+                mod::Log(
+                    "Takeover: tournament post-init SaveRenderContext=%d",
+                    renderSavedAfter ? 1 : 0);
+            }
+            if (IsActiveRevival102jProfile())
+            {
+                const bool textEnableOk = SetRevivalTextRenderingEnabled(
+                    true,
+                    "title_vs_human_tournament_102j_start");
+                mod::Log(
+                    "Takeover: 1.02j tournament start text rendering enable=%d",
+                    textEnableOk ? 1 : 0);
+            }
+            mod::Log(
+                "Takeover: direct Tournament committed role=3 session=0x%08lX queueNeutralized=1",
+                static_cast<unsigned long>(tournamentSession));
+            LogRevival102jDeepSnapshot("TitleSelection.21.tournament_init_post", ioStatus);
         }
         else
         {
@@ -2402,31 +3902,144 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     {
         (void)SetRoleFlagDirect(kLocalRoleLocalPlay, "title_other");
     }
+    // Normalize a stranded client input swap before entering any offline/local
+    // mode.  A prior client (P2) netplay session that returned via the
+    // frontend_return path leaves the persistent P1/P2 input blocks swapped;
+    // these local-play title paths run neither StartSession nor (for regular VS
+    // Human) ForceLocalPlayInit, so without this the offline match would start
+    // with P1/P2 inputs swapped.  No-op when nothing is stranded; the tournament
+    // branch already cleared the flag via ForceLocalPlayInit.  Safe here because
+    // title selection implies no live netplay session.
+    if (IsClientInputSwapApplied())
+    {
+        mod::Log(
+            "TitleSelection: normalizing stranded client input swap before "
+            "offline/local play");
+        ReverseInputSwapIfClient();
+    }
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TitleSelection.99.complete", ioStatus);
 }
+
+namespace
+{
+class TemporaryHostProtocolFailureGuard
+{
+public:
+    explicit TemporaryHostProtocolFailureGuard(bool armed)
+        : armed_(armed)
+    {
+    }
+
+    ~TemporaryHostProtocolFailureGuard()
+    {
+        if (armed_)
+        {
+            RestoreTemporaryHostProtocolOverride(
+                "Revival netplay session helper startup failed");
+        }
+    }
+
+    void Disarm()
+    {
+        armed_ = false;
+    }
+
+private:
+    bool armed_ = false;
+};
+} // namespace
 
 bool StartSession(
     NetbridgeRole role,
     uint16_t port,
     const char* address,
+    const char* iniAddress,
     const char* nickname,
     bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol,
     NetbridgeStatus* ioStatus,
     uint32_t* outConnectStartTick)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // A launcher-first session can release the ordinary peer slot while its
+    // exact parent guard remains protect-only. Reap it opportunistically once
+    // the old parent has exited; this never re-enables retired signal delivery.
+    (void)ReapExternalLauncherGuardIfParentExited();
+    if (g_peerProcessOwnership
+            == PeerProcessOwnership::ExternalLauncherParent
+        && g_revivalProcess != nullptr)
+    {
+        if (ProcessAlive(ioStatus))
+        {
+            SetPhase(
+                ioStatus,
+                NetbridgePhase::Failed,
+                "Previous external Revival launcher is still exiting; try again shortly.");
+            return false;
+        }
+        // ProcessAlive observed the exact retained process object signaled,
+        // normalized the launch disposition, and released the old peer slot.
+    }
+
     mod::Log(
-        "Takeover: StartSession role=%d port=%u address='%s' nickname='%s' writeNicknameToIni=%d",
+        "Takeover: StartSession role=%d port=%u address='%s' iniAddress='%s' nickname='%s' "
+        "writeNicknameToIni=%d family=%s writeHostProtocol=%d",
         static_cast<int>(role),
         static_cast<unsigned>(port),
         (address != nullptr) ? address : "",
+        (iniAddress != nullptr) ? iniAddress : "",
         (nickname != nullptr) ? nickname : "",
-        writeNicknameToIni ? 1 : 0);
+        writeNicknameToIni ? 1 : 0,
+        network::FamilyName(sessionFamily),
+        writeHostProtocol ? 1 : 0);
+    LogRevival102jDeepStep("StartSession.01.entry", ioStatus);
+
+    const bool temporaryHostProtocol =
+        role == NetbridgeRole::Host && writeHostProtocol;
+    if (temporaryHostProtocol
+        && !PrepareTemporaryHostProtocolOverride(sessionFamily))
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Revival netplay session Protocol setup failed.");
+        return false;
+    }
+    TemporaryHostProtocolFailureGuard protocolFailureGuard(
+        temporaryHostProtocol);
 
     // --- Session-start diagnostic dump (2nd-session crash investigation) ---
-    ResetForceLocalPlayInitCount();
-    ResetGameModeValidation();
+    const uint32_t sessionEpoch = BeginManagedSessionBoundary("StartSession");
+    (void)sessionEpoch;
+    // Normalize a stranded client input swap before the new session inits.  If
+    // the previous session was a client (P2) whose swap was never reversed
+    // (e.g. it returned to the netplay menu via frontend_return, which clears
+    // the role without running ForceLocalPlayInit), the persistent P1/P2 input
+    // blocks are still swapped and would corrupt this session's input ownership
+    // (immediate desync).  This reverses+clears it iff the flag is still set;
+    // a no-op otherwise.  Runs before the helper spawns and long before this
+    // session's own StartInitPlayer applies its swap, so it cannot race.
+    if (IsClientInputSwapApplied())
+    {
+        mod::Log(
+            "StartSession: normalizing stranded client input swap from a prior "
+            "session before new init");
+        ReverseInputSwapIfClient();
+    }
+    if (g_tournamentReturnCleanupPending)
+    {
+        LogRevival102jDeepSnapshot("StartSession.02.stale_tournament_pre", ioStatus);
+        mod::Log(
+            "StartSession: rejected while transactional Tournament cleanup is still pending");
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Tournament cleanup is still in progress; try again after returning to title.");
+        return false;
+    }
 
     // --- Session boundary cleanup logging ---
     // Log EXE hook bytes at both hook sites for cross-session tracking.
@@ -2448,7 +4061,7 @@ bool StartSession(
     // Clear stale exit-interception flags from a previous session.
     // If g_revivalExitIntercepted leaked from session 1 (e.g. ExitProcess
     // raced with CancelSession), ConsumeRevivalExitInterception would fire
-    // during session 2's setup — running the full reverse-init cleanup and
+    // during session 2's setup - running the full reverse-init cleanup and
     // destroying the new session.
     if (InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0)
     {
@@ -2469,45 +4082,54 @@ bool StartSession(
         return false;
     }
 
-    // Zero the entire shared block to prevent stale data from session 1
-    // leaking into session 2.  Re-populate the header fields that
-    // EnsureHostIpc wrote (magic, version, hostPid, hostRevivalBase)
-    // since StartSession's later code repopulates the rest.
-    if (g_hostBlock != nullptr)
+    if (ResetHostSharedBlockForSession(
+            role == NetbridgeRole::Host,
+            port,
+            "StartSession"))
     {
-        mod::Log("StartSession: resetting SharedBlock (initSerial=%ld consoleSerial=%ld)",
-                 static_cast<long>(g_hostBlock->initSerial),
-                 static_cast<long>(g_hostBlock->consoleSerial));
-        const uint32_t savedMagic = g_hostBlock->magic;
-        const uint32_t savedVersion = g_hostBlock->version;
-        const uint32_t savedPid = g_hostBlock->hostPid;
-        const uint32_t savedBase = g_hostBlock->hostRevivalBase;
-        const uint32_t savedTimestamp = g_hostBlock->hostRevivalTimestamp;
-        memset(g_hostBlock, 0, sizeof(SharedBlock));
-        g_hostBlock->magic = savedMagic;
-        g_hostBlock->version = savedVersion;
-        g_hostBlock->hostPid = savedPid;
-        g_hostBlock->hostRevivalBase = savedBase;
-        g_hostBlock->hostRevivalTimestamp = savedTimestamp;
-        // Restore default values for delay prompt fields.
-        g_hostBlock->delayInputValue = -1;
-        g_hostBlock->delayAveragePingMs = -1;
-        g_hostBlock->delayMinPingMs = -1;
-        g_hostBlock->delayMaxPingMs = -1;
-        g_hostBlock->delayRecommended = -1;
-        g_hostBlock->delayRangeMax = 20;
+        LogRevival102jDeepStep("StartSession.05.shared_block_reset", ioStatus);
     }
 
-    if (!EnsureLocalRevivalLoaded())
+    if (!EnsureLocalRevivalLoaded(true))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
         return false;
     }
+    if (!ActiveRevivalProfileSupportsSessionStart())
+    {
+        const char* const tag =
+            (g_activeRevival != nullptr && g_activeRevival->versionTag != nullptr)
+                ? g_activeRevival->versionTag
+                : "(null)";
+        const uintptr_t roleOffset =
+            (g_activeRevival != nullptr && g_activeRevival->roleFlagOffsetCount > 0)
+                ? g_activeRevival->roleFlagOffsets[0]
+                : 0;
+        const uintptr_t sessionOffset =
+            (g_activeRevival != nullptr && g_activeRevival->sessionPtrOffsetCount > 0)
+                ? g_activeRevival->sessionPtrOffsets[0]
+                : 0;
+        mod::Log(
+            "Takeover: StartSession rejected Revival profile version=%s roleCount=%u role0=0x%08lX "
+            "sessionCount=%u session0=0x%08lX startInit=0x%08lX frameHook=0x%08lX tick=0x%08lX",
+            tag,
+            (g_activeRevival != nullptr) ? static_cast<unsigned>(g_activeRevival->roleFlagOffsetCount) : 0u,
+            static_cast<unsigned long>(roleOffset),
+            (g_activeRevival != nullptr) ? static_cast<unsigned>(g_activeRevival->sessionPtrOffsetCount) : 0u,
+            static_cast<unsigned long>(sessionOffset),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->startInitPlayerRva : 0),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->frameHookRva : 0),
+            static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->perFrameTickRva : 0));
+        SetPhase(ioStatus, NetbridgePhase::Failed, "Unsupported EfzRevival.dll profile");
+        return false;
+    }
+
+    LogRevival102jDeepSnapshot("StartSession.06.profile_and_ipc_ready", ioStatus);
 
     // Save the EfzRender* pointer now so that ClearRevivalText /
     // DisableRevivalTextRendering can restore it during CancelSession.
     // Tournament mode already does this in OnTitleSelectionConfirmed,
-    // but online sessions (host/join/spectate) skipped it — causing
+    // but online sessions (host/join/spectate) skipped it - causing
     // both clear and disable to silently fail on the cleanup path.
     (void)SaveRenderContext();
 
@@ -2527,6 +4149,7 @@ bool StartSession(
         CopyString(ioStatus->nickname, sizeof(ioStatus->nickname), nickname);
     }
     SetPhase(ioStatus, NetbridgePhase::Connecting, nullptr);
+    LogRevival102jDeepStep("StartSession.07.phase_connecting", ioStatus);
     g_lastConnectingDiagnosticTick = 0;
     g_lastSessionPtrOffset = 0;
     g_lastValidatedSessionPtr = 0;
@@ -2534,6 +4157,8 @@ bool StartSession(
     g_lastRuntimeReadyProbeLogTick = 0;
     g_lastRuntimeReadyProbeMask = 0;
     g_lastRuntimeReadyProbeMaskValid = false;
+    g_lastNativeDelayTimeoutTraceSerial = 0;
+    g_lastNativeDelayTimeoutTraceTick = 0;
     if (outConnectStartTick != nullptr)
     {
         *outConnectStartTick = GetTickCount();
@@ -2541,12 +4166,18 @@ bool StartSession(
 
     const std::string gameDir = GameDirectory();
     const std::wstring gameDirWide = GameDirectoryWide();
-    if (!WriteIni(static_cast<int>(role), port, address, nickname, writeNicknameToIni))
+    if (!WriteIni(
+            static_cast<int>(role),
+            port,
+            iniAddress,
+            nickname,
+            writeNicknameToIni,
+            sessionFamily,
+            writeHostProtocol))
     {
         SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
         return false;
     }
-
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -2598,7 +4229,7 @@ bool StartSession(
         }
 
         // Build the override string: "efz_netplay_mod=n"
-        // n = native — tells Wine to load the DLL from the filesystem.
+        // n = native - tells Wine to load the DLL from the filesystem.
         std::string baseName = BaseLower(selfPath);
         {
             // Strip .dll extension if present.
@@ -2617,7 +4248,7 @@ bool StartSession(
             overrideValue = std::string(existingOverride) + ";" + overrideValue;
         }
 
-        // Build an environment block — a double-null-terminated sequence of
+        // Build an environment block - a double-null-terminated sequence of
         // "KEY=VALUE\0" strings.  We inherit the current environment and
         // append/override WINEDLLOVERRIDES.
         std::vector<char> envBlock;
@@ -2680,6 +4311,7 @@ bool StartSession(
 
         mod::Log("Takeover [Wine]: spawned EfzRevival suspended pid=%lu (DLL override active)",
                  static_cast<unsigned long>(pi.dwProcessId));
+        LogRevival102jDeepStep("StartSession.10.helper_spawned_suspended_wine", ioStatus);
     }
     else
     {
@@ -2705,6 +4337,7 @@ bool StartSession(
         }
 
         mod::Log("Takeover: spawned EfzRevival suspended pid=%lu", static_cast<unsigned long>(pi.dwProcessId));
+        LogRevival102jDeepStep("StartSession.10.helper_spawned_suspended", ioStatus);
     }
 
     // Assign to kill-on-close job so that if the host process terminates
@@ -2743,6 +4376,7 @@ bool StartSession(
         CloseHandle(pi.hProcess);
         return false;
     }
+    LogRevival102jDeepStep("StartSession.11.helper_injected", ioStatus);
 
     std::unordered_map<std::string, uint32_t> patches = BuildPatchMap(remoteBase);
 
@@ -2754,6 +4388,7 @@ bool StartSession(
         CloseHandle(pi.hProcess);
         return false;
     }
+    LogRevival102jDeepStep("StartSession.12.helper_iat_patched", ioStatus);
 
     int localRoleMode = kLocalRoleOnline;
     if (role == NetbridgeRole::Spectate || role == NetbridgeRole::JoinSpectate)
@@ -2765,11 +4400,12 @@ bool StartSession(
     g_hostBlock->initParams[1] = 102;
     ResetDebugCounters(g_hostBlock);
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
     g_sessionHistoryRepairHits = 0;
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
-    g_injectedDelayPromptWaitStartTick = 0;
     InterlockedExchange(&g_injectedSpectateConfirmPromptSerial, 0);
     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, 0);
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -2789,44 +4425,26 @@ bool StartSession(
         g_consolePendingWriteConsoleOutputCharacterW.clear();
         g_consolePendingOutputDebugStringA.clear();
         g_consolePendingOutputDebugStringW.clear();
-        g_diskCapturePathHits.clear();
     }
     CloseMirrorLogFiles();
     InterlockedIncrement(&g_hostBlock->initSerial);
+    LogRevival102jDeepSnapshot("StartSession.13.ipc_payload_initialized", ioStatus);
 
-    std::string primaryInput;
-    std::string auxInput;
-    int menuChoice = 0;
-    if (role == NetbridgeRole::Host)
+    const console_handoff::InitialConsoleInputPlan consoleInputPlan =
+        console_handoff::BuildInitialConsoleInputPlan(role);
+    std::string primaryInput = consoleInputPlan.primaryInput;
+    int menuChoice = consoleInputPlan.menuChoice;
+    if (role == NetbridgeRole::Join)
     {
-        menuChoice = 1;
-        primaryInput = "1\r\n";
-        auxInput = "\r\n";
-    }
-    else if (role == NetbridgeRole::Join)
-    {
-        menuChoice = 3;
-        primaryInput = "3\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (!clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: join clipboard seeded with address '%s'", clipboardAddress.c_str());
@@ -2835,6 +4453,15 @@ bool StartSession(
                 {
                     mod::Log("Takeover: join clipboard write failed; Revival will use existing clipboard");
                 }
+            }
+            else
+            {
+                mod::Log(
+                    "Takeover: Revival netplay session join endpoint formatting failed "
+                    "family=%s address='%s' port=%u",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
             }
         }
     }
@@ -2846,28 +4473,15 @@ bool StartSession(
         // - "Host not yet playing, join as a player?"   -> show Join/Wait/Cancel
         //   in the in-game overlay and let the host-side UI decide whether to
         //   keep waiting, restart as a normal Join, or cancel cleanly.
-        menuChoice = 3;
-        primaryInput = "3\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (!clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: join-spectate clipboard seeded with address '%s'", clipboardAddress.c_str());
@@ -2877,36 +4491,37 @@ bool StartSession(
                     mod::Log("Takeover: join-spectate clipboard write failed; Revival will use existing clipboard");
                 }
             }
+            else
+            {
+                mod::Log(
+                    "Takeover: Revival netplay session join-spectate endpoint formatting failed "
+                    "family=%s address='%s' port=%u",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
+            }
         }
     }
     else if (role == NetbridgeRole::Spectate)
     {
-        menuChoice = 4;
-        primaryInput = "4\r\n";
-
         if (address != nullptr && address[0] != '\0')
         {
-            std::string clipboardAddress = address;
-            clipboardAddress.erase(
-                std::remove_if(
-                    clipboardAddress.begin(),
-                    clipboardAddress.end(),
-                    [](char c) { return c == '\r' || c == '\n'; }),
-                clipboardAddress.end());
-
-            if (clipboardAddress.empty())
+            network::NetworkEndpoint endpoint = {};
+            endpoint.family = sessionFamily;
+            endpoint.host = address;
+            endpoint.port = port;
+            std::string clipboardAddress;
+            if (!network::FormatEndpoint(endpoint, &clipboardAddress))
             {
-                mod::Log("Takeover: spectate address empty after trim; using clipboard option as-is");
+                mod::Log(
+                    "Takeover: Revival netplay session spectate endpoint formatting failed "
+                    "family=%s address='%s' port=%u; using clipboard option as-is",
+                    network::FamilyName(sessionFamily),
+                    address,
+                    static_cast<unsigned>(port));
             }
             else
             {
-                if (clipboardAddress.find(':') == std::string::npos && port > 0)
-                {
-                    char portSuffix[16] = {};
-                    std::snprintf(portSuffix, sizeof(portSuffix), ":%u", static_cast<unsigned>(port));
-                    clipboardAddress += portSuffix;
-                }
-
                 if (!TryWriteClipboardAscii(clipboardAddress.c_str()))
                 {
                     mod::Log("Takeover: spectate clipboard write failed; using option 4 with existing clipboard");
@@ -2927,22 +4542,26 @@ bool StartSession(
 
     CopyString(g_hostBlock->consoleInput, sizeof(g_hostBlock->consoleInput), primaryInput.c_str());
     InterlockedIncrement(&g_hostBlock->consoleSerial);
-    g_hostBlock->consoleInputAux[0] = '\0';
+    CopyString(
+        g_hostBlock->consoleInputAux,
+        sizeof(g_hostBlock->consoleInputAux),
+        consoleInputPlan.auxiliaryInput);
     LONG auxSerialForSession = 0;
-    if (!auxInput.empty())
+    if (g_hostBlock->consoleInputAux[0] != '\0')
     {
-        CopyString(g_hostBlock->consoleInputAux, sizeof(g_hostBlock->consoleInputAux), auxInput.c_str());
-        auxSerialForSession = InterlockedIncrement(&g_hostBlock->consoleAuxSerial);
+        auxSerialForSession =
+            InterlockedIncrement(&g_hostBlock->consoleAuxSerial);
     }
 
     ResetEvent(g_hostInitEvent);
     ResetEvent(g_hostConsoleEvent);
+    LogRevival102jDeepStep("StartSession.14.auto_reset_events_cleared", ioStatus);
 
     // --- Pre-launch ring buffer flush (spectate only) ----------------------
     // Revival's named shared-memory ring buffers ("InputP1", "InputP2", etc.)
     // may still contain stale data from a previous session if the kernel
-    // objects haven't been destroyed.  Flush them NOW — before the child
-    // process is resumed — so that only fresh data from the new session is
+    // objects haven't been destroyed.  Flush them NOW - before the child
+    // process is resumed - so that only fresh data from the new session is
     // present when the DLL eventually starts consuming.
     //
     // Previously this flush lived inside the Tick() init-handshake block
@@ -2951,8 +4570,8 @@ bool StartSession(
     // signalling the init event and the next game-frame's Tick() detecting
     // it (~16 ms), the child had already started writing the host's
     // historical input stream into the ring buffers.  The flush then
-    // discarded those early entries — the very beginning of the charselect
-    // replay — leaving the DLL to start mid-stream against a freshly-
+    // discarded those early entries - the very beginning of the charselect
+    // replay - leaving the DLL to start mid-stream against a freshly-
     // initialised charselect state.
     //
     // By flushing here (child still suspended), we clear only genuinely
@@ -2971,15 +4590,15 @@ bool StartSession(
             volatile DWORD* view;
         };
         RingMapping mappings[] = {
-            {"InputP1",   nullptr, nullptr},
-            {"InputP2",   nullptr, nullptr},
-            {"PaletteP1", nullptr, nullptr},
-            {"PaletteP2", nullptr, nullptr},
-            {"Sync",      nullptr, nullptr},
-            {"Quit",      nullptr, nullptr},
-            {"LoadMatch", nullptr, nullptr},
-            {"Init",      nullptr, nullptr},
-            {"Net",       nullptr, nullptr},
+            {RevivalWireName("InputP1"),   nullptr, nullptr},
+            {RevivalWireName("InputP2"),   nullptr, nullptr},
+            {RevivalWireName("PaletteP1"), nullptr, nullptr},
+            {RevivalWireName("PaletteP2"), nullptr, nullptr},
+            {RevivalWireName("Sync"),      nullptr, nullptr},
+            {RevivalWireName("Quit"),      nullptr, nullptr},
+            {RevivalWireName("LoadMatch"), nullptr, nullptr},
+            {RevivalWireName("Init"),      nullptr, nullptr},
+            {RevivalWireName("Net"),       nullptr, nullptr},
         };
         constexpr int kMappingCount = 9;
 
@@ -3012,7 +4631,7 @@ bool StartSession(
                     static_cast<unsigned long>(oldTail));
             }
         }
-        // Alignment verification is unnecessary here — no producer is
+        // Alignment verification is unnecessary here - no producer is
         // running yet, so no interleaved writes can occur.
         for (int mi = 0; mi < kMappingCount; ++mi)
         {
@@ -3022,19 +4641,73 @@ bool StartSession(
                 CloseHandle(mappings[mi].hMap);
         }
     }
+    LogRevival102jDeepSnapshot("StartSession.15.prelaunch_rings_flushed", ioStatus);
+
+    // The helper's DllMain bootstrap is asynchronous. Do not let its main
+    // thread emit one-shot listener/prompt text until the helper-local raw
+    // ingress worker has positively acknowledged readiness through IPC.
+    const DWORD captureReadyStart = GetTickCount();
+    while (InterlockedCompareExchange(
+               &g_hostBlock->helperCaptureReady, 0, 0) == 0
+        && GetTickCount() - captureReadyStart
+            < kInjectedCaptureReadyTimeoutMs)
+    {
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0)
+        {
+            break;
+        }
+        Sleep(1);
+    }
+    if (InterlockedCompareExchange(
+            &g_hostBlock->helperCaptureReady, 0, 0) == 0)
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Helper console capture worker unavailable");
+        (void)TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
 
     // Both Wine and native: the process was created suspended, resume it
     // now that injection and IAT patching are complete.
+    const DWORD resumeResult = ResumeThread(pi.hThread);
+    mod::Log("Takeover: resumed main thread result=%lu%s",
+             static_cast<unsigned long>(resumeResult),
+             useWinePath ? " [Wine]" : "");
+    if (resumeResult == static_cast<DWORD>(-1))
     {
-        const DWORD resumeResult = ResumeThread(pi.hThread);
-        mod::Log("Takeover: resumed main thread result=%lu%s",
-                 static_cast<unsigned long>(resumeResult),
-                 useWinePath ? " [Wine]" : "");
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Failed to resume EfzRevival helper main thread");
+        (void)TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
     }
+    LogRevival102jDeepStep("StartSession.16.helper_resumed", ioStatus);
 
     g_revivalProcess = pi.hProcess;
     g_revivalProcessId = pi.dwProcessId;
+    g_peerProcessOwnership = PeerProcessOwnership::SpawnedHelper;
+    if (!StartPeerProcessExitWatch())
+    {
+        SetPhase(
+            ioStatus,
+            NetbridgePhase::Failed,
+            "Helper process-exit watcher unavailable");
+        const BOOL terminateOk =
+            TerminatePeerProcessIfOwned(0, "start_watcher_failure");
+        CloseHandle(pi.hThread);
+        (void)ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, ioStatus, "start_watcher_failure");
+        return false;
+    }
     g_remoteInjectedSelfBase = remoteBase;
+    g_remoteInjectedPatchMap = std::move(patches);
     g_lastLatePatchRetryTick = GetTickCount();
     g_lastLatePatchRetryLogTick = 0;
     g_latePatchRetryAttempts = 0;
@@ -3058,13 +4731,16 @@ bool StartSession(
         static_cast<long>(auxSerialForSession));
     SetPhase(ioStatus, NetbridgePhase::Connecting, "awaiting handshake");
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("StartSession.99.armed", ioStatus);
     mod::Log("Takeover: start session armed (asynchronous handshake via Tick)");
+    protocolFailureGuard.Disarm();
     return true;
 }
 
 bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("ApplyInputDelay.01.entry", ioStatus);
 
     // Input delay is only applicable to online sessions (mode 0).
     // Spectator sessions have a different layout and the delay offset
@@ -3111,6 +4787,28 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
             value,
             static_cast<long>(delayPromptSerial),
             static_cast<long>(inputSerial));
+        MOD_LIFECYCLE_TRACE(
+            "CONSOLE_DELAY_INPUT_QUEUE promptSerial=%ld promptServed=%ld "
+            "inputSerial=%ld inputServed=%ld value=%d controlWake=%ld/%ld",
+            static_cast<long>(delayPromptSerial),
+            static_cast<long>(delayPromptServedSerial),
+            static_cast<long>(inputSerial),
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->delayInputServedSerial,
+                    0,
+                    0)),
+            value,
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeRequestSerial,
+                    0,
+                    0)),
+            static_cast<long>(
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeServedSerial,
+                    0,
+                    0)));
         RefreshRuntimeStatus(ioStatus);
         if (ioStatus != nullptr)
         {
@@ -3121,6 +4819,7 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
 
     if (promptPending && queuePromptInput(delayFrames))
     {
+        LogRevival102jDeepSnapshot("ApplyInputDelay.02.prompt_value_queued", ioStatus);
         return true;
     }
 
@@ -3167,12 +4866,14 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
     {
         ioStatus->rollbackFrames = delayFrames;
     }
+    LogRevival102jDeepSnapshot("ApplyInputDelay.99.direct_write_complete", ioStatus);
     return true;
 }
 
 bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("SpectatePrompt.01.answer_entry", ioStatus);
 
     LONG promptSerial = 0;
     LONG promptServedSerial = 0;
@@ -3226,12 +4927,14 @@ bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
         static_cast<long>(promptSerial),
         static_cast<long>(inputSerial));
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("SpectatePrompt.99.answer_queued", ioStatus);
     return true;
 }
 
 bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    LogRevival102jDeepStep("Handoff.01.prepare_entry", ioStatus);
 
     if (!EnsureLocalRevivalLoaded())
     {
@@ -3258,6 +4961,7 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     RefreshRuntimeStatus(ioStatus);
 
     const bool syncReady = IsSyncReadyForVsHuman(ioStatus);
+    const bool strictNativeSync = RequiresNativeVsHumanSyncForHandoff(ioStatus);
     const int mode = ioStatus != nullptr ? ioStatus->syncGameMode : -1;
     const int flag1084 = ioStatus != nullptr ? ioStatus->syncMode0Flag1084 : -1;
     const int sessionByte = ioStatus != nullptr ? ioStatus->syncSessionByte : -1;
@@ -3274,10 +4978,12 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     static int s_lastFlag4964 = std::numeric_limits<int>::min();
     static int s_lastFlag4965 = std::numeric_limits<int>::min();
     static int s_lastRoleFlag = std::numeric_limits<int>::min();
+    static int s_lastStrictNativeSync = -1;
     const DWORD now = GetTickCount();
     const bool changed =
         s_lastRoleSet != (roleSet ? 1 : 0)
         || s_lastSyncReady != (syncReady ? 1 : 0)
+        || s_lastStrictNativeSync != (strictNativeSync ? 1 : 0)
         || s_lastMode != mode
         || s_lastFlag1084 != flag1084
         || s_lastSessionByte != sessionByte
@@ -3288,6 +4994,7 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     {
         s_lastRoleSet = roleSet ? 1 : 0;
         s_lastSyncReady = syncReady ? 1 : 0;
+        s_lastStrictNativeSync = strictNativeSync ? 1 : 0;
         s_lastMode = mode;
         s_lastFlag1084 = flag1084;
         s_lastSessionByte = sessionByte;
@@ -3296,17 +5003,24 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
         s_lastRoleFlag = roleFlag;
         s_lastLogTick = now;
         mod::Log(
-            "Takeover: PrepareVsHumanHandoff roleSet=%d syncReady=%d mode=%d flag1084=%d sessionByte=%d flags=%d/%d roleFlag=%d",
+            "Takeover: PrepareVsHumanHandoff roleSet=%d syncReady=%d strictNativeSync=%d mode=%d flag1084=%d sessionByte=%d flags=%d/%d roleFlag=%d",
             roleSet ? 1 : 0,
             syncReady ? 1 : 0,
+            strictNativeSync ? 1 : 0,
             mode,
             flag1084,
             sessionByte,
             flag4964,
             flag4965,
             roleFlag);
+        LogRevival102jDeepStep("Handoff.02.readiness_changed_or_periodic", ioStatus);
     }
-    return roleSet || syncReady;
+    const bool ready = syncReady || (roleSet && !strictNativeSync);
+    if (ready)
+    {
+        LogRevival102jDeepSnapshot("Handoff.99.ready", ioStatus);
+    }
+    return ready;
 }
 
 void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
@@ -3317,23 +5031,144 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         return;
     }
 
+    HandleTemporaryHostProtocolListenerAck();
     const NetbridgePhase phase = static_cast<NetbridgePhase>(ioStatus->phase);
     if (phase != NetbridgePhase::Connecting
         && phase != NetbridgePhase::DelaySetup
         && phase != NetbridgePhase::Connected)
     {
+        RestoreTemporaryHostProtocolOverride(
+            "Revival netplay session reached a terminal phase before listener acknowledgement");
         RefreshRuntimeStatus(ioStatus);
         return;
     }
 
-    if (!ProcessAlive(ioStatus))
+    const bool helperAlive = ProcessAlive(ioStatus);
+    if (g_hostBlock != nullptr
+        && g_hostBlock->magic == kIpcMagic
+        && g_hostBlock->version == kIpcVersion
+        && g_hostBlock->hostPid != 0)
     {
+        const LONG nativeTimeoutSerial =
+            InterlockedCompareExchange(
+                &g_hostBlock->nativeDelayTimeoutSerial,
+                0,
+                0);
+        const LONG nativeTimeoutHandled =
+            InterlockedCompareExchange(
+                &g_hostBlock->nativeDelayTimeoutHandledSerial,
+                0,
+                0);
+        if (nativeTimeoutSerial > 0
+            && nativeTimeoutSerial > nativeTimeoutHandled)
+        {
+            const LONG requiredControlWakeSerial =
+                InterlockedCompareExchange(
+                    &g_hostBlock->nativeDelayTimeoutRequiredWakeSerial,
+                    0,
+                    0);
+            const LONG controlWakeRequest =
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeRequestSerial,
+                    0,
+                    0);
+            const LONG controlWakeServed =
+                InterlockedCompareExchange(
+                    &g_hostBlock->consoleControlWakeServedSerial,
+                    0,
+                    0);
+            const bool cleanupReady =
+                console_handoff::IsNativeTimeoutCleanupReady(
+                    helperAlive,
+                    controlWakeServed,
+                    requiredControlWakeSerial);
+            const DWORD now = GetTickCount();
+            if (nativeTimeoutSerial
+                    != g_lastNativeDelayTimeoutTraceSerial
+                || g_lastNativeDelayTimeoutTraceTick == 0
+                || now - g_lastNativeDelayTimeoutTraceTick >= 1000)
+            {
+                g_lastNativeDelayTimeoutTraceSerial =
+                    nativeTimeoutSerial;
+                g_lastNativeDelayTimeoutTraceTick = now;
+                MOD_LIFECYCLE_TRACE(
+                    "NATIVE_DELAY_TIMEOUT_GATE serial=%ld handled=%ld "
+                    "helperAlive=%d controlWake=%ld/%ld required=%ld "
+                    "cleanupReady=%d",
+                    static_cast<long>(nativeTimeoutSerial),
+                    static_cast<long>(nativeTimeoutHandled),
+                    helperAlive ? 1 : 0,
+                    static_cast<long>(controlWakeRequest),
+                    static_cast<long>(controlWakeServed),
+                    static_cast<long>(requiredControlWakeSerial),
+                    cleanupReady ? 1 : 0);
+            }
+
+            if (!cleanupReady)
+            {
+                RefreshRuntimeStatus(ioStatus);
+                return;
+            }
+
+            MOD_LIFECYCLE_TRACE(
+                "NATIVE_DELAY_TIMEOUT_RELEASE serial=%ld evidence=%s "
+                "controlWake=%ld/%ld required=%ld",
+                static_cast<long>(nativeTimeoutSerial),
+                helperAlive ? "bel_served" : "helper_exit",
+                static_cast<long>(controlWakeRequest),
+                static_cast<long>(controlWakeServed),
+                static_cast<long>(requiredControlWakeSerial));
+            mod::Log(
+                "Takeover: native held-delay timeout cleanup complete "
+                "serial=%ld evidence=%s wake=%ld/%ld required=%ld",
+                static_cast<long>(nativeTimeoutSerial),
+                helperAlive ? "BEL served" : "helper exited",
+                static_cast<long>(controlWakeRequest),
+                static_cast<long>(controlWakeServed),
+                static_cast<long>(requiredControlWakeSerial));
+            PublishConsoleError("Opponent timed out.");
+            InterlockedExchange(
+                &g_hostBlock->nativeDelayTimeoutHandledSerial,
+                nativeTimeoutSerial);
+            RefreshRuntimeStatus(ioStatus);
+        }
+    }
+
+    if (!helperAlive)
+    {
+        RestoreTemporaryHostProtocolOverride(
+            "Revival netplay session helper ended before listener acknowledgement");
+        LogRevival102jDeepSnapshot("Tick.10.helper_not_alive_pre_recovery", ioStatus);
         RefreshRuntimeStatus(ioStatus);
         const bool runtimeReady = HasRuntimeReadySignal(ioStatus);
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         {
             if (g_localInitAppliedForSession)
             {
+                const bool spectatorStarting =
+                    g_localRoleFlag == kLocalRoleSpectate
+                    || (g_hostBlock != nullptr
+                        && g_hostBlock->initParams[0] == kLocalRoleSpectate);
+                if (spectatorStarting)
+                {
+                    SetPhase(
+                        ioStatus,
+                        NetbridgePhase::Failed,
+                        "EfzRevival spectator process ended during initialization");
+                    g_localInitAppliedForSession = false;
+                    const bool localInitOk = ForceLocalPlayInit();
+                    mod::Log(
+                        "Takeover: spectator helper exited before handoff; "
+                        "local recovery result=%d postInitAttempted=%d postInitOk=%d",
+                        localInitOk ? 1 : 0,
+                        g_spectatorPostInitAttemptedForSession ? 1 : 0,
+                        g_spectatorPostInitSucceededForSession ? 1 : 0);
+                    LogRevival102jDeepSnapshot(
+                        "Tick.11.spectator_helper_exit_recovered",
+                        ioStatus);
+                    return;
+                }
+
                 if (runtimeReady)
                 {
                     SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
@@ -3370,9 +5205,10 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             ReinitLocalPlay();
             if (runtimeReady)
             {
-                mod::Log("Takeover: helper process exited during Connected phase — forcing SessionEnded (runtime was still ready)");
+                mod::Log("Takeover: helper process exited during Connected phase - forcing SessionEnded (runtime was still ready)");
             }
         }
+        LogRevival102jDeepSnapshot("Tick.12.helper_exit_branch_complete", ioStatus);
         return;
     }
 
@@ -3390,16 +5226,26 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(cpHits),
                 static_cast<long>(wpmHits),
                 static_cast<long>(crtHits));
+            LogRevival102jDeepStep("Tick.20.takeover_create_path_observed", ioStatus);
         }
 
-        if (!g_observedTakeoverCreatePath
+        if (g_peerProcessOwnership == PeerProcessOwnership::SpawnedHelper
+            && !g_observedTakeoverCreatePath
             && g_revivalProcess != nullptr
             && g_revivalProcessId != 0
             && g_remoteInjectedSelfBase != 0
             && (g_lastLatePatchRetryTick == 0 || now - g_lastLatePatchRetryTick >= 500))
         {
-            const std::unordered_map<std::string, uint32_t> patches = BuildPatchMap(g_remoteInjectedSelfBase);
-            const bool patchedLate = PatchIat(g_revivalProcess, g_revivalProcessId, patches, false);
+            if (g_remoteInjectedPatchMap.empty())
+            {
+                g_remoteInjectedPatchMap =
+                    BuildPatchMap(g_remoteInjectedSelfBase);
+            }
+            const bool patchedLate = PatchIat(
+                g_revivalProcess,
+                g_revivalProcessId,
+                g_remoteInjectedPatchMap,
+                false);
             ++g_latePatchRetryAttempts;
             if (patchedLate)
             {
@@ -3486,6 +5332,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(cpHits),
                 static_cast<long>(wpmHits),
                 static_cast<long>(crtHits));
+            LogRevival102jDeepStep("Tick.21.connecting_periodic", ioStatus);
         }
 
         const bool spectateRoleActive =
@@ -3499,15 +5346,45 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         }
     }
 
-    if ((phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
+    const bool initHandshakeEligible =
+        (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         && !g_localInitAppliedForSession
         && g_hostInitEvent != nullptr
         && g_hostBlock != nullptr
-        && g_localInitFn != nullptr)
+        && g_localInitFn != nullptr;
+
+    if (initHandshakeEligible
+        && IsInsideFrameTick()
+        && WaitForSingleObject(g_hostInitEvent, 0) == WAIT_OBJECT_0)
+    {
+        // g_hostInitEvent is an auto-reset event.  The zero-timeout wait above
+        // consumes its one signal, so put the signal back for the post-tick
+        // takeover::Tick() call that is allowed to run the destructor/init.
+        // Without this, every session remains stuck in Connecting because the
+        // deferred call can no longer observe the helper's init handshake.
+        if (!SetEvent(g_hostInitEvent))
+        {
+            mod::Log(
+                "Takeover: failed to preserve deferred init handshake event: %s",
+                ErrorString(GetLastError()).c_str());
+        }
+        LogRevival102jDeepStep("Tick.30.init_event_detected_and_rearmed", ioStatus);
+        const LONG wasPending =
+            InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        if (wasPending == 0)
+        {
+            mod::Log(
+                "Takeover: init handshake ready inside active Revival tick; "
+                "deferring destructor/init until post-tick");
+        }
+    }
+
+    if (initHandshakeEligible && !IsInsideFrameTick())
     {
         const DWORD initReady = WaitForSingleObject(g_hostInitEvent, 0);
         if (initReady == WAIT_OBJECT_0)
         {
+            LogRevival102jDeepSnapshot("Tick.31.init_event_post_tick_consumed", ioStatus);
             // --- Diagnostic dump before init handshake (2nd-session crash investigation) ---
             LogSessionDiagnosticState("Tick_init_handshake_pre");
 
@@ -3526,10 +5403,15 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // --- Full init write snapshot BEFORE ---
             LogInitWriteSnapshot("Tick_init_pre");
 
-            // Destroy the current session to prevent leaking the old object.
-            // This is the root cause fix for the 2nd-session crash (H1).
+            // 1.02j installs 0x401642 only once, outside exported init().
+            // Capture it before invoking the verified session destructor.
             const uintptr_t oldSessionPtr = ReadSessionPointerFromRevival();
+            if (IsActiveRevival102jProfile())
+            {
+                SaveExeDispatchHookBytes();
+            }
             DestroyCurrentSession("Tick_init_handshake");
+            LogRevival102jDeepStep("Tick.32.old_session_destroyed", ioStatus);
 
             // Prevent init() from chaining another trampoline at 0x401582.
             mod::Log(
@@ -3538,15 +5420,17 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 initParams[0],
                 static_cast<unsigned long>(oldSessionPtr));
             SaveExeFrameHookBytes();
-            // Save the 8 bytes at 0x401642 (per-frame dispatch replacement
-            // hook) so init()'s EFZ_BufferProcess_WithSize doesn't leak a
-            // new malloc'd trampoline on every session.
-            SaveExeDispatchHookBytes();
+            if (!IsActiveRevival102jProfile())
+            {
+                // Legacy builds may replace this hook from exported init().
+                SaveExeDispatchHookBytes();
+            }
             // Restore original (pre-hook) bytes at mode-ctor hook sites
             // BEFORE init() so the new trampoline copies clean EXE bytes
             // instead of stale hooks from a previous session's mode.
             RestoreModeCtorOriginalBytes();
             ResetModeConstructorTrampolineCache();
+            LogRevival102jDeepSnapshot("Tick.33.exported_init_pre", ioStatus);
 
             // Dump the 10 bytes at 0x401582 right before init().
             {
@@ -3563,6 +5447,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                      initParams[0], initParams[1]);
             CloseMirrorLogFiles();
             const int initResult = g_localInitFn(initParams);
+            LogRevival102jDeepSnapshot("Tick.34.exported_init_returned_unrestored", ioStatus);
 
             // Dump the 10 bytes AFTER init() to see what sub_1006F160 wrote.
             {
@@ -3593,11 +5478,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     verify[5], verify[6], verify[7], verify[8], verify[9]);
             }
 
-            // Restore saved 0x401642 bytes to undo init()'s new trampoline.
-            RestoreExeDispatchHookBytes();
+            // Restore the saved 0x401642 state. On 1.02j this must remain the
+            // one-time persistent dispatcher because init() never recreates it.
+            RestoreExeDispatchHookBytesAfterSessionInit(initParams[0]);
 
             // Fix up relative instructions in mode-constructor trampolines.
             FixupModeConstructorTrampolines("Tick_init_handshake");
+            LogRevival102jDeepSnapshot("Tick.35.hooks_restored_and_fixed", ioStatus);
 
             // --- Dump bytes at 0x401642 (double-speed investigation) --------
             // After init(), check that the REPLACEMENT hook at 0x401642 is
@@ -3626,6 +5513,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // --- Full init write snapshot AFTER init() ---
             LogInitWriteSnapshot("Tick_init_post");
+            LogRevival102jDeepSnapshot("Tick.36.local_init_applied", ioStatus);
 
             mod::Log(
                 "Takeover: local init(mode=%d magic=%d) result=%d [deferred] oldSession=0x%08lX newSession=0x%08lX",
@@ -3639,7 +5527,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // calling InvokeStartInitPlayer.  When the heap reuses the same
             // address as a previous session, initComplete may still be 1
             // (stale), which would cause InvokeStartInitPlayer to skip the
-            // critical sub_10072880 call — leaving the session in an
+            // critical sub_10072880 call - leaving the session in an
             // uninitialized state and freezing the game.
             //
             // Only meaningful for online sessions (mode 0) where
@@ -3647,7 +5535,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // sessions, the initComplete offset overlaps with different
             // fields in the smaller session object.
             if (initParams[0] == kLocalRoleOnline
-                && newSessionPtr != 0 && newSessionPtr >= 0x00100000u)
+                && newSessionPtr != 0 && newSessionPtr >= 0x00100000u
+                && g_activeRevival->sessionOffsetInitComplete != 0)
             {
                 int prevInitComplete = -1;
                 (void)SafeReadInt(
@@ -3670,7 +5559,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     else
                     {
                         mod::Log(
-                            "Takeover: FAILED to clear stale initComplete=1 on session 0x%08lX — "
+                            "Takeover: FAILED to clear stale initComplete=1 on session 0x%08lX - "
                             "VirtualProtect err=%lu (StartInitPlayer will likely skip sub_10072880!)",
                             static_cast<unsigned long>(newSessionPtr),
                             static_cast<unsigned long>(GetLastError()));
@@ -3689,7 +5578,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             else if (initParams[0] == kLocalRoleOnline && startInitOk)
             {
                 // Read the activePlayer field that StartInitPlayer just wrote.
-                // 0 = host (P1), 1 = joiner/client (P2 — inputs were swapped).
+                // 0 = host (P1), 1 = joiner/client (P2 - inputs were swapped).
                 const uintptr_t sessionPtr = ReadSessionPointerFromRevival();
                 int activePlayer = -1;
                 if (sessionPtr != 0)
@@ -3702,6 +5591,11 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 if (activePlayer == 1)
                 {
                     g_netplayRole = kNetplayRoleClient;
+                    // Revival's StartInitPlayer just swapped the P1/P2 input
+                    // blocks for the P2/client side.  Record it durably so the
+                    // swap is reversed even if this session ends via a path
+                    // that clears the role without running ForceLocalPlayInit.
+                    SetClientInputSwapApplied(true);
                     mod::Log("Takeover: netplay role = Client (P2, inputs swapped)");
                 }
                 else
@@ -3714,29 +5608,34 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
 
             // --- Snapshot after StartInitPlayer (writes session fields) ---
             LogInitWriteSnapshot("Tick_startInitPlayer_post");
+            LogRevival102jDeepSnapshot("Tick.37.start_init_player_returned", ioStatus);
 
             mod::Log(
                 "Takeover: InvokeStartInitPlayer result=%d [deferred]",
                 startInitOk ? 1 : 0);
 
-            // For spectator mode, init(1,102) creates the spectator object
-            // but does NOT allocate its BGM manager (offset +1068).  The
-            // full init (EFZ_Spectator_Init) only runs when the game hits
-            // address 0x401582 → sub_1006E590 → vtable+4.  However, the
-            // BGM dispatch hook at 0x40DE80 is already installed from a
-            // previous session, and if the game triggers a BGM event before
-            // 0x401582 fires, it dispatches to the uninitialized spectator
-            // and crashes on the NULL BGM manager.  Calling vtable+4 here
-            // ensures the spectator is fully initialized before any hook
-            // can dispatch to it — identical to what ForceLocalPlayInit
-            // does for mode 2.
+            // init(1,102) only constructs the spectator object. Legacy builds
+            // use vtable[1] for the required match init; 1.02j moved it to
+            // verified vtable[2] (RVA 0x5E640), while vtable[1] became its
+            // MinGW deleting destructor.
             if (initParams[0] == kLocalRoleSpectate)
             {
-                const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
-                mod::Log(
-                    "Takeover: spectator vtable init result=%d [deferred]",
-                    vtableInitOk ? 1 : 0);
-                LogInitWriteSnapshot("Tick_spectateVtable1_post");
+                if (IsActiveRevival102jProfile())
+                {
+                    mod::Log(
+                        "Takeover: 1.02j spectator object constructed; "
+                        "waiting for native PID/wire readiness before vtable[2]");
+                }
+                else
+                {
+                    const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
+                    g_spectatorPostInitAttemptedForSession = true;
+                    g_spectatorPostInitSucceededForSession = vtableInitOk;
+                    mod::Log(
+                        "Takeover: spectator vtable init result=%d [deferred]",
+                        vtableInitOk ? 1 : 0);
+                    LogInitWriteSnapshot("Tick_spectateVtable1_post");
+                }
             }
 
             // Init-snapshot: record the DLL ExitProcess Jcc call-site bytes
@@ -3750,29 +5649,92 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 "Takeover: init snapshot step SaveAndApplyDllExitProcessPatches "
                 "for mode=%d (to be reversed by RestoreDllExitProcessPatches on exit)",
                 initParams[0]);
-            (void)SaveAndApplyDllExitProcessPatches();
+            const bool exitGuardsApplied = SaveAndApplyDllExitProcessPatches();
+            if (exitGuardsApplied
+                && (initParams[0] == kLocalRoleOnline
+                    || initParams[0] == kLocalRoleSpectate))
+            {
+                PrimeGracefulQuitRingForSession();
+            }
+            LogRevival102jDeepSnapshot("Tick.38.exit_guards_applied", ioStatus);
             mod::Log(
                 "Takeover: init snapshot complete for mode=%d",
                 initParams[0]);
 
             StabilizeOnlineSessionBindingAfterInit(initParams[0]);
 
+            if (initParams[0] == kLocalRoleOnline
+                || initParams[0] == kLocalRoleSpectate
+                || initParams[0] == kLocalRoleTournament)
+            {
+                const bool textEnableOk = SetRevivalTextRenderingEnabled(
+                    true,
+                    "Tick_initSequence_session_start");
+                mod::Log(
+                    "Takeover: session text rendering enable mode=%d result=%d",
+                    initParams[0],
+                    textEnableOk ? 1 : 0);
+            }
+
             // NOTE: The spectate ring-buffer flush that used to live here
             // has been moved to StartSession (before ResumeThread).  Flushing
-            // here — after the child process has already been running for up
-            // to a game frame — discarded the beginning of the host's input
+            // here - after the child process has already been running for up
+            // to a game frame - discarded the beginning of the host's input
             // replay stream, causing spectator desync at charselect.
             // See the "Pre-launch ring buffer flush" block in StartSession.
 
             // --- Final snapshot after all init steps complete ---
             LogInitWriteSnapshot("Tick_initSequence_complete");
+            MarkRevivalSyncDiagnosticsSessionStart("Tick_initSequence_complete");
             LogSessionDiagnosticState("Tick_init_handshake_post");
+            LogRevival102jDeepSnapshot("Tick.39.init_sequence_complete", ioStatus);
         }
     }
 
     if (g_localInitAppliedForSession)
     {
         RepairRollbackHistoryBindingsIfNeeded();
+    }
+
+    // 1.02j spectator post-init opens the peer process from the PID copied
+    // through Init_Spec.  The injected init event is emitted earlier, when
+    // the helper merely attempts the remote init call, so invoking vtable[2]
+    // in that event handler can race the native wire/PID publication.  Wait
+    // until those prerequisites are observable, invoke exactly once, and do
+    // not allow phase promotion unless all postconditions validate.
+    if (g_localInitAppliedForSession
+        && g_localRoleFlag == kLocalRoleSpectate
+        && IsActiveRevival102jProfile()
+        && !g_spectatorPostInitAttemptedForSession
+        && IsRevival102jSpectatorPostInitReady("Tick_spectate_ready"))
+    {
+        LogRevival102jDeepSnapshot("Tick.50.spectator_post_init_ready", ioStatus);
+        g_spectatorPostInitAttemptedForSession = true;
+        g_spectatorPostInitSucceededForSession =
+            InvokeRevival102jSpectatorPostInit("Tick_spectate");
+        mod::Log(
+            "Takeover: 1.02j spectator vtable[2] one-shot result=%d",
+            g_spectatorPostInitSucceededForSession ? 1 : 0);
+        LogInitWriteSnapshot(
+            g_spectatorPostInitSucceededForSession
+                ? "Tick_spectateVtable2_post_102j"
+                : "Tick_spectateVtable2_failed_102j");
+        LogRevival102jDeepSnapshot("Tick.51.spectator_post_init_returned", ioStatus);
+
+        if (!g_spectatorPostInitSucceededForSession)
+        {
+            SetPhase(
+                ioStatus,
+                NetbridgePhase::Failed,
+                "EfzRevival spectator initialization failed");
+            g_localInitAppliedForSession = false;
+            const bool localInitOk = ForceLocalPlayInit();
+            mod::Log(
+                "Takeover: spectator post-init failure local recovery result=%d",
+                localInitOk ? 1 : 0);
+            LogRevival102jDeepSnapshot("Tick.52.spectator_post_init_recovered", ioStatus);
+            return;
+        }
     }
 
     if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
@@ -3794,19 +5756,37 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     RefreshRuntimeStatus(ioStatus);
 
     // --- Console error detection ---
-    // If the Revival process reported a connection error (e.g., "Connection timed out",
-    // "Source quit or timed out", "Host timed out", "Remote timed out", "Peer died",
-    // "Socket error"), act immediately.
+    // If the helper published a connection error (e.g., "Connection timed out",
+    // "Source quit or timed out", "Host timed out", "Remote timed out",
+    // "Socket error"), act immediately. Active-opponent quit packets are
+    // promoted into this path earlier by console capture; raw "<endpoint> died"
+    // lines are no longer treated as fatal by themselves.
     if (ioStatus->consoleErrorSerial > 0)
     {
+        const bool desyncDetected =
+            (phase == NetbridgePhase::Connecting
+                || phase == NetbridgePhase::DelaySetup
+                || phase == NetbridgePhase::Connected)
+            && ConsoleErrorIndicatesDesync(ioStatus->consoleErrorText);
+        if (desyncDetected)
+        {
+            mod::Log(
+                "Takeover: desync console error detected serial=%d text='%s' phase=%d - emitting forced diagnostic report",
+                ioStatus->consoleErrorSerial,
+                ioStatus->consoleErrorText,
+                static_cast<int>(phase));
+            LogSessionDiagnosticStateForced("console_desync_detected");
+        }
+
         if (phase == NetbridgePhase::Connecting || phase == NetbridgePhase::DelaySetup)
         {
             mod::Log(
-                "Takeover: console error detected serial=%d text='%s' phase=%d — transitioning to Failed",
+                "Takeover: console error detected serial=%d text='%s' phase=%d - transitioning to Failed",
                 ioStatus->consoleErrorSerial,
                 ioStatus->consoleErrorText,
                 static_cast<int>(phase));
             SetPhase(ioStatus, NetbridgePhase::Failed, ioStatus->consoleErrorText);
+            LogRevival102jDeepSnapshot("Tick.60.console_error_connecting", ioStatus);
             ReinitLocalPlay();
             return;
         }
@@ -3820,10 +5800,11 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             // has ended.  The heavy recovery (ForceLocalPlayInit, restore
             // patches, ForceGameModeToTitle) is handled by the tick hook.
             mod::Log(
-                "Takeover: console error detected serial=%d text='%s' phase=Connected — transitioning to SessionEnded",
+                "Takeover: console error detected serial=%d text='%s' phase=Connected - transitioning to SessionEnded",
                 ioStatus->consoleErrorSerial,
                 ioStatus->consoleErrorText);
             SetPhase(ioStatus, NetbridgePhase::SessionEnded, ioStatus->consoleErrorText);
+            LogRevival102jDeepSnapshot("Tick.61.console_error_connected", ioStatus);
             return;
         }
     }
@@ -3853,6 +5834,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 runtimeProbe.helperHandleMatches ? 1 : 0,
                 runtimeProbe.nativeSyncReady ? 1 : 0,
                 ioStatus->roleFlag);
+            LogRevival102jDeepStep("Tick.70.runtime_probe_changed_or_periodic", ioStatus);
         }
     }
 
@@ -3870,6 +5852,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 ioStatus->delayPromptServedSerial,
                 ioStatus->pingMs,
                 ioStatus->rollbackFrames);
+            LogRevival102jDeepSnapshot("Tick.71.promoted_delay_setup", ioStatus);
         }
     }
 
@@ -3890,6 +5873,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             ioStatus->syncSessionByte,
             ioStatus->pingMs,
             ioStatus->rollbackFrames);
+        LogRevival102jDeepSnapshot("Tick.72.promoted_connected", ioStatus);
     }
 
     // Spectator sessions don't go through the rollback sync handshake, so
@@ -3900,6 +5884,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
     if ((currentPhase == NetbridgePhase::Connecting || currentPhase == NetbridgePhase::DelaySetup)
         && g_localInitAppliedForSession
         && g_localRoleFlag == kLocalRoleSpectate
+        && g_spectatorPostInitSucceededForSession
         && AreDllExitPatchesSaved())
     {
         SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
@@ -3908,16 +5893,49 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             *ioConnectStartTick = GetTickCount();
         }
         mod::Log(
-            "Takeover: spectator promoted to connected (init applied, exit patches saved)");
+            "Takeover: spectator promoted to connected "
+            "(post-init/liveness validated, exit patches saved)");
+        LogRevival102jDeepSnapshot("Tick.73.spectator_promoted_connected", ioStatus);
     }
 }
 
 // ---------------------------------------------------------------------------
-// CancelSessionUnlocked — shared body for CancelSession and exit interception.
+// CancelSessionUnlocked - shared body for CancelSession and exit interception.
 // Caller MUST hold g_mutex.
 // ---------------------------------------------------------------------------
 static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 {
+    RestoreTemporaryHostProtocolOverride(
+        reason != nullptr
+            ? reason
+            : "Revival netplay session cancel");
+
+    // Idempotency guard for the normal match-end double-cancel: the flow fires
+    // CancelSession twice per boundary - "match_ended" (heavy teardown, parks
+    // phase at SessionEnded) then "no_overlay_session_ended" (drives phase to
+    // Idle).  Every operation in the body is individually idempotent EXCEPT
+    // ForceLocalPlayInit, which unconditionally destroys+rebuilds the session
+    // and re-runs Revival's init() - running it a second time per boundary is a
+    // prime suspect for the 2nd/3rd-session desync.  The session epoch (bumped
+    // once per session at StartSession) lets a repeat teardown within one
+    // boundary be recognized and skip that non-idempotent step.  The peer-death
+    // path (where "no_overlay_session_ended" is the FIRST cancel) has no prior
+    // teardown for this epoch, so it runs the full teardown normally.
+    const uint32_t boundaryEpoch =
+        netplay::bridge::session_lifecycle::CurrentSessionEpoch();
+    const uint32_t cleanupInvocation =
+        netplay::bridge::session_lifecycle::NextCleanupInvocation();
+    (void)cleanupInvocation;  // read only by the (release-compiled-out) trace
+    const bool repeatTeardown =
+        boundaryEpoch != 0
+        && netplay::bridge::session_lifecycle::LastTornDownEpoch() == boundaryEpoch;
+    MOD_LIFECYCLE_TRACE(
+        "LIFECYCLE ep=%u cleanup=%u stage=cancel_session action=%s reason=%s role=%d",
+        boundaryEpoch, cleanupInvocation,
+        repeatTeardown ? "repeat" : "begin",
+        (reason != nullptr) ? reason : "", g_localRoleFlag);
+
+    LogRevival102jDeepSnapshot("CancelSession.01.entry", ioStatus);
     // --- Diagnostic dump before teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_entry");
     mod::Log(
@@ -3947,12 +5965,24 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (revival != nullptr)
         {
             const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
-            const uint16_t guardVal = *reinterpret_cast<const volatile uint16_t*>(
-                base + g_activeRevival->initOnceGuardOffset);
-            const uintptr_t timerPtr = *reinterpret_cast<const volatile uintptr_t*>(
-                base + g_activeRevival->timerPtrOffset);
-            const uintptr_t renderCtx = *reinterpret_cast<const volatile uintptr_t*>(
-                base + g_activeRevival->renderContextGlobalOffset);
+            uint16_t guardVal = 0;
+            uintptr_t timerPtr = 0;
+            uintptr_t renderCtx = 0;
+            if (g_activeRevival->initOnceGuardOffset != 0)
+            {
+                guardVal = *reinterpret_cast<const volatile uint16_t*>(
+                    base + g_activeRevival->initOnceGuardOffset);
+            }
+            if (g_activeRevival->timerPtrOffset != 0)
+            {
+                timerPtr = *reinterpret_cast<const volatile uintptr_t*>(
+                    base + g_activeRevival->timerPtrOffset);
+            }
+            if (g_activeRevival->renderContextGlobalOffset != 0)
+            {
+                renderCtx = *reinterpret_cast<const volatile uintptr_t*>(
+                    base + g_activeRevival->renderContextGlobalOffset);
+            }
             mod::Log(
                 "CancelSession: DLL globals guard=0x%04X timer=0x%08lX renderCtx=0x%08lX",
                 static_cast<unsigned>(guardVal),
@@ -3964,45 +5994,94 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     InterlockedExchange(&g_startAbortRequested, 1);
     FlushPendingConsoleOutput("cancel");
 
-    const bool gameplayEscPeerQuitPending =
-        g_localRoleFlag == kLocalRoleOnline
-        && ConsumeOnlineMatchEscGracefulQuit();
-    if (gameplayEscPeerQuitPending)
+    const bool suppressSharedRecoveryTeardown =
+        netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup();
+    if (suppressSharedRecoveryTeardown)
+    {
+        mod::Log(
+            "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=cancel_session_unlocked inProgress=%d pendingMenu=%d completed=%d origin=%s state=%s",
+            netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+            netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+            netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin(),
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName());
+        (void)SuppressDeferredCancelCleanupAfterGameplayRecovery(
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+    }
+
+    // Pre-teardown peer-quit broadcast (rank 4).  The natural match-end cancel
+    // ("match_ended") and most other cancel reasons historically said nothing
+    // to the peer - the old ConsumeOnlineMatchEscGracefulQuit gate here was
+    // never armed (dead code), so a fast peer that reached title first would
+    // TerminateProcess its helper and leave the slow peer stalled waiting for
+    // frames until a network timeout.  Broadcast a native MessageQuit to the
+    // peer BEFORE tearing down, unconditionally for online/spectate cancels
+    // while the helper is still alive.  This is the same proven mechanism the
+    // disconnect-recovery path already uses (gameplay_exit_recovery.cpp:142).
+    // It is idempotent on both ends: the receiver re-entering its terminal quit
+    // state is a no-op, and the sender's peer-manager lookup no-ops if the
+    // session already tore down.  MUST use the ...Impl variant - the public
+    // wrapper re-locks the takeover mutex we already hold (self-deadlock).
+    // Skip on shutdown/emergency (loader lock) and on repeat teardown.
+    const bool broadcastReasonOk =
+        reason == nullptr
+        || (std::strcmp(reason, "shutdown") != 0
+            && std::strcmp(reason, "emergency") != 0);
+    const bool shouldBroadcastPeerQuit =
+        !repeatTeardown
+        && broadcastReasonOk
+        // The shared gameplay-exit recovery path broadcasts its own MessageQuit
+        // (gameplay_exit_recovery.cpp) before it tears down; don't double-fire.
+        && !suppressSharedRecoveryTeardown
+        // The broadcast blocks up to 300ms on WaitForSingleObject.  Never run
+        // that on the rollback/per-frame tick thread (an in-tick cancel would
+        // stall the simulation and itself risk a desync); the normal match-end
+        // cancel that needs the broadcast fires from the title hook, not in-tick.
+        && !IsInsideFrameTick()
+        // Online only.  Spectator MessageQuit via sendQuitAll on the spectator's
+        // peer manager is unverified against the players' match and could end a
+        // real 2-player game, so keep the historical Online-only scope.
+        && g_localRoleFlag == kLocalRoleOnline
+        && g_revivalProcess != nullptr;
+    if (shouldBroadcastPeerQuit)
     {
         HANDLE helperProcess = nullptr;
         HANDLE sourceHelperProcess = g_revivalProcess;
         DWORD duplicateErr = 0;
-        if (g_revivalProcess != nullptr)
+        if (!DuplicateHandle(
+                GetCurrentProcess(),
+                g_revivalProcess,
+                GetCurrentProcess(),
+                &helperProcess,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS))
         {
-            if (!DuplicateHandle(
-                    GetCurrentProcess(),
-                    g_revivalProcess,
-                    GetCurrentProcess(),
-                    &helperProcess,
-                    0,
-                    FALSE,
-                    DUPLICATE_SAME_ACCESS))
-            {
-                duplicateErr = GetLastError();
-            }
+            duplicateErr = GetLastError();
         }
 
+        const uintptr_t peerQuitRemoteBase =
+            g_peerProcessOwnership
+                    == PeerProcessOwnership::ExternalLauncherParent
+                ? g_externalLauncherGuardRemoteBase
+                : g_remoteInjectedSelfBase;
         mod::Log(
-            "Takeover: cancel session gameplay-ESC peer-quit prepare sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
+            "Takeover: cancel session peer-quit prepare reason='%s' sourceHelper=%p helperDup=%p helperPid=%lu remoteSelfBase=0x%08lX dupErr=%lu",
+            reason != nullptr ? reason : "",
             sourceHelperProcess,
             helperProcess,
             static_cast<unsigned long>(g_revivalProcessId),
-            static_cast<unsigned long>(g_remoteInjectedSelfBase),
+            static_cast<unsigned long>(peerQuitRemoteBase),
             static_cast<unsigned long>(duplicateErr));
 
         const bool peerQuitSent = RequestInjectedPeerQuitBroadcastImpl(
             helperProcess,
-            g_remoteInjectedSelfBase,
+            peerQuitRemoteBase,
             g_revivalProcessId,
-            "cancel_session_gameplay_esc",
+            "cancel_session_peer_quit",
             300u);
         mod::Log(
-            "Takeover: cancel session gameplay-ESC peer-quit broadcast=%d "
+            "Takeover: cancel session peer-quit broadcast=%d "
             "reason='%s' helperPid=%lu",
             peerQuitSent ? 1 : 0,
             reason != nullptr ? reason : "",
@@ -4010,23 +6089,30 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (!peerQuitSent)
         {
             mod::Log(
-                "Takeover: cancel session gameplay-ESC broadcast failed; "
+                "Takeover: cancel session peer-quit broadcast failed; "
                 "continuing with local teardown");
         }
     }
 
     const bool hadProcess = ProcessAlive(ioStatus);
-    if (hadProcess && g_revivalProcess != nullptr)
+    LogRevival102jDeepStep("CancelSession.10.helper_teardown_begin", ioStatus);
+    BOOL terminateOk = TRUE;
+    if (!suppressSharedRecoveryTeardown && hadProcess && g_revivalProcess != nullptr)
     {
-        TerminateProcess(g_revivalProcess, 0);
+        terminateOk = TerminatePeerProcessIfOwned(0, "cancel_session");
     }
-    CloseProcessHandle(ioStatus);
-    // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
-    // spawned by EfzRevival.exe are also terminated.  A fresh job will be
-    // created for the next StartSession call.
-    CloseChildJobObject();
-    RestoreDllExitProcessPatches();
-    ReinitLocalPlay();
+    if (!suppressSharedRecoveryTeardown)
+    {
+        (void)ReleasePeerProcessAfterTerminationAttempt(
+            terminateOk, ioStatus, "cancel_session");
+        // Close the job object so any grandchild processes (cmd.exe, conhost.exe)
+        // spawned by EfzRevival.exe are also terminated.  A fresh job will be
+        // created for the next StartSession call.
+        CloseChildJobObject();
+        RestoreDllExitProcessPatches();
+        ReinitLocalPlay();
+    }
+    LogRevival102jDeepSnapshot("CancelSession.11.helper_teardown_complete", ioStatus);
 
     // ---- Additional cleanup (Issues 1, 4, 5 in CONNECTION_INTERRUPTION doc) ----
     // During normal operation (not process shutdown), reinitialise the DLL
@@ -4038,9 +6124,26 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     const bool isShutdown = (reason != nullptr &&
         (std::strcmp(reason, "shutdown") == 0 ||
          std::strcmp(reason, "emergency") == 0));
+    const bool isExitInterception =
+        reason != nullptr && std::strcmp(reason, "exit_intercepted") == 0;
+    const bool alreadyRecoveredLocal102j =
+        IsActiveRevival102jProfile()
+        && isExitInterception
+        && g_localRoleFlag == kLocalRoleLocalPlay
+        && GetForceLocalPlayInitCount() > 0
+        && ReadSessionPointerFromRevival() != 0;
 
-    if (!isShutdown)
+    // True only when this call actually ran (or deferred) the non-idempotent
+    // ForceLocalPlayInit teardown.  Used to gate NoteTeardownComplete so that a
+    // cancel SKIPPED for a transient reason (recovery-suppressed, shutdown,
+    // already-recovered) does NOT mark the epoch torn down - otherwise a later
+    // cancel of the same boundary would falsely see a repeat and skip the real
+    // teardown that never happened.
+    bool ranTeardown = false;
+    if (!isShutdown && !suppressSharedRecoveryTeardown && !alreadyRecoveredLocal102j
+        && !repeatTeardown)
     {
+        ranTeardown = true;
         // If we're inside the per-frame tick (sub_1006E570 -> vtable[2] ->
         // RollbackLoopTick), ForceLocalPlayInit MUST NOT run now because it
         // would destroy the session that RollbackLoopTick is actively using
@@ -4050,44 +6153,70 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         if (IsInsideFrameTick())
         {
             mod::Log(
-                "Takeover: cancel cleanup — DEFERRED (inside frame tick, "
+                "Takeover: cancel cleanup - DEFERRED (inside frame tick, "
                 "ForceLocalPlayInit would destroy active session)");
-            RequestDeferredCancelCleanup();
+            RequestDeferredCancelCleanup(reason);
+            LogRevival102jDeepSnapshot("CancelSession.20.local_reinit_deferred", ioStatus);
         }
         else
         {
+            LogRevival102jDeepSnapshot("CancelSession.21.local_reinit_pre", ioStatus);
             const bool initOk = ForceLocalPlayInit();
             mod::Log(
-                "Takeover: cancel cleanup — ForceLocalPlayInit result=%d",
+                "Takeover: cancel cleanup - ForceLocalPlayInit result=%d",
                 initOk ? 1 : 0);
 
             const bool clearOk = ClearRevivalText();
             mod::Log(
-                "Takeover: cancel cleanup — ClearRevivalText result=%d",
+                "Takeover: cancel cleanup - ClearRevivalText result=%d",
                 clearOk ? 1 : 0);
 
-            const bool textOk = DisableRevivalTextRendering();
+            const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+                "cancel_cleanup");
             mod::Log(
-                "Takeover: cancel cleanup — DisableRevivalTextRendering result=%d",
+                "Takeover: cancel cleanup - ResetRevivalTextRenderingAfterCleanup result=%d",
                 textOk ? 1 : 0);
 
             mod::ResetCrashRecoveryState();
-            mod::Log("Takeover: cancel cleanup — crash recovery state reset");
+            mod::Log("Takeover: cancel cleanup - crash recovery state reset");
 
             ResetGameModeValidation();
-            mod::Log("Takeover: cancel cleanup — game mode validation reset");
+            mod::Log("Takeover: cancel cleanup - game mode validation reset");
+            LogRevival102jDeepSnapshot("CancelSession.22.local_reinit_post", ioStatus);
         }
     }
     else
     {
         mod::Log(
-            "Takeover: cancel cleanup — skipped DLL re-init (shutdown path reason='%s')",
-            reason != nullptr ? reason : "");
+            "Takeover: cancel cleanup - skipped DLL re-init "
+            "(reason='%s' shutdown=%d suppressShared=%d alreadyRecoveredLocal102j=%d repeat=%d)",
+            reason != nullptr ? reason : "",
+            isShutdown ? 1 : 0,
+            suppressSharedRecoveryTeardown ? 1 : 0,
+            alreadyRecoveredLocal102j ? 1 : 0,
+            repeatTeardown ? 1 : 0);
         // Still reset the netplay role even on shutdown so stale state
         // doesn't leak to a future session (belt-and-suspenders).
         g_netplayRole = kNetplayRoleNone;
     }
     // ---- End additional cleanup ------------------------------------------------
+
+    // Mark this session boundary's teardown as run so a repeat cancel within
+    // the same boundary (the normal match_ended -> no_overlay_session_ended
+    // double-cancel) is recognized above and skips the non-idempotent
+    // ForceLocalPlayInit.  Only mark when this call actually ran/deferred the
+    // teardown (ranTeardown) - a transiently-skipped cancel must not claim the
+    // boundary.  Idempotent; the terminal phase block below still runs on every
+    // call so the SessionEnded -> Idle transition is unaffected.
+    if (boundaryEpoch != 0 && ranTeardown)
+    {
+        netplay::bridge::session_lifecycle::NoteTeardownComplete(boundaryEpoch);
+    }
+    MOD_LIFECYCLE_TRACE(
+        "LIFECYCLE ep=%u cleanup=%u stage=cancel_session action=%s reason=%s",
+        boundaryEpoch, cleanupInvocation,
+        repeatTeardown ? "repeat_complete" : "complete",
+        (reason != nullptr) ? reason : "");
 
     // Clear per-session IAT hook tracking vectors to prevent unbounded
     // growth across sessions (GAP 4 in cleanup audit).
@@ -4096,22 +6225,25 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         const size_t oldFakeCount = g_fakeThreads.size();
         // Unlock before calling ClearFakeThreads which takes the same lock,
         // so log the count first then clear outside the lock.
-        mod::Log("Takeover: cancel cleanup — clearing g_fakeThreads (count=%zu)",
+        mod::Log("Takeover: cancel cleanup - clearing g_fakeThreads (count=%zu)",
                  oldFakeCount);
     }
     ClearFakeThreads();
     {
         std::lock_guard<std::mutex> raLock(g_redirectAllocMutex);
-        mod::Log("Takeover: cancel cleanup — clearing g_redirectAllocations (count=%zu)",
+        mod::Log("Takeover: cancel cleanup - clearing g_redirectAllocations (count=%zu)",
                  g_redirectAllocations.size());
     }
     ClearRedirectAllocations();
 
     g_localInitAppliedForSession = false;
+    g_spectatorPostInitAttemptedForSession = false;
+    g_spectatorPostInitSucceededForSession = false;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
+    InterlockedExchange(&g_deferredTitleSelection, -1);
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
     InterlockedExchange(&g_injectedConnectedFromDelayPromptSerial, 0);
-    g_injectedDelayPromptWaitStartTick = 0;
     InterlockedExchange(&g_injectedSpectateConfirmPromptSerial, 0);
     InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, 0);
     g_injectedSpectateConfirmPromptWaitStartTick = 0;
@@ -4127,6 +6259,25 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_hostBlock->delayMetricsSerial, 0);
         InterlockedExchange(&g_hostBlock->delayInputSerial, 0);
         InterlockedExchange(&g_hostBlock->delayInputServedSerial, 0);
+        InterlockedExchange(&g_hostBlock->isHostSession, 0);
+        InterlockedExchange(
+            &g_hostBlock->consoleControlWakeRequestSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->consoleControlWakeServedSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->delayPromptTransitionWakeSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutRequiredWakeSerial,
+            0);
+        InterlockedExchange(
+            &g_hostBlock->nativeDelayTimeoutHandledSerial,
+            0);
         g_hostBlock->delayInputValue = -1;
         g_hostBlock->delayAveragePingMs = -1;
         g_hostBlock->delayMinPingMs = -1;
@@ -4143,6 +6294,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
         g_hostBlock->consoleErrorText[0] = '\0';
     }
+    LogRevival102jDeepStep("CancelSession.30.per_session_state_cleared", ioStatus);
     ResetNativeWorkflowFlags();
     g_lastConnectingDiagnosticTick = 0;
     g_lastSpectateConsoleSnapshotTick = 0;
@@ -4162,15 +6314,18 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_consolePendingWriteConsoleOutputCharacterW.clear();
         g_consolePendingOutputDebugStringA.clear();
         g_consolePendingOutputDebugStringW.clear();
-        g_diskCapturePathHits.clear();
     }
     CloseMirrorLogFiles();
 
     if (ioStatus != nullptr)
     {
-        if (reason != nullptr && (std::strcmp(reason, "user_cancel") == 0 || std::strcmp(reason, "leave_menu") == 0 || std::strcmp(reason, "external_cancel") == 0))
+        if (ShouldCancelToIdle(reason))
         {
             SetPhase(ioStatus, NetbridgePhase::Idle, nullptr);
+            mod::Log(
+                "Takeover: cancel acknowledged -> Idle reason='%s' hadProcess=%d",
+                reason != nullptr ? reason : "",
+                hadProcess ? 1 : 0);
         }
         else if (hadProcess)
         {
@@ -4187,6 +6342,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
 
     // --- Diagnostic dump after teardown (2nd-session crash investigation) ---
     LogSessionDiagnosticState("CancelSession_exit");
+    LogRevival102jDeepSnapshot("CancelSession.99.exit", ioStatus);
 }
 
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus)
@@ -4203,7 +6359,22 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
         return false;
     }
 
+    if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+    {
+        const LONG clearedIntercepted =
+            InterlockedExchange(&g_revivalExitIntercepted, 0);
+        const LONG clearedMode =
+            InterlockedExchange(&g_revivalExitMode, -1);
+        mod::Log(
+            "GAMEPLAY_EXIT_SUPPRESS_OLD_EXIT_INTERCEPTION reason=frontend_return_owner exitIntercepted=%ld exitMode=%ld state=%s",
+            static_cast<long>(clearedIntercepted),
+            static_cast<long>(clearedMode),
+            netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName());
+        return false;
+    }
+
     LogSessionDiagnosticState("ConsumeExitInterception_entry");
+    LogRevival102jDeepSnapshot("ExitInterception.01.entry", ioStatus);
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -4228,7 +6399,8 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     //   b) DLL ExitProcess Jcc patched   →  step 1: RestoreDllExitProcessPatches
     //   c) EXE patches (tournament only) →  step 2: RestoreTournamentExePatches
     //   d) Online session object created →  step 3: ForceLocalPlayInit (new local)
-    //   e) Text rendering active         →  step 4: ClearRevivalText / Disable
+    //   e) Text rendering active         →  step 4: ClearRevivalText /
+    //                                               version-aware renderer reset
     //                                               (tournament: both;
     //                                                online/spectate: Disable only)
     // -----------------------------------------------------------------------
@@ -4238,6 +6410,7 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
         "(step 1: cancel session / terminate peer / restore DLL patches)",
         mode);
     CancelSessionUnlocked("exit_intercepted", ioStatus);
+    LogRevival102jDeepSnapshot("ExitInterception.10.cancel_complete", ioStatus);
 
     // step 2: revert EXE patches applied by the session constructor.
     // Tournament: 4 inline EXE hooks (0x763F04, 0x763E50, 0x754C1A, 0x7599ED).
@@ -4245,13 +6418,14 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // frame-by-frame patches every tick and they are self-healing after step 3).
     if (mode == kLocalRoleTournament)
     {
-        mod::Log("Takeover: exit interception step 2 — RestoreTournamentExePatches");
+        mod::Log("Takeover: exit interception step 2 - RestoreTournamentExePatches");
         RestoreTournamentExePatches();
+        LogRevival102jDeepSnapshot("ExitInterception.20.tournament_patches_restored", ioStatus);
     }
     else
     {
         mod::Log(
-            "Takeover: exit interception step 2 — no EXE patch restore "
+            "Takeover: exit interception step 2 - no EXE patch restore "
             "needed for mode=%d (online/spectate)",
             mode);
     }
@@ -4259,30 +6433,47 @@ bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus)
     // step 3: reinstate a live local-play session.
     // Both OurFrameDispatch (frame-hook longjmp recovery) and
     // CancelSessionUnlocked (step 1 above) now call ForceLocalPlayInit
-    // eagerly.  This third call is a defence-in-depth guarantee: even if
-    // the earlier calls were bypassed (e.g. VEH TOCTOU path or a code
-    // path that doesn't go through OurFrameDispatch), the session is
-    // always replaced here.  Repeated calls are harmless.
-    mod::Log("Takeover: exit interception step 3 — ForceLocalPlayInit (defence-in-depth)");
-    ForceLocalPlayInit();
+    // eagerly.  This third call is a defence-in-depth guarantee for the
+    // older MSVC-built DLLs where repeated calls are harmless.  On 1.02j,
+    // avoid re-running init once recovery has already produced a local
+    // session because the MinGW object lifecycle is not ABI-compatible with
+    // our old scalar-deleting destructor path.
+    const bool alreadyRecoveredLocal102j =
+        IsActiveRevival102jProfile()
+        && g_localRoleFlag == kLocalRoleLocalPlay
+        && GetForceLocalPlayInitCount() > 0
+        && ReadSessionPointerFromRevival() != 0;
+    if (alreadyRecoveredLocal102j)
+    {
+        mod::Log(
+            "Takeover: exit interception step 3 - skipped ForceLocalPlayInit "
+            "(1.02j already has recovered local session, count=%d)",
+            GetForceLocalPlayInitCount());
+    }
+    else
+    {
+        mod::Log("Takeover: exit interception step 3 - ForceLocalPlayInit (defence-in-depth)");
+        ForceLocalPlayInit();
+        LogRevival102jDeepSnapshot("ExitInterception.30.defensive_local_init_complete", ioStatus);
+    }
 
     // step 4: clear any DLL-side text overlay state left by the session.
     // Tournament writes win counters and nicknames to the EfzRender text
     // buffer.  init(2,102) zeroes dword_100A0778 so we must RestoreRenderContext
     // before the clear; ClearRevivalText does this internally.
     //
-    // Online/spectate do not write to the EfzRender buffer (they use ImGui
-    // overlays), but we call DisableRevivalTextRendering as a defensive
-    // clean-up in case the session left the DLL text-draw hook active.
-    mod::Log("Takeover: exit interception step 4 — clear text / disable renderer");
+    // 1.02j keeps the renderer usable after cleanup; older builds retain the
+    // historical defensive disable.
+    mod::Log("Takeover: exit interception step 4 - clear text / reset renderer");
     // Both tournament and online/spectate paths share the same cleanup now.
     // SaveRenderContext() is called in StartSession for all session types,
     // so RestoreRenderContext inside ClearRevivalText works for all modes.
     ClearRevivalText();
-    DisableRevivalTextRendering();
+    ResetRevivalTextRenderingAfterCleanup("exit_interception");
 
     mod::Log("Takeover: exit interception fully consumed mode=%d", mode);
     LogSessionDiagnosticState("ConsumeExitInterception_exit");
+    LogRevival102jDeepSnapshot("ExitInterception.99.complete", ioStatus);
     return true;
 }
 
@@ -4311,12 +6502,34 @@ DelayPromptMetrics GetDelayPromptMetrics()
     return metrics;
 }
 
+void ArmTournamentReturnCleanup(const char* reason)
+{
+    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
+    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
+    g_tournamentReturnCleanupPending = true;
+    InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+    mod::Log(
+        "Takeover: tournament return cleanup armed reason=%s",
+        reason != nullptr && reason[0] != '\0' ? reason : "unspecified");
+}
+
 bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (g_localRoleFlag != kLocalRoleTournament)
     {
+        return false;
+    }
+
+    if (g_launchDisposition
+            == revival_launch::LaunchDisposition::AttachExistingTournament
+        && InterlockedCompareExchange(
+               &g_externalTournamentInitialTitleLeft, 0, 0) == 0)
+    {
+        // Launcher option 6 begins on game mode 0 while its queued inputs are
+        // still driving the initial title selection. That is startup, not a
+        // completed Tournament return.
         return false;
     }
 
@@ -4332,16 +6545,153 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
         return false;
     }
 
-    mod::Log("Takeover: tournament returned to title screen (mode 0) — cleaning up proactively");
+    mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
+    LogRevival102jDeepSnapshot("TournamentReturn.01.title_observed", ioStatus);
 
-    RestoreDllExitProcessPatches();
-    RestoreTournamentExePatches();
-    ForceLocalPlayInit();
-    ClearRevivalText();
-    DisableRevivalTextRendering();
-    g_localRoleFlag = kLocalRoleLocalPlay;
+    if (g_tournamentReturnCleanupPending)
+    {
+        mod::Log(
+            "Takeover: tournament return cleanup already pending");
+        return false;
+    }
 
+    // This callback runs inside the role-3 virtual tick on every supported
+    // version. Never destroy that object or restore its executing code here;
+    // arm stage 2 and let the post-tick owner perform all destructive work.
+    ArmTournamentReturnCleanup("native_title_return");
+    mod::Log(
+        "Takeover: tournament return cleanup stage 1 complete "
+        "(all destructive work deferred post-tick)");
     RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TournamentReturn.02.stage1_armed", ioStatus);
+    return true;
+}
+
+bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_tournamentReturnCleanupPending)
+    {
+        return false;
+    }
+
+    if (IsInsideFrameTick())
+    {
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+        mod::Log(
+            "Takeover: tournament return cleanup remains deferred "
+            "until the active role-3 tick returns");
+        LogRevival102jDeepSnapshot("TournamentReturn.10.stage2_still_deferred", ioStatus);
+        return false;
+    }
+
+    if (InterlockedCompareExchange(
+            &g_tournamentReturnCleanupTerminalFailure, 0, 0) != 0)
+    {
+        // A prior attempt crossed the object-destruction boundary but could
+        // not construct a verified local session.  Repeating init blindly
+        // would compound an unknown partial state.  Keep the fatal tick latch
+        // and journals owned for diagnosis/recovery instead.
+        return false;
+    }
+
+    mod::Log("Takeover: tournament return cleanup stage 2 begin");
+    LogRevival102jDeepSnapshot("TournamentReturn.11.stage2_pre", ioStatus);
+    const auto retainTournamentQuarantine = [&]() {
+        InterlockedExchange(
+            &g_revivalExitMode,
+            static_cast<LONG>(kLocalRoleTournament));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+        InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
+    };
+
+    LONG stage = InterlockedCompareExchange(
+        &g_tournamentReturnCleanupStage, 0, 0);
+    if (stage < 1)
+    {
+        const bool exePatchOk = RestoreTournamentExePatches();
+        mod::Log(
+            "Takeover: tournament return cleanup RestoreTournamentExePatches=%d",
+            exePatchOk ? 1 : 0);
+        if (!exePatchOk)
+        {
+            retainTournamentQuarantine();
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 1);
+        stage = 1;
+    }
+
+    if (stage < 2)
+    {
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "Takeover: tournament return cleanup ForceLocalPlayInit=%d",
+            initOk ? 1 : 0);
+        if (!initOk)
+        {
+            InterlockedExchange(
+                &g_tournamentReturnCleanupTerminalFailure, 1);
+            retainTournamentQuarantine();
+            mod::Log(
+                "Takeover: tournament cleanup quarantined after unverified local init; refusing repeated destruction/init");
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 2);
+        stage = 2;
+        LogRevival102jDeepSnapshot(
+            "TournamentReturn.12.local_init_complete", ioStatus);
+    }
+
+    if (stage < 3)
+    {
+        const bool dllPatchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "Takeover: tournament return cleanup RestoreDllExitProcessPatches=%d",
+            dllPatchOk ? 1 : 0);
+        if (!dllPatchOk)
+        {
+            retainTournamentQuarantine();
+            return false;
+        }
+        InterlockedExchange(&g_tournamentReturnCleanupStage, 3);
+    }
+
+    const bool modeOk = ForceGameModeToTitle();
+    if (!modeOk)
+    {
+        mod::Log(
+            "Takeover: tournament cleanup could not publish title mode; retaining recovery owner");
+        retainTournamentQuarantine();
+        return false;
+    }
+
+    const bool clearOk = ClearRevivalText();
+    const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+        "102j_tournament_return_cleanup_stage2");
+    mod::Log(
+        "Takeover: tournament return cleanup text clear=%d reset=%d",
+        clearOk ? 1 : 0,
+        textOk ? 1 : 0);
+
+    g_tournamentReturnCleanupPending = false;
+    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
+    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
+    g_localRoleFlag = kLocalRoleLocalPlay;
+    g_localInitAppliedForSession = false;
+    g_launchDisposition =
+        revival_launch::LaunchDisposition::DirectGameHost;
+    InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
+    InterlockedExchange(&g_revivalExitIntercepted, 0);
+    InterlockedExchange(&g_revivalExitMode, -1);
+    if (g_hostBlock != nullptr)
+    {
+        InterlockedExchange(&g_hostBlock->consoleErrorSerial, 0);
+        g_hostBlock->consoleErrorText[0] = '\0';
+    }
+    RefreshRuntimeStatus(ioStatus);
+    LogRevival102jDeepSnapshot("TournamentReturn.99.stage2_complete", ioStatus);
     return true;
 }
 

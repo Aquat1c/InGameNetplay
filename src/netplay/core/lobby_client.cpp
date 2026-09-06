@@ -1,4 +1,5 @@
 #include "netplay/core/lobby_client.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
@@ -86,7 +87,18 @@ constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kReceiveTimeoutMs = 12000;
 constexpr DWORD kShutdownConnectTimeoutMs = 1200;
 constexpr DWORD kShutdownReceiveTimeoutMs = 1500;
+// Lobby state is user-facing and challenge transitions are short-lived.  A
+// half-second cadence is responsive on modern Windows where WinHTTP can reuse
+// its connection.  XP deliberately retains Concerto's one-second cadence:
+// its reliable HTTPS path is the one-shot embedded TLS backend, so polling it
+// twice as often would only add CPU/network cost.
+#ifdef EFZ_XP_COMPAT
 constexpr DWORD kPollIntervalMs = 1000;
+#else
+constexpr DWORD kPollIntervalMs = 500;
+#endif
+constexpr int kPollFailureLimit = 3;
+constexpr DWORD kStatusResponseLogIntervalMs = 30000;
 std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
 
 bool OutgoingChallengeTargetStillPresent(
@@ -651,14 +663,36 @@ const LobbyEndpointConfig& GetLobbyEndpointConfig()
     if (!hasExplicitBackendOverride)
     {
         const WindowsVersionInfo windowsVersion = QueryWindowsVersion();
-        if (IsWindowsXpFamily(windowsVersion))
+        bool useXpCompatibleTransport = IsWindowsXpFamily(windowsVersion);
+#ifdef EFZ_XP_COMPAT
+        // Also enforce the XP-safe path if the compatibility build is run on
+        // a newer Windows host (the normal development/test configuration).
+        useXpCompatibleTransport = true;
+#endif
+        if (useXpCompatibleTransport)
         {
-            config.preferWinInet = true;
-            mod::Log(
-                "LobbySession: detected legacy Windows %lu.%lu build=%lu; auto enabling PreferWinInet=1",
-                static_cast<unsigned long>(windowsVersion.major),
-                static_cast<unsigned long>(windowsVersion.minor),
-                static_cast<unsigned long>(windowsVersion.build));
+            // XP's SChannel-backed WinINet/WinHTTP stacks cannot negotiate
+            // the modern TLS configuration used by the Concerto endpoint.
+            // The bundled mbedTLS client is independent of SChannel and is
+            // the supported default for the XP build/runtime.  Retain the
+            // platform fallback only if embedded TLS was not compiled in.
+            if (netplay::tls::IsAvailable())
+            {
+                config.forceEmbeddedTls = true;
+                mod::Log(
+                    "LobbySession: detected legacy Windows %lu.%lu build=%lu; "
+                    "auto enabling ForceEmbeddedTls=1",
+                    static_cast<unsigned long>(windowsVersion.major),
+                    static_cast<unsigned long>(windowsVersion.minor),
+                    static_cast<unsigned long>(windowsVersion.build));
+            }
+            else
+            {
+                config.preferWinInet = true;
+                mod::Log(
+                    "LobbySession: detected legacy Windows without embedded TLS; "
+                    "falling back to PreferWinInet=1");
+            }
         }
 
         // Wine's WinHTTP implementation has known TLS negotiation edge
@@ -796,6 +830,8 @@ struct WinInetApi
 WinInetApi& GetWinInetApi()
 {
     static WinInetApi api;
+    static std::mutex initMutex;
+    std::lock_guard<std::mutex> initLock(initMutex);
     if (api.initialized)
     {
         return api;
@@ -937,6 +973,63 @@ std::wstring Utf8ToWideNullTerminated(const std::string& utf8)
     return wide;
 }
 
+struct PersistentWinHttpConnection
+{
+    std::mutex mutex;
+    HINTERNET session = nullptr;
+    HINTERNET connection = nullptr;
+};
+
+PersistentWinHttpConnection g_persistentWinHttpConnection;
+
+PersistentWinHttpConnection& GetPersistentWinHttpConnection()
+{
+    // All normal lobby requests target the same Concerto origin.  Keeping
+    // these handles alive lets WinHTTP reuse the underlying HTTPS connection,
+    // matching the persistent requests.Session used by Concerto itself.
+    return g_persistentWinHttpConnection;
+}
+
+void ResetPersistentWinHttpConnection(
+    WinHttpApi& api,
+    PersistentWinHttpConnection& state)
+{
+    if (state.connection != nullptr)
+    {
+        api.CloseHandle(state.connection);
+        state.connection = nullptr;
+    }
+    if (state.session != nullptr)
+    {
+        api.CloseHandle(state.session);
+        state.session = nullptr;
+    }
+}
+
+void ClosePersistentWinHttpConnection()
+{
+    PersistentWinHttpConnection& state = GetPersistentWinHttpConnection();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    // XP normally uses embedded TLS and never initializes WinHTTP.  Avoid
+    // loading winhttp.dll solely because a lobby session is being destroyed.
+    if (state.session == nullptr && state.connection == nullptr)
+    {
+        g_lobbyHttpBackend.store(-1);
+        return;
+    }
+
+    WinHttpApi& api = GetWinHttpApi();
+    if (!api.available)
+    {
+        g_lobbyHttpBackend.store(-1);
+        return;
+    }
+
+    ResetPersistentWinHttpConnection(api, state);
+    g_lobbyHttpBackend.store(-1);
+}
+
 std::string DoHttpGetViaWinHttp(
     const std::string& path,
     DWORD connectTimeoutMs = kConnectTimeoutMs,
@@ -949,42 +1042,53 @@ std::string DoHttpGetViaWinHttp(
         return result;
     }
 
-    HINTERNET hSession = api.Open(
-        L"EFZNetplayMod/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0);
-    if (hSession == nullptr)
+    PersistentWinHttpConnection& state = GetPersistentWinHttpConnection();
+    std::lock_guard<std::mutex> connectionLock(state.mutex);
+
+    if (state.session == nullptr)
     {
-        mod::Log("LobbySession::DoHttpGet: WinHttpOpen failed (%lu)", GetLastError());
-        return result;
+        state.session = api.Open(
+            L"EFZNetplayMod/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0);
+        if (state.session == nullptr)
+        {
+            mod::Log("LobbySession::DoHttpGet: WinHttpOpen failed (%lu)", GetLastError());
+            return result;
+        }
     }
 
-    api.SetTimeouts(hSession,
+    api.SetTimeouts(state.session,
         static_cast<int>(connectTimeoutMs),
         static_cast<int>(connectTimeoutMs),
         static_cast<int>(receiveTimeoutMs),
         static_cast<int>(receiveTimeoutMs));
 
-    HINTERNET hConnect = api.Connect(hSession, kConcertoHost, kConcertoPort, 0);
-    if (hConnect == nullptr)
+    if (state.connection == nullptr)
     {
-        mod::Log("LobbySession::DoHttpGet: WinHttpConnect failed (%lu)", GetLastError());
-        api.CloseHandle(hSession);
-        return result;
+        state.connection = api.Connect(
+            state.session,
+            kConcertoHost,
+            kConcertoPort,
+            0);
+        if (state.connection == nullptr)
+        {
+            mod::Log("LobbySession::DoHttpGet: WinHttpConnect failed (%lu)", GetLastError());
+            ResetPersistentWinHttpConnection(api, state);
+            return result;
+        }
     }
 
     const std::wstring wPath = Utf8ToWideNullTerminated(path);
     if (wPath.empty())
     {
-        api.CloseHandle(hConnect);
-        api.CloseHandle(hSession);
         return result;
     }
 
     HINTERNET hRequest = api.OpenRequest(
-        hConnect,
+        state.connection,
         L"GET",
         wPath.c_str(),
         nullptr,
@@ -994,8 +1098,7 @@ std::string DoHttpGetViaWinHttp(
     if (hRequest == nullptr)
     {
         mod::Log("LobbySession::DoHttpGet: WinHttpOpenRequest failed (%lu)", GetLastError());
-        api.CloseHandle(hConnect);
-        api.CloseHandle(hSession);
+        ResetPersistentWinHttpConnection(api, state);
         return result;
     }
 
@@ -1011,27 +1114,41 @@ std::string DoHttpGetViaWinHttp(
     {
         mod::Log("LobbySession::DoHttpGet: WinHttp send/receive failed (%lu)", GetLastError());
         api.CloseHandle(hRequest);
-        api.CloseHandle(hConnect);
-        api.CloseHandle(hSession);
+        ResetPersistentWinHttpConnection(api, state);
         return result;
     }
 
-    DWORD available = 0;
-    while (api.QueryDataAvailable(hRequest, &available) && available > 0)
+    for (;;)
     {
+        DWORD available = 0;
+        if (!api.QueryDataAvailable(hRequest, &available))
+        {
+            mod::Log(
+                "LobbySession::DoHttpGet: WinHttpQueryDataAvailable failed (%lu)",
+                GetLastError());
+            api.CloseHandle(hRequest);
+            ResetPersistentWinHttpConnection(api, state);
+            return std::string();
+        }
+        if (available == 0)
+        {
+            break;
+        }
+
         const size_t oldSize = result.size();
         result.resize(oldSize + available);
         DWORD bytesRead = 0;
         if (!api.ReadData(hRequest, &result[oldSize], available, &bytesRead))
         {
-            break;
+            mod::Log("LobbySession::DoHttpGet: WinHttpReadData failed (%lu)", GetLastError());
+            api.CloseHandle(hRequest);
+            ResetPersistentWinHttpConnection(api, state);
+            return std::string();
         }
         result.resize(oldSize + bytesRead);
     }
 
     api.CloseHandle(hRequest);
-    api.CloseHandle(hConnect);
-    api.CloseHandle(hSession);
     return result;
 }
 
@@ -1136,36 +1253,40 @@ std::string TryHttpGetForEndpoint(
     const bool isHttps = HasHttpsScheme(requestUrl);
     const bool tryEmbeddedTls = isHttps && (!endpointConfig.forceWinInet || endpointConfig.forceEmbeddedTls);
     bool triedWinInet = false;
+    bool triedWinHttp = false;
+    bool triedEmbeddedTls = false;
 
-    const bool tryPreferredWinInetFirst =
-        endpointConfig.preferWinInet
-        && !endpointConfig.forceWinInet
-        && !endpointConfig.forceEmbeddedTls;
-    if (tryPreferredWinInetFirst)
-    {
+    const auto tryWinInet = [&]() -> std::string {
         triedWinInet = true;
-        const std::string preferredWinInetResult =
+        const std::string result =
             DoHttpGetViaWinInet(requestUrl, connectTimeoutMs, receiveTimeoutMs);
-        if (!preferredWinInetResult.empty())
+        if (!result.empty() && outBackend != nullptr)
         {
-            if (outBackend != nullptr)
-            {
-                *outBackend = 2;
-            }
-            return preferredWinInetResult;
+            *outBackend = 2;
         }
-
-        mod::Log(
-            "LobbySession::DoHttpGet: %s endpoint preferred WinINet failed url='%s'; falling back",
-            endpointTag.c_str(),
-            requestUrl.c_str());
-    }
-
-    if (tryEmbeddedTls)
-    {
+        return result;
+    };
+    const auto tryWinHttp = [&]() -> std::string {
+        triedWinHttp = true;
+        const std::string result =
+            DoHttpGetViaWinHttp(defaultPathForWinHttp, connectTimeoutMs, receiveTimeoutMs);
+        if (!result.empty() && outBackend != nullptr)
+        {
+            *outBackend = 1;
+        }
+        return result;
+    };
+    const auto tryEmbedded = [&]() -> std::string {
+        triedEmbeddedTls = true;
         std::string body;
         std::string error;
-        if (netplay::tls::HttpGet(requestUrl, endpointConfig.tlsVerify, receiveTimeoutMs, &body, &error))
+        if (netplay::tls::HttpGet(
+                requestUrl,
+                endpointConfig.tlsVerify,
+                connectTimeoutMs,
+                receiveTimeoutMs,
+                &body,
+                &error))
         {
             if (outBackend != nullptr)
             {
@@ -1175,10 +1296,101 @@ std::string TryHttpGetForEndpoint(
         }
 
         mod::Log(
-            "LobbySession::DoHttpGet: %s endpoint EmbeddedTLS failed url='%s' error='%s'",
+            "LobbySession::DoHttpGet: %s endpoint EmbeddedTLS failed "
+            "url='%s' error='%s'",
             endpointTag.c_str(),
             requestUrl.c_str(),
             error.c_str());
+        return std::string();
+    };
+
+    // Reuse the last successful backend as the next request's first choice.
+    // Previously every 500/1000 ms poll retried known-failing transports
+    // before reaching the backend that had just succeeded.
+    const int rememberedBackend = g_lobbyHttpBackend.load();
+    if (rememberedBackend == 2 && !endpointConfig.forceEmbeddedTls)
+    {
+        const std::string rememberedResult = tryWinInet();
+        if (!rememberedResult.empty())
+        {
+            return rememberedResult;
+        }
+        mod::Log(
+            "LobbySession::DoHttpGet: %s endpoint remembered WinINet failed; falling back",
+            endpointTag.c_str());
+    }
+    else if (rememberedBackend == 3 && tryEmbeddedTls)
+    {
+        const std::string rememberedResult = tryEmbedded();
+        if (!rememberedResult.empty())
+        {
+            return rememberedResult;
+        }
+        if (endpointConfig.forceEmbeddedTls)
+        {
+            return std::string();
+        }
+    }
+    else if (rememberedBackend == 1
+        && allowWinHttpForThisUrl
+        && !endpointConfig.forceWinInet
+        && !endpointConfig.forceEmbeddedTls)
+    {
+        const std::string rememberedResult = tryWinHttp();
+        if (!rememberedResult.empty())
+        {
+            return rememberedResult;
+        }
+        mod::Log(
+            "LobbySession::DoHttpGet: %s endpoint remembered WinHTTP failed; falling back",
+            endpointTag.c_str());
+    }
+
+    const bool tryPreferredWinInetFirst =
+        endpointConfig.preferWinInet
+        && !endpointConfig.forceWinInet
+        && !endpointConfig.forceEmbeddedTls
+        && !triedWinInet;
+    if (tryPreferredWinInetFirst)
+    {
+        const std::string preferredWinInetResult = tryWinInet();
+        if (!preferredWinInetResult.empty())
+        {
+            return preferredWinInetResult;
+        }
+
+        mod::Log(
+            "LobbySession::DoHttpGet: %s endpoint preferred WinINet failed url='%s'; falling back",
+            endpointTag.c_str(),
+            requestUrl.c_str());
+    }
+
+    // On native Windows, prefer the platform HTTP stack.  The embedded TLS
+    // helper is deliberately one-shot (fresh entropy, TCP and TLS handshake,
+    // then Connection: close), which made every 500 ms lobby poll pay a full
+    // handshake.  Concerto's requests.Session reuses its transport.  WinHTTP
+    // is the closest available runtime equivalent and keeps TLS/session work
+    // in the OS.  Wine still selects embedded TLS explicitly above, and URL
+    // overrides that WinHTTP cannot represent still fall back below.
+    if (allowWinHttpForThisUrl
+        && !endpointConfig.forceWinInet
+        && !endpointConfig.forceEmbeddedTls
+        && !triedWinHttp)
+    {
+        const std::string result = tryWinHttp();
+        if (!result.empty())
+        {
+            return result;
+        }
+    }
+
+    if (tryEmbeddedTls && !triedEmbeddedTls)
+    {
+        const std::string body = tryEmbedded();
+        if (!body.empty())
+        {
+            return body;
+        }
 
         // Explicit force means skip non-embedded backends for this endpoint only.
         if (endpointConfig.forceEmbeddedTls)
@@ -1187,30 +1399,11 @@ std::string TryHttpGetForEndpoint(
         }
     }
 
-    if (allowWinHttpForThisUrl && !endpointConfig.forceWinInet && !endpointConfig.forceEmbeddedTls)
-    {
-        const std::string result =
-            DoHttpGetViaWinHttp(defaultPathForWinHttp, connectTimeoutMs, receiveTimeoutMs);
-        if (!result.empty())
-        {
-            if (outBackend != nullptr)
-            {
-                *outBackend = 1;
-            }
-            return result;
-        }
-    }
-
     if (!triedWinInet)
     {
-        const std::string winInetResult =
-            DoHttpGetViaWinInet(requestUrl, connectTimeoutMs, receiveTimeoutMs);
+        const std::string winInetResult = tryWinInet();
         if (!winInetResult.empty())
         {
-            if (outBackend != nullptr)
-            {
-                *outBackend = 2;
-            }
             return winInetResult;
         }
     }
@@ -1552,7 +1745,510 @@ void ParsePublicRoomSummaries(const std::string& json, std::vector<PublicRoomSum
         }
     }
 }
+
+constexpr DWORD kPublicIpTimeoutMs = 2000;
+
+bool IsPublicIpDiscoveryCancelled(const std::atomic<bool>* cancelFlag)
+{
+    return cancelFlag != nullptr && cancelFlag->load();
+}
+
+network::NetworkFamily NormalizeNetworkFamily(network::NetworkFamily family)
+{
+    return family == network::NetworkFamily::IPv6
+        ? network::NetworkFamily::IPv6
+        : network::NetworkFamily::IPv4;
+}
+
+network::NetworkFamily AlternateNetworkFamily(network::NetworkFamily family)
+{
+    return NormalizeNetworkFamily(family) == network::NetworkFamily::IPv6
+        ? network::NetworkFamily::IPv4
+        : network::NetworkFamily::IPv6;
+}
+
+PublicIpDiscoveryResult::FamilyDiagnostics* DiagnosticsForFamily(
+    PublicIpDiscoveryResult* result,
+    network::NetworkFamily family)
+{
+    if (result == nullptr)
+    {
+        return nullptr;
+    }
+    return NormalizeNetworkFamily(family) == network::NetworkFamily::IPv6
+        ? &result->ipv6
+        : &result->ipv4;
+}
+
+bool TryAcceptPublicIpResponse(
+    std::string body,
+    network::NetworkFamily expectedFamily,
+    const char* source,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || outPublicIp == nullptr)
+    {
+        return false;
+    }
+
+    body = TrimAscii(std::move(body));
+    network::NetworkHost parsedHost;
+    if (!network::ParseBareHost(body, &parsedHost))
+    {
+        ++diagnostics->parseFailures;
+        mod::Log(
+            "PublicIpDiscovery: rejected malformed response source=%s expected=%s bytes=%zu",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            body.size());
+        return false;
+    }
+    if (parsedHost.family != expectedFamily)
+    {
+        ++diagnostics->parseFailures;
+        mod::Log(
+            "PublicIpDiscovery: rejected wrong-family response source=%s expected=%s actual=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            network::FamilyName(parsedHost.family));
+        return false;
+    }
+    if (!network::IsGloballyRoutableHost(parsedHost))
+    {
+        ++diagnostics->nonGlobalResponses;
+        mod::Log(
+            "PublicIpDiscovery: rejected non-global response source=%s expected=%s address=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(expectedFamily),
+            parsedHost.host.c_str());
+        return false;
+    }
+
+    *outPublicIp = std::move(parsedHost.host);
+    diagnostics->resolved = true;
+    mod::Log(
+        "PublicIpDiscovery: resolved family=%s source=%s address=%s",
+        network::FamilyName(expectedFamily),
+        source != nullptr ? source : "",
+        outPublicIp->c_str());
+    return true;
+}
+
+bool TryTlsPublicIpSource(
+    const char* url,
+    const char* source,
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    ++diagnostics->sourceAttempts;
+    std::string body;
+    std::string error;
+    if (!netplay::tls::HttpGet(
+            url,
+            false,
+            kPublicIpTimeoutMs,
+            kPublicIpTimeoutMs,
+            &body,
+            &error))
+    {
+        ++diagnostics->transportFailures;
+        mod::Log(
+            "PublicIpDiscovery: transport failure source=%s family=%s detail=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(family),
+            error.empty() ? "(none)" : error.c_str());
+        return false;
+    }
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+    return TryAcceptPublicIpResponse(
+        std::move(body),
+        family,
+        source,
+        diagnostics,
+        outPublicIp);
+}
+
+bool TryWinInetPublicIpSource(
+    const char* url,
+    const char* source,
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    if (diagnostics == nullptr || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    ++diagnostics->sourceAttempts;
+    std::string body = DoHttpGetViaWinInet(
+        url,
+        kPublicIpTimeoutMs,
+        kPublicIpTimeoutMs);
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+    if (body.empty())
+    {
+        // The existing WinINet wrapper exposes an empty body for transport
+        // failures and for unusable empty responses. Record that as a lookup
+        // transport/no-body failure without claiming the address family itself
+        // is unavailable.
+        ++diagnostics->transportFailures;
+        mod::Log(
+            "PublicIpDiscovery: transport/no-body failure source=%s family=%s",
+            source != nullptr ? source : "",
+            network::FamilyName(family));
+        return false;
+    }
+    return TryAcceptPublicIpResponse(
+        std::move(body),
+        family,
+        source,
+        diagnostics,
+        outPublicIp);
+}
+
+bool TryDiscoverPublicIpForFamily(
+    network::NetworkFamily family,
+    const std::atomic<bool>* cancelFlag,
+    const network::LocalNetworkCapabilitySnapshot* capabilitySnapshot,
+    PublicIpDiscoveryResult::FamilyDiagnostics* diagnostics,
+    std::string* outPublicIp)
+{
+    family = NormalizeNetworkFamily(family);
+    if (diagnostics == nullptr)
+    {
+        return false;
+    }
+
+    if (capabilitySnapshot != nullptr)
+    {
+        const network::LocalFamilyCapability& capability =
+            network::GetFamilyCapability(*capabilitySnapshot, family);
+        diagnostics->localCapabilityAvailable = true;
+        diagnostics->localCapability = capability;
+        mod::Log(
+            "PublicIpDiscovery: cached local capability family=%s state=%s "
+            "listenerStage=%s listenerError=%d addresses=%u strongestScope=%s "
+            "routeAttempted=%d routeAvailable=%d routeUnavailable=%d "
+            "routeError=%d routeSource=%s action=%s",
+            network::FamilyName(family),
+            network::LocalFamilyCapabilityStateName(capability.state),
+            network::ProbeStageName(capability.listenerProbe.stage),
+            capability.listenerProbe.nativeError,
+            capability.bindableAddressCount,
+            network::LocalAddressScopeName(
+                capability.strongestAddressScope),
+            capability.routeProbeAttempted ? 1 : 0,
+            capability.routeAvailable ? 1 : 0,
+            capability.routeDefinitelyUnavailable ? 1 : 0,
+            capability.routeNativeError,
+            network::LocalAddressScopeName(capability.routeSourceScope),
+            network::CanAttemptGlobalPublicDiscovery(capability)
+                ? "discover_global"
+                : "skip_global");
+        if (!network::CanAttemptGlobalPublicDiscovery(capability))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        // A missing or stale cache is intentionally not a reason to wait or
+        // run a local socket probe here. This worker is then purely public
+        // address discovery, and Revival's listener is the final authority.
+        mod::Log(
+            "PublicIpDiscovery: local capability family=%s cache=unavailable "
+            "action=discover_global",
+            network::FamilyName(family));
+    }
+
+    const bool ipv6 = family == network::NetworkFamily::IPv6;
+    const char* apiUrl = ipv6 ? "https://api6.ipify.org" : "https://api4.ipify.org";
+    const char* apiLabel = ipv6 ? "api6.ipify.org" : "api4.ipify.org";
+    const char* identUrl = ipv6 ? "http://6.ident.me" : "http://4.ident.me";
+    const char* identLabel = ipv6 ? "6.ident.me" : "4.ident.me";
+    const char* tnediUrl = ipv6 ? "http://6.tnedi.me" : "http://4.tnedi.me";
+    const char* tnediLabel = ipv6 ? "6.tnedi.me" : "4.tnedi.me";
+
+    // These services are independent and each has its own two-second
+    // transport timeout. Running them sequentially could hold Direct Host for
+    // three full timeout windows before the listener is even started. Race the
+    // same-family sources, join them here (the outer discovery worker owns all
+    // lifetimes), then retain the deterministic ipify -> ident.me -> tnedi.me
+    // selection order.
+    struct SourceAttempt
+    {
+        PublicIpDiscoveryResult::FamilyDiagnostics diagnostics;
+        std::string publicIp;
+        bool resolved = false;
+    };
+
+    SourceAttempt apiAttempt;
+    SourceAttempt identAttempt;
+    SourceAttempt tnediAttempt;
+    const bool useTlsForApi = netplay::tls::IsAvailable();
+
+    // GetWinInetApi has a manually initialized runtime symbol table. Resolve
+    // it on this one owner thread before the two/three request threads read it.
+    (void)GetWinInetApi();
+
+    const DWORD familyDiscoveryStartTick = GetTickCount();
+    std::thread apiThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        apiAttempt.resolved =
+            useTlsForApi
+                ? TryTlsPublicIpSource(
+                      apiUrl,
+                      apiLabel,
+                      family,
+                      cancelFlag,
+                      &apiAttempt.diagnostics,
+                      &apiAttempt.publicIp)
+                : TryWinInetPublicIpSource(
+                      apiUrl,
+                      apiLabel,
+                      family,
+                      cancelFlag,
+                      &apiAttempt.diagnostics,
+                      &apiAttempt.publicIp);
+    });
+    std::thread identThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        identAttempt.resolved = TryWinInetPublicIpSource(
+            identUrl,
+            identLabel,
+            family,
+            cancelFlag,
+            &identAttempt.diagnostics,
+            &identAttempt.publicIp);
+    });
+    std::thread tnediThread([&]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        tnediAttempt.resolved = TryWinInetPublicIpSource(
+            tnediUrl,
+            tnediLabel,
+            family,
+            cancelFlag,
+            &tnediAttempt.diagnostics,
+            &tnediAttempt.publicIp);
+    });
+
+    apiThread.join();
+    identThread.join();
+    tnediThread.join();
+
+    const SourceAttempt* attempts[] = {
+        &apiAttempt,
+        &identAttempt,
+        &tnediAttempt,
+    };
+    const SourceAttempt* selected = nullptr;
+    for (const SourceAttempt* attempt : attempts)
+    {
+        diagnostics->sourceAttempts +=
+            attempt->diagnostics.sourceAttempts;
+        diagnostics->transportFailures +=
+            attempt->diagnostics.transportFailures;
+        diagnostics->parseFailures +=
+            attempt->diagnostics.parseFailures;
+        diagnostics->nonGlobalResponses +=
+            attempt->diagnostics.nonGlobalResponses;
+        if (selected == nullptr && attempt->resolved)
+        {
+            selected = attempt;
+        }
+    }
+
+    mod::Log(
+        "PublicIpDiscovery: family batch complete family=%s elapsedMs=%lu "
+        "attempts=%u transportFailures=%u parseFailures=%u nonGlobalResponses=%u resolved=%d",
+        network::FamilyName(family),
+        static_cast<unsigned long>(
+            GetTickCount() - familyDiscoveryStartTick),
+        diagnostics->sourceAttempts,
+        diagnostics->transportFailures,
+        diagnostics->parseFailures,
+        diagnostics->nonGlobalResponses,
+        selected != nullptr ? 1 : 0);
+
+    if (selected == nullptr
+        || IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        return false;
+    }
+
+    diagnostics->resolved = true;
+    *outPublicIp = selected->publicIp;
+    return true;
+}
 } // namespace
+
+PublicIpDiscoveryResult DiscoverPublicIpSynchronously(
+    network::NetworkFamily preferredFamily,
+    const std::atomic<bool>* cancelFlag,
+    bool allowAlternateFamily,
+    const network::LocalNetworkCapabilitySnapshot* capabilitySnapshot)
+{
+    PublicIpDiscoveryResult result;
+    result.preferredFamily = NormalizeNetworkFamily(preferredFamily);
+    result.effectiveFamily = result.preferredFamily;
+
+    mod::Log(
+        "PublicIpDiscovery: begin preferred=%s capabilityCache=%s",
+        network::FamilyName(result.preferredFamily),
+        capabilitySnapshot != nullptr ? "completed" : "unavailable");
+
+    PublicIpDiscoveryResult::FamilyDiagnostics* preferredDiagnostics =
+        DiagnosticsForFamily(&result, result.preferredFamily);
+    if (TryDiscoverPublicIpForFamily(
+            result.preferredFamily,
+            cancelFlag,
+            capabilitySnapshot,
+            preferredDiagnostics,
+            &result.publicIp))
+    {
+        return result;
+    }
+
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        result.cancelled = true;
+        mod::Log(
+            "PublicIpDiscovery: cancelled preferred=%s",
+            network::FamilyName(result.preferredFamily));
+        return result;
+    }
+
+    if (!allowAlternateFamily)
+    {
+        result.publicIp.clear();
+        mod::Log(
+            "PublicIpDiscovery: no validated %s address detected across %u "
+            "sources; alternate family disabled for controlled retry",
+            network::FamilyName(result.preferredFamily),
+            preferredDiagnostics != nullptr
+                ? preferredDiagnostics->sourceAttempts
+                : 0u);
+        return result;
+    }
+
+    const network::NetworkFamily alternateFamily =
+        AlternateNetworkFamily(result.preferredFamily);
+    mod::Log(
+        "PublicIpDiscovery: no validated %s address detected across %u sources; trying alternate=%s",
+        network::FamilyName(result.preferredFamily),
+        preferredDiagnostics != nullptr ? preferredDiagnostics->sourceAttempts : 0u,
+        network::FamilyName(alternateFamily));
+
+    PublicIpDiscoveryResult::FamilyDiagnostics* alternateDiagnostics =
+        DiagnosticsForFamily(&result, alternateFamily);
+    if (TryDiscoverPublicIpForFamily(
+            alternateFamily,
+            cancelFlag,
+            capabilitySnapshot,
+            alternateDiagnostics,
+            &result.publicIp))
+    {
+        result.effectiveFamily = alternateFamily;
+        result.usedFamilyFallback = true;
+        mod::Log(
+            "PublicIpDiscovery: selected alternate=%s preferred=%s",
+            network::FamilyName(result.effectiveFamily),
+            network::FamilyName(result.preferredFamily));
+        return result;
+    }
+
+    if (IsPublicIpDiscoveryCancelled(cancelFlag))
+    {
+        result.cancelled = true;
+        mod::Log(
+            "PublicIpDiscovery: cancelled preferred=%s alternate=%s",
+            network::FamilyName(result.preferredFamily),
+            network::FamilyName(alternateFamily));
+        return result;
+    }
+
+    // If the prewarmed cache proved that the preferred family cannot even
+    // create/bind a listener, retry Revival on the alternate even when neither
+    // public-address service succeeded. This preserves LAN/manual hosting
+    // while avoiding any synchronous local probe on the Host path.
+    if (preferredDiagnostics != nullptr
+        && preferredDiagnostics->localCapabilityAvailable
+        && preferredDiagnostics->localCapability.state
+            == network::LocalFamilyCapabilityState::HardUnavailable
+        && alternateDiagnostics != nullptr
+        && alternateDiagnostics->localCapabilityAvailable
+        && alternateDiagnostics->localCapability.state
+            != network::LocalFamilyCapabilityState::HardUnavailable)
+    {
+        result.publicIp.clear();
+        result.effectiveFamily = alternateFamily;
+        result.usedFamilyFallback = true;
+        mod::Log(
+            "PublicIpDiscovery: selected alternate local Host family=%s "
+            "without public address; preferred=%s capability=%s "
+            "listenerStage=%s nativeError=%d",
+            network::FamilyName(result.effectiveFamily),
+            network::FamilyName(result.preferredFamily),
+            network::LocalFamilyCapabilityStateName(
+                preferredDiagnostics->localCapability.state),
+            network::ProbeStageName(
+                preferredDiagnostics->localCapability.listenerProbe.stage),
+            preferredDiagnostics->localCapability.listenerProbe.nativeError);
+        return result;
+    }
+
+    // Lookup failure alone is not proof that either local socket family is
+    // unavailable. Retain the user's preferred family so LAN/manual hosting
+    // can continue while callers report public-address detection failure.
+    result.publicIp.clear();
+    result.effectiveFamily = result.preferredFamily;
+    result.usedFamilyFallback = false;
+    mod::Log(
+        "PublicIpDiscovery: detection failed preferred=%s attempts=%u transport=%u parse=%u nonGlobal=%u "
+        "preferredCapability=%s alternate=%s attempts=%u transport=%u parse=%u nonGlobal=%u "
+        "alternateCapability=%s; "
+        "retaining preferred family",
+        network::FamilyName(result.preferredFamily),
+        preferredDiagnostics != nullptr ? preferredDiagnostics->sourceAttempts : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->transportFailures : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->parseFailures : 0u,
+        preferredDiagnostics != nullptr ? preferredDiagnostics->nonGlobalResponses : 0u,
+        preferredDiagnostics != nullptr
+                && preferredDiagnostics->localCapabilityAvailable
+            ? network::LocalFamilyCapabilityStateName(
+                preferredDiagnostics->localCapability.state)
+            : "not_cached",
+        network::FamilyName(alternateFamily),
+        alternateDiagnostics != nullptr ? alternateDiagnostics->sourceAttempts : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->transportFailures : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->parseFailures : 0u,
+        alternateDiagnostics != nullptr ? alternateDiagnostics->nonGlobalResponses : 0u,
+        alternateDiagnostics != nullptr
+                && alternateDiagnostics->localCapabilityAvailable
+            ? network::LocalFamilyCapabilityStateName(
+                alternateDiagnostics->localCapability.state)
+            : "not_cached");
+    return result;
+}
 
 bool ListPublicRooms(std::vector<PublicRoomSummary>* outRooms, std::string* outError)
 {
@@ -1734,9 +2430,11 @@ bool CreateRoom(
 LobbySession::LobbySession(
     std::string nickname,
     uint16_t hostPort,
-    const LobbyJoinedRoom* joinedRoom)
+    const LobbyJoinedRoom* joinedRoom,
+    network::NetworkFamily preferredFamily)
     : m_nickname(std::move(nickname))
     , m_hostPort(hostPort)
+    , m_preferredFamily(NormalizeNetworkFamily(preferredFamily))
 {
     if (joinedRoom != nullptr)
     {
@@ -1762,13 +2460,17 @@ LobbySession::LobbySession(
     m_status.roomCode = m_joinedRoom.roomCode;
     m_status.roomOrigin = m_joinedRoom.origin;
     m_status.isGlobalRoom = m_joinedRoom.isGlobalRoom;
+    m_status.preferredFamily = m_preferredFamily;
+    m_status.effectiveFamily = m_preferredFamily;
+    m_status.usedFamilyFallback = false;
     m_pollThread = std::thread(&LobbySession::PollThreadEntry, this);
     mod::Log(
-        "LobbySession: started for nickname='%s' prejoined=%d roomCode='%s' origin=%d",
+        "LobbySession: started for nickname='%s' prejoined=%d roomCode='%s' origin=%d preferredFamily=%s",
         m_nickname.c_str(),
         m_hasPrejoinedRoom ? 1 : 0,
         m_joinedRoom.roomCode.c_str(),
-        static_cast<int>(m_joinedRoom.origin));
+        static_cast<int>(m_joinedRoom.origin),
+        network::FamilyName(m_preferredFamily));
 }
 
 LobbySession::~LobbySession()
@@ -1787,6 +2489,10 @@ LobbySession::~LobbySession()
     {
         m_publicIpThread.join();
     }
+    // The WinHTTP origin handles are shared across requests so the transport
+    // can reuse HTTPS connections.  Release them after both session-owned
+    // workers have stopped; a later lobby session will lazily reopen them.
+    ClosePersistentWinHttpConnection();
     if (m_wakeEvent != nullptr)
     {
         CloseHandle(m_wakeEvent);
@@ -1806,6 +2512,18 @@ LobbyStatus LobbySession::GetStatus() const
     return m_status;
 }
 
+network::NetworkFamily LobbySession::GetEffectiveFamily() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_status.effectiveFamily;
+}
+
+bool LobbySession::UsedFamilyFallback() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_status.usedFamilyFallback;
+}
+
 bool LobbySession::HasPendingEndActionLocked() const
 {
     for (const PendingAction& action : m_pendingActions)
@@ -1823,8 +2541,9 @@ void LobbySession::ClearMatchLifecycleState(bool clearStatusInBattle)
     m_inBattle.store(false);
     m_returningFromMatch.store(false);
     m_challengePending.store(false);
-    m_abandonedOutgoingChallenge.store(false);
-    m_abandonedIncomingChallenge.store(false);
+    // Abandonment flags are edge-triggered notifications for the title
+    // thread.  Do not erase them during asynchronous HTTP cleanup/rejoin;
+    // only their consumer or the start of a new challenge may clear them.
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     m_endPending.store(false);
@@ -1948,6 +2667,7 @@ void LobbySession::SendChallenge(int targetPlayerId, const std::string& targetNa
     m_isMatchHost.store(true);
     m_challengePending.store(true);
     m_abandonedOutgoingChallenge.store(false);
+    m_abandonedIncomingChallenge.store(false);
     m_matchConnected.store(false);
     m_endDeferred.store(false);
     m_endPending.store(false);
@@ -2025,6 +2745,7 @@ void LobbySession::NotifyMatchConnected()
     m_inBattle.store(true);
     m_challengePending.store(false);
     m_abandonedOutgoingChallenge.store(false);
+    m_abandonedIncomingChallenge.store(false);
     m_matchConnected.store(true);
     m_endDeferred.store(false);
     m_endPending.store(false);
@@ -2036,7 +2757,7 @@ void LobbySession::NotifyMatchConnected()
         m_status.inBattle = true;
         PendingAction action;
         action.type = PendingAction::ConfirmAccept;
-        // targetPlayerId is not needed for accept — the server tracks the
+        // targetPlayerId is not needed for accept - the server tracks the
         // pending challenge state.  We send 0 and DoAccept will use
         // the last pre_accept target if needed.
         action.targetPlayerId = 0;
@@ -2058,21 +2779,18 @@ void LobbySession::NotifySpectateStarted()
 
     m_spectateActive.store(true);
     m_returningFromSpectate.store(false);
-    if (m_joinedRoom.lobbyNumericId != 0 && !m_spectateDetachedFromRoom.load())
-    {
-        m_spectateLeavePending.store(true);
-    }
+    // Concerto invariant: spectating does NOT leave the room. We keep polling
+    // status as a normal member and just launch the local watch session, so we
+    // stay visible and never churn our server identity (the old leave+rejoin
+    // detach was a primary source of ghost entries and stale state).
+    m_spectateLeavePending.store(false);
+    m_spectateDetachedFromRoom.store(false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_status.inBattle = true;
-        if (m_spectateLeavePending.load())
-        {
-            m_status.statusMessage = "Leaving room for spectate...";
-        }
     }
     mod::Log(
-        "LobbySession::NotifySpectateStarted: local spectate lifecycle active detachPending=%d roomCode='%s' origin=%d",
-        m_spectateLeavePending.load() ? 1 : 0,
+        "LobbySession::NotifySpectateStarted: local spectate active (no room detach) roomCode='%s' origin=%d",
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
     if (m_wakeEvent != nullptr)
@@ -2131,28 +2849,20 @@ void LobbySession::NotifyEndMatch()
         action.type = PendingAction::End;
         m_pendingActions.push_back(std::move(action));
     }
-    else if (wasHost)
-    {
-        // HOST: defer the End action until we re-enter the lobby menu
-        // (via RequestRefresh).  This keeps the playing-pair visible on
-        // the server and prevents us from appearing idle prematurely.
-        m_endDeferred.store(true);
-        m_endPending.store(false);
-        mod::Log("LobbySession::NotifyEndMatch (host): inBattle=false "
-                 "returningFromMatch=true (End deferred)");
-    }
     else
     {
-        // CLIENT: send End immediately so the server drops the playing
-        // pair.  The host is responsible for maintaining lobby presence;
-        // having the client also "post" would create duplicates.  We
-        // still set m_returningFromMatch so IsInBattle() returns true
-        // and local challenge acceptance is suppressed until we return
-        // to the lobby menu.
+        // Concerto invariant: send End immediately when a match/challenge ends
+        // (host AND client), so the server drops the playing pair right away
+        // instead of leaving a stale "playing" entry until menu re-entry. The
+        // old host-side deferral let a third party challenge an already-free
+        // host (double matches) and left ghost "playing" pairs on hard exit.
+        // m_returningFromMatch stays set so IsInBattle() suppresses local
+        // challenge acceptance until we return to the lobby menu.
         m_endDeferred.store(false);
         m_endPending.store(true);
-        mod::Log("LobbySession::NotifyEndMatch (client): inBattle=false "
-                 "returningFromMatch=true, queuing End immediately");
+        mod::Log("LobbySession::NotifyEndMatch (%s): inBattle=false "
+                 "returningFromMatch=true, queuing End immediately",
+                 wasHost ? "host" : "client");
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pendingChallengeTargetId = 0;
         m_pendingChallengeTargetName.clear();
@@ -2243,6 +2953,10 @@ bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::
     }
 
     const std::string message = ExtractJsonMessage(body, "Lobby session expired");
+    const bool abandonPendingOutgoing =
+        m_isMatchHost.load() && m_challengePending.load() && !m_matchConnected.load();
+    const bool abandonPendingIncoming =
+        !m_isMatchHost.load() && m_challengePending.load() && !m_matchConnected.load();
     mod::Log(
         "%s: stale lobby session detected msg='%s' roomCode='%s' roomId=%d playerId=%d origin=%d -- scheduling rejoin",
         operation != nullptr ? operation : "LobbySession",
@@ -2268,7 +2982,14 @@ bool LobbySession::HandleServerRemovalFailure(const char* operation, const std::
 
     m_pendingAcceptTargetId = 0;
     ClearMatchLifecycleState(true);
-    m_abandonedOutgoingChallenge.store(false);
+    if (abandonPendingOutgoing)
+    {
+        m_abandonedOutgoingChallenge.store(true);
+    }
+    if (abandonPendingIncoming)
+    {
+        m_abandonedIncomingChallenge.store(true);
+    }
     m_rejoinRequested.store(true);
     if (m_wakeEvent != nullptr)
     {
@@ -2300,6 +3021,15 @@ bool LobbySession::TryRejoinIfNeeded()
         m_joinedRoom.playerId,
         static_cast<int>(m_joinedRoom.origin));
 
+    // One-identity invariant: leave our previous server registration before
+    // re-joining, so the server never carries a stale duplicate of us (the
+    // "I left but I'm still in the room" ghost). If our membership is already
+    // gone, DoLeave is a harmless no-op (it treats a missing lobby as success).
+    if (m_joinedRoom.lobbyNumericId != 0)
+    {
+        (void)DoLeave();
+    }
+
     if (!DoJoin())
     {
         mod::Log(
@@ -2313,72 +3043,6 @@ bool LobbySession::TryRejoinIfNeeded()
         "LobbySession::TryRejoinIfNeeded: rejoined lobby id=%d playerId=%d roomCode='%s' origin=%d",
         m_joinedRoom.lobbyNumericId,
         m_joinedRoom.playerId,
-        m_joinedRoom.roomCode.c_str(),
-        static_cast<int>(m_joinedRoom.origin));
-    return true;
-}
-
-bool LobbySession::TryDetachFromLobbyForSpectate()
-{
-    if (!m_spectateLeavePending.load())
-    {
-        return true;
-    }
-
-    if (m_spectateDetachedFromRoom.load())
-    {
-        m_spectateLeavePending.store(false);
-        return true;
-    }
-
-    if (m_joinedRoom.lobbyNumericId == 0)
-    {
-        m_spectateLeavePending.store(false);
-        m_spectateDetachedFromRoom.store(true);
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.pollState = PollState::NotJoined;
-        m_status.idlePlayers.clear();
-        m_status.challenges.clear();
-        m_status.displayEntries.clear();
-        m_status.playing.clear();
-        m_status.statusMessage = "Spectating...";
-        m_status.inBattle = true;
-        mod::Log("LobbySession::TryDetachFromLobbyForSpectate: no joined credentials, treating room as detached");
-        return true;
-    }
-
-    mod::Log(
-        "LobbySession::TryDetachFromLobbyForSpectate: leaving roomCode='%s' roomId=%d playerId=%d origin=%d",
-        m_joinedRoom.roomCode.c_str(),
-        m_joinedRoom.lobbyNumericId,
-        m_joinedRoom.playerId,
-        static_cast<int>(m_joinedRoom.origin));
-
-    if (!DoLeave())
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.statusMessage = "Leaving room for spectate...";
-        return false;
-    }
-
-    m_spectateLeavePending.store(false);
-    m_spectateDetachedFromRoom.store(true);
-    m_joinedRoom.lobbyNumericId = 0;
-    m_joinedRoom.playerId = 0;
-    m_joinedRoom.secret = 0;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.pollState = PollState::NotJoined;
-        m_status.idlePlayers.clear();
-        m_status.challenges.clear();
-        m_status.displayEntries.clear();
-        m_status.playing.clear();
-        m_status.statusMessage = "Spectating...";
-        m_status.inBattle = true;
-    }
-
-    mod::Log(
-        "LobbySession::TryDetachFromLobbyForSpectate: detached roomCode='%s' origin=%d",
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
     return true;
@@ -2429,47 +3093,34 @@ void LobbySession::PollThreadEntry()
         m_joinedRoom.roomCode.c_str(),
         static_cast<int>(m_joinedRoom.origin));
 
+    // Joining remains normal-priority so the visible menu operation is not
+    // delayed.  Once joined, polling is keepalive/control-plane work and may
+    // coexist with EFZ battle simulation; give the normal-priority game thread
+    // precedence without changing the poll interval or server semantics.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     // Discover public IP in the background after joining so lobby entry is not blocked.
     StartPublicIpDiscoveryAsync();
 
-    // Poll loop.
+    // Poll loop. Concerto invariant: poll status every tick for BOTH host and
+    // client, throughout matches and spectating. The server treats the poll as
+    // the room keepalive, so we never stop polling or detach while joined -
+    // doing so lets the server expire or duplicate our membership (ghosts).
     while (!m_shouldStop.load())
     {
         m_refreshRequested.store(false);
 
-        // Process any queued challenge/accept actions before polling.
+        // Process any queued challenge/accept/end actions before polling.
         ProcessPendingActions();
         if (m_shouldStop.load())
         {
             break;
         }
 
-        if (m_spectateLeavePending.load() && !TryDetachFromLobbyForSpectate())
-        {
-            if (m_wakeEvent != nullptr)
-            {
-                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
-            }
-            else
-            {
-                Sleep(kPollIntervalMs);
-            }
-            continue;
-        }
-
-        if (m_spectateDetachedFromRoom.load() && !m_rejoinRequested.load())
-        {
-            if (m_wakeEvent != nullptr)
-            {
-                WaitForSingleObject(m_wakeEvent, kPollIntervalMs);
-            }
-            else
-            {
-                Sleep(kPollIntervalMs);
-            }
-            continue;
-        }
-
+        // Service a scheduled rejoin (error recovery only). TryRejoinIfNeeded
+        // always leaves the previous identity before re-joining, so we never
+        // orphan a server-side entry.
         if (!TryRejoinIfNeeded())
         {
             if (m_wakeEvent != nullptr)
@@ -2483,29 +3134,18 @@ void LobbySession::PollThreadEntry()
             continue;
         }
 
-        // CLIENT in an active match: skip polling to avoid "posting"
-        // our presence to the lobby — only the host maintains lobby
-        // visibility during a match.  We still process pending actions
-        // above (e.g. ConfirmAccept, End) so the server is notified.
         bool allowPoll = true;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             allowPoll = (m_status.pollState != PollState::Error);
         }
-        const bool skipPoll = m_inBattle.load() && !m_isMatchHost.load();
         if (m_shouldStop.load())
         {
             break;
         }
-        if (!skipPoll && allowPoll)
+        if (allowPoll)
         {
-            if (!DoPollStatus() && m_rejoinRequested.load())
-            {
-                if (TryRejoinIfNeeded())
-                {
-                    (void)DoPollStatus();
-                }
-            }
+            (void)DoPollStatus();
         }
 
         // Wait for kPollIntervalMs or until woken early.
@@ -2624,6 +3264,9 @@ bool LobbySession::DoJoin()
     }
     m_joinedRoom.isGlobalRoom = joinedRoom.isGlobalRoom;
     ClearMatchLifecycleState(true);
+    m_consecutivePollFailures = 0;
+    m_lastLoggedStatusBody.clear();
+    m_lastStatusResponseLogTick = 0;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_pendingChallengeTargetId = 0;
@@ -2652,14 +3295,44 @@ bool LobbySession::DoPollStatus()
     const std::string body = DoHttpGet(path);
     if (body.empty())
     {
-        mod::Log("LobbySession::DoPollStatus: empty response");
+        ++m_consecutivePollFailures;
+        mod::Log(
+            "LobbySession::DoPollStatus: empty response failure=%d/%d",
+            m_consecutivePollFailures,
+            kPollFailureLimit);
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.pollState = PollState::Error;
-        m_status.statusMessage = "Poll request failed";
+        if (m_consecutivePollFailures >= kPollFailureLimit)
+        {
+            m_status.pollState = PollState::Error;
+            m_status.statusMessage = "Lobby refresh failed";
+        }
+        else
+        {
+            // Match Concerto's retry behaviour: a single transient request
+            // failure must not wedge the room until the user manually asks
+            // for a refresh.
+            m_status.pollState = PollState::Polling;
+            char retryMessage[64] = {};
+            std::snprintf(
+                retryMessage,
+                sizeof(retryMessage),
+                "Lobby refresh retry %d/%d...",
+                m_consecutivePollFailures,
+                kPollFailureLimit);
+            m_status.statusMessage = retryMessage;
+        }
         return false;
     }
 
-    mod::Log("LobbySession::DoPollStatus: response='%s'", body.c_str());
+    const DWORD responseTick = GetTickCount();
+    if (body != m_lastLoggedStatusBody
+        || m_lastStatusResponseLogTick == 0
+        || responseTick - m_lastStatusResponseLogTick >= kStatusResponseLogIntervalMs)
+    {
+        mod::Log("LobbySession::DoPollStatus: response='%s'", body.c_str());
+        m_lastLoggedStatusBody = body;
+        m_lastStatusResponseLogTick = responseTick;
+    }
 
     if (!IsJsonStatusOk(body))
     {
@@ -2672,6 +3345,14 @@ bool LobbySession::DoPollStatus()
         m_status.pollState = PollState::Error;
         m_status.statusMessage = ExtractJsonMessage(body, "Lobby status rejected by server");
         return false;
+    }
+
+    if (m_consecutivePollFailures != 0)
+    {
+        mod::Log(
+            "LobbySession::DoPollStatus: recovered after %d transient failure(s)",
+            m_consecutivePollFailures);
+        m_consecutivePollFailures = 0;
     }
 
     std::vector<LobbyPlayer> idlePlayers;
@@ -2801,7 +3482,7 @@ bool LobbySession::DoPollStatus()
     if (abandonIncomingChallenge)
     {
         // We hadn't sent 'accept' yet (we were still waiting on the bridge
-        // to connect), so there's nothing to End on the server — our
+        // to connect), so there's nothing to End on the server - our
         // pre_accept state will expire naturally once the challenger's
         // challenge record is gone. Just drop the local pending-accept
         // target so a late-arriving ConfirmAccept turns into a no-op.
@@ -3342,7 +4023,7 @@ void LobbySession::BuildDisplayEntries(
         return std::string();
     };
 
-    // Challenges first — they are actionable and time-sensitive.
+    // Challenges first - they are actionable and time-sensitive.
     for (const auto& ch : effectiveChallenges)
     {
         std::string playingSpectateIp;
@@ -3391,7 +4072,7 @@ void LobbySession::BuildDisplayEntries(
         }
 
         // Skip if this exact player ID already appears (e.g. challenger
-        // with the same ID).  We no longer deduplicate by name alone —
+        // with the same ID).  We no longer deduplicate by name alone -
         // two different players can legitimately share a nickname.
         if (isIdAlreadyListed(p.playerId))
         {
@@ -3448,7 +4129,24 @@ bool LobbySession::DoChallenge(int targetPlayerId, const std::string& ipPort)
     mod::Log("LobbySession::DoChallenge: target=%d ip=%s response='%s'",
         targetPlayerId, ipPort.c_str(), body.c_str());
 
-    return !body.empty() && body.find("\"OK\"") != std::string::npos;
+    if (body.empty())
+    {
+        return false;
+    }
+
+    if (HandleServerRemovalFailure("LobbySession::DoChallenge", body))
+    {
+        return false;
+    }
+
+    if (!IsJsonStatusOk(body))
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status.statusMessage = ExtractJsonMessage(body, "Challenge rejected by server");
+        return false;
+    }
+
+    return true;
 }
 
 bool LobbySession::DoPreAccept(int challengerPlayerId)
@@ -3487,7 +4185,7 @@ bool LobbySession::DoPreAccept(int challengerPlayerId)
 
     if (!IsJsonStatusOk(body))
     {
-        // Server rejected pre_accept — most commonly because the challenger
+        // Server rejected pre_accept - most commonly because the challenger
         // already left the lobby or their challenge expired. Signal the
         // title layer so it can cancel the bridge and close the overlay.
         mod::Log("LobbySession::DoPreAccept: server rejected pre_accept, marking incoming challenge abandoned");
@@ -3612,84 +4310,40 @@ void LobbySession::StartPublicIpDiscoveryAsync()
     }
 
     m_publicIpThread = std::thread([this]() {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         DiscoverPublicIp();
     });
 }
 
 void LobbySession::DiscoverPublicIp()
 {
-    constexpr DWORD kPublicIpTimeoutMs = 2000;
-
     if (m_shouldStop.load())
     {
         return;
     }
 
-    // Try the embedded TLS client first (works on all platforms).
-    if (netplay::tls::IsAvailable())
-    {
-        std::string body;
-        std::string error;
-        if (netplay::tls::HttpGet("https://api.ipify.org", false, kPublicIpTimeoutMs, &body, &error))
-        {
-            // Trim whitespace.
-            while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
-            {
-                body.pop_back();
-            }
-            if (!body.empty())
-            {
-                m_publicIp = body;
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_status.publicIp = m_publicIp;
-                mod::Log("LobbySession::DiscoverPublicIp: resolved=%s", m_publicIp.c_str());
-                return;
-            }
-        }
-        mod::Log("LobbySession::DiscoverPublicIp: TLS request failed: %s", error.c_str());
-    }
-
-    if (m_shouldStop.load())
+    const PublicIpDiscoveryResult result =
+        DiscoverPublicIpSynchronously(m_preferredFamily, &m_shouldStop);
+    if (m_shouldStop.load() || result.cancelled)
     {
         return;
     }
 
-    // Fallback: plain HTTP to 4.ident.me (same service Concerto uses) via WinINet.
-    static auto TrimIpBody = [](std::string& s) {
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-        {
-            s.pop_back();
-        }
-    };
-
-    std::string body = DoHttpGetViaWinInet("http://4.ident.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
-    TrimIpBody(body);
-    if (!body.empty())
-    {
-        m_publicIp = body;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.publicIp = m_publicIp;
-        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.ident.me", m_publicIp.c_str());
-        return;
-    }
-
-    if (m_shouldStop.load())
-    {
-        return;
-    }
-
-    body = DoHttpGetViaWinInet("http://4.tnedi.me", kPublicIpTimeoutMs, kPublicIpTimeoutMs);
-    TrimIpBody(body);
-    if (!body.empty())
-    {
-        m_publicIp = body;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_status.publicIp = m_publicIp;
-        mod::Log("LobbySession::DiscoverPublicIp: resolved=%s via 4.tnedi.me", m_publicIp.c_str());
-        return;
-    }
-
-    mod::Log("LobbySession::DiscoverPublicIp: unable to resolve public IP");
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_publicIp = result.publicIp;
+    m_status.publicIp = result.publicIp;
+    m_status.publicIpDiscoveryComplete = true;
+    m_status.publicIpDetectionFailed = result.publicIp.empty();
+    m_status.preferredFamily = result.preferredFamily;
+    m_status.effectiveFamily = result.effectiveFamily;
+    m_status.usedFamilyFallback = result.usedFamilyFallback;
+    mod::Log(
+        "LobbySession::DiscoverPublicIp: complete preferred=%s effective=%s fallback=%d resolved=%s",
+        network::FamilyName(result.preferredFamily),
+        network::FamilyName(result.effectiveFamily),
+        result.usedFamilyFallback ? 1 : 0,
+        result.publicIp.empty() ? "(none)" : result.publicIp.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -3714,25 +4368,136 @@ void LobbySession::ProcessPendingActions()
         switch (action.type)
         {
         case PendingAction::Challenge:
+        {
             mod::Log("LobbySession: processing challenge target=%d ip=%s",
                 action.targetPlayerId, action.ipPort.c_str());
-            DoChallenge(action.targetPlayerId, action.ipPort);
+            if (!DoChallenge(action.targetPlayerId, action.ipPort))
+            {
+                // The local host bridge is already running by the time this
+                // action executes.  Surface a one-shot abandonment event so
+                // the title thread cancels that bridge instead of waiting
+                // forever.  Unless a stale-session rejoin is already queued,
+                // also send End: an empty response is ambiguous and the
+                // server may have committed the challenge before it vanished.
+                const bool queueEnd = !m_rejoinRequested.load();
+                mod::Log(
+                    "LobbySession: challenge failed target=%d queueEnd=%d -- canceling local host session",
+                    action.targetPlayerId,
+                    queueEnd ? 1 : 0);
+                m_inBattle.store(false);
+                m_returningFromMatch.store(false);
+                m_challengePending.store(false);
+                m_matchConnected.store(false);
+                m_endDeferred.store(false);
+                m_endPending.store(queueEnd);
+                m_abandonedOutgoingChallenge.store(true);
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_pendingChallengeTargetId = 0;
+                    m_pendingChallengeTargetName.clear();
+                    m_status.inBattle = false;
+                    if (m_status.statusMessage.empty())
+                    {
+                        m_status.statusMessage = "Challenge request failed";
+                    }
+                    if (queueEnd && !HasPendingEndActionLocked())
+                    {
+                        PendingAction cleanup;
+                        cleanup.type = PendingAction::End;
+                        m_pendingActions.push_back(std::move(cleanup));
+                    }
+                }
+                if (m_wakeEvent != nullptr)
+                {
+                    SetEvent(m_wakeEvent);
+                }
+            }
             break;
+        }
 
         case PendingAction::PreAccept:
+        {
             mod::Log("LobbySession: processing pre_accept challenger=%d",
                 action.targetPlayerId);
             m_pendingAcceptTargetId = action.targetPlayerId;
-            DoPreAccept(action.targetPlayerId);
+            if (!DoPreAccept(action.targetPlayerId))
+            {
+                // pre_accept does not create a playing pair, so no End is
+                // needed.  It does, however, need to release the local busy
+                // state and abort the already-started joining bridge.
+                mod::Log(
+                    "LobbySession: pre_accept failed challenger=%d -- canceling local join session",
+                    action.targetPlayerId);
+                m_inBattle.store(false);
+                m_returningFromMatch.store(false);
+                m_challengePending.store(false);
+                m_matchConnected.store(false);
+                m_endDeferred.store(false);
+                m_endPending.store(false);
+                m_abandonedIncomingChallenge.store(true);
+                m_pendingAcceptTargetId = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_pendingAcceptChallengerName.clear();
+                    m_status.inBattle = false;
+                    if (m_status.statusMessage.empty())
+                    {
+                        m_status.statusMessage = "Pre-accept request failed";
+                    }
+                }
+                if (m_wakeEvent != nullptr)
+                {
+                    SetEvent(m_wakeEvent);
+                }
+            }
             break;
+        }
 
         case PendingAction::ConfirmAccept:
             if (m_pendingAcceptTargetId != 0)
             {
+                const int acceptTargetId = m_pendingAcceptTargetId;
                 mod::Log("LobbySession: processing deferred accept target=%d",
-                    m_pendingAcceptTargetId);
-                DoAccept(m_pendingAcceptTargetId);
+                    acceptTargetId);
+                const bool acceptOk = DoAccept(acceptTargetId);
                 m_pendingAcceptTargetId = 0;
+                if (!acceptOk)
+                {
+                    // The peer connection exists, but the lobby transition
+                    // did not complete.  Abort locally and issue End unless
+                    // stale-session recovery is already doing leave+join.
+                    const bool queueEnd = !m_rejoinRequested.load();
+                    mod::Log(
+                        "LobbySession: accept failed target=%d queueEnd=%d -- canceling local join session",
+                        acceptTargetId,
+                        queueEnd ? 1 : 0);
+                    m_inBattle.store(false);
+                    m_returningFromMatch.store(false);
+                    m_challengePending.store(false);
+                    m_matchConnected.store(false);
+                    m_endDeferred.store(false);
+                    m_endPending.store(queueEnd);
+                    m_abandonedIncomingChallenge.store(true);
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_pendingAcceptChallengerName.clear();
+                        m_status.inBattle = false;
+                        if (m_status.statusMessage.empty())
+                        {
+                            m_status.statusMessage = "Accept request failed";
+                        }
+                        if (queueEnd && !HasPendingEndActionLocked())
+                        {
+                            PendingAction cleanup;
+                            cleanup.type = PendingAction::End;
+                            m_pendingActions.push_back(std::move(cleanup));
+                        }
+                    }
+                    if (m_wakeEvent != nullptr)
+                    {
+                        SetEvent(m_wakeEvent);
+                    }
+                }
             }
             else
             {
@@ -3748,7 +4513,7 @@ void LobbySession::ProcessPendingActions()
             if (!endOk && m_joinedRoom.lobbyNumericId != 0)
             {
                 // DoEnd failed (network error or server rejection that
-                // wasn't a stale-session failure — HandleServerRemovalFailure
+                // wasn't a stale-session failure - HandleServerRemovalFailure
                 // already self-heals that case).  Force a rejoin so our
                 // server-side presence matches the freshly cleared local
                 // state; otherwise we'd keep appearing as "playing" to
@@ -3770,5 +4535,10 @@ void LobbySession::ProcessPendingActions()
         }
         }
     }
+}
+
+std::string HttpGetViaWinInet(const std::string& url, DWORD connectTimeoutMs, DWORD receiveTimeoutMs)
+{
+    return DoHttpGetViaWinInet(url, connectTimeoutMs, receiveTimeoutMs);
 }
 }

@@ -3,11 +3,14 @@
 #include "efz_netplay_state.h"
 #include "logger.h"
 #include "mod_version.h"
+#include "netplay/bridge/session_bridge.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/core/update_check.h"
 #include "netplay/core/options_keybinds.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
+#include "netplay/hooks/debug_overlay.h"
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/render/draw_surface.h"
 #include "netplay/render/software_font.h"
@@ -68,6 +71,10 @@ struct Item
     std::wstring rawKeyName;
     std::string currentValue;
     std::string originalValue;
+    // Exact parsed INI text. Protocol is normalized for display/runtime, but
+    // an untouched malformed or differently-cased value must not be rewritten
+    // merely because the user saved another option.
+    std::string originalIniValue;
     std::string tooltipSummary;
     std::vector<std::string> choiceValues;
     int lineIndex = -1;
@@ -87,17 +94,31 @@ struct EditState
     DWORD errorExpireTick = 0;
 };
 
+// One rendered line inside a category page: either a non-selectable section
+// header (grouping the settings under it, e.g. "MATCH" / "LOGGING") or an
+// actual setting. Built once at load from the curated group table below.
+struct PageRow
+{
+    bool header = false;
+    const char* headerLabel = "";
+    int itemIndex = -1;
+};
+
 struct Category
 {
     std::string sectionName;
     std::string tooltipSummary;
     std::vector<int> itemIndices;
+    // Ordered page content (headers interleaved with items). Falls back to a
+    // plain item list when the section has no curated groups.
+    std::vector<PageRow> pageRows;
 };
 
 enum class VisibleEntryKind : uint8_t
 {
     None = 0,
     Category,
+    Header,
     Item,
 };
 
@@ -106,6 +127,7 @@ struct VisibleEntry
     VisibleEntryKind kind = VisibleEntryKind::None;
     int categoryIndex = -1;
     int itemIndex = -1;
+    const char* headerLabel = "";
 };
 
 enum class ModalKind : uint8_t
@@ -141,11 +163,56 @@ struct State
     ModalOverlayState modal = {};
     DWORD statusExpireTick = 0;
     std::string statusMessage;
+    std::string lastSaveError;
     std::array<NetplayMenuEntry, kVisibleRowCount + 1> entries = {};
     NetplayMenuSpec spec = {};
 };
 
 State g_state = {};
+
+class ScopedOptionsIniAccess
+{
+public:
+    explicit ScopedOptionsIniAccess(bool writeAccess)
+        : acquired_(
+              netplay::bridge::BeginOptionsIniAccess(
+                  writeAccess,
+                  &overrideState_))
+    {
+    }
+
+    ~ScopedOptionsIniAccess()
+    {
+        Release();
+    }
+
+    ScopedOptionsIniAccess(const ScopedOptionsIniAccess&) = delete;
+    ScopedOptionsIniAccess& operator=(
+        const ScopedOptionsIniAccess&) = delete;
+
+    bool Acquired() const
+    {
+        return acquired_;
+    }
+
+    const netplay::bridge::HostProtocolOverrideState& OverrideState() const
+    {
+        return overrideState_;
+    }
+
+    void Release()
+    {
+        if (acquired_)
+        {
+            netplay::bridge::EndOptionsIniAccess();
+            acquired_ = false;
+        }
+    }
+
+private:
+    bool acquired_ = false;
+    netplay::bridge::HostProtocolOverrideState overrideState_ = {};
+};
 
 void EnsureSpecInitialized();
 std::wstring TrimWide(std::wstring_view value);
@@ -185,6 +252,7 @@ void ClearStatusMessage();
 void RebuildMenuEntries();
 bool LoadItemsFromIni();
 void AppendSyntheticItems();
+void BuildCategoryPageRows(Category& category);
 void ApplyRuntimeNetplaySettings();
 bool SaveItemsToDisk();
 void SetSelection(uint32_t screenContext, int selection);
@@ -641,6 +709,13 @@ std::string ResolveRevivalIniPath()
 
 ItemKind InferItemKind(const std::string& key, const std::string& value)
 {
+    // Protocol is identified by its key, not by whatever value happened to be
+    // on disk. This keeps a malformed/missing family from degrading into an
+    // unrestricted text field.
+    if (key == "Protocol")
+    {
+        return ItemKind::Protocol;
+    }
     if (keybinds::IsBindableValue(value))
     {
         return ItemKind::KeyBinding;
@@ -652,10 +727,6 @@ ItemKind InferItemKind(const std::string& key, const std::string& value)
     if (value == "0" || value == "1")
     {
         return ItemKind::BoolInt;
-    }
-    if (value == "IPv4" || value == "IPv6")
-    {
-        return ItemKind::Protocol;
     }
     if (key == "Port" || key == "MaxRollback"
         || key.find("Window") != std::string::npos
@@ -916,8 +987,89 @@ int GetCurrentContentCount()
     return IsRootCategoryView()
         ? static_cast<int>(g_state.categories.size())
         : (IsValidCategoryIndex(g_state.currentCategoryIndex)
-            ? static_cast<int>(g_state.categories[static_cast<size_t>(g_state.currentCategoryIndex)].itemIndices.size())
+            ? static_cast<int>(g_state.categories[static_cast<size_t>(g_state.currentCategoryIndex)].pageRows.size())
             : 0);
+}
+
+// A content index maps to a non-selectable section header. Only in-category
+// pages have headers; the root category list is fully selectable.
+bool IsContentIndexHeader(int contentIndex)
+{
+    if (IsRootCategoryView() || !IsValidCategoryIndex(g_state.currentCategoryIndex))
+    {
+        return false;
+    }
+    const Category& category = g_state.categories[static_cast<size_t>(g_state.currentCategoryIndex)];
+    if (contentIndex < 0 || contentIndex >= static_cast<int>(category.pageRows.size()))
+    {
+        return false;
+    }
+    return category.pageRows[static_cast<size_t>(contentIndex)].header;
+}
+
+// Nearest selectable (non-header) content index from |from| walking |direction|
+// (+1/-1); -1 when none remain in that direction.
+int FindSelectableContentIndex(int from, int direction)
+{
+    const int count = GetCurrentContentCount();
+    for (int index = from; index >= 0 && index < count; index += direction)
+    {
+        if (!IsContentIndexHeader(index))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+// Clamp scrollOffset so |contentIndex| is visible; pull the section header
+// directly above it into view too so the group context stays on screen.
+void ScrollContentIndexIntoView(int contentIndex)
+{
+    int minTarget = contentIndex;
+    if (minTarget > 0 && IsContentIndexHeader(minTarget - 1))
+    {
+        --minTarget;
+    }
+    if (g_state.scrollOffset > minTarget)
+    {
+        g_state.scrollOffset = minTarget;
+    }
+    if (g_state.scrollOffset < contentIndex - (kVisibleRowCount - 1))
+    {
+        g_state.scrollOffset = contentIndex - (kVisibleRowCount - 1);
+    }
+    if (g_state.scrollOffset < 0)
+    {
+        g_state.scrollOffset = 0;
+    }
+}
+
+// Nearest selectable slot in the current window (scanning down, then up);
+// returns the BACK row index when the window holds only headers.
+int SnapSlotToSelectable(int desiredSlot)
+{
+    const int visibleCount = GetVisibleContentCount();
+    if (visibleCount <= 0)
+    {
+        return 0;
+    }
+    const int start = (std::min)((std::max)(desiredSlot, 0), visibleCount - 1);
+    for (int slot = start; slot < visibleCount; ++slot)
+    {
+        if (!IsContentIndexHeader(g_state.scrollOffset + slot))
+        {
+            return slot;
+        }
+    }
+    for (int slot = start - 1; slot >= 0; --slot)
+    {
+        if (!IsContentIndexHeader(g_state.scrollOffset + slot))
+        {
+            return slot;
+        }
+    }
+    return visibleCount;
 }
 
 int GetVisibleContentCount()
@@ -957,14 +1109,21 @@ VisibleEntry GetVisibleEntryForSlot(int slot)
     }
 
     const Category& category = g_state.categories[static_cast<size_t>(g_state.currentCategoryIndex)];
-    if (contentIndex < 0 || contentIndex >= static_cast<int>(category.itemIndices.size()))
+    if (contentIndex < 0 || contentIndex >= static_cast<int>(category.pageRows.size()))
     {
         return visible;
     }
 
-    visible.kind = VisibleEntryKind::Item;
+    const PageRow& row = category.pageRows[static_cast<size_t>(contentIndex)];
     visible.categoryIndex = g_state.currentCategoryIndex;
-    visible.itemIndex = category.itemIndices[static_cast<size_t>(contentIndex)];
+    if (row.header)
+    {
+        visible.kind = VisibleEntryKind::Header;
+        visible.headerLabel = row.headerLabel;
+        return visible;
+    }
+    visible.kind = VisibleEntryKind::Item;
+    visible.itemIndex = row.itemIndex;
     return visible;
 }
 
@@ -1032,7 +1191,8 @@ void RebuildMenuEntries()
     g_state.spec.headerLabel = "OPTIONS";
     g_state.spec.entries = g_state.entries.data();
     g_state.spec.entryCount = visibleCount + 1;
-    g_state.spec.defaultSelection = 0;
+    // Never default onto a section header (in-category pages may lead with one).
+    g_state.spec.defaultSelection = SnapSlotToSelectable(0);
 
     hooks::g_netplayMenuState.optionCount = g_state.spec.entryCount;
     hooks::g_netplayMenuState.backIndex = g_state.spec.entryCount > 0 ? (g_state.spec.entryCount - 1) : 0;
@@ -1055,6 +1215,20 @@ void SetSelection(uint32_t screenContext, int selection)
     hooks::g_lastLoggedSelection = static_cast<int8_t>(clamped);
 }
 
+// Category drill-in/out slide (mirrors the netplay menu-to-menu transition):
+// entering a category slides the new page in from the right, going back slides
+// it in from the left. Idle (offset 0) rendering is the plain path.
+constexpr DWORD kOptionsSlideDurationMs = 150;
+constexpr int kOptionsSlideDistance = 306; // ~ options panel content width
+int g_optionsSlideDir = 0;                 // +1 = from right (drill in), -1 = from left (back)
+DWORD g_optionsSlideStartTick = 0;
+
+void StartOptionsSlide(int direction)
+{
+    g_optionsSlideDir = direction > 0 ? 1 : -1;
+    g_optionsSlideStartTick = GetTickCount();
+}
+
 void EnterCategoryView(uint32_t screenContext, int categoryIndex)
 {
     if (!IsValidCategoryIndex(categoryIndex))
@@ -1065,7 +1239,9 @@ void EnterCategoryView(uint32_t screenContext, int categoryIndex)
     g_state.currentCategoryIndex = categoryIndex;
     g_state.scrollOffset = 0;
     RebuildMenuEntries();
-    SetSelection(screenContext, 0);
+    // Land on the first setting, not a leading section header.
+    SetSelection(screenContext, SnapSlotToSelectable(0));
+    StartOptionsSlide(1);
     mod::Log("OptionsMenu: enter category '%s'", g_state.categories[static_cast<size_t>(categoryIndex)].sectionName.c_str());
 }
 
@@ -1075,6 +1251,7 @@ void ReturnToCategoryRoot(uint32_t screenContext, int focusCategoryIndex)
     g_state.scrollOffset = 0;
     RebuildMenuEntries();
     SetSelection(screenContext, focusCategoryIndex);
+    StartOptionsSlide(-1);
     mod::Log("OptionsMenu: return to category root focus=%d", focusCategoryIndex);
 }
 
@@ -1110,7 +1287,10 @@ bool CommitExit(uint32_t screenContext, bool saveChanges)
 {
     if (saveChanges && !SaveItemsToDisk())
     {
-        g_state.modal.errorMessage = "Save failed.";
+        g_state.modal.errorMessage =
+            !g_state.lastSaveError.empty()
+            ? g_state.lastSaveError
+            : "Save failed.";
         return false;
     }
 
@@ -1229,6 +1409,143 @@ std::string TruncateLabel(std::string text, size_t maxChars)
     return text;
 }
 
+// Curated in-category section headers. Each group lists the exact key names
+// (in display order) that belong under a header inside a section's page. Keys
+// are matched by name, so unknown/renamed keys across Revival versions simply
+// fall through to a trailing "MISC" header instead of breaking. A section with
+// no group here renders as a plain (header-less) list.
+struct PageGroupDef
+{
+    const char* section;
+    const char* header;
+    std::vector<const char*> keys;
+};
+
+const std::vector<PageGroupDef>& GetPageGroupDefs()
+{
+    static const std::vector<PageGroupDef> kGroups = {
+        // [Network]
+        {"Network", "CONNECTION", {"Name", "MaxRollback", "Port", "Protocol", "HolePunchingServer", "Address"}},
+        {"Network", "MATCH", {"AllowPracticeKeys", "IncreaseInputDelay", "DecreaseInputDelay", "ToggleRemotePalettes", "DisplayScore", "LogScore"}},
+        {"Network", "SPECTATING", {"AllowSpectating", "IncreaseSpecSpeed", "DecreaseSpecSpeed"}},
+        {"Network", "REPLAYS", {"SaveAllReplays", "SavePreviousReplay", "ReplayFolder", "BattleLogFile", "SaveBattleLog"}},
+        // [Practice]
+        {"Practice", "PLAYBACK", {"Pause", "StepFrame", "IncreaseFPS", "DecreaseFPS", "ResetFPS"}},
+        {"Practice", "RECORDING", {"Save", "Load", "ToggleRecord", "ToggleReplay", "ToggleReplayRandom", "SwitchStartCondition"}},
+        {"Practice", "BUFFERS", {"SetBuffer1", "SetBuffer2", "SetBuffer3", "SetBuffer4", "SetBuffer5"}},
+        {"Practice", "DISPLAY", {"ToggleDisplay", "ToggleHitBoxes", "ToggleHurtBoxes", "ToggleCollisionBoxes"}},
+        {"Practice", "PLAYERS", {"SwitchPlayers", "MirrorPlayers"}},
+        // [Global]
+        {"Global", "WINDOW", {"WindowX", "WindowY", "WindowWidth", "WindowHeight", "BackBufferWidth", "BackBufferHeight"}},
+        {"Global", "AUDIO", {"ToggleBGM", "MuteBGM", "BGMFolder"}},
+        {"Global", "SYSTEM", {"SoftwareRendering", "Debug"}},
+        // [Others] (mod-owned settings)
+        {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
+        {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
+        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
+        {"Others", "MOD", {"CheckForUpdates", "About"}},
+    };
+    return kGroups;
+}
+
+bool IsCurrentOthersSetting(const std::string& key)
+{
+    for (const PageGroupDef& group : GetPageGroupDefs())
+    {
+        if (std::strcmp(group.section, "Others") != 0)
+        {
+            continue;
+        }
+        for (const char* currentKey : group.keys)
+        {
+            if (currentKey != nullptr && key == currentKey)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void BuildCategoryPageRows(Category& category)
+{
+    category.pageRows.clear();
+    if (category.itemIndices.empty())
+    {
+        return;
+    }
+
+    std::vector<char> claimed(category.itemIndices.size(), 0);
+    bool anyGroup = false;
+
+    for (const PageGroupDef& group : GetPageGroupDefs())
+    {
+        if (category.sectionName != group.section)
+        {
+            continue;
+        }
+        anyGroup = true;
+
+        std::vector<int> groupItems;
+        for (const char* key : group.keys)
+        {
+            for (size_t pos = 0; pos < category.itemIndices.size(); ++pos)
+            {
+                if (claimed[pos] != 0)
+                {
+                    continue;
+                }
+                const int itemIndex = category.itemIndices[pos];
+                if (g_state.items[static_cast<size_t>(itemIndex)].keyName == key)
+                {
+                    groupItems.push_back(itemIndex);
+                    claimed[pos] = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!groupItems.empty())
+        {
+            PageRow header;
+            header.header = true;
+            header.headerLabel = group.header;
+            category.pageRows.push_back(header);
+            for (const int itemIndex : groupItems)
+            {
+                PageRow row;
+                row.itemIndex = itemIndex;
+                category.pageRows.push_back(row);
+            }
+        }
+    }
+
+    std::vector<int> leftovers;
+    for (size_t pos = 0; pos < category.itemIndices.size(); ++pos)
+    {
+        if (claimed[pos] == 0)
+        {
+            leftovers.push_back(category.itemIndices[pos]);
+        }
+    }
+    if (!leftovers.empty())
+    {
+        if (anyGroup)
+        {
+            PageRow header;
+            header.header = true;
+            header.headerLabel = "MISC";
+            category.pageRows.push_back(header);
+        }
+        for (const int itemIndex : leftovers)
+        {
+            PageRow row;
+            row.itemIndex = itemIndex;
+            category.pageRows.push_back(row);
+        }
+    }
+}
+
 bool LoadItemsFromIni()
 {
     g_state.iniPath = ResolveRevivalIniPath();
@@ -1240,6 +1557,17 @@ bool LoadItemsFromIni()
     g_state.edit = {};
     g_state.modal = {};
     ClearStatusMessage();
+
+    ScopedOptionsIniAccess iniAccess(false);
+    if (!iniAccess.Acquired())
+    {
+        SetStatusMessage("EfzRevival.ini is temporarily busy.");
+        mod::Log(
+            "OptionsMenu: failed to acquire serialized INI read access");
+        return false;
+    }
+    const netplay::bridge::HostProtocolOverrideState& protocolOverride =
+        iniAccess.OverrideState();
 
     std::wstring text;
     FileEncoding encoding = FileEncoding::Utf16Le;
@@ -1298,6 +1626,14 @@ bool LoadItemsFromIni()
         const std::string key = WideToUtf8(keyWide);
         const std::string value = WideToUtf8(valueWide);
 
+        // [Others] is mod-owned. Admit only current settings so retired
+        // investigation keys in an old INI cannot reappear as dead controls.
+        if (currentSection == "Others" && !IsCurrentOthersSetting(key))
+        {
+            commentLines.clear();
+            continue;
+        }
+
         Item item;
         item.kind = InferItemKind(key, value);
         item.sectionName = currentSection;
@@ -1305,6 +1641,49 @@ bool LoadItemsFromIni()
         item.rawKeyName = keyWide;
         item.currentValue = value;
         item.originalValue = value;
+        item.originalIniValue = value;
+        if (item.kind == ItemKind::Protocol)
+        {
+            if (currentSection == "Network" && protocolOverride.active)
+            {
+                item.currentValue = netplay::network::FamilyName(
+                    protocolOverride.originalFamily);
+                item.originalValue = item.currentValue;
+                item.originalIniValue =
+                    protocolOverride.originalValueExisted
+                    ? protocolOverride.originalValue
+                    : item.currentValue;
+                mod::Log(
+                    "OptionsMenu: temporary Network.Protocol override "
+                    "hidden original=%s effective=%s originalExisted=%d",
+                    netplay::network::FamilyName(
+                        protocolOverride.originalFamily),
+                    netplay::network::FamilyName(
+                        protocolOverride.effectiveFamily),
+                    protocolOverride.originalValueExisted ? 1 : 0);
+            }
+            else
+            {
+                netplay::network::NetworkFamily family =
+                    netplay::network::NetworkFamily::IPv4;
+                if (netplay::network::TryParseFamilyName(
+                        item.currentValue,
+                        &family))
+                {
+                    item.currentValue =
+                        netplay::network::FamilyName(family);
+                }
+                else
+                {
+                    mod::Log(
+                        "OptionsMenu: invalid Network.Protocol='%s'; "
+                        "presenting safe IPv4 fallback",
+                        item.currentValue.c_str());
+                    item.currentValue = "IPv4";
+                }
+                item.originalValue = item.currentValue;
+            }
+        }
         item.tooltipSummary = ResolveTooltipSummary(currentSection, key, commentLines);
         item.lineIndex = lineIndex;
         g_state.items.push_back(std::move(item));
@@ -1318,6 +1697,11 @@ bool LoadItemsFromIni()
     }
 
     AppendSyntheticItems();
+
+    for (Category& category : g_state.categories)
+    {
+        BuildCategoryPageRows(category);
+    }
 
     mod::Log(
         "OptionsMenu: loaded %zu items across %zu categories from '%s'",
@@ -1444,6 +1828,39 @@ void AppendSyntheticItems()
             static_cast<int>(g_state.items.size()) - 1);
     };
 
+    const auto upsertKeybindItem =
+        [&](const char* keyName, const char* defaultValue, const char* tooltip)
+    {
+        const int existingItemIndex = FindItemIndexBySectionAndKey("Others", keyName);
+        if (existingItemIndex >= 0)
+        {
+            Item& item = g_state.items[static_cast<size_t>(existingItemIndex)];
+            item.kind = ItemKind::KeyBinding;
+            item.rawKeyName = Utf8ToWide(keyName);
+            item.tooltipSummary = tooltip;
+            if (!keybinds::IsBindableValue(item.currentValue))
+            {
+                item.currentValue = defaultValue;
+                item.originalValue = defaultValue;
+            }
+            return;
+        }
+
+        Item item;
+        item.kind = ItemKind::KeyBinding;
+        item.sectionName = "Others";
+        item.keyName = keyName;
+        item.rawKeyName = Utf8ToWide(keyName);
+        item.currentValue = defaultValue;
+        item.originalValue = defaultValue;
+        item.tooltipSummary = tooltip;
+        item.lineIndex = -1;
+
+        g_state.items.push_back(std::move(item));
+        g_state.categories[static_cast<size_t>(categoryIndex)].itemIndices.push_back(
+            static_cast<int>(g_state.items.size()) - 1);
+    };
+
     upsertChoiceItem(
         "OfflineVsHumanMode",
         "Tournament",
@@ -1468,11 +1885,52 @@ void AppendSyntheticItems()
     upsertBoolIntItem(
         "EnableDebugMenu",
         false,
-        "Allow the D button to open the in-game debug menu.");
+        "Enable the ImGui debug overlay. Toggle it on any screen with the \\ (backslash) key.");
+    upsertBoolIntItem(
+        "VerboseBridgePatchLogging",
+        false,
+        "Log extra byte windows and vtable slots around Revival bridge patches.");
+    upsertBoolIntItem(
+        "VerboseSyncDiagnostics",
+        false,
+        "Log detailed rollback session, ring, FPU, and sync-frame diagnostics.");
+    upsertBoolIntItem(
+        "VerboseRevival102jLifecycleLogging",
+        false,
+        "Log full 1.02j lifecycle checkpoints, IPC state, hooks, mappings, vtables, and session-object byte dumps.");
     upsertBoolIntItem(
         "HideEmptySetsInBattleLog",
         true,
         "Hide empty 0-0 Battle Log sets by default.");
+    upsertBoolIntItem(
+        "OnlineCustomColors",
+        true,
+        "Show your custom EDIT COLOR palette to your opponent in online matches, "
+        "and see theirs, on the character-select and win screens. Rides the "
+        "existing netplay connection; players without the mod are unaffected.");
+    upsertBoolIntItem(
+        "MenuTtfText",
+        true,
+        "Draw supported menu text (Battle Log, footer tooltips) with a crisp TTF font instead of the pixel font. Falls back automatically if unavailable.");
+    upsertChoiceItem(
+        "MenuTtfFont",
+        "Yu Gothic",
+        {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
+        "TTF face for menu text. The Noto faces ship with the mod and always cover Japanese and Cyrillic; system faces fall back to them when missing glyphs.");
+    upsertChoiceItem(
+        "HostingTipFont",
+        "Yu Gothic",
+        {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
+        "TTF face for the in-game hosting-overlay tip ('Hosting... Press F1...'). Independent of the menu font so the tip can stand out.");
+    upsertKeybindItem(
+        "AsyncHostReturnKey",
+        "DIK_F1",
+        "Hotkey to return to the netplay menu (or rehost) while the hosting overlay is minimized in-game.");
+    upsertBoolIntItem(
+        "CheckForUpdates",
+        true,
+        "Look up the newest mod release on GitHub once per launch (first netplay menu visit) "
+        "and mark OPTIONS / About with [!] while a newer version is out.");
     upsertActionItem(
         "About",
         "Show the mod version and build information.");
@@ -1511,14 +1969,31 @@ void ApplyRuntimeNetplaySettings()
         }
         else if (item.keyName == "Address")
         {
-            if (netplay::validation::IsValidJoinAddress(item.currentValue))
+            netplay::network::RemoteHostInput hostInput = {};
+            if (netplay::network::ParseRemoteHostInput(
+                    item.currentValue,
+                    &hostInput))
             {
-                hooks::g_netplayMenuState.joinAddress = item.currentValue;
+                hooks::g_netplayMenuState.joinAddress =
+                    hostInput.host;
+            }
+        }
+        else if (item.keyName == "Protocol")
+        {
+            netplay::network::NetworkFamily family =
+                netplay::network::NetworkFamily::IPv4;
+            if (netplay::network::TryParseFamilyName(item.currentValue, &family))
+            {
+                hooks::g_netplayMenuState.hostFamily = family;
+                mod::Log(
+                    "NET_FAMILY_CONFIG source=options value=%s",
+                    netplay::network::FamilyName(family));
             }
         }
     }
 
     netplay::mod_settings::Reload();
+    netplay::debug_overlay::NotifyFontSettingsChanged();
 
     HMODULE moduleHandle = nullptr;
     (void)GetModuleHandleExA(
@@ -1537,8 +2012,39 @@ void ApplyRuntimeNetplaySettings()
 
 bool SaveItemsToDisk()
 {
+    g_state.lastSaveError.clear();
     if (g_state.iniPath.empty() || g_state.lines.empty())
     {
+        g_state.lastSaveError = "EfzRevival.ini is unavailable.";
+        return false;
+    }
+
+    ScopedOptionsIniAccess iniAccess(true);
+    if (!iniAccess.Acquired())
+    {
+        if (iniAccess.OverrideState().active)
+        {
+            g_state.lastSaveError =
+                "Host restart active. Wait, then save again.";
+            SetStatusMessage(
+                "Host listener is restarting; settings were not saved.");
+            mod::Log(
+                "OptionsMenu: save blocked "
+                "reason=temporary_host_protocol_override "
+                "original=%s effective=%s",
+                netplay::network::FamilyName(
+                    iniAccess.OverrideState().originalFamily),
+                netplay::network::FamilyName(
+                    iniAccess.OverrideState().effectiveFamily));
+        }
+        else
+        {
+            g_state.lastSaveError =
+                "EfzRevival.ini is temporarily busy.";
+            mod::Log(
+                "OptionsMenu: save blocked "
+                "reason=serialized_ini_access_unavailable");
+        }
         return false;
     }
 
@@ -1562,7 +2068,14 @@ bool SaveItemsToDisk()
         }
         if (item.lineIndex >= 0 && item.lineIndex < static_cast<int>(updatedLines.size()))
         {
-            updatedLines[static_cast<size_t>(item.lineIndex)] = item.rawKeyName + L"=" + Utf8ToWide(item.currentValue);
+            const std::string& valueToPersist =
+                item.kind == ItemKind::Protocol
+                        && !IsDirty(item)
+                    ? item.originalIniValue
+                    : item.currentValue;
+            updatedLines[static_cast<size_t>(item.lineIndex)] =
+                item.rawKeyName + L"="
+                + Utf8ToWide(valueToPersist);
             continue;
         }
     }
@@ -1635,13 +2148,19 @@ bool SaveItemsToDisk()
     const std::wstring joined = JoinLines(updatedLines);
     if (!WriteWideTextFile(g_state.iniPath, joined, g_state.encoding))
     {
+        g_state.lastSaveError = "Could not write EfzRevival.ini.";
         mod::Log("OptionsMenu: failed to save '%s'", g_state.iniPath.c_str());
         return false;
     }
 
+    iniAccess.Release();
     g_state.lines = std::move(updatedLines);
     for (Item& item : g_state.items)
     {
+        if (item.kind != ItemKind::Protocol || IsDirty(item))
+        {
+            item.originalIniValue = item.currentValue;
+        }
         item.originalValue = item.currentValue;
     }
     ApplyRuntimeNetplaySettings();
@@ -1734,12 +2253,25 @@ std::string BuildCategoryLabel(int categoryIndex)
 std::string BuildSettingLabel(const Item& item)
 {
     const std::string prefix = IsDirty(item) ? "* " : "";
-    return prefix + PrettyKeyLabel(item.keyName);
+    std::string label = prefix + PrettyKeyLabel(item.keyName);
+    if (item.kind == ItemKind::Action && item.keyName == "About")
+    {
+        // "[!]" while a newer mod release exists; opening About acknowledges it.
+        const char* badge = netplay::update_check::BadgeText();
+        if (badge[0] != 0)
+        {
+            label += ' ';
+            label += badge;
+        }
+    }
+    return label;
 }
 
 size_t GetStringEditLimit(const Item& item)
 {
-    if (item.sectionName == "Network" && item.keyName == "Name")
+    if (item.sectionName == "Network"
+        && (item.keyName == "Name"
+            || item.keyName == "Address"))
     {
         return 63;
     }
@@ -2084,6 +2616,19 @@ bool CommitEdit()
             SetEditError("Invalid nickname");
             return false;
         }
+    }
+    else if (item.sectionName == "Network"
+             && item.keyName == "Address")
+    {
+        netplay::network::RemoteHostInput hostInput = {};
+        if (!netplay::network::ParseRemoteHostInput(
+                value,
+                &hostInput))
+        {
+            SetEditError("Invalid address");
+            return false;
+        }
+        value = hostInput.host;
     }
 
     item.currentValue = value;
@@ -2433,6 +2978,11 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             *escapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         }
 
+        // D opens the GitHub releases page in the default browser so the user
+        // can download the update. Edge-triggered on our own latch so a held
+        // button cannot spawn a browser tab per frame.
+        static bool s_openReleasesHeld = false;
+        bool openReleasesPressed = false;
         bool closeRequested = hooks::ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
         {
@@ -2440,9 +2990,30 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             {
                 closeRequested = true;
             }
+            if (inputBytes[playerIndex + 22] == 1)
+            {
+                openReleasesPressed = true;
+            }
         }
+        const bool openReleasesEdge = openReleasesPressed && !s_openReleasesHeld;
+        s_openReleasesHeld = openReleasesPressed;
 
         ++(*inactivityCounter);
+        if (openReleasesEdge && !closeRequested)
+        {
+            *inactivityCounter = 0;
+            if (netplay::update_check::OpenReleasesPage())
+            {
+                hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
+                SetStatusMessage("Opened the GitHub releases page in your browser.");
+            }
+            else
+            {
+                hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
+                SetStatusMessage("Could not open a browser. See the log for the URL.");
+            }
+            return true;
+        }
         if (!closeRequested)
         {
             return true;
@@ -2540,7 +3111,10 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             else
             {
                 hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
-                g_state.modal.errorMessage = "Save failed.";
+                g_state.modal.errorMessage =
+                    !g_state.lastSaveError.empty()
+                    ? g_state.lastSaveError
+                    : "Save failed.";
             }
         }
         else
@@ -2588,6 +3162,10 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
     {
         return BuildCategoryLabel(visible.categoryIndex);
     }
+    if (visible.kind == VisibleEntryKind::Header)
+    {
+        return visible.headerLabel != nullptr ? visible.headerLabel : "";
+    }
     if (visible.kind != VisibleEntryKind::Item
         || visible.itemIndex < 0
         || visible.itemIndex >= static_cast<int>(g_state.items.size()))
@@ -2596,6 +3174,11 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
     }
 
     return BuildSettingLabel(g_state.items[static_cast<size_t>(visible.itemIndex)]);
+}
+
+bool IsHeaderRowAction(NetplayMenuAction action)
+{
+    return GetVisibleEntryForAction(action).kind == VisibleEntryKind::Header;
 }
 
 std::string BuildRowSecondaryText(NetplayMenuAction action)
@@ -2609,6 +3192,11 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
     if (visible.kind == VisibleEntryKind::Category)
     {
         return ">";
+    }
+    if (visible.kind == VisibleEntryKind::Header)
+    {
+        // Section headers have no value column.
+        return {};
     }
     if (visible.kind != VisibleEntryKind::Item
         || visible.itemIndex < 0
@@ -2687,6 +3275,12 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         return help + "\nA=Open C=Revert D=Save";
     }
 
+    if (visible.kind == VisibleEntryKind::Header)
+    {
+        // Selection never rests on a header, but stay safe if it ever does.
+        return "\nC=Revert D=Save";
+    }
+
     if (visible.kind != VisibleEntryKind::Item
         || visible.itemIndex < 0
         || visible.itemIndex >= static_cast<int>(g_state.items.size()))
@@ -2706,6 +3300,10 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     }
     if (IsActionItem(item))
     {
+        if (item.keyName == "About" && netplay::update_check::IsUpdateAvailable())
+        {
+            help += " New release " + netplay::update_check::LatestVersion() + " is on GitHub.";
+        }
         return help + "\nA=Open C=Revert D=Save";
     }
     if (IsToggleEditable(item))
@@ -2730,49 +3328,36 @@ bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelec
         return true;
     }
 
-    if (delta > 0)
+    // Selection walks the current view's content skipping section headers; the
+    // window scrolls whenever the next selectable row is outside it. The BACK
+    // row sits just past the last content slot.
+    const int direction = delta > 0 ? 1 : -1;
+    int searchFrom;
+    if (currentSelection >= 0 && currentSelection < visibleCount)
     {
-        if (currentSelection < visibleCount - 1)
-        {
-            *outNextSelection = currentSelection + 1;
-            return true;
-        }
-        if (currentSelection == visibleCount - 1)
-        {
-            const int contentCount = GetCurrentContentCount();
-            const int maxScroll = (std::max)(0, contentCount - visibleCount);
-            if (g_state.scrollOffset < maxScroll)
-            {
-                ++g_state.scrollOffset;
-                RebuildMenuEntries();
-                *outNextSelection = currentSelection;
-            }
-            else
-            {
-                *outNextSelection = backSelection;
-            }
-            return true;
-        }
-        *outNextSelection = 0;
-        return true;
+        searchFrom = g_state.scrollOffset + currentSelection + direction;
     }
-
-    if (currentSelection > 0 && currentSelection <= backSelection)
+    else if (direction > 0)
     {
-        *outNextSelection = currentSelection - 1;
-        return true;
-    }
-
-    if (g_state.scrollOffset > 0)
-    {
-        --g_state.scrollOffset;
-        RebuildMenuEntries();
-        *outNextSelection = currentSelection;
+        // Down from BACK: wrap to the first selectable row from the top.
+        searchFrom = 0;
     }
     else
     {
-        *outNextSelection = backSelection;
+        // Up from BACK: last selectable row.
+        searchFrom = GetCurrentContentCount() - 1;
     }
+
+    const int target = FindSelectableContentIndex(searchFrom, direction);
+    if (target < 0)
+    {
+        *outNextSelection = backSelection;
+        return true;
+    }
+
+    ScrollContentIndexIntoView(target);
+    RebuildMenuEntries();
+    *outNextSelection = target - g_state.scrollOffset;
     return true;
 }
 
@@ -2825,7 +3410,10 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
                         static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection));
                     g_state.scrollOffset = nextScroll;
                     RebuildMenuEntries();
-                    SetSelection(screenContext, (std::min)(currentSelection, GetVisibleContentCount() - 1));
+                    // Keep the slot where possible, but never land on a header.
+                    SetSelection(
+                        screenContext,
+                        SnapSlotToSelectable((std::min)(currentSelection, GetVisibleContentCount() - 1)));
                     hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
                     mod::Log(
                         "OptionsMenu: page %s scroll=%d",
@@ -2908,6 +3496,12 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         return true;
     }
 
+    if (visible.kind == VisibleEntryKind::Header)
+    {
+        // Section headers are display-only; selection never lands here.
+        return true;
+    }
+
     if (visible.kind != VisibleEntryKind::Item
         || visible.itemIndex < 0
         || visible.itemIndex >= static_cast<int>(g_state.items.size()))
@@ -2936,6 +3530,9 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
     if (IsActionItem(item))
     {
+        // Visiting About counts as having seen the current latest release: the
+        // "[!]" badge stays hidden until an even newer one is published.
+        netplay::update_check::AcknowledgeLatest();
         OpenModal(ModalKind::About);
         return true;
     }
@@ -2984,7 +3581,8 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const bool isAboutModal = (g_state.modal.kind == ModalKind::About);
     const int optionCount = isExitModal ? 3 : 2;
     constexpr int panelW = 214;
-    const int panelH = isAboutModal ? 96 : (isRebindModal ? 92 : (isExitModal ? 100 : 84));
+    const bool aboutHasUpdate = isAboutModal && netplay::update_check::HasNewerRelease();
+    const int panelH = isAboutModal ? (aboutHasUpdate ? 112 : 96) : (isRebindModal ? 92 : (isExitModal ? 100 : 84));
     constexpr int panelX = (320 - panelW) / 2;
     const int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
@@ -2992,6 +3590,36 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     const int textLeft = panelX + 6;
     const int textRight = panelX + panelW - 6;
+
+    // Palette byte -> RGBA recovery so the modal text keeps its intended
+    // colors on the TTF layer (same trick as the battle log color registry).
+    const struct
+    {
+        uint8_t palette;
+        uint32_t rgba;
+    } kModalColorMap[] = {
+        {titleColor,  0xFFF5F5DCu}, // (220,245,245)
+        {textColor,   0xFFD0D0B4u}, // (180,208,208)
+        {brightColor, 0xFFFFFFFFu}, // (255,255,255)
+        {dimColor,    0xFFB4B4A0u}, // (160,180,180)
+        {errorColor,  0xFF8282FFu}, // (255,130,130)
+    };
+    const auto modalRgbaFor = [&](uint8_t palette) -> uint32_t
+    {
+        for (const auto& entry : kModalColorMap)
+        {
+            if (entry.palette == palette)
+            {
+                return entry.rgba;
+            }
+        }
+        return 0xFFFFFFFFu;
+    };
+
+    const bool rtModalText =
+        netplay::mod_settings::IsMenuTtfTextEnabled()
+        && netplay::debug_overlay::IsRtTextAvailable();
+
     auto drawModalText = [&](const std::string& line, int left, int right, int y, uint8_t color)
     {
         const int availableWidth = right - left;
@@ -3000,7 +3628,6 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             return;
         }
 
-        const int textWidth = netplay::font::MeasureText5x7Width(line, 1);
         bool hasNonAscii = false;
         for (unsigned char c : line)
         {
@@ -3011,6 +3638,41 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             }
         }
 
+        if (rtModalText
+            && (!hasNonAscii || netplay::debug_overlay::RtTextHasExtendedGlyphs()))
+        {
+            namespace ov = netplay::debug_overlay;
+            std::string window = line;
+            // Trim to fit at UTF-8 boundaries; the RT layer has no clipping.
+            while (!window.empty()
+                && ov::MeasureRtTextWidth(ov::RtTextProfile::MenuRow, window.c_str())
+                       > availableWidth)
+            {
+                while (!window.empty()
+                    && (static_cast<unsigned char>(window.back()) & 0xC0u) == 0x80u)
+                {
+                    window.pop_back();
+                }
+                if (!window.empty())
+                {
+                    window.pop_back();
+                }
+            }
+            ov::RtTextItem item;
+            item.x0 = static_cast<int16_t>(left);
+            item.x1 = static_cast<int16_t>(right);
+            item.y = static_cast<int16_t>(y);
+            item.align = ov::RtTextAlign::Center;
+            item.profile = ov::RtTextProfile::MenuRow;
+            item.rgba = modalRgbaFor(color);
+            const size_t bytes = (std::min)(window.size(), sizeof(item.text) - 1);
+            std::memcpy(item.text, window.data(), bytes);
+            item.text[bytes] = '\0';
+            ov::SubmitRtText(item);
+            return;
+        }
+
+        const int textWidth = netplay::font::MeasureText5x7Width(line, 1);
         if (textWidth <= availableWidth || hasNonAscii)
         {
             netplay::font::DrawTextCentered5x7(sv, line, left, right, y, 1, 1, color);
@@ -3044,7 +3706,18 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             textRight,
             panelY + 54,
             dimColor);
-        drawModalText("A/B/Esc=Close", textLeft, textRight, panelY + 72, dimColor);
+        int closeY = panelY + 72;
+        if (aboutHasUpdate)
+        {
+            drawModalText(
+                "New release " + netplay::update_check::LatestVersion() + " on GitHub",
+                textLeft,
+                textRight,
+                panelY + 70,
+                titleColor);
+            closeY = panelY + 88;
+        }
+        drawModalText("A/B/Esc=Close  D=Open GitHub", textLeft, textRight, closeY, dimColor);
     }
     else if (isRebindModal)
     {
@@ -3099,6 +3772,23 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 bool IsSaveOverlayActive()
 {
     return g_state.modal.active;
+}
+
+int GetOptionsSlideOffsetX()
+{
+    if (g_optionsSlideDir == 0)
+    {
+        return 0;
+    }
+    const DWORD elapsed = GetTickCount() - g_optionsSlideStartTick;
+    if (elapsed >= kOptionsSlideDurationMs)
+    {
+        g_optionsSlideDir = 0;
+        return 0;
+    }
+    const float remaining = 1.0f - static_cast<float>(elapsed) / static_cast<float>(kOptionsSlideDurationMs);
+    const float eased = remaining * remaining;
+    return static_cast<int>(eased * static_cast<float>(kOptionsSlideDistance)) * g_optionsSlideDir;
 }
 
 bool IsBusy()

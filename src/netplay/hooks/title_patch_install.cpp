@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "netplay/assets/assets.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/hooks/debug_overlay.h"
 
 namespace netplay
 {
@@ -50,7 +51,7 @@ bool InstallHooks()
     g_netplayAssetsAvailable = !probeBg.empty();
     if (!g_netplayAssetsAvailable)
     {
-        mod::Log("InstallHooks: WARNING — netplay assets not found, netplay menu will be disabled");
+        mod::Log("InstallHooks: WARNING - netplay assets not found, netplay menu will be disabled");
         mod::Log("InstallHooks: looked in DLL dir '%s', mods\\efz_netplay_mod\\, working dir, system\\", g_moduleDirectory.c_str());
     }
     else
@@ -194,6 +195,7 @@ void RemoveHooks()
 
     g_netplayMenuState = {};
     g_netplayAssetsAvailable = false;
+    g_onlineSimulationUiSuspended.store(false, std::memory_order_release);
     g_spriteFont = {};
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
@@ -201,8 +203,17 @@ void RemoveHooks()
     g_replaySelectionGuardFramesRemaining = 0;
     g_replaySelectionRestoreTarget = -1;
     g_replayCaseDispatchAddress = 0;
-    netplay::battle_log::ShutdownRenderOverlay();
-    RemoveNetplayWindowHook();
+    const bool windowOk = RemoveNetplayWindowHook();
+    const bool imguiOk = netplay::debug_overlay::SuspendForOnlineSimulation();
+    const bool overlayOk = netplay::battle_log::ShutdownRenderOverlay();
+    if (!windowOk || !imguiOk || !overlayOk)
+    {
+        mod::Log(
+            "RemoveHooks: UI teardown incomplete window=%d imgui=%d overlay=%d",
+            windowOk ? 1 : 0,
+            imguiOk ? 1 : 0,
+            overlayOk ? 1 : 0);
+    }
     RestorePatches();
     g_hooksInstalled.store(false);
     mod::Log("RemoveHooks: restored original bytes");

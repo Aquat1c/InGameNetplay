@@ -1,8 +1,10 @@
 #pragma once
 // Internal shared header for the revival_takeover module decomposition.
-// Not part of the public API — only included by src/netplay/bridge/*.cpp files.
+// Not part of the public API - only included by src/netplay/bridge/*.cpp files.
 
 #include "netplay/bridge/revival_addresses.h"
+#include "netplay/bridge/external_launcher_guard.h"
+#include "netplay/bridge/revival_launch_policy.h"
 #include "netplay/bridge/session_bridge.h"
 #include "logger.h"
 
@@ -22,13 +24,13 @@ namespace netplay::bridge::takeover
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kIpcMagic = 0x4E425247;
-constexpr uint32_t kIpcVersion = 1;
+constexpr uint32_t kIpcVersion = 6;
 constexpr char kSharedBlockName[] = "EFZNetbridge_Shared";
 constexpr char kInitReadyEventName[] = "EFZNetbridge_InitReady";
 constexpr char kConsoleReadyEventName[] = "EFZNetbridge_ConsoleReady";
 constexpr DWORD kStartTimeoutMs = 15000;
+constexpr DWORD kInjectedCaptureReadyTimeoutMs = 3000;
 constexpr DWORD kLatePatchRetryLogIntervalMs = 3000;
-constexpr DWORD kPromptDelayInputWaitTimeoutMs = 30000;
 constexpr DWORD kPromptSpectateConfirmWaitTimeoutMs = 30000;
 
 // Version-specific Revival addresses and offsets live in
@@ -45,13 +47,20 @@ constexpr int kLocalRoleSpectate = 1;
 constexpr int kLocalRoleLocalPlay = 2;
 constexpr int kLocalRoleTournament = 3;
 
-// Netplay connection role — distinguishes host from client (joiner) within
+// Netplay connection role - distinguishes host from client (joiner) within
 // the kLocalRoleOnline umbrella.  Tracked by the mod so we know whether
 // the P1/P2 input-config swap needs to be reversed on disconnect.
 constexpr int kNetplayRoleNone      = 0;  // not in a netplay session
 constexpr int kNetplayRoleHost      = 1;  // hosting (P1 side)
-constexpr int kNetplayRoleClient    = 2;  // joined (P2 side — inputs swapped)
+constexpr int kNetplayRoleClient    = 2;  // joined (P2 side - inputs swapped)
 constexpr int kNetplayRoleSpectator = 3;  // spectating
+
+enum class PeerProcessOwnership : uint8_t
+{
+    None = 0,
+    SpawnedHelper,
+    ExternalLauncherParent,
+};
 
 // ---------------------------------------------------------------------------
 // Shared structures
@@ -98,6 +107,31 @@ struct SharedBlock
     char consoleErrorText[128] = {};
     volatile LONG peerQuitDiagnosticSerial = 0;
     char peerQuitDiagnosticText[8192] = {};
+    // Native listener acknowledgement. The serial is a seqlock: odd while a
+    // writer is updating and even for a completed record. The publisher PID
+    // prevents a delayed line from a retiring helper being accepted as the
+    // next consecutive session's listener.
+    volatile LONG hostListenerSerial = 0;
+    volatile LONG hostListenerFamily = 0; // NetworkFamily numeric value (4/6)
+    volatile LONG hostListenerPort = 0;
+    volatile LONG hostListenerProcessId = 0;
+    volatile LONG hostExpectedListenerPort = 0;
+    volatile LONG isHostSession = 0;
+    // Native Host reader cancellation. EfzRevival writes one exact
+    // VK_RETURN/BEL INPUT_RECORD before joining the outgoing console reader.
+    volatile LONG consoleControlWakeRequestSerial = 0;
+    volatile LONG consoleControlWakeServedSerial = 0;
+    // The exact BEL generation that replaces the generic Host reader with the
+    // real delay reader. The prompt text is written before that replacement.
+    volatile LONG delayPromptTransitionWakeSerial = 0;
+    volatile LONG nativeDelayTimeoutSerial = 0;
+    // The timeout transition's exact BEL generation. Recovery cannot publish
+    // until this generation has actually been returned by ReadConsole.
+    volatile LONG nativeDelayTimeoutRequiredWakeSerial = 0;
+    volatile LONG nativeDelayTimeoutHandledSerial = 0;
+    // Helper-local raw console consumer is running. Host waits for this before
+    // resuming the helper main thread, so startup prompts cannot outrun it.
+    volatile LONG helperCaptureReady = 0;
 };
 #pragma pack(pop)
 
@@ -155,14 +189,22 @@ struct RuntimeReadyProbe
 extern std::mutex g_mutex;
 extern const RevivalAddressProfile* g_activeRevival;
 
-// Runtime version detection — reads PE TimeDateStamp, sets g_activeRevival.
+// Runtime version detection - reads PE TimeDateStamp, sets g_activeRevival.
 void DetectRevivalVersion();
 void EnsureActiveRevivalProfile();
+bool ActiveRevivalProfileSupportsSessionStart();
+
+// Resolve a legacy Revival shared-memory channel name to the name used by
+// the active binary.  The MinGW 1.02j build suffixes every native wire with
+// "_Spec"; older MSVC builds use the unsuffixed names.
+const char* RevivalWireName(const char* legacyName);
 
 extern HMODULE g_localRevivalModule;
 extern RevivalInitFn g_localInitFn;
 extern HANDLE g_revivalProcess;
 extern DWORD g_revivalProcessId;
+extern PeerProcessOwnership g_peerProcessOwnership;
+extern revival_launch::LaunchDisposition g_launchDisposition;
 extern int g_localRoleFlag;
 extern int g_netplayRole;
 extern uintptr_t g_hostRevivalBase;
@@ -187,7 +229,6 @@ extern volatile LONG g_injectedTerminateUnknownPidHits;
 extern volatile LONG g_injectedDelayPromptSerial;
 extern volatile LONG g_injectedDelayPromptServedSerial;
 extern volatile LONG g_injectedConnectedFromDelayPromptSerial;
-extern DWORD g_injectedDelayPromptWaitStartTick;
 extern volatile LONG g_injectedSpectateConfirmPromptSerial;
 extern volatile LONG g_injectedSpectateConfirmPromptServedSerial;
 extern DWORD g_injectedSpectateConfirmPromptWaitStartTick;
@@ -207,7 +248,18 @@ extern DWORD g_lastRuntimeReadyProbeLogTick;
 extern uint32_t g_lastRuntimeReadyProbeMask;
 extern bool g_lastRuntimeReadyProbeMaskValid;
 extern bool g_localInitAppliedForSession;
+extern bool g_spectatorPostInitAttemptedForSession;
+extern bool g_spectatorPostInitSucceededForSession;
+extern volatile LONG g_deferredLifecycleWorkRequested;
+extern volatile LONG g_deferredTitleSelection;
+extern bool g_tournamentReturnCleanupPending;
+// Set once the launcher-owned Tournament session has actually left its
+// initial title screen.  Until then, title mode 0 is startup—not a completed
+// match—and must not trigger the ordinary Tournament return cleanup.
+extern volatile LONG g_externalTournamentInitialTitleLeft;
+void ArmTournamentReturnCleanup(const char* reason);
 extern uintptr_t g_remoteInjectedSelfBase;
+extern uintptr_t g_externalLauncherGuardRemoteBase;
 extern DWORD g_lastLatePatchRetryTick;
 extern DWORD g_lastLatePatchRetryLogTick;
 extern DWORD g_latePatchRetryAttempts;
@@ -230,7 +282,6 @@ extern std::string g_consolePendingWriteConsoleOutputCharacterA;
 extern std::string g_consolePendingWriteConsoleOutputCharacterW;
 extern std::string g_consolePendingOutputDebugStringA;
 extern std::string g_consolePendingOutputDebugStringW;
-extern std::unordered_map<std::string, LONG> g_diskCapturePathHits;
 extern bool g_captureRevivalNativeLogsConfigured;
 extern bool g_captureRevivalNativeLogs;
 extern bool g_revivalErrorCodeNullGuardPatched;
@@ -265,20 +316,26 @@ bool ExtractDelayRange(const std::string& text, int* outMin, int* outMax);
 void EnsureHostLogEfzIatPatched(bool verboseLogs);
 DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool* outHasMetrics);
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
-bool TryGetDiskFilePathFromHandle(HANDLE hFile, std::string* outPath);
-bool TryGetLogEfzDiskPath(HANDLE hFile, std::string* outPath);
 void PrimeManagedLogEfzHistory();
+// Starts the process-local capture/control worker. The EFZ host uses
+// enableRawIngress=false (event-driven mirror controls only); the injected
+// EfzRevival helper uses true to drain its IAT capture ring.
+bool StartConsoleCaptureWorker(bool enableRawIngress);
 void BeginManagedLogEfzWrite();
 void EndManagedLogEfzWrite();
 bool IsManagedLogEfzWriteActive();
 void ResetNativeWorkflowFlags();
-void NoteConsolePromptLine(const std::string& text);
+void NoteConsolePromptLine(
+    const std::string& text,
+    LONG controlWakeRequestSerialSnapshot = -1);
 std::string* SelectPendingConsoleLine(const char* sourceTag);
 bool IsLikelyRevivalDiskLogPath(const std::string& path);
+void RegisterConsoleCaptureFileHandle(HANDLE hFile, bool captureAsTextLog);
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length);
 void FlushPendingConsoleOutput(const char* reason);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
 void CloseMirrorLogFiles();
+void StopManagedLogEfzWorker(bool waitForDrain);
 void MaybeLogConsoleWriteAChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleWriteWChunk(const VOID* lpBuffer, DWORD nChars);
 void MaybeLogConsoleOutputCharacterAChunk(const VOID* lpBuffer, DWORD nChars, COORD writeCoord);
@@ -308,32 +365,78 @@ bool ReadRevivalSyncFlags(RevivalSyncFlags* outFlags);
 void RefreshRuntimeStatus(NetbridgeStatus* ioStatus);
 bool SetLocalRoleFlag(int roleFlag, const char* reason);
 bool SetRoleFlagDirect(int roleFlag, const char* reason);
+// Stops the off-sim-thread spectator Esc-exit watcher (started lazily by
+// SetLocalRoleFlag on a spectate role).  No-op if it was never started.
+void StopSpectatorEscWatcher();
 bool NeutralizeTournamentAutoNav();
 bool SaveTournamentExePatches();
+// Adopt the already-applied, exact native Tournament patch set without
+// snapshotting its live JMP/NOP bytes as the restoration originals.
+bool AdoptExistingTournamentExePatchState();
 bool RestoreTournamentExePatches();
 bool SaveAndApplyDllExitProcessPatches();
+bool SaveAndApplyExternalTournamentExitGuard();
+bool IsExternalTournamentExitGuardOwned();
+bool ArmExternalLauncherExitRecovery();
+void PrimeGracefulQuitRingForSession();
 bool RestoreDllExitProcessPatches();
 bool AreDllExitPatchesSaved();
 bool DestroyCurrentSession(const char* caller);
 bool ForceLocalPlayInit();
 bool InvokeSessionVtableInit(const char* caller);
+bool IsRevival102jSpectatorPostInitReady(const char* caller);
+bool InvokeRevival102jSpectatorPostInit(const char* caller);
 bool SaveRenderContext();
 bool RestoreRenderContext();
 bool ClearRevivalText();
+bool SetRevivalTextRenderingEnabled(bool enable, const char* reason);
 bool DisableRevivalTextRendering();
+bool ResetRevivalTextRenderingAfterCleanup(const char* reason);
+bool ShouldRepeatPostExitTextCleanup();
+bool RestoreRenderContextForGameplayExitCleanup();
+void MarkRenderContextConsumedForGameplayExitCleanup();
+bool ClearRevivalTextWithCurrentRenderContext();
+bool SetRevivalTextRenderingEnabledWithCurrentRenderContext(bool enable, const char* reason);
+bool DisableRevivalTextRenderingWithCurrentRenderContext();
+bool ResetRevivalTextRenderingAfterCleanupWithCurrentRenderContext(const char* reason);
+int GetRevivalGraphicsPatchState();
+bool EnsureRevivalGraphicsPatchSetEnabled(const char* reason);
 
 // Reverse the P1/P2 input-config swap that Revival applied when we joined
 // as client (P2).  No-op unless g_netplayRole == kNetplayRoleClient.
 bool ReverseInputSwapIfClient();
+// Durable "a client (P2) input swap is currently applied" flag, independent of
+// g_netplayRole.  Set true when a client init applies Revival's P1/P2 swap;
+// ReverseInputSwapIfClient() clears it on a successful reversal.  Lets a swap
+// stranded by a role-clearing exit path be normalized at the next session
+// boundary.  See ReverseInputSwapIfClient in revival_memory.cpp.
+void SetClientInputSwapApplied(bool applied);
+bool IsClientInputSwapApplied();
 
 void ResetDebugCounters(SharedBlock* block);
 bool InvokeStartInitPlayer(int initMode);
 void StabilizeOnlineSessionBindingAfterInit(int initMode);
 void RepairRollbackHistoryBindingsIfNeeded();
+void MarkRevivalSyncDiagnosticsSessionStart(const char* context);
 bool InstallNetplayFrameHook();
+bool RemoveNetplayFrameHook();
+bool HasAnyNetplayFrameHookInstalled();
+bool HasNetplayPerFrameTickHookInstalled();
+void SetExternalLauncherAttachPending(bool pending);
+bool WaitForExternalLauncherAttachBoundary(DWORD timeoutMs);
+bool IsExternalLauncherAttachBoundaryPending();
+bool CompleteExternalLauncherAttachBoundary(bool commit);
+void EmergencyQuarantineExternalLauncherAttachBoundary();
 // Force the game mode index to 0 (title screen).
 // Safe to call from the crash handler VEH where minimal code should run.
 bool ForceGameModeToTitle();
+
+// ExitProcess recovery temporarily replaces the live session vtable.  Keep
+// and restore the original identity before destructor selection so cleanup
+// can still invoke the correct version-specific deleting destructor.
+bool RestoreNeutralizedSessionVtableForCleanup(
+    uintptr_t sessionPtr,
+    uintptr_t* outOriginalVtable);
 
 // Save / restore the 10 bytes at EXE address 0x401582 before and after
 // every g_localInitFn() call.  Prevents Revival's init() from chaining
@@ -346,6 +449,8 @@ void RestoreExeFrameHookBytes();
 // trampolines and changing the JMP target between sessions.
 void SaveExeDispatchHookBytes();
 void RestoreExeDispatchHookBytes();
+void RestoreExeDispatchHookBytesAfterSessionInit(int initMode);
+bool RestoreExeDispatchHookForTitle(const char* caller);
 
 // Save / restore the 7 bytes at EXE addresses 0x763E50 and 0x763F04
 // before and after every g_localInitFn() call.  Prevents trampoline
@@ -370,6 +475,7 @@ void ResetModeConstructorTrampolineCache();
 // Diagnostic logging for second-session crash investigation.
 // Dumps all critical session lifecycle state to the log file.
 void LogSessionDiagnosticState(const char* context);
+void LogSessionDiagnosticStateForced(const char* context);
 
 // Comprehensive snapshot of ALL values that init() writes to.
 // Call before and after every init() invocation to capture a complete
@@ -382,6 +488,23 @@ void LogSessionDiagnosticState(const char* context);
 // and our module's patch/flag state.
 void LogInitWriteSnapshot(const char* context);
 
+// 1.02j-only diagnostic layer. Every function is a no-op unless the active
+// profile is 1.02j and [Others] VerboseRevival102jLifecycleLogging is enabled.
+// Step logging is intentionally compact; Snapshot logging includes raw IPC,
+// wire, hook, global, vtable, and complete role-specific session-object dumps.
+bool IsRevival102jDeepDiagnosticsEnabled();
+void LogRevival102jDeepStep(
+    const char* context,
+    const NetbridgeStatus* status = nullptr);
+void LogRevival102jDeepSnapshot(
+    const char* context,
+    const NetbridgeStatus* status = nullptr);
+void LogRevival102jDeepBytes(
+    const char* context,
+    const char* label,
+    uintptr_t address,
+    size_t size);
+
 // Track ForceLocalPlayInit call count for diagnostic purposes.
 void IncrementForceLocalPlayInitCount();
 int GetForceLocalPlayInitCount();
@@ -390,17 +513,31 @@ void ResetForceLocalPlayInitCount();
 // Reset the per-frame game mode vtable validator state so the next session
 // gets fresh validation.  Call when a session starts or is cancelled.
 void ResetGameModeValidation();
+uint32_t GetGameplayExitRecoveryFrameTick();
+bool IsGameplayExitRecoveryInsideFrameTick();
+bool ClearDeferredCancelCleanupForRecovery(const char* reason = nullptr);
+bool SuppressDeferredCancelCleanupAfterGameplayRecovery(const char* origin);
+bool IsDeferredCancelCleanupPending();
+bool IsDeferredCancelCleanupGameplaySource();
+const char* CurrentDeferredCancelCleanupReason();
+uint8_t CurrentDeferredCancelCleanupSourceScreen();
+void NotifyLocalProcessCloseForGameplayStall();
+void ClearLocalProcessCloseForGameplayStall();
+// True once the user has initiated a window close (WM_CLOSE/DESTROY etc.) and
+// before the next session start. Used by the ExitProcess neutralizer to tell a
+// genuine quit apart from a peer-death interception.
+bool IsLocalProcessCloseForGameplayStallActive();
 
 // Returns true while the per-frame tick hook (OurPerFrameTickHook) is
 // executing the original sub_1006E570.  Used by CancelSessionUnlocked to
 // defer ForceLocalPlayInit (which destroys the session object) until after
-// the frame tick completes — destroying it mid-tick would cause
+// the frame tick completes - destroying it mid-tick would cause
 // RollbackLoopTick to use a freed 'this' pointer.
 bool IsInsideFrameTick();
 
 // Request that ForceLocalPlayInit + associated cleanup run after the
 // current frame tick completes instead of immediately.
-void RequestDeferredCancelCleanup();
+void RequestDeferredCancelCleanup(const char* reason = nullptr);
 
 // Arm/consume the one-shot "online match ESC should trigger a native peer
 // quit broadcast" marker. The per-frame tick sets it when it detects a local
@@ -414,18 +551,33 @@ void ResetOnlineMatchEscGracefulQuit();
 // packet to connected peers before the host tears the helper down locally.
 // This is used for the "press ESC but don't actually exit EFZ.exe" path.
 bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs);
+// Clear the successful-send coalescing state when a helper session closes.
+void ResetInjectedPeerQuitBroadcastState();
 
 // Helper-process entry point invoked inside EfzRevival.exe. Resolves the live
 // peer manager object and calls the native "send quit to every peer" routine.
 DWORD RunInjectedPeerQuitBroadcast();
 
+// Classify a native helper quit-packet sender using Revival's own peer-role
+// helpers. Returns true when classification ran successfully; the output flags
+// then indicate whether the endpoint is the active remote peer and/or a
+// spectator endpoint.
+bool TryClassifyRevivalQuitEndpoint(
+    const char* endpointText,
+    bool* outIsActivePeer,
+    bool* outIsSpectator);
+
 // Advisory peer-process liveness check. No lock held; result is TOCTOU.
 bool IsPeerProcessAlive();
+bool StartPeerProcessExitWatch();
+void StopPeerProcessExitWatch(bool waitForExit = true);
+bool HasPeerProcessExitSignal();
 
 // setjmp buffer and active flag used by the netplay frame-hook recovery
 // mechanism.  Defined in revival_memory.cpp; read by iat_stubs.cpp.
 extern jmp_buf       g_netplayFrameJmpBuf;
 extern volatile bool g_netplayFrameJmpActive;
+extern volatile DWORD g_netplayFrameJmpOwnerThreadId;
 
 // Secondary setjmp buffer used by title/menu update hooks as a fallback
 // recovery path when ExitProcess fires outside OurFrameDispatch.
@@ -433,6 +585,7 @@ extern volatile bool g_netplayFrameJmpActive;
 // read by iat_stubs.cpp.
 extern jmp_buf       g_netplayUiJmpBuf;
 extern volatile bool g_netplayUiJmpActive;
+extern volatile DWORD g_netplayUiJmpOwnerThreadId;
 
 // ---------------------------------------------------------------------------
 // IPC, config, module loading (ipc_shared.cpp)
@@ -441,12 +594,47 @@ extern volatile bool g_netplayUiJmpActive;
 void* EnsureRevivalErrorCodeNullGuardStub();
 bool OpenTempIpcContext(TempIpcContext* ctx, bool needInitEvent, bool needConsoleEvent);
 void CloseTempIpcContext(TempIpcContext* ctx);
-void PublishDelayPromptSerial(LONG serial);
+void ClearDelayPromptState(const char* reason);
+void PublishDelayPromptSerial(
+    LONG serial,
+    LONG controlWakeRequestSerialSnapshot);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
 void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);
+bool TryPublishHeldHostDelayTimeout(
+    LONG controlWakeRequestSerialSnapshot = -1);
+bool HasPendingHeldHostDelayTimeout();
 void ReadConsoleError(LONG* outSerial, char* outText, int outTextSize);
+void PublishHostListenerObservation(
+    network::NetworkFamily family,
+    uint16_t port);
+void ClearHostListenerObservation();
+bool ReadHostListenerObservation(
+    LONG* outSerial,
+    network::NetworkFamily* outFamily,
+    uint16_t* outPort,
+    DWORD* outProcessId);
+void HandleTemporaryHostProtocolListenerAck();
+void HandleTemporaryHostProtocolListenerAck(
+    DWORD expectedProcessId,
+    uint16_t expectedPort);
+// Connected-handoff confirmation: the bridge has already committed the exact
+// helper PID/port and may accept a matching listener observation immediately,
+// without depending on a later gameplay tick to finish the normal debounce.
+void ConfirmTemporaryHostProtocolListenerAckAtHandoff(
+    DWORD expectedProcessId,
+    uint16_t expectedPort);
+bool RecoverTemporaryHostProtocolOverride(const char* reason);
+bool PrepareTemporaryHostProtocolOverride(
+    network::NetworkFamily effectiveFamily);
+void RestoreTemporaryHostProtocolOverride(const char* reason);
+bool GetHostProtocolOverrideState(
+    HostProtocolOverrideState* outState);
+bool BeginOptionsIniAccess(
+    bool writeAccess,
+    HostProtocolOverrideState* outState);
+void EndOptionsIniAccess();
 void ClearPeerQuitDiagnostic();
 void AppendPeerQuitDiagnostic(const char* text);
 void ReadPeerQuitDiagnostic(LONG* outSerial, char* outText, int outTextSize);
@@ -459,21 +647,51 @@ std::string GameDirectory();
 std::wstring GameDirectoryWide();
 bool TryWriteClipboardAscii(const char* text);
 void SetPhase(NetbridgeStatus* status, NetbridgePhase phase, const char* error);
-void CloseProcessHandle(NetbridgeStatus* status);
+void CloseProcessHandle(
+    NetbridgeStatus* status,
+    bool waitForPeerWatcher = true);
 bool ProcessAlive(NetbridgeStatus* status);
+bool CanTerminatePeerProcess();
+bool IsExternalLauncherPeerProcess();
+BOOL TerminatePeerProcessIfOwned(
+    UINT exitCode,
+    const char* context,
+    bool waitForExit = true);
+bool ReleasePeerProcessAfterTerminationAttempt(
+    BOOL terminationSucceeded,
+    NetbridgeStatus* status,
+    const char* context,
+    bool waitForPeerWatcher = true);
 bool IsSyncReadyForVsHuman(const NetbridgeStatus* status);
+bool RequiresNativeVsHumanSyncForHandoff(const NetbridgeStatus* status);
 RuntimeReadyProbe EvaluateRuntimeReadyProbe(const NetbridgeStatus* status);
 uint32_t BuildRuntimeReadyProbeMask(const RuntimeReadyProbe& probe);
 bool HasRuntimeReadySignal(const NetbridgeStatus* status);
 bool EnsureHostIpc();
 void CloseHostIpc();
-bool EnsureLocalRevivalLoaded();
+bool ResetHostSharedBlockForSession(
+    bool isHostSession,
+    uint16_t expectedListenerPort,
+    const char* reason);
+uint32_t BeginManagedSessionBoundary(const char* reason);
+bool EnsureLocalRevivalLoaded(bool prepareManagedSession = false);
+// Reports whether an adopted Online/Spectator generation is still parked and
+// needs the hooks-layer simulation handoff before its first native title tick.
+bool NeedsExternalLauncherSimulationHandoff();
+// Finishes a deferred launcher-owned Online/Spectator/Tournament attach after
+// title/UI patch installation. Other launch dispositions are a successful
+// no-op. simulationHandoffReady is meaningful only for Online/Spectator.
+bool CompleteExternalLauncherUiAttachment(
+    bool hooksInstalled,
+    bool simulationHandoffReady);
 void ReinitLocalPlay();
 // Custom exception code historically used for ExitProcess interception.
 // Retained for diagnostic purposes in crash handler log output.
 static constexpr DWORD kExitProcessInterceptedException = 0xE0EF0001u;
 
 bool PatchRevivalDllExitProcess();
+bool IsRevivalDllExitProcessIatPatched();
+bool RestoreRevivalDllExitProcessIat();
 bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva);
 void NeutralizeRevivalSessionVtable();
 uintptr_t ResolveHostRevivalBase();
@@ -485,7 +703,9 @@ bool WriteIni(
     uint16_t port,
     const char* address,
     const char* nickname,
-    bool writeNicknameToIni);
+    bool writeNicknameToIni,
+    network::NetworkFamily sessionFamily,
+    bool writeHostProtocol);
 bool IsCurrentProcessRevival();
 bool IsRunningUnderWine();
 void InitializeInjected();
@@ -514,7 +734,7 @@ bool PatchIatModule(
     bool verboseLogs);
 std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase);
 bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::string, uint32_t>& patchMap, bool verboseLogs);
-// In-process IAT patching for Wine — safe to call from DllMain.
+// In-process IAT patching for Wine - safe to call from DllMain.
 // Returns number of entries patched, or -1 on error.
 int SelfPatchIat();
 HANDLE CreateFakeThread(DWORD exitCode);
@@ -538,10 +758,14 @@ LPVOID StubVirtualAllocEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWOR
 BOOL StubVirtualFreeEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
 BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten);
 HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId);
-BOOL StubTerminateProcess(HANDLE hProcess, UINT uExitCode);
+BOOL StubTerminateProcess(
+    HANDLE hProcess,
+    UINT uExitCode,
+    const void* callerReturnAddress);
 HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
 BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
+BOOL StubWriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten);
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved);
 BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved);

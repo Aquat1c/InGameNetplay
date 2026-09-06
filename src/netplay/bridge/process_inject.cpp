@@ -20,6 +20,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_TerminateProcess(HANDLE, UI
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD, BOOL, DWORD);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE, const INPUT_RECORD*, DWORD, LPDWORD);
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
@@ -47,7 +48,19 @@ static uint32_t RemoteExportAddress(uintptr_t remoteBase, const void* localExpor
 std::vector<RemoteModuleRecord> EnumerateRemoteModules(DWORD processId)
 {
     std::vector<RemoteModuleRecord> modules;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        snap = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+            processId);
+        if (snap != INVALID_HANDLE_VALUE
+            || GetLastError() != ERROR_BAD_LENGTH)
+        {
+            break;
+        }
+        Sleep(1);
+    }
     if (snap == INVALID_HANDLE_VALUE)
     {
         return modules;
@@ -78,6 +91,45 @@ bool ReadRemoteString(HANDLE process, uintptr_t address, char* out, size_t outSi
     {
         return false;
     }
+
+    if (outSize == 1)
+    {
+        out[0] = '\0';
+        return true;
+    }
+
+    // Import names are short and normally reside wholly within a readable PE
+    // page. Read the complete bounded span with one syscall first; late IAT
+    // retries otherwise perform one cross-process syscall for every character
+    // of every DLL and import name. Preserve the byte-loop as the exact
+    // fallback for page boundaries or partially readable memory.
+    char bulk[128] = {};
+    const size_t bulkSize = outSize - 1;
+    if (bulkSize <= sizeof(bulk))
+    {
+        SIZE_T bulkRead = 0;
+        if (ReadProcessMemory(
+                process,
+                reinterpret_cast<LPCVOID>(address),
+                bulk,
+                bulkSize,
+                &bulkRead) != FALSE
+            && bulkRead == bulkSize)
+        {
+            const void* terminator = std::memchr(bulk, '\0', bulkSize);
+            if (terminator != nullptr)
+            {
+                const size_t length =
+                    static_cast<const char*>(terminator) - bulk + 1;
+                std::memcpy(out, bulk, length);
+                return true;
+            }
+            std::memcpy(out, bulk, bulkSize);
+            out[outSize - 1] = '\0';
+            return true;
+        }
+    }
+
     size_t index = 0;
     while (index + 1 < outSize)
     {
@@ -236,6 +288,7 @@ std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
     patches["TerminateProcess"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_TerminateProcess));
     patches["ReadConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleA));
     patches["ReadConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleW));
+    patches["WriteConsoleInputA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleInputA));
     patches["CreateFileA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileA));
     patches["CreateFileW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileW));
     patches["WriteFile"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteFile));
@@ -357,9 +410,6 @@ bool PatchIatModule(
             }
 
             const uintptr_t ftAddress = imageBase + ftRva + static_cast<uintptr_t>(thunk) * sizeof(uint32_t);
-            DWORD oldProtect = 0;
-            (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), PAGE_READWRITE, &oldProtect);
-
             uint32_t oldAddress = 0;
             SIZE_T oldRead = 0;
             (void)ReadProcessMemory(process, reinterpret_cast<LPCVOID>(ftAddress), &oldAddress, sizeof(oldAddress), &oldRead);
@@ -367,14 +417,21 @@ bool PatchIatModule(
             const uint32_t newAddress = it->second;
             if (oldAddress != newAddress)
             {
+                // Late startup retries revisit every imported function. Most
+                // slots are already correct, so do not make their pages
+                // writable on every 500 ms scan. The compare is read-only and
+                // leaves the actual patch path and retry semantics unchanged.
+                DWORD oldProtect = 0;
+                (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), PAGE_READWRITE, &oldProtect);
+
                 SIZE_T written = 0;
                 if (WriteProcessMemory(process, reinterpret_cast<LPVOID>(ftAddress), &newAddress, sizeof(newAddress), &written) == FALSE || written != sizeof(newAddress))
                 {
                     return false;
                 }
+                DWORD ignored = 0;
+                (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), oldProtect, &ignored);
             }
-            DWORD ignored = 0;
-            (void)VirtualProtectEx(process, reinterpret_cast<LPVOID>(ftAddress), sizeof(uint32_t), oldProtect, &ignored);
 
             ++patched;
             auto shouldLogPatchedImport = [](const char* name) -> bool {
@@ -387,6 +444,7 @@ bool PatchIatModule(
                     || _stricmp(name, "TerminateProcess") == 0
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
+                    || _stricmp(name, "WriteConsoleInputA") == 0
                     || _stricmp(name, "CreateFileA") == 0
                     || _stricmp(name, "CreateFileW") == 0
                     || _stricmp(name, "WriteFile") == 0
@@ -401,6 +459,26 @@ bool PatchIatModule(
                     importName,
                     static_cast<unsigned long>(oldAddress),
                     static_cast<unsigned long>(newAddress));
+            }
+            if (oldAddress != newAddress && IsRevival102jDeepDiagnosticsEnabled())
+            {
+                mod::Log(
+                    "J102_DIAG_REMOTE_IAT: module='%s' import='%s' slot=0x%08lX "
+                    "old=0x%08lX [%02X %02X %02X %02X] "
+                    "new=0x%08lX [%02X %02X %02X %02X]",
+                    moduleName,
+                    importName,
+                    static_cast<unsigned long>(ftAddress),
+                    static_cast<unsigned long>(oldAddress),
+                    static_cast<unsigned>(oldAddress & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 8u) & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 16u) & 0xFFu),
+                    static_cast<unsigned>((oldAddress >> 24u) & 0xFFu),
+                    static_cast<unsigned long>(newAddress),
+                    static_cast<unsigned>(newAddress & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 8u) & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 16u) & 0xFFu),
+                    static_cast<unsigned>((newAddress >> 24u) & 0xFFu));
             }
         }
     }
@@ -550,6 +628,25 @@ bool PatchIat(HANDLE process, DWORD processId, const std::unordered_map<std::str
             "Takeover: PatchIat refused - no target modules found (first='%s')",
             modules.front().moduleLower.c_str());
         return false;
+    }
+
+    if (IsRevival102jDeepDiagnosticsEnabled())
+    {
+        mod::Log(
+            "J102_DIAG_REMOTE_IAT: process=0x%p pid=%lu modules=%zu targets=%zu patchMap=%zu",
+            static_cast<void*>(process),
+            static_cast<unsigned long>(processId),
+            modules.size(),
+            targets.size(),
+            patchMap.size());
+        for (const RemoteModuleRecord& module : modules)
+        {
+            mod::Log(
+                "J102_DIAG_REMOTE_MODULE: pid=%lu name='%s' base=0x%08lX",
+                static_cast<unsigned long>(processId),
+                module.moduleLower.c_str(),
+                static_cast<unsigned long>(module.base));
+        }
     }
 
     int totalPatched = 0;
@@ -773,7 +870,17 @@ bool EnsureInjectedContextFast()
         g_injectedConsoleEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, kConsoleReadyEventName);
     }
 
-    g_injectedReady = (g_injectedBlock != nullptr && g_injectedInitEvent != nullptr && g_injectedConsoleEvent != nullptr);
+    const bool ipcReady =
+        g_injectedBlock != nullptr
+        && g_injectedInitEvent != nullptr
+        && g_injectedConsoleEvent != nullptr;
+    g_injectedReady = ipcReady && StartConsoleCaptureWorker(true);
+    if (g_injectedBlock != nullptr)
+    {
+        InterlockedExchange(
+            &g_injectedBlock->helperCaptureReady,
+            g_injectedReady ? 1 : 0);
+    }
     if (g_injectedReady && !g_injectedLazyBound)
     {
         g_injectedLazyBound = true;
@@ -788,7 +895,7 @@ bool EnsureInjectedContextFast()
 }
 
 // ---------------------------------------------------------------------------
-// SelfPatchIat — in-process IAT patching for Wine/Proton
+// SelfPatchIat - in-process IAT patching for Wine/Proton
 // ---------------------------------------------------------------------------
 // Called from DllMain(DLL_PROCESS_ATTACH) under Wine so that all IAT entries
 // in the host EXE already point to our nb_stub_* exports BEFORE the loader
@@ -797,16 +904,16 @@ bool EnsureInjectedContextFast()
 // and the host-side remote PatchIat() call.
 //
 // Safety notes for DllMain context:
-//   - GetModuleHandleA(nullptr) — safe (no DLL load)
-//   - Direct PE header reads — safe (in-process memory)
-//   - VirtualProtect — safe (no cross-process call)
+//   - GetModuleHandleA(nullptr) - safe (no DLL load)
+//   - Direct PE header reads - safe (in-process memory)
+//   - VirtualProtect - safe (no cross-process call)
 //   - No heap allocation beyond the patch map (std::unordered_map)
 //   - No logging (mod::Log not initialised yet); use OutputDebugStringA
 // ---------------------------------------------------------------------------
 int SelfPatchIat()
 {
     // Build a local patch map: function name → address of our stub.
-    // Since we are in-process, the stub addresses are direct — no
+    // Since we are in-process, the stub addresses are direct - no
     // base-relocation arithmetic needed.
     struct PatchEntry { const char* name; uint32_t address; };
     const PatchEntry entries[] = {
@@ -820,6 +927,7 @@ int SelfPatchIat()
         { "TerminateProcess",               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_TerminateProcess)) },
         { "ReadConsoleA",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleA)) },
         { "ReadConsoleW",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleW)) },
+        { "WriteConsoleInputA",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleInputA)) },
         { "CreateFileA",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)) },
         { "CreateFileW",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)) },
         { "WriteFile",                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)) },
@@ -861,7 +969,7 @@ int SelfPatchIat()
     const DWORD importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     if (importRva == 0)
     {
-        // No imports — nothing to patch (unusual but not an error).
+        // No imports - nothing to patch (unusual but not an error).
         return 0;
     }
 
@@ -900,7 +1008,7 @@ int SelfPatchIat()
                 imageBase + oft[i].u1.AddressOfData);
             const char* importName = reinterpret_cast<const char*>(importByName->Name);
 
-            // Linear scan through entries — the list is small (21 entries).
+            // Linear scan through entries - the list is small (21 entries).
             uint32_t targetAddr = 0;
             for (int e = 0; e < kEntryCount; ++e)
             {

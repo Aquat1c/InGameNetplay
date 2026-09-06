@@ -37,7 +37,8 @@ std::deque<std::string> g_queue;
 std::atomic<bool> g_writerShouldStop{false};
 std::thread g_writerThread;
 std::atomic<uint64_t> g_droppedLines{0};
-constexpr std::size_t kMaxQueuedLines = 4096;
+constexpr std::size_t kNormalMaxQueuedLines = 4096;
+constexpr std::size_t kRevival102jDiagnosticMaxQueuedLines = 32768;
 
 // File/console side: guards the FILE* and console-attachment state.
 // The writer thread locks this to do fputs/fflush; SetFileLoggingEnabled /
@@ -122,7 +123,7 @@ std::string BuildLogPathFromModule(HMODULE moduleHandle)
     }
 
     path.resize(slashPos + 1);
-    path += "efz_netplay_mod.log";
+    path += "logs\\efz_netplay_mod.log";
     return path;
 }
 
@@ -161,6 +162,14 @@ void OpenLogFileUnlocked()
         return;
     }
 
+    // The log lives in <mod>\logs\; create the folder lazily so it only
+    // exists when file logging is actually enabled.
+    const std::size_t dirEnd = g_logPath.find_last_of("\\/");
+    if (dirEnd != std::string::npos)
+    {
+        (void)CreateDirectoryA(g_logPath.substr(0, dirEnd).c_str(), nullptr);
+    }
+
     const bool preserveAcrossLaunches = netplay::mod_settings::PreserveModLogAcrossLaunches();
     bool previousExists = false;
     const unsigned long long previousBytes = QueryExistingFileSizeUnlocked(g_logPath, &previousExists);
@@ -193,21 +202,33 @@ void CloseLogFileUnlocked()
 
 void WriterThreadEntry()
 {
+    // EFZ's game thread is paced by a time-critical event source but runs at
+    // normal priority.  Log flushing is diagnostic I/O and must always yield
+    // to the game when both become runnable at once.
+    (void)SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     std::vector<std::string> batch;
     batch.reserve(64);
 
     while (true)
     {
         {
-            std::unique_lock<std::mutex> lock(g_queueMutex);
-            g_queueCv.wait(lock, []() {
-                return !g_queue.empty() || g_writerShouldStop.load();
-            });
-
-            while (!g_queue.empty())
+            // Swap the whole deque out under the lock (O(1)) instead of an
+            // element-wise move+pop (O(queue length)) - producers, including
+            // the game thread's Log(), must never block behind a long drain
+            // (2026-07-20 desync-surface audit hygiene finding).
+            std::deque<std::string> pending;
             {
-                batch.push_back(std::move(g_queue.front()));
-                g_queue.pop_front();
+                std::unique_lock<std::mutex> lock(g_queueMutex);
+                g_queueCv.wait(lock, []() {
+                    return !g_queue.empty() || g_writerShouldStop.load();
+                });
+                pending.swap(g_queue);
+            }
+            for (std::string& line : pending)
+            {
+                batch.push_back(std::move(line));
             }
         }
 
@@ -223,11 +244,14 @@ void WriterThreadEntry()
             // Drain one final time in case producers enqueued after our
             // last wake-up but before they observed the stop flag.
             {
-                std::lock_guard<std::mutex> lock(g_queueMutex);
-                while (!g_queue.empty())
+                std::deque<std::string> pending;
                 {
-                    batch.push_back(std::move(g_queue.front()));
-                    g_queue.pop_front();
+                    std::lock_guard<std::mutex> lock(g_queueMutex);
+                    pending.swap(g_queue);
+                }
+                for (std::string& line : pending)
+                {
+                    batch.push_back(std::move(line));
                 }
             }
             if (!batch.empty())
@@ -260,7 +284,11 @@ void EnqueueLine(std::string line)
 {
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
-        if (g_queue.size() >= kMaxQueuedLines)
+        const std::size_t maxQueuedLines =
+            netplay::mod_settings::IsVerboseRevival102jLifecycleLoggingEnabled()
+                ? kRevival102jDiagnosticMaxQueuedLines
+                : kNormalMaxQueuedLines;
+        if (g_queue.size() >= maxQueuedLines)
         {
             g_queue.pop_front();
             g_droppedLines.fetch_add(1, std::memory_order_relaxed);
@@ -452,7 +480,7 @@ void ShutdownLogger()
 
 void Log(const char* fmt, ...)
 {
-    // Format on the caller's stack — no mutex held during vsnprintf.
+    // Format on the caller's stack - no mutex held during vsnprintf.
     char message[1024];
     va_list args;
     va_start(args, fmt);
@@ -476,11 +504,33 @@ void Log(const char* fmt, ...)
         return;
     }
 
-    // OutputDebugStringA on the caller — lock-free and very fast when no
-    // debugger is attached; callers that attach a debugger get immediate
-    // output without waiting on the writer thread.
+    // Debugger delivery is intentionally absent from shipping builds.
+    // OutputDebugString can synchronously rendezvous with a debugger/DBWIN
+    // consumer, so it does not belong on a rollback-thread call path.
+#if defined(EFZ_LIFECYCLE_TRACE)
     OutputDebugStringA(line);
+#endif
 
     EnqueueLine(std::string(line, static_cast<std::size_t>(lineLen)));
 }
+
+#if defined(EFZ_LIFECYCLE_TRACE)
+namespace
+{
+// Trace binaries must capture startup before mod_settings::Reload can read an
+// optional override. The release binary compiles this state and all trace call
+// sites out entirely.
+std::atomic<bool> g_lifecycleTraceEnabled{true};
+}
+
+bool IsLifecycleTraceEnabled()
+{
+    return g_lifecycleTraceEnabled.load(std::memory_order_relaxed);
+}
+
+void SetLifecycleTraceEnabled(bool enabled)
+{
+    g_lifecycleTraceEnabled.store(enabled, std::memory_order_relaxed);
+}
+#endif
 }

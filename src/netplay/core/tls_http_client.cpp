@@ -1,8 +1,13 @@
 #include "netplay/core/tls_http_client.h"
 
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +25,177 @@ namespace netplay::tls
 {
 namespace
 {
+#if defined(EFZ_EMBEDDED_TLS)
+int ConnectTcpWithTimeout(
+    mbedtls_net_context* context,
+    const char* host,
+    const char* port,
+    uint32_t timeoutMs,
+    std::string* outError)
+{
+    if (context == nullptr || host == nullptr || port == nullptr)
+    {
+        return MBEDTLS_ERR_NET_BAD_INPUT_DATA;
+    }
+
+    WSADATA wsaData = {};
+    if (WSAStartup(MAKEWORD(2, 0), &wsaData) != 0)
+    {
+        if (outError != nullptr)
+        {
+            *outError = "WSAStartup failed";
+        }
+        return MBEDTLS_ERR_NET_SOCKET_FAILED;
+    }
+
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host, port, &hints, &addresses) != 0)
+    {
+        WSACleanup();
+        if (outError != nullptr)
+        {
+            *outError = "getaddrinfo failed";
+        }
+        return MBEDTLS_ERR_NET_UNKNOWN_HOST;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs != 0 ? timeoutMs : 1u);
+    int result = MBEDTLS_ERR_NET_CONNECT_FAILED;
+    int lastSocketError = 0;
+
+    for (const addrinfo* address = addresses;
+         address != nullptr;
+         address = address->ai_next)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            lastSocketError = WSAETIMEDOUT;
+            break;
+        }
+
+        SOCKET socketHandle = socket(
+            address->ai_family,
+            address->ai_socktype,
+            address->ai_protocol);
+        if (socketHandle == INVALID_SOCKET)
+        {
+            lastSocketError = WSAGetLastError();
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        u_long nonBlocking = 1;
+        if (ioctlsocket(socketHandle, FIONBIO, &nonBlocking) != 0)
+        {
+            lastSocketError = WSAGetLastError();
+            closesocket(socketHandle);
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        int connectResult = connect(
+            socketHandle,
+            address->ai_addr,
+            static_cast<int>(address->ai_addrlen));
+        if (connectResult == SOCKET_ERROR)
+        {
+            lastSocketError = WSAGetLastError();
+            if (lastSocketError != WSAEWOULDBLOCK
+                && lastSocketError != WSAEINPROGRESS
+                && lastSocketError != WSAEALREADY
+                && lastSocketError != WSAEINVAL)
+            {
+                closesocket(socketHandle);
+                continue;
+            }
+
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0)
+            {
+                lastSocketError = WSAETIMEDOUT;
+                closesocket(socketHandle);
+                break;
+            }
+
+            fd_set writeSet;
+            fd_set errorSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&errorSet);
+            FD_SET(socketHandle, &writeSet);
+            FD_SET(socketHandle, &errorSet);
+            timeval timeout = {};
+            timeout.tv_sec = static_cast<long>(remaining.count() / 1000);
+            timeout.tv_usec = static_cast<long>((remaining.count() % 1000) * 1000);
+            const int selected = select(0, nullptr, &writeSet, &errorSet, &timeout);
+            if (selected <= 0)
+            {
+                lastSocketError = selected == 0 ? WSAETIMEDOUT : WSAGetLastError();
+                closesocket(socketHandle);
+                if (selected == 0)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            int socketError = 0;
+            int socketErrorSize = sizeof(socketError);
+            if (getsockopt(
+                    socketHandle,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    reinterpret_cast<char*>(&socketError),
+                    &socketErrorSize) != 0
+                || socketError != 0)
+            {
+                lastSocketError = socketError != 0 ? socketError : WSAGetLastError();
+                closesocket(socketHandle);
+                continue;
+            }
+        }
+
+        u_long blocking = 0;
+        if (ioctlsocket(socketHandle, FIONBIO, &blocking) != 0)
+        {
+            lastSocketError = WSAGetLastError();
+            closesocket(socketHandle);
+            result = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+
+        context->fd = static_cast<int>(socketHandle);
+        result = 0;
+        break;
+    }
+
+    freeaddrinfo(addresses);
+    if (result != 0)
+    {
+        WSACleanup();
+        if (outError != nullptr)
+        {
+            char errorText[96] = {};
+            std::snprintf(
+                errorText,
+                sizeof(errorText),
+                "TCP connect failed/timeout (WSA=%d timeoutMs=%lu)",
+                lastSocketError,
+                static_cast<unsigned long>(timeoutMs));
+            *outError = errorText;
+        }
+    }
+    // On success the matching WSACleanup occurs after mbedtls_net_free().
+    return result;
+}
+#endif
+
 constexpr const char kIsrgRootX1Pem[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
@@ -52,6 +228,78 @@ constexpr const char kIsrgRootX1Pem[] =
     "mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n"
     "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n"
     "-----END CERTIFICATE-----\n";
+
+// GitHub (api.github.com) chains to Sectigo / USERTrust; both USERTrust
+// roots (ECC for ECDSA-capable clients like mbedTLS, RSA as the fallback
+// chain) are needed for the once-per-launch update check to verify.
+// USERTrust ECC Certification Authority (expires 2038-01-18).
+constexpr const char kUsertrustEccRootPem[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL\n"
+    "MAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNl\n"
+    "eSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMT\n"
+    "JVVTRVJUcnVzdCBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMjAx\n"
+    "MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgT\n"
+    "Ck5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVUaGUg\n"
+    "VVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBFQ0MgQ2VydGlm\n"
+    "aWNhdGlvbiBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQarFRaqflo\n"
+    "I+d61SRvU8Za2EurxtW20eZzca7dnNYMYf3boIkDuAUU7FfO7l0/4iGzzvfUinng\n"
+    "o4N+LZfQYcTxmdwlkWOrfzCjtHDix6EznPO/LlxTsV+zfTJ/ijTjeXmjQjBAMB0G\n"
+    "A1UdDgQWBBQ64QmG1M8ZwpZ2dEl23OA1xmNjmjAOBgNVHQ8BAf8EBAMCAQYwDwYD\n"
+    "VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB\n"
+    "zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW\n"
+    "RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=\n"
+    "-----END CERTIFICATE-----\n";
+
+// USERTrust RSA Certification Authority (expires 2038-01-18).
+constexpr const char kUsertrustRsaRootPem[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIF3jCCA8agAwIBAgIQAf1tMPyjylGoG7xkDjUDLTANBgkqhkiG9w0BAQwFADCB\n"
+    "iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl\n"
+    "cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV\n"
+    "BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAw\n"
+    "MjAxMDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNV\n"
+    "BAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVU\n"
+    "aGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBSU0EgQ2Vy\n"
+    "dGlmaWNhdGlvbiBBdXRob3JpdHkwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK\n"
+    "AoICAQCAEmUXNg7D2wiz0KxXDXbtzSfTTK1Qg2HiqiBNCS1kCdzOiZ/MPans9s/B\n"
+    "3PHTsdZ7NygRK0faOca8Ohm0X6a9fZ2jY0K2dvKpOyuR+OJv0OwWIJAJPuLodMkY\n"
+    "tJHUYmTbf6MG8YgYapAiPLz+E/CHFHv25B+O1ORRxhFnRghRy4YUVD+8M/5+bJz/\n"
+    "Fp0YvVGONaanZshyZ9shZrHUm3gDwFA66Mzw3LyeTP6vBZY1H1dat//O+T23LLb2\n"
+    "VN3I5xI6Ta5MirdcmrS3ID3KfyI0rn47aGYBROcBTkZTmzNg95S+UzeQc0PzMsNT\n"
+    "79uq/nROacdrjGCT3sTHDN/hMq7MkztReJVni+49Vv4M0GkPGw/zJSZrM233bkf6\n"
+    "c0Plfg6lZrEpfDKEY1WJxA3Bk1QwGROs0303p+tdOmw1XNtB1xLaqUkL39iAigmT\n"
+    "Yo61Zs8liM2EuLE/pDkP2QKe6xJMlXzzawWpXhaDzLhn4ugTncxbgtNMs+1b/97l\n"
+    "c6wjOy0AvzVVdAlJ2ElYGn+SNuZRkg7zJn0cTRe8yexDJtC/QV9AqURE9JnnV4ee\n"
+    "UB9XVKg+/XRjL7FQZQnmWEIuQxpMtPAlR1n6BB6T1CZGSlCBst6+eLf8ZxXhyVeE\n"
+    "Hg9j1uliutZfVS7qXMYoCAQlObgOK6nyTJccBz8NUvXt7y+CDwIDAQABo0IwQDAd\n"
+    "BgNVHQ4EFgQUU3m/WqorSs9UgOHYm8Cd8rIDZsswDgYDVR0PAQH/BAQDAgEGMA8G\n"
+    "A1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAFzUfA3P9wF9QZllDHPF\n"
+    "Up/L+M+ZBn8b2kMVn54CVVeWFPFSPCeHlCjtHzoBN6J2/FNQwISbxmtOuowhT6KO\n"
+    "VWKR82kV2LyI48SqC/3vqOlLVSoGIG1VeCkZ7l8wXEskEVX/JJpuXior7gtNn3/3\n"
+    "ATiUFJVDBwn7YKnuHKsSjKCaXqeYalltiz8I+8jRRa8YFWSQEg9zKC7F4iRO/Fjs\n"
+    "8PRF/iKz6y+O0tlFYQXBl2+odnKPi4w2r78NBc5xjeambx9spnFixdjQg3IM8WcR\n"
+    "iQycE0xyNN+81XHfqnHd4blsjDwSXWXavVcStkNr/+XeTWYRUc+ZruwXtuhxkYze\n"
+    "Sf7dNXGiFSeUHM9h4ya7b6NnJSFd5t0dCy5oGzuCr+yDZ4XUmFF0sbmZgIn/f3gZ\n"
+    "XHlKYC6SQK5MNyosycdiyA5d9zZbyuAlJQG03RoHnHcAP9Dc1ew91Pq7P8yF1m9/\n"
+    "qS3fuQL39ZeatTXaw2ewh0qpKJ4jjv9cJ2vhsE/zB+4ALtRZh8tSQZXq9EfX7mRB\n"
+    "VXyNWQKV3WKdwrnuWih0hKWbt5DHDAff9Yk2dDLWKMGwsAvgnEzDHNb842m1R0aB\n"
+    "L6KCq9NjRHDEjf8tM7qtj3u1cIiuPhnPQCjY/MiQu12ZIvVS5ljFH4gxQ+6IHdfG\n"
+    "jjxDah2nGN59PRbxYvnKkKj9\n"
+    "-----END CERTIFICATE-----\n";
+
+struct TrustedRootPem
+{
+    const char* name;
+    const char* pem;
+    size_t size;   // includes the terminating NUL, as mbedtls_x509_crt_parse requires for PEM
+};
+
+constexpr TrustedRootPem kTrustedRootPems[] = {
+    {"ISRG Root X1", kIsrgRootX1Pem, sizeof(kIsrgRootX1Pem)},
+    {"USERTrust ECC", kUsertrustEccRootPem, sizeof(kUsertrustEccRootPem)},
+    {"USERTrust RSA", kUsertrustRsaRootPem, sizeof(kUsertrustRsaRootPem)},
+};
 
 struct ParsedUrl
 {
@@ -291,6 +539,7 @@ bool IsAvailable()
 bool HttpGet(
     const std::string& url,
     bool verifyPeer,
+    uint32_t connectTimeoutMs,
     uint32_t receiveTimeoutMs,
     std::string* outBody,
     std::string* outError)
@@ -328,6 +577,7 @@ bool HttpGet(
     mbedtls_x509_crt_init(&cacert);
 
     bool ok = false;
+    bool winsockConnected = false;
     std::string request;
     size_t writeOffset = 0;
     std::string rawResponse;
@@ -345,12 +595,21 @@ bool HttpGet(
         goto cleanup;
     }
 
-    ret = mbedtls_net_connect(&serverFd, parsed.host.c_str(), parsed.port.c_str(), MBEDTLS_NET_PROTO_TCP);
+    ret = ConnectTcpWithTimeout(
+        &serverFd,
+        parsed.host.c_str(),
+        parsed.port.c_str(),
+        connectTimeoutMs,
+        outError);
     if (ret != 0)
     {
-        *outError = "mbedtls_net_connect: " + MbedErrorToString(ret);
+        if (outError->empty())
+        {
+            *outError = "TCP connect: " + MbedErrorToString(ret);
+        }
         goto cleanup;
     }
+    winsockConnected = true;
 
     ret = mbedtls_ssl_config_defaults(
         &conf,
@@ -365,14 +624,18 @@ bool HttpGet(
 
     if (verifyPeer)
     {
-        ret = mbedtls_x509_crt_parse(
-            &cacert,
-            reinterpret_cast<const unsigned char*>(kIsrgRootX1Pem),
-            sizeof(kIsrgRootX1Pem));
-        if (ret < 0)
+        for (const TrustedRootPem& root : kTrustedRootPems)
         {
-            *outError = "mbedtls_x509_crt_parse: " + MbedErrorToString(ret);
-            goto cleanup;
+            ret = mbedtls_x509_crt_parse(
+                &cacert,
+                reinterpret_cast<const unsigned char*>(root.pem),
+                root.size);
+            if (ret < 0)
+            {
+                *outError = std::string("mbedtls_x509_crt_parse(") + root.name + "): "
+                    + MbedErrorToString(ret);
+                goto cleanup;
+            }
         }
 
         mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -488,6 +751,10 @@ bool HttpGet(
 cleanup:
     mbedtls_ssl_close_notify(&ssl);
     mbedtls_net_free(&serverFd);
+    if (winsockConnected)
+    {
+        WSACleanup();
+    }
     mbedtls_x509_crt_free(&cacert);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);

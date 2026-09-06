@@ -4,6 +4,7 @@
 #include "netplay/core/inline_edit.h"
 #include "netplay/core/lobby_client.h"
 #include "netplay/core/menu_model.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/patch_utils.h"
 #include "netplay/render/menu_overlay.h"
 #include "netplay/render/sprite_font_map.h"
@@ -17,6 +18,9 @@
 
 namespace netplay::hooks::internal
 {
+// Per-frame render tracing for gameplay-exit menu recovery (issue fixed).
+inline constexpr bool kEnableGameplayExitRecoveryRenderDiagnostics = false;
+
 enum class NetplayNicknameSource : uint8_t
 {
     Placeholder = 0,
@@ -40,6 +44,8 @@ struct NetplayMenuState
     int mainSelection = 0;
     int optionCount = netplay::constants::kNetplayDefaultOptionCount;
     int backIndex = netplay::constants::kNetplayDefaultBackIndex;
+    netplay::network::NetworkFamily hostFamily =
+        netplay::network::NetworkFamily::IPv4;
     uint16_t hostPort = netplay::constants::kDefaultNetplayPort;
     std::string joinAddress = "127.0.0.1";
     uint16_t joinPort = netplay::constants::kDefaultNetplayPort;
@@ -115,18 +121,48 @@ struct HostingOverlayState
     bool active = false;
     uint16_t port = 0;
     bool challengeMode = false;
+    netplay::network::NetworkFamily preferredFamily =
+        netplay::network::NetworkFamily::IPv4;
+    netplay::network::NetworkFamily effectiveFamily =
+        netplay::network::NetworkFamily::IPv4;
+    bool usedFamilyFallback = false;
+    bool discoveryInProgress = false;
+    bool sessionQueued = false;
+    bool listenerReady = false;
+    bool listenerMismatch = false;
+    bool familyRetryAllowed = false;
+    bool automaticFamilyRetryAttempted = false;
+    bool failed = false;
+    bool failureNeedsBridgeCancel = false;
+    bool writeNicknameToIni = true;
     char publicIp[128] = {};       // filled asynchronously
+    char hostNickname[64] = {};
     char targetName[64] = {};
+    char errorText[128] = {};
     bool ipFetchDone = false;      // true once background fetch completes (success or fail)
     bool ipFetchFailed = false;    // true if all attempts failed
+    uint32_t preferredSourceAttempts = 0;
+    uint32_t preferredTransportFailures = 0;
+    uint32_t preferredParseFailures = 0;
+    uint32_t alternateSourceAttempts = 0;
+    uint32_t alternateTransportFailures = 0;
+    uint32_t alternateParseFailures = 0;
     bool copiedToClipboard = false;
     DWORD copiedFlashTick = 0;     // GetTickCount() when copy happened (for brief visual feedback)
+    bool familyFallbackNoticeStarted = false;
+    DWORD familyFallbackNoticeStartTick = 0;
+    DWORD listenerWaitStartTick = 0;
+    uint32_t listenerMismatchSerial = 0;
+    uint16_t listenerMismatchPort = 0;
+    DWORD listenerMismatchFirstTick = 0;
 };
 
 struct JoiningOverlayState
 {
     bool active = false;
     uint16_t port = 0;
+    netplay::network::NetworkFamily family =
+        netplay::network::NetworkFamily::IPv4;
     bool displayTargetName = false;
     bool spectateMode = false;
     bool waitingForGameBegin = false;
@@ -190,6 +226,7 @@ extern uint32_t g_replayCaseDispatchAddress;
 extern "C" uint32_t g_titleCaseReturnAddress;
 extern std::string g_moduleDirectory;
 extern bool g_netplayAssetsAvailable;
+extern std::atomic<bool> g_onlineSimulationUiSuspended;
 extern NetplayMenuState g_netplayMenuState;
 extern MenuSlideTransition g_menuSlideTransition;
 extern netplay::inline_edit::State g_inlineEditState;
@@ -214,13 +251,34 @@ extern bool g_pendingVsHumanAutoConfirm;
 extern DWORD g_pendingVsHumanAutoConfirmTick;
 extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
 extern bool g_returnToNetplayAfterMatch;
-extern bool g_charSelectEntryHoldArmed;
+extern int g_recoveryRenderTraceFramesRemaining;
 extern InputSnapshot g_lastInputSnapshot;
 extern DelaySetupOverlayState g_delaySetupOverlay;
 extern SpectateConfirmOverlayState g_spectateConfirmOverlay;
 extern HostingOverlayState g_hostingOverlay;
 extern JoiningOverlayState g_joiningOverlay;
 extern DebugOverlayState g_debugOverlay;
+
+// "Stop hosting?" confirmation modal shown when the user selects a netplay-menu
+// option that conflicts with an active async-host listener (Join / Spectate IP /
+// Lobby / Player Rooms). On confirm, the host session is cancelled and the deferred
+// action runs; on cancel, hosting continues.
+struct StopHostingConfirmState
+{
+    bool active = false;
+    // The A press that opened the modal must be released before the modal
+    // accepts navigation/confirmation. Per-player button state then provides
+    // true press edges instead of treating a held value as a new press every
+    // frame.
+    bool waitingForInputRelease = true;
+    uint8_t confirmDown[2] = {};
+    uint8_t cancelDown[2] = {};
+    int  selection = 1;  // 0 = Stop hosting (Yes), 1 = Keep hosting (No, default)
+    netplay::menu::NetplayMenuAction pendingAction = netplay::menu::NetplayMenuAction::BackToMain;
+    int  pendingLogicalSelection = 0;
+};
+extern StopHostingConfirmState g_stopHostingConfirm;
+bool DrawStopHostingConfirmGdi(uint32_t screenContext);
 extern std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 
 HMODULE ResolveCurrentModule();
@@ -238,23 +296,23 @@ bool HasNetplayStatusMessage();
 void ClearNetplayStatusMessage();
 std::string GetNetplayStatusMessage();
 void PlayUiSound(uint32_t screenContext, unsigned short soundIndex);
-void ActivateHostingOverlay(uint16_t port);
-void ActivateChallengeHostingOverlay(const char* targetName, uint16_t port);
+void ActivateChallengeHostingOverlay(
+    const char* targetName,
+    uint16_t port,
+    netplay::network::NetworkFamily preferredFamily,
+    netplay::network::NetworkFamily effectiveFamily,
+    bool usedFamilyFallback,
+    const char* publicIp);
 void ResetHostingOverlayState();
 void ActivateJoiningOverlay(const char* address, uint16_t port);
 void ActivateChallengeJoiningOverlay(const char* targetName, const char* address, uint16_t port);
 void ResetJoiningOverlayState();
 bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string* outErrorMessage);
-void InstallNetplayWindowHook(uint32_t screenContext);
-void RemoveNetplayWindowHook();
+bool InstallNetplayWindowHook(uint32_t screenContext);
+bool RemoveNetplayWindowHook();
 bool IsWindowFocused(HWND hwnd);
 bool IsScreenWindowFocused(uint32_t screenContext);
 bool ConsumeNetplayEscapeEdge();
-bool EnsureCharSelectEntryHoldHook();
-void ArmCharSelectEntryHold();
-bool EnsureReplayScreenHook();
-void ArmSpectateReplayBypass();
-void DisarmSpectateReplayBypass();
 
 int GetCurrentMenuEntryCount();
 int ClampSelectionToCurrentMenu(int selection);
@@ -289,6 +347,7 @@ bool ShouldWriteNicknameToRevivalIni();
 
 std::string BuildMenuHeaderText();
 std::string BuildRowLabel(const netplay::menu::NetplayMenuEntry& entry);
+std::string BuildRowBadgeText(const netplay::menu::NetplayMenuEntry& entry);
 std::string BuildFooterText();
 HFONT GetMenuOverlayFont();
 const netplay::render::OverlayCallbacks& GetOverlayCallbacks();
@@ -307,7 +366,10 @@ void DrawAnimatedCompactMenuLayer(uint32_t screenContext);
 void DrawNetplayBaseLayer(uint32_t screenContext);
 
 void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut = false);
-void LeaveNetplayMenu(uint32_t screenContext);
+// |keepHostSession| true = "minimize": tear down the menu UI but DO NOT cancel
+// the active netplay session (async hosting keeps the host listener alive while
+// the user returns to the title screen).
+void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession = false);
 bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason);
 void ExecuteNetplayAction(uint32_t screenContext, netplay::menu::NetplayMenuAction action, int logicalSelection);
 char UpdateNetplayMenu(uint32_t screenContext);
@@ -324,6 +386,5 @@ extern "C" void __cdecl ReplayCaseCompatImpl(uint32_t screenContext);
 extern "C" void ReplayCaseCompatThunk();
 extern "C" void HookedTitleUpdateThunk();
 extern "C" void HookedTitleRenderThunk();
-extern "C" void HookedReplayScreenUpdateThunk();
 #endif
 } // namespace netplay::hooks::internal

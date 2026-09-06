@@ -1,7 +1,11 @@
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/hooks/internal/shared.h"
+#include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/battle_log_menu.h"
+#include "netplay/core/mod_settings.h"
 
 #include "crash_handler.h"
 #include "logger.h"
@@ -24,8 +28,10 @@ extern "C" uint32_t g_titleCaseReturnAddress = 0;
 std::string g_moduleDirectory;
 bool g_netplayAssetsAvailable = false;
 bool g_titleAssetsOverrideApplied = false;
+std::atomic<bool> g_onlineSimulationUiSuspended{false};
 
 NetplayMenuState g_netplayMenuState;
+StopHostingConfirmState g_stopHostingConfirm;
 MenuSlideTransition g_menuSlideTransition;
 netplay::inline_edit::State g_inlineEditState;
 DWORD g_lastNetplayFrameLogTick = 0;
@@ -49,7 +55,6 @@ bool g_pendingVsHumanAutoConfirm = false;
 DWORD g_pendingVsHumanAutoConfirmTick = 0;
 DWORD g_pendingVsHumanAutoConfirmLastLogTick = 0;
 bool g_returnToNetplayAfterMatch = false;
-bool g_charSelectEntryHoldArmed = false;
 InputSnapshot g_lastInputSnapshot = {};
 DelaySetupOverlayState g_delaySetupOverlay = {};
 SpectateConfirmOverlayState g_spectateConfirmOverlay = {};
@@ -58,220 +63,114 @@ JoiningOverlayState g_joiningOverlay = {};
 DebugOverlayState g_debugOverlay = {};
 std::unique_ptr<netplay::lobby::LobbySession> g_lobbySession;
 bool g_titleConfirmDown = false;
-// Number of frames to keep calling ClearRevivalText after an ExitProcess
-// interception.  Ensures stale tournament text is removed even if transient
-// state (e.g. init(2,102) resetting dword_100A0778) re-adds it briefly.
+// Legacy builds can need several cleanup frames. 1.02j repopulates text from
+// its persistent native frame driver, so repeated clears are disabled there.
 static int g_postExitTextClearFrames = 0;
-static bool g_charSelectEntryHoldActive = false;
-static int g_charSelectEntryHoldFramesRemaining = 0;
-static uint32_t g_charSelectUpdateSlotAddress = 0;
-static TitleUpdateFn g_originalCharSelectUpdate = nullptr;
-static constexpr int kCharSelectEntryHoldFrames = 8;
 
-extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext);
-extern "C" void HookedCharSelectUpdateThunk();
-
-// ---- Replay screen hook (spectate bypass) ----
-// When spectating, the title flow transitions to screen 8 (Replay) so that
-// the Revival DLL's mode-transition detector creates the spectator watcher.
-// However, the native replay screen shows an interactive file-selection UI.
-// This hook intercepts the replay update function and, when the spectate
-// bypass is armed, skips the file selection entirely by returning 1 (go to
-// charselect) after a short delay to let the DLL detect the 0→8 transition.
-static uint32_t g_replayUpdateSlotAddress = 0;
-static TitleUpdateFn g_originalReplayUpdate = nullptr;
-static bool g_spectateReplayBypassActive = false;
-static int g_spectateReplayBypassCountdown = 0;
-static constexpr int kSpectateReplayBypassFrames = 3;
-
-extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext);
-extern "C" void HookedReplayScreenUpdateThunk();
-
-bool EnsureCharSelectEntryHoldHook()
+static void SchedulePostExitTextCleanup(const char* reason)
 {
-    if (g_charSelectUpdateSlotAddress != 0)
-    {
-        return g_originalCharSelectUpdate != nullptr;
-    }
-
-    constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
-    const uintptr_t tableAddress = RuntimeAddress(kVaScreenObjectTable);
-    if (tableAddress == 0)
-    {
-        return false;
-    }
-
-    uint32_t charSelectObject = 0;
-    uint32_t charSelectVtable = 0;
-    __try
-    {
-        auto* const screenTable = reinterpret_cast<uint32_t*>(tableAddress);
-        charSelectObject = screenTable[1];
-        if (charSelectObject == 0)
-        {
-            return false;
-        }
-        charSelectVtable = *reinterpret_cast<uint32_t*>(charSelectObject);
-        if (charSelectVtable == 0)
-        {
-            return false;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-
-    auto* const updateSlot = reinterpret_cast<uint32_t*>(charSelectVtable + 4);
-    uint32_t originalUpdateAddress = 0;
-    __try
-    {
-        originalUpdateAddress = *updateSlot;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-
-    const uint32_t hookAddress = reinterpret_cast<uint32_t>(&HookedCharSelectUpdateThunk);
-    if (originalUpdateAddress == hookAddress)
-    {
-        g_charSelectUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
-        return g_originalCharSelectUpdate != nullptr;
-    }
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(updateSlot, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProtect))
-    {
-        return false;
-    }
-
-    *updateSlot = hookAddress;
-    DWORD ignored = 0;
-    (void)VirtualProtect(updateSlot, sizeof(uint32_t), oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), updateSlot, sizeof(uint32_t));
-
-    g_originalCharSelectUpdate = reinterpret_cast<TitleUpdateFn>(originalUpdateAddress);
-    g_charSelectUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
+    g_postExitTextClearFrames =
+        netplay::bridge::takeover::ShouldRepeatPostExitTextCleanup() ? 5 : 0;
     mod::Log(
-        "InstallHooks: charselect update hook installed slot=0x%08X original=0x%08X",
-        g_charSelectUpdateSlotAddress,
-        originalUpdateAddress);
-    return true;
+        "SchedulePostExitTextCleanup: reason=%s repeatFrames=%d",
+        reason != nullptr ? reason : "unknown",
+        g_postExitTextClearFrames);
+}
+static DWORD g_lastTitleUpdateRecoveryCheckLogMs = 0;
+static DWORD g_lastTitleRenderRecoveryPendingLogMs = 0;
+static constexpr DWORD kTitleRecoveryDiagThrottleMs = 1000u;
+int g_recoveryRenderTraceFramesRemaining = 0;
+static uint32_t g_titleRenderRecoveryTraceCall = 0;
+static constexpr int kRecoveryRenderTraceFrames = 180;
+
+static uint8_t ReadRecoveryDiagScreenIndex()
+{
+    uint8_t screen = 0xFF;
+    __try
+    {
+        screen = *reinterpret_cast<const volatile uint8_t*>(0x00790148u);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return screen;
 }
 
-void ArmCharSelectEntryHold()
+static int ReadRecoveryDiagGameMode()
 {
-    if (!EnsureCharSelectEntryHoldHook())
+    uint8_t mode = 0xFF;
+    __try
     {
-        mod::Log("CharSelectHold: failed to arm (charselect hook unavailable)");
+        const uint32_t gameSys =
+            *reinterpret_cast<const volatile uint32_t*>(0x0079010Cu);
+        if (gameSys != 0)
+        {
+            mode = *reinterpret_cast<const volatile uint8_t*>(gameSys + 4964);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return mode == 0xFF ? -1 : static_cast<int>(mode);
+}
+
+static void LogTitleUpdateRecoveryCheckIfDue(uint32_t screenContext)
+{
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics)
+    {
         return;
     }
 
-    g_charSelectEntryHoldArmed = true;
-    g_charSelectEntryHoldActive = false;
-    g_charSelectEntryHoldFramesRemaining = 0;
-    mod::Log("CharSelectHold: armed frames=%d", kCharSelectEntryHoldFrames);
-}
-
-// ---------------------------------------------------------------------------
-// Replay screen hook — spectate bypass
-// ---------------------------------------------------------------------------
-bool EnsureReplayScreenHook()
-{
-    if (g_replayUpdateSlotAddress != 0)
+    if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        && !netplay::bridge::frontend_return::HasPendingReturn())
     {
-        return g_originalReplayUpdate != nullptr;
-    }
-
-    constexpr uintptr_t kVaScreenObjectTable = 0x00790110;
-    const uintptr_t tableAddress = RuntimeAddress(kVaScreenObjectTable);
-    if (tableAddress == 0)
-    {
-        return false;
-    }
-
-    uint32_t replayScreenObject = 0;
-    uint32_t replayVtable = 0;
-    __try
-    {
-        auto* const screenTable = reinterpret_cast<uint32_t*>(tableAddress);
-        replayScreenObject = screenTable[8]; // screen index 8 = replay
-        if (replayScreenObject == 0)
-        {
-            return false;
-        }
-        replayVtable = *reinterpret_cast<uint32_t*>(replayScreenObject);
-        if (replayVtable == 0)
-        {
-            return false;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-
-    auto* const updateSlot = reinterpret_cast<uint32_t*>(replayVtable + 4);
-    uint32_t originalUpdateAddress = 0;
-    __try
-    {
-        originalUpdateAddress = *updateSlot;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-
-    const uint32_t hookAddress = reinterpret_cast<uint32_t>(&HookedReplayScreenUpdateThunk);
-    if (originalUpdateAddress == hookAddress)
-    {
-        g_replayUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
-        return g_originalReplayUpdate != nullptr;
-    }
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(updateSlot, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProtect))
-    {
-        return false;
-    }
-
-    *updateSlot = hookAddress;
-    DWORD ignored = 0;
-    (void)VirtualProtect(updateSlot, sizeof(uint32_t), oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), updateSlot, sizeof(uint32_t));
-
-    g_originalReplayUpdate = reinterpret_cast<TitleUpdateFn>(originalUpdateAddress);
-    g_replayUpdateSlotAddress = reinterpret_cast<uint32_t>(updateSlot);
-    mod::Log(
-        "InstallHooks: replay screen update hook installed slot=0x%08X original=0x%08X",
-        g_replayUpdateSlotAddress,
-        originalUpdateAddress);
-    return true;
-}
-
-void ArmSpectateReplayBypass()
-{
-    if (!EnsureReplayScreenHook())
-    {
-        mod::Log("SpectateReplayBypass: failed to arm (replay hook unavailable)");
         return;
     }
 
-    g_spectateReplayBypassActive = true;
-    g_spectateReplayBypassCountdown = kSpectateReplayBypassFrames;
-    mod::Log("SpectateReplayBypass: armed countdown=%d", kSpectateReplayBypassFrames);
+    const DWORD nowMs = GetTickCount();
+    if (g_lastTitleUpdateRecoveryCheckLogMs != 0
+        && nowMs - g_lastTitleUpdateRecoveryCheckLogMs < kTitleRecoveryDiagThrottleMs)
+    {
+        return;
+    }
+    g_lastTitleUpdateRecoveryCheckLogMs = nowMs;
+
+    mod::Log(
+        "TITLE_UPDATE_RECOVERY_CHECK pending=1 screenContext=0x%08X screen=%u mode=%d netplayActive=%d",
+        screenContext,
+        static_cast<unsigned>(ReadRecoveryDiagScreenIndex()),
+        ReadRecoveryDiagGameMode(),
+        g_netplayMenuState.active ? 1 : 0);
 }
 
-void DisarmSpectateReplayBypass()
+static void LogTitleRenderRecoveryPendingIfDue(uint32_t screenContext)
 {
-    if (g_spectateReplayBypassActive)
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics)
     {
-        mod::Log("SpectateReplayBypass: disarmed (was active, countdown=%d)",
-            g_spectateReplayBypassCountdown);
+        return;
     }
-    g_spectateReplayBypassActive = false;
-    g_spectateReplayBypassCountdown = 0;
+
+    if (!netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        && !netplay::bridge::frontend_return::HasPendingReturn()
+        && g_recoveryRenderTraceFramesRemaining <= 0)
+    {
+        return;
+    }
+
+    const DWORD nowMs = GetTickCount();
+    if (g_lastTitleRenderRecoveryPendingLogMs != 0
+        && nowMs - g_lastTitleRenderRecoveryPendingLogMs < kTitleRecoveryDiagThrottleMs)
+    {
+        return;
+    }
+    g_lastTitleRenderRecoveryPendingLogMs = nowMs;
+
+    mod::Log(
+        "TITLE_RENDER_RECOVERY_PENDING screenContext=0x%08X screen=%u mode=%d netplayActive=%d",
+        screenContext,
+        static_cast<unsigned>(ReadRecoveryDiagScreenIndex()),
+        ReadRecoveryDiagGameMode(),
+        g_netplayMenuState.active ? 1 : 0);
 }
 
 void ObserveOfflineSelectionConfirm(uint32_t screenContext)
@@ -299,14 +198,166 @@ void ObserveOfflineSelectionConfirm(uint32_t screenContext)
     netplay::bridge::OnTitleSelectionConfirmed(selection);
 }
 
+static const char* FrontendReturnOwnerToString(
+    netplay::bridge::frontend_return::ReturnOwner owner)
+{
+    using netplay::bridge::frontend_return::ReturnOwner;
+    switch (owner)
+    {
+    case ReturnOwner::DisconnectRecovery:
+        return "disconnect_recovery";
+    case ReturnOwner::AsyncHostAccept:
+        return "async_host_accept";
+    case ReturnOwner::UserMenuExit:
+        return "user_menu_exit";
+    case ReturnOwner::Diagnostic:
+        return "diagnostic";
+    }
+    return "unknown";
+}
+
+static const char* FrontendReturnTargetToString(
+    netplay::bridge::frontend_return::ReturnTarget target)
+{
+    using netplay::bridge::frontend_return::ReturnTarget;
+    switch (target)
+    {
+    case ReturnTarget::Title:
+        return "title";
+    case ReturnTarget::NetplayMenu:
+        return "netplay_menu";
+    case ReturnTarget::CharacterSelect:
+        return "charselect";
+    }
+    return "unknown";
+}
+
+static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
+{
+    using namespace netplay::bridge::frontend_return;
+
+    TickFrontendReturn();
+
+    ReturnOwner owner = ReturnOwner::Diagnostic;
+    ReturnTarget target = ReturnTarget::Title;
+    if (!ConsumeTitleContinuation(&owner, &target))
+    {
+        return false;
+    }
+
+    mod::ResetCrashRecoveryState();
+    g_returnToNetplayAfterMatch = false;
+    g_pendingVsHumanAutoConfirm = false;
+    g_pendingVsHumanAutoConfirmTick = 0;
+    g_pendingVsHumanAutoConfirmLastLogTick = 0;
+
+    netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
+    const bool completedRecovery =
+        owner == ReturnOwner::DisconnectRecovery
+        && netplay::bridge::recovery::CompleteFrontendReturnMenuEntry(
+            screenContext,
+            &gameplayExit);
+
+    if (completedRecovery && g_lobbySession)
+    {
+        if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleSpectate)
+        {
+            g_lobbySession->NotifyEndSpectate(true);
+        }
+        else if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleOnline)
+        {
+            g_lobbySession->NotifyEndMatch();
+        }
+    }
+
+    if (completedRecovery)
+    {
+        netplay::bridge::CompleteGameplayExitRecovery(
+            gameplayExit.mode,
+            gameplayExit.origin);
+    }
+
+    mod::Log(
+        "FRONTEND_RETURN_MENU_CONTINUATION_CONSUMED owner=%s target=%s",
+        FrontendReturnOwnerToString(owner),
+        FrontendReturnTargetToString(target));
+
+    if (target == ReturnTarget::NetplayMenu)
+    {
+        if (kEnableGameplayExitRecoveryRenderDiagnostics)
+        {
+            g_recoveryRenderTraceFramesRemaining = kRecoveryRenderTraceFrames;
+        }
+        const char* origin = completedRecovery ? gameplayExit.origin : FrontendReturnOwnerToString(owner);
+        const int mode = completedRecovery ? gameplayExit.mode : -1;
+        mod::Log(
+            "GAMEPLAY_EXIT_TITLE_CONTINUATION_ENTER_MENU skipFadeOut=1 screenContext=0x%08X origin=%s mode=%d",
+            screenContext,
+            origin,
+            mode);
+        EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
+        return true;
+    }
+
+    return target == ReturnTarget::Title;
+}
+
+static bool SuppressOldExitInterceptionIfRecoveryOwned()
+{
+    if (!netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+    {
+        return false;
+    }
+
+    const LONG exitIntercepted =
+        InterlockedCompareExchange(
+            &netplay::bridge::takeover::g_revivalExitIntercepted,
+            0,
+            0);
+    const LONG exitMode =
+        InterlockedCompareExchange(
+            &netplay::bridge::takeover::g_revivalExitMode,
+            0,
+            0);
+    if (exitIntercepted == 0 && exitMode == -1)
+    {
+        return false;
+    }
+
+    const LONG clearedIntercepted =
+        InterlockedExchange(
+            &netplay::bridge::takeover::g_revivalExitIntercepted,
+            0);
+    const LONG clearedMode =
+        InterlockedExchange(
+            &netplay::bridge::takeover::g_revivalExitMode,
+            -1);
+    mod::Log(
+        "GAMEPLAY_EXIT_SUPPRESS_OLD_EXIT_INTERCEPTION reason=frontend_return_owner exitIntercepted=%ld exitMode=%ld state=%s frontendReturnState=%s",
+        static_cast<long>(clearedIntercepted),
+        static_cast<long>(clearedMode),
+        netplay::bridge::recovery::CurrentGameplayExitRecoveryStateName(),
+        netplay::bridge::frontend_return::CurrentStateName());
+    return true;
+}
+
 // ---------------------------------------------------------------------------
-// HookedTitleUpdateImplBody — the real title-screen update logic.
+// HookedTitleUpdateImplBody - the real title-screen update logic.
 // Called from HookedTitleUpdateImpl which wraps it in setjmp/longjmp
 // protection so NeutralizeExitProcess can safely escape.
 // ---------------------------------------------------------------------------
 static char HookedTitleUpdateImplBody(uint32_t screenContext)
 {
     ++g_titleUpdateCallCount;
+
+    // When the debug option is enabled, make sure the D3D9 EndScene overlay hook
+    // is installed early (from the title screen) so the ImGui debug overlay can
+    // be toggled with DELETE on any screen. Idempotent/cheap once installed.
+    if (!g_onlineSimulationUiSuspended.load(std::memory_order_acquire)
+        && netplay::mod_settings::IsDebugMenuEnabled())
+    {
+        (void)netplay::battle_log::EnsureGameplayOverlayHook();
+    }
     if ((g_titleUpdateCallCount % 300ull) == 0ull)
     {
         mod::Log(
@@ -327,21 +378,36 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         g_titleAssetsOverrideApplied = true;
         if (netplay::bridge::IsRunningUnderWine())
         {
-            mod::Log("HookedTitleUpdateImpl: Wine detected — applying one-shot title assets override");
+            mod::Log("HookedTitleUpdateImpl: Wine detected - applying one-shot title assets override");
             (void)LoadTitleAssets(screenContext);
         }
     }
 
-    // Post-exit text clearing: keep issuing ClearRevivalText for a few
-    // frames after an ExitProcess interception to guarantee stale
-    // tournament text (nicknames, win counts) is removed even if
-    // init(2,102) or session tick re-adds it transiently.
+    if (!g_netplayMenuState.active
+        && netplay::bridge::CompletePendingTournamentReturnCleanup())
+    {
+        SchedulePostExitTextCleanup("pending_tournament_return");
+        mod::Log(
+            "HookedTitleUpdateImpl: completed pending 1.02j tournament return cleanup");
+        return 0;
+    }
+
+    // Legacy post-exit text clearing. 1.02j schedules zero repeat frames.
     if (g_postExitTextClearFrames > 0)
     {
         --g_postExitTextClearFrames;
         netplay::bridge::takeover::ClearRevivalText();
-        netplay::bridge::takeover::DisableRevivalTextRendering();
+        netplay::bridge::takeover::ResetRevivalTextRenderingAfterCleanup(
+            "post_exit_text_clear_loop");
     }
+
+    if (!g_netplayMenuState.active
+        && HandleFrontendReturnTitleContinuation(screenContext))
+    {
+        return 0;
+    }
+
+    LogTitleUpdateRecoveryCheckIfDue(screenContext);
 
     if (!g_netplayMenuState.active)
     {
@@ -352,8 +418,46 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         // game mode is 0, clean up immediately and schedule text clearing.
         if (netplay::bridge::NotifyTitleScreenActive())
         {
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("tournament_return_title");
             mod::Log("HookedTitleUpdateImpl: tournament return to title detected, clearing text");
+            return 0;
+        }
+
+        netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
+        if (!netplay::bridge::frontend_return::IsReturningToFrontend()
+            && netplay::bridge::recovery::ConsumePendingGameplayExitMenuEntry(
+                screenContext,
+                &gameplayExit))
+        {
+            mod::ResetCrashRecoveryState();
+            g_returnToNetplayAfterMatch = false;
+            g_pendingVsHumanAutoConfirm = false;
+            g_pendingVsHumanAutoConfirmTick = 0;
+            g_pendingVsHumanAutoConfirmLastLogTick = 0;
+
+            if (g_lobbySession)
+            {
+                if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleSpectate)
+                {
+                    g_lobbySession->NotifyEndSpectate(true);
+                }
+                else if (gameplayExit.mode == netplay::bridge::takeover::kLocalRoleOnline)
+                {
+                    g_lobbySession->NotifyEndMatch();
+                }
+            }
+
+            netplay::bridge::CompleteGameplayExitRecovery(
+                gameplayExit.mode,
+                gameplayExit.origin);
+
+            mod::Log(
+                "GAMEPLAY_EXIT_TITLE_CONTINUATION_ENTER_MENU skipFadeOut=1 screenContext=0x%08X origin=%s mode=%d",
+                screenContext,
+                gameplayExit.origin,
+                gameplayExit.mode);
+            EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
+            return 0;
         }
 
         // Check for Revival DLL ExitProcess interception BEFORE ticking.
@@ -362,21 +466,21 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         // appropriate screen:  netplay menu for online modes, title screen
         // for tournament / offline modes.
         int exitMode = -1;
-        if (netplay::bridge::ConsumeRevivalExitInterception(&exitMode))
+        if (!SuppressOldExitInterceptionIfRecoveryOwned()
+            && netplay::bridge::ConsumeRevivalExitInterception(&exitMode))
         {
             mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
-            DisarmSpectateReplayBypass();
             g_pendingVsHumanAutoConfirm = false;
             g_pendingVsHumanAutoConfirmTick = 0;
             g_pendingVsHumanAutoConfirmLastLogTick = 0;
 
             if (exitMode == 0 || exitMode == 1)
             {
-                // Online or spectate netplay — return to the netplay menu.
+                // Online or spectate netplay - return to the netplay menu.
                 // Schedule multi-frame text clearing to ensure any DLL-side
                 // text overlays (nicknames, ping, delay) are fully purged.
-                g_postExitTextClearFrames = 5;
+                SchedulePostExitTextCleanup("exit_intercepted_netplay");
                 if (g_lobbySession)
                 {
                     if (exitMode == netplay::bridge::takeover::kLocalRoleSpectate)
@@ -395,10 +499,10 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
                 return 0;
             }
 
-            // Tournament or other — stay on the normal title screen.
+            // Tournament or other - stay on the normal title screen.
             // Schedule a few frames of ClearRevivalText to ensure stale
             // tournament text overlays are fully cleared.
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("exit_intercepted_title");
             mod::Log(
                 "HookedTitleUpdateImpl: exit intercepted (mode=%d), staying on title screen",
                 exitMode);
@@ -414,7 +518,6 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         {
             g_returnToNetplayAfterMatch = false;
             mod::ResetCrashRecoveryState();
-            DisarmSpectateReplayBypass();
             const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
             const bool wasSpectate = (bridgeStatus.roleFlag == netplay::bridge::takeover::kLocalRoleSpectate);
 
@@ -440,7 +543,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             // Keep clearing DLL text rendering for several frames, just as
             // the tournament-mode exit path does.  init(3,102) or a transient
             // session tick can re-add text after the first clear.
-            g_postExitTextClearFrames = 5;
+            SchedulePostExitTextCleanup("post_match_return");
             EnterNetplayMenu(screenContext, /*skipFadeOut=*/true);
             return 0;
         }
@@ -553,267 +656,7 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
 }
 
 // ---------------------------------------------------------------------------
-// Replay screen bypass — hooked update implementation.
-// ---------------------------------------------------------------------------
-static char HookedReplayScreenUpdateImplBody(uint32_t screenContext)
-{
-    if (g_spectateReplayBypassActive)
-    {
-        // Clear init flag to skip BGM playback and replay file scanning.
-        // The native init code plays track 6 BGM and calls
-        // initializeReplaySystem — both are undesirable for spectating.
-        __try
-        {
-            *reinterpret_cast<int8_t*>(screenContext + 44) = 0;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (g_spectateReplayBypassCountdown > 0)
-        {
-            --g_spectateReplayBypassCountdown;
-            mod::Log(
-                "SpectateReplayBypass: waiting for DLL mode detection countdown=%d",
-                g_spectateReplayBypassCountdown);
-            return 8; // Stay on replay screen to let DLL detect 0→8 transition
-        }
-
-        // Done waiting — transition to character select.
-        g_spectateReplayBypassActive = false;
-        mod::Log("SpectateReplayBypass: advancing to charselect (return 1)");
-        return 1;
-    }
-
-    // Normal (non-spectate) replay screen: call original function.
-    if (g_originalReplayUpdate == nullptr)
-        return 8;
-    return g_originalReplayUpdate(screenContext);
-}
-
-// ---------------------------------------------------------------------------
-// HookedReplayScreenUpdateImpl — dispatches to HookedReplayScreenUpdateImplBody.
-//
-// Spectate and join-spectate both pass through the replay screen during the
-// lightweight watcher handoff. ExitProcess can fire here if the spectate
-// session ends or disconnects before the handoff fully completes. Without
-// the UI setjmp guard, NeutralizeExitProcess falls through to the fragile
-// VEH TOCTOU recovery path and EFZ can close outright instead of returning
-// to the netplay menu.
-//
-// Reuse the same g_netplayUiJmpBuf that title/charselect use: only one UI
-// screen update runs at a time, so replay is safe to guard the same way.
-// On longjmp recovery, force game mode 0 and let the title hook consume the
-// exit interception and re-enter the netplay menu cleanly.
-// ---------------------------------------------------------------------------
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable: 4611) // setjmp / C++ destruction interaction
-#endif
-extern "C" char __cdecl HookedReplayScreenUpdateImpl(uint32_t screenContext)
-{
-    netplay::bridge::takeover::g_netplayUiJmpActive = true;
-    if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
-    {
-        netplay::bridge::takeover::g_netplayUiJmpActive = false;
-
-        mod::Log(
-            "HookedReplayScreenUpdateImpl: recovered from ExitProcess via "
-            "ui longjmp — forcing game mode to title");
-
-        mod::ResetCrashRecoveryState();
-        DisarmSpectateReplayBypass();
-        g_restoreReplaySelectionOnNextTitleUpdate = false;
-        g_replaySelectionGuardFramesRemaining = 0;
-        netplay::bridge::ForceGameModeToTitle();
-
-        // Exit interception is already armed; skip this frame and let the
-        // title-screen update consume/cleanup in a clean state.
-        return 0;
-    }
-
-    const char result = HookedReplayScreenUpdateImplBody(screenContext);
-    netplay::bridge::takeover::g_netplayUiJmpActive = false;
-    return result;
-}
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-
-// ---------------------------------------------------------------------------
-// Charselect intro animation input suppression.
-// ---------------------------------------------------------------------------
-// HookedCharSelectUpdateImplBody — the real charselect update logic.
-// Called from HookedCharSelectUpdateImpl which wraps it in setjmp/longjmp
-// protection so NeutralizeExitProcess can safely escape.
-// ---------------------------------------------------------------------------
-static uint32_t g_charSelectUpdateCallCount = 0;
-
-static char HookedCharSelectUpdateImplBody(uint32_t screenContext)
-{
-    ++g_charSelectUpdateCallCount;
-
-    // Drive the bridge and state export every charselect frame.
-    // Previously this was only called during the entry-hold window, which
-    // caused the exported state to freeze as soon as the hold ended.
-    netplay::bridge::Tick();
-
-    // Diagnostic: log charselect screen state on the first 5 frames
-    // and then every 300 frames to track init/exit flags and game mode.
-    if (g_charSelectUpdateCallCount <= 5
-        || (g_charSelectUpdateCallCount % 300 == 0 && g_charSelectUpdateCallCount <= 3000))
-    {
-        uint8_t initFlag = 0xFF, exitFlag = 0xFF, gameMode = 0xFF, secondaryMode = 0xFF;
-        __try
-        {
-            initFlag = *reinterpret_cast<const uint8_t*>(screenContext + 44);
-            exitFlag = *reinterpret_cast<const uint8_t*>(screenContext + 45);
-            const uint32_t gameSys = *reinterpret_cast<const uint32_t*>(
-                screenContext + netplay::constants::kOffsetGameSystem);
-            if (gameSys != 0)
-            {
-                gameMode = *reinterpret_cast<const uint8_t*>(gameSys + 4964);
-                secondaryMode = *reinterpret_cast<const uint8_t*>(gameSys + 4965);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        mod::Log(
-            "CHARSELECT_UPDATE: frame=%u ctx=0x%08lX init=%u exit=%u mode=%u/%u",
-            g_charSelectUpdateCallCount,
-            static_cast<unsigned long>(screenContext),
-            static_cast<unsigned>(initFlag),
-            static_cast<unsigned>(exitFlag),
-            static_cast<unsigned>(gameMode),
-            static_cast<unsigned>(secondaryMode));
-    }
-
-    if (g_originalCharSelectUpdate == nullptr)
-    {
-        return 1;
-    }
-
-    if (g_charSelectEntryHoldArmed && !g_charSelectEntryHoldActive)
-    {
-        g_charSelectEntryHoldArmed = false;
-        g_charSelectEntryHoldActive = true;
-        g_charSelectEntryHoldFramesRemaining = kCharSelectEntryHoldFrames;
-        g_charSelectUpdateCallCount = 0;  // reset for fresh logging window
-        mod::Log("CharSelectHold: started on first charselect frame budget=%d", g_charSelectEntryHoldFramesRemaining);
-    }
-
-    if (!g_charSelectEntryHoldActive)
-    {
-        const char csResult = g_originalCharSelectUpdate(screenContext);
-        if (csResult != 1)
-        {
-            mod::Log(
-                "CHARSELECT_UPDATE: originalUpdate returned %d (non-1) frame=%u",
-                static_cast<int>(csResult), g_charSelectUpdateCallCount);
-        }
-        return csResult;
-    }
-    const auto bridgeStatus = netplay::bridge::GetStatus();
-    const bool syncReady = bridgeStatus.vsHumanSyncReady != 0;
-    if (syncReady)
-    {
-        g_charSelectEntryHoldActive = false;
-        g_charSelectEntryHoldFramesRemaining = 0;
-        mod::Log(
-            "CharSelectHold: released early sync(mode=%d flag1084=%d session=%d)",
-            bridgeStatus.syncGameMode,
-            bridgeStatus.syncMode0Flag1084,
-            bridgeStatus.syncSessionByte);
-        {
-            const char csResult = g_originalCharSelectUpdate(screenContext);
-            if (csResult != 1)
-                mod::Log("CHARSELECT_UPDATE: hold-release originalUpdate returned %d frame=%u",
-                    static_cast<int>(csResult), g_charSelectUpdateCallCount);
-            return csResult;
-        }
-    }
-
-    --g_charSelectEntryHoldFramesRemaining;
-    if (g_charSelectEntryHoldFramesRemaining <= 0)
-    {
-        g_charSelectEntryHoldActive = false;
-        g_charSelectEntryHoldFramesRemaining = 0;
-        mod::Log(
-            "CharSelectHold: timeout release sync(mode=%d flag1084=%d session=%d)",
-            bridgeStatus.syncGameMode,
-            bridgeStatus.syncMode0Flag1084,
-            bridgeStatus.syncSessionByte);
-        {
-            const char csResult = g_originalCharSelectUpdate(screenContext);
-            if (csResult != 1)
-                mod::Log("CHARSELECT_UPDATE: hold-timeout originalUpdate returned %d frame=%u",
-                    static_cast<int>(csResult), g_charSelectUpdateCallCount);
-            return csResult;
-        }
-    }
-
-    return 1;
-}
-
-// ---------------------------------------------------------------------------
-// HookedCharSelectUpdateImpl — dispatches to HookedCharSelectUpdateImplBody.
-//
-// ExitProcess can fire during charselect when the DLL detects a desync (e.g.
-// State mismatch at early rollback frames).  The frame-hook setjmp
-// (g_netplayFrameJmpBuf) only guards sub_1006E590; other DLL vtable methods
-// called during charselect are NOT covered.  Without setjmp protection here,
-// NeutralizeExitProcess falls through to the fragile VEH TOCTOU last-resort
-// recovery which fails silently (game closes, no crash logs).
-//
-// Wrap the body in setjmp on g_netplayUiJmpBuf — the same buffer used by
-// HookedTitleUpdateImpl.  Only one screen update runs at a time (title OR
-// charselect), so reusing the UI jmpbuf is safe.  On longjmp recovery: force
-// game mode to 0 so the title hook can consume the exit interception and
-// re-enter the netplay menu cleanly.
-// ---------------------------------------------------------------------------
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable: 4611) // setjmp / C++ destruction interaction
-#endif
-extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
-{
-    netplay::bridge::takeover::g_netplayUiJmpActive = true;
-    if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
-    {
-        netplay::bridge::takeover::g_netplayUiJmpActive = false;
-
-        mod::Log(
-            "HookedCharSelectUpdateImpl: recovered from ExitProcess via "
-            "ui longjmp — forcing game mode to title");
-
-        // Reset the one-shot VEH TOCTOU guard so future sessions can still
-        // be recovered if needed.
-        mod::ResetCrashRecoveryState();
-
-        // Force game mode to 0 (title screen).  On the next main-loop
-        // iteration, HookedTitleUpdateImplBody runs, detects
-        // g_revivalExitIntercepted, calls ConsumeRevivalExitInterception
-        // (which does full teardown: terminate helper, restore patches,
-        // ForceLocalPlayInit, disable text), and re-enters the netplay menu.
-        netplay::bridge::ForceGameModeToTitle();
-
-        // Clear charselect hold state so it doesn't carry over.
-        g_charSelectEntryHoldActive = false;
-        g_charSelectEntryHoldArmed = false;
-        g_charSelectEntryHoldFramesRemaining = 0;
-
-        // ExitProcess interception flag is already set; skip this frame and
-        // let the title-screen update consume/cleanup in a clean state.
-        return 0;
-    }
-
-    const char result = HookedCharSelectUpdateImplBody(screenContext);
-    netplay::bridge::takeover::g_netplayUiJmpActive = false;
-    return result;
-}
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-
-// ---------------------------------------------------------------------------
-// HookedTitleUpdateImpl — dispatches to HookedTitleUpdateImplBody.
+// HookedTitleUpdateImpl - dispatches to HookedTitleUpdateImplBody.
 //
 // ExitProcess interception no longer uses longjmp.  The DLL call-site
 // patches (SaveAndApplyDllExitProcessPatches) make ExitProcess unreachable
@@ -821,10 +664,18 @@ extern "C" char __cdecl HookedCharSelectUpdateImpl(uint32_t screenContext)
 // ---------------------------------------------------------------------------
 extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 {
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(
+            &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+        static_cast<LONG>(GetCurrentThreadId()));
     netplay::bridge::takeover::g_netplayUiJmpActive = true;
     if (setjmp(netplay::bridge::takeover::g_netplayUiJmpBuf) != 0)
     {
         netplay::bridge::takeover::g_netplayUiJmpActive = false;
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(
+                &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+            0);
         mod::Log("HookedTitleUpdateImpl: recovered from ExitProcess via ui longjmp");
         // ExitProcess interception flag is already set; skip this frame and let
         // the next title update consume/cleanup in a clean state.
@@ -833,20 +684,63 @@ extern "C" char __cdecl HookedTitleUpdateImpl(uint32_t screenContext)
 
     const char result = HookedTitleUpdateImplBody(screenContext);
     netplay::bridge::takeover::g_netplayUiJmpActive = false;
+    InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(
+            &netplay::bridge::takeover::g_netplayUiJmpOwnerThreadId),
+        0);
     return result;
 }
 
 extern "C" BOOL __cdecl HookedTitleRenderImpl(uint32_t screenContext)
 {
+    LogTitleRenderRecoveryPendingIfDue(screenContext);
+
+    netplay::bridge::recovery::ObserveGameplayExitRecoveryProgress(
+        0,
+        -1,
+        -1);
+
+    const bool traceRecoveryRender =
+        g_recoveryRenderTraceFramesRemaining > 0
+        || netplay::bridge::recovery::HasPendingGameplayExitMenuEntry()
+        || netplay::bridge::frontend_return::HasPendingReturn();
+    const char* path = "original_title";
+    BOOL result = FALSE;
     if (g_netplayMenuState.active && g_useRuntimeTextOverlay)
     {
-        return RenderNetplayMenuRuntimeText(screenContext);
+        path = "netplay_runtime";
+        result = RenderNetplayMenuRuntimeText(screenContext);
     }
-    if (g_netplayMenuState.active && g_netplayMenuState.useConfigStyleRender)
+    else if (g_netplayMenuState.active && g_netplayMenuState.useConfigStyleRender)
     {
-        return RenderNetplayMenuConfigStyle(screenContext);
+        path = "netplay_config";
+        result = RenderNetplayMenuConfigStyle(screenContext);
     }
-    return GetOriginalTitleRender()(screenContext);
+    else
+    {
+        result = GetOriginalTitleRender()(screenContext);
+        // (The HOSTING indicator outside the netplay menu is drawn by the ImGui
+        // top-middle badge via the D3D9 EndScene hook, not the indexed surface.)
+    }
+
+    if (traceRecoveryRender && kEnableGameplayExitRecoveryRenderDiagnostics)
+    {
+        ++g_titleRenderRecoveryTraceCall;
+        mod::Log(
+            "TITLE_RENDER_RECOVERY_TRACE call=%u path=%s result=%d",
+            g_titleRenderRecoveryTraceCall,
+            path,
+            result ? 1 : 0);
+        if (std::strcmp(path, "original_title") == 0)
+        {
+            mod::Log("TITLE_RENDER_RECOVERY_WRONG_PATH path=original_title");
+        }
+        if (g_recoveryRenderTraceFramesRemaining > 0)
+        {
+            --g_recoveryRenderTraceFramesRemaining;
+        }
+    }
+    return result;
 }
 
 #if defined(_M_IX86)
@@ -930,29 +824,16 @@ extern "C" __declspec(naked) void HookedTitleRenderThunk()
     }
 }
 
-extern "C" __declspec(naked) void HookedCharSelectUpdateThunk()
-{
-    __asm
-    {
-        push ecx
-        call HookedCharSelectUpdateImpl
-        add esp, 4
-        ret
-    }
-}
-
-extern "C" __declspec(naked) void HookedReplayScreenUpdateThunk()
-{
-    __asm
-    {
-        push ecx
-        call HookedReplayScreenUpdateImpl
-        add esp, 4
-        ret
-    }
-}
 #endif
 } // namespace netplay::hooks::internal
+
+namespace netplay::hooks
+{
+bool IsNetplayMenuActive()
+{
+    return internal::g_netplayMenuState.active;
+}
+} // namespace netplay::hooks
 
 namespace netplay
 {

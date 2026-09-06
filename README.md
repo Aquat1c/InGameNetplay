@@ -19,61 +19,109 @@ This project does **not** embed Concerto itself. Instead, it reimplements the re
 
 ## Installation
 
-- Build the DLL from source (see Building) or download a release.
-- Install EFZ Mod Manager if it's not installed already:
-  - EFZ Mod Manager download: https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing
-- Place `efz_netplay_mod.dll` in your EFZ mods folder, alongside the other mod assets.
-  Example path:
-  `EFZ\\mods\\efz_netplay_mod\\efz_netplay_mod.dll`
-- Edit `EfzModManager.ini` and add:
-  - `efz_netplay_mod=1`
-- Launch the game through `efz.exe`.
-  Do not start the mod through `EfzRevival.exe` or `Concerto.exe`; this project expects to be injected into the main game process and can crash if started from those executables directly.
-- After installing, a new `NETPLAY` option should appear on the title screen.
+1. **Get the mod DLL and assets**
+   - Build from source (see **Build** below), or download a release from [GitHub Releases](https://github.com/Aquat1c/InGameNetplay/releases).
+   - You need both `efz_netplay_mod.dll` and the bundled `assets\` folder (menu backgrounds, object sheet, optional alert sound, Battle Log portraits, etc.). A release package or a local build's `assets\deploy\` folder contains the files to copy.
 
-## Expected Mod Folder Layout
+2. **Install EFZ Mod Manager** (if you don't have it already)
+   - Download: [EFZ Mod Manager spreadsheet](https://docs.google.com/spreadsheets/d/1r0nBAaQczj9K4RG5zAVV4uXperDeoSnXaqQBal2-8Us/edit?usp=sharing)
 
-At minimum, the mod expects this structure next to the DLL:
+3. **Place the mod in your game directory**
 
-```text
-mods\efz_netplay_mod\
-  efz_netplay_mod.dll
-  assets\
-    netplay_bg.dat
-    netplay_ob.dat
-```
+   The mod expects this layout inside your game folder (where `efz.exe` lives):
 
-Common optional files:
+   ```text
+   EFZ/                              ← your game folder
+   ├── efz.exe
+   ├── EfzRevival.dll                ← required for online play
+   ├── EfzRevival.exe                ← required for online play
+   ├── EfzRevival.ini
+   ├── EfzModManager.ini             ← mod enable list (edit this)
+   └── mods/
+       └── efz_netplay_mod/          ← mod folder (name matches the DLL)
+           ├── efz_netplay_mod.dll
+           └── assets/
+               ├── netplay_bgd.dat
+               ├── netplay_bgn.dat
+               ├── netplay_ob.dat
+               ├── res_alert.wav      ← optional
+               └── sprites/           ← optional Battle Log portraits
+                   ├── akane.png
+                   ├── akiko.png
+                   └── ...
+   ```
 
-```text
-mods\efz_netplay_mod\
-  assets\
-    res_alert.wav
-    sprites\
-      akane.png
-      akiko.png
-      ayu.png
-      ...
-      unknown.png
-  wave\
-    bgm\
-      bgm08.wav
-  system\
-    title_ob.dat
-```
+   Example full path: `EFZ\mods\efz_netplay_mod\efz_netplay_mod.dll`
 
-What they are used for:
-- `assets\netplay_bg.dat` - netplay menu background
-- `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
-- `assets\res_alert.wav` - custom lobby challenge alert sound
-- `assets\sprites\*.png` - Battle Log character portraits
-- `wave\bgm\bgm08.wav` - optional netplay menu BGM override with proper loop information; this project may be packaged with a replacement based on track 14 from `ONE.` (2023)
-- `system\title_ob.dat` - optional title object-sheet override
+   Optional mod-local overrides (same folder as the DLL):
 
-Fallback behavior:
-- If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
-- If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`(EFZ Bad Moon edition character selection OST).
-- Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
+   ```text
+   mods\efz_netplay_mod\
+     wave\
+       bgm\
+         bgm08.wav                    ← optional netplay menu BGM override
+     system\
+       title_ob.dat                   ← optional title object-sheet fallback
+   ```
+
+   What the bundled assets are used for:
+   - `assets\netplay_bgd.dat` - daytime netplay menu background (09:00–17:59 local PC time)
+   - `assets\netplay_bgn.dat` - nighttime netplay menu background (18:00–08:59)
+   - `assets\netplay_ob.dat` - netplay menu object/title-sheet UI graphics
+   - `assets\res_alert.wav` - custom lobby challenge alert sound
+   - `assets\sprites\*.png` - Battle Log character portraits
+   - `wave\bgm\bgm08.wav` - optional menu BGM override with proper loop info
+   - `system\title_ob.dat` - optional title object-sheet override
+
+   Fallback behavior:
+   - If `assets\netplay_ob.dat` is missing, the mod tries other object-sheet candidates and eventually falls back to vanilla `system\title_ob.dat`.
+   - If `wave\bgm\bgm08.wav` is missing, the mod falls back to vanilla `wave\bgm\bgm08.wav`.
+   - Under Wine / Proton, the same files are also searched through mod-relative fallback paths.
+
+4. **Enable the mod in `EfzModManager.ini`**
+
+   Open `EfzModManager.ini` in your **game folder** (next to `efz.exe`, not inside `mods/`) and add:
+
+   ```ini
+   efz_netplay_mod=1
+   ```
+
+   If other mods are already listed, add this line alongside them.
+
+5. **Launch the game**
+
+   You can launch through either **`efz.exe`** or an exact supported
+   **`EfzRevival.exe` + `EfzRevival.dll` pair**. EFZ Mod Manager loads the mod
+   into the resulting `efz.exe` process in both cases.
+
+   `efz.exe` remains the normal entry point for the integrated in-game menu.
+   When launched through `EfzRevival.exe`, the mod detects and adopts the
+   already-created Online/Spectator session without calling Revival's exported
+   `init` a second time. Practice is observed passively. An exact Tournament
+   option-6 session is also attached without a duplicate init: Revival keeps
+   its native auto-navigation, while the mod installs its title UI and a
+   managed return-to-title path. Modified, mismatched, or unsupported
+   launcher/DLL pairs fail closed instead of receiving fixed-address hooks.
+
+   Launcher-first Tournament attachment has source/byte-level support for the
+   exact 1.02e, 1.02f, 1.02f-framestepping, 1.02g, 1.02h, 1.02i, and 1.02j
+   pairs. Live testing has exercised 1.02j only so far; the automated natural
+   return could not be completed because EFZ was configured for a controller
+   that was not plugged in. Treat the other versions, and natural return, as
+   not yet live-qualified.
+
+   Tournament selected from a regular `efz.exe` launch remains a separate
+   mod-managed path; it does not use the option-6 existing-session attachment.
+
+   `Concerto.exe` is not a supported entry point.
+
+   After a successful install, a new **`NETPLAY`** option should appear on the title screen.
+
+**First Run**
+- Open **NETPLAY** from the title screen to reach the in-game host/join/lobby flow.
+- The mod writes `efz_netplay_mod.log` next to the DLL (`mods\efz_netplay_mod\`). File logging can be toggled from **Options → Others** in the netplay menu.
+- Nickname, port, and most online settings are read from / saved to `EfzRevival.ini` in the game folder. You do not need to drive the old Revival console window during normal use.
+- A `native_host\` subfolder may appear under the mod folder for captured Revival-side logs during host sessions.
 
 ## Current Feature Set
 
@@ -90,6 +138,7 @@ Online flow:
 - Integrated Revival takeover bridge
 - Host / Join / Spectate session startup from the in-game menu
 - Delay prompt overlay and connected-session handoff back into EFZ
+- **Async hosting** - start a host listener, minimize the overlay, and keep using EFZ while waiting (see **Async Hosting** below)
 - Cancel / disconnect / recovery paths back into the netplay menu
 - Runtime state export for companion mods/tools
 
@@ -116,17 +165,77 @@ Options:
   - `WriteLogFile`
   - `EnableConsole`
   - `EnableDebugMenu`
+  - `VerboseBridgePatchLogging`
+  - `VerboseSyncDiagnostics`
+  - `VerboseRevival102jLifecycleLogging`
   - `HideEmptySetsInBattleLog`
-- `About` modal with version/build information
+  - `AsyncHostReturnKey` - hotkey to return to the HOST menu (or rehost) while async hosting is minimized (default: `F1`)
+  - `CheckForUpdates` - once per launch (first netplay menu visit) look up the newest GitHub release in the background and show `[!]` next to `OPTIONS` and `About` while a newer version is out; opening `About` clears the badge until the next release (default: `1`)
+- `About` modal with version/build information (and the newest GitHub release when it is newer than the running build)
 
 Netplay menu theming:
 - The menu background theme is currently read from `EfzRevival.ini` under `[NetplayMenu]` with `Theme=scroll` or `Theme=classic`.
-- The `scroll` theme uses a wrapped horizontal pan and expects `assets\netplay_bg.dat` to decode as `320x240`; unsupported background sizes fall back to the classic static draw.
+- The active background is selected from local PC time: `assets\netplay_bgd.dat` from 09:00 through 17:59, and `assets\netplay_bgn.dat` from 18:00 through 08:59.
+- The `scroll` theme uses a wrapped horizontal pan and expects the selected background DAT to decode as `320x240`; unsupported background sizes fall back to the classic static draw.
 
 Logging and diagnostics:
 - Logger banner includes version and build timestamp
 - Optional console and optional file logging
 - Crash handler writes crash logs / diagnostics
+
+## Async Hosting
+
+Async hosting lets you **start a host session and keep playing EFZ** while the listener waits for an opponent. The host process stays alive in the background; you are not stuck on the hosting overlay.
+
+### Quick flow
+
+```text
+NETPLAY → Host → start hosting
+→ full HOSTING panel shows your IP / port
+→ D: minimize - listener stays open, small badge appears
+→ browse the netplay menu, leave to title, or play offline/practice
+→ opponent connects - badge changes to OPPONENT FOUND!
+→ return to the full HOST overlay (select Host, or press F1 from outside the menu)
+→ normal delay setup runs, then charselect / match as usual
+```
+
+### While waiting for an opponent
+
+- The full **HOSTING** panel shows your public IP and port (press **C** to copy).
+- **D** minimizes hosting: the overlay collapses to a small top-right badge (`HOSTING`) and you return to the main netplay menu. The listener **stays active**.
+- You can browse **Battle Log**, **Options**, and other netplay pages, or leave the netplay menu entirely - hosting is **not** cancelled when you exit the menu.
+- Select **Host** again (or re-enter NETPLAY) to restore the full hosting panel.
+
+### When an opponent connects
+
+- The mod **holds** Revival at the delay prompt instead of jumping straight into the delay overlay.
+- The badge updates to **OPPONENT FOUND!**
+- Once the full HOST overlay is visible again, accept happens automatically and the normal delay-setup / handoff flow continues.
+- If you are outside the netplay menu (title screen, practice, etc.), press the **return hotkey** (default **F1**) to drive back to the HOST menu; a held opponent is accepted on arrival.
+
+### Controls and settings
+
+| Action | Input |
+|---|---|
+| Minimize hosting (keep listening) | **D** on the full HOSTING panel |
+| Cancel hosting | **B** / **Esc** on the full HOSTING panel |
+| Copy IP:port | **C** on the full HOSTING panel |
+| Return to HOST menu from gameplay / title | **F1** (default; configurable) |
+
+Configure the return hotkey under **Options → Others → AsyncHostReturnKey** in the netplay menu (saved to `EfzRevival.ini` as a `DIK_*` keyboard binding).
+
+### Indicators
+
+- **Inside the netplay menu** (minimized): a small indexed badge in the top-right - `HOSTING`, `OPPONENT FOUND!`, or `TIMED OUT`.
+- **Outside the netplay menu** (minimized): a top-center on-screen message with the same state (e.g. `Hosting... Press F1 to return to HOST menu`).
+
+### Conflicts and cancellation
+
+- Starting **Join**, **Lobby**, or **Player Rooms** while async hosting is active shows a **Stop hosting?** confirmation. Choose **Stop hosting** to proceed, or **Keep hosting** to stay listening.
+- **B** / **Esc** on the full hosting panel cancels the listener.
+- If a connected opponent drops before you accept, the mod **auto-rehosts** on the same port so you return to waiting without manual restart.
+
+Companion mods can read async-host state through the shared export (`EFZ_CAP_ASYNC_HOST`: active, minimized, peer found, timed out, host port). See **Shared Netplay Exports** below.
 
 ## How Revival Is Used
 
@@ -144,20 +253,71 @@ What this means for a regular player:
 - you still need a supported `EfzRevival` installation in your EFZ folder
 - you do **not** need to manually drive the old Revival console flow during normal use
 - the in-game menu is the intended front end, while Revival runs behind it
-- always launch through `efz.exe`, not `EfzRevival.exe` or `Concerto.exe`
+- launch through `efz.exe` for the integrated flow, or through an exact
+  supported `EfzRevival.exe` when you intentionally want Revival's native
+  launcher flow; `Concerto.exe` remains unsupported
+- adopted Online/Spectator disconnect recovery, and the managed
+  launcher-first Tournament completion path, keep the game process alive and
+  route it back toward the title/netplay UI instead of accepting Revival's
+  normal child-process exit
 
 ## Supported Revival Versions
 
 Supported `EfzRevival.dll` versions:
 - `1.02e`
 - `1.02f`
+- `1.02f-framestepping`
 - `1.02g`
-- `1.02h!!!`
-- `1.02i!!!`
+- `1.02h`
+- `1.02i`
+- `1.02j`
 
 Notes:
-- `1.02h!!!` and `1.02i!!!` are the most tested versions.
-- Unsupported Revival builds fail safely with log output instead of applying unknown hooks.
+- `1.02h` and `1.02i` remain the most exercised legacy builds.
+- `1.02j` uses its own MinGW-specific object, vtable, and lifecycle profile.
+- Launcher-first admission requires the catalogued exact EXE/DLL fingerprint
+  for the selected version; unsupported or modified builds stay passive with
+  log output instead of receiving unknown hooks.
+- After a committed launcher-first Online/Spectator session ends, the exact
+  admitted `EfzRevival.exe` parent is terminated and its exit is confirmed
+  before another online attempt is admitted. This closes Revival's terminal
+  pause window and releases its native singleton; admission failures still
+  leave the native launcher untouched.
+- Launcher-first Tournament option 6 validates the exact role-3 object/vtable,
+  native bootstrap and Tournament trampolines, and the remaining suffix of
+  Revival's canonical 22-input auto-navigation queue before attaching. Its
+  survival and title/UI hooks are installed without calling exported init
+  again.
+- The role-3 attach journals the four pre-Revival EFZ patch ranges, parks one
+  acknowledged game-thread tick, revalidates the native state, and installs
+  only the profile's Tournament return Jcc plus the child `ExitProcess` IAT
+  interception before completing title/UI control-plane hooks. Return cleanup
+  restores the journal and exact object ownership transactionally before
+  publishing the Practice/title baseline.
+- Tournament option-6 source and byte contracts cover every version listed
+  above, but live validation currently covers 1.02j only. The configured
+  controller being unplugged prevented an automated natural-return test, so
+  that end-to-end return is not yet claimed as live-verified.
+
+## Online Simulation Cadence
+
+EFZ's native battle update, character-select update, render/present sequence,
+effect-ring walk, and RNG rules are left unchanged. Before an online handoff,
+the mod verifies that its ImGui/EndScene and loading/battle/result update hooks
+are removed and that live-memory state export is quiescent. Host-side Revival
+log IAT capture is disabled; the injected helper owns console parsing and must
+acknowledge that its worker is ready before the helper is resumed.
+
+Launcher-first Online/Spectator adoption keeps its acknowledged native tick
+parked through state-export initialization and title-hook installation. The
+same UI/export barrier then completes outside the bridge mutex before that
+single invocation is released, so launcher-first and in-menu handoffs enter
+simulation with the same recurring-work boundary.
+
+Diagnostic disk flushing and post-join lobby keepalive/public-IP work run below
+the normal-priority EFZ simulation thread. Their queueing, polling intervals,
+and server-visible behavior are unchanged. The `xp-native-tick` preset is the
+strict A/B arm: it also leaves Revival's native per-frame tick target untouched.
 
 ## Shared Netplay Exports
 
@@ -168,7 +328,7 @@ Public interface:
 - Header: `include/efz_netplay_state.h`
 - Named shared memory block: `EFZNetplay_State`
 - DLL export: `EFZNetplay_GetState()`
-- Current ABI version: `6`
+- Current ABI version: `7`
 
 Consumer expectations:
 - Validate `magic == EFZ_NETPLAY_STATE_MAGIC`
@@ -186,14 +346,20 @@ Exported state currently includes:
 - activity phase and last end reason
 - online character-select state
 - match context such as stage, round index, and timer
+- async hosting state (listener active, minimized, peer found, timed out, host port)
 
-The shared state is refreshed continuously while the mod is active, which makes
-it suitable for rich presence, overlays, stream tooling, and companion mods.
+The shared state is published from safe control-plane activity. Immediately
+before online handoff, the final accepted menu-side request is drained and the
+export worker is suspended. It is intentionally not refreshed from the active
+rollback-frame hook, so battle metrics can remain at that last pre-handoff
+value until control returns to the menu. Consumers should use `stateSeq` and
+`lastUpdateTick` to judge freshness.
 
 ## Runtime Assets
 
 DLL-relative assets:
-- `<dll_folder>\\assets\\netplay_bg.dat`
+- `<dll_folder>\\assets\\netplay_bgd.dat`
+- `<dll_folder>\\assets\\netplay_bgn.dat`
 - `<dll_folder>\\assets\\netplay_ob.dat`
 - `<dll_folder>\\assets\\res_alert.wav`
 - `<dll_folder>\\assets\\netplay_font_map.txt` (optional)
@@ -219,6 +385,15 @@ Linux / Wine / Proton notes:
 
 ## Build
 
+Initialize the tracked mbedTLS dependency after cloning:
+
+```powershell
+git submodule update --init --recursive
+```
+
+MinHook must be available at `third_party/minhook` or in the sibling
+`../InGameControlsRebind/third_party/minhook` checkout.
+
 Configure and build:
 
 ```powershell
@@ -231,6 +406,13 @@ XP-compatible build:
 ```powershell
 cmake --preset xp-release
 cmake --build --preset build-xp-release
+```
+
+Strict native-tick parity build:
+
+```powershell
+cmake --preset xp-native-tick
+cmake --build --preset build-xp-native-tick
 ```
 
 Result:

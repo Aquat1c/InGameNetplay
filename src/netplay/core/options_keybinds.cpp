@@ -268,6 +268,17 @@ bool IsBindableValue(const std::string& value)
     return IsKeyboardBindingValue(value) || IsPadBindingValue(value);
 }
 
+int VirtualKeyForBindingValue(const std::string& value)
+{
+    if (!IsKeyboardBindingValue(value))
+    {
+        return 0;
+    }
+    const std::string upper = ToUpperAscii(value);
+    const BindingEntry* entry = FindByDikName(upper);
+    return entry != nullptr ? entry->virtualKey : 0;
+}
+
 std::string NormalizeBindingValue(const std::string& value)
 {
     if (!IsBindableValue(value))

@@ -5,32 +5,72 @@
 #include "crash_handler.h"
 #include "logger.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
+#include "netplay/interop/palette_charselect.h"
+#include "netplay/interop/overlay_helper_hooks.h"
 
 namespace
 {
+volatile LONG g_passiveInitialization = 0;
+
 DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
 {
     const auto moduleHandle = static_cast<HMODULE>(moduleHandleRaw);
-    netplay::mod_settings::Reload();
-    mod::InitializeLogger(
-        moduleHandle,
-        netplay::mod_settings::IsConsoleEnabled(),
-        netplay::mod_settings::IsFileLoggingEnabled());
-    mod::InstallCrashHandlers(moduleHandle, false);
-    mod::Log("Module attached at %p", moduleHandle);
-
-    netplay::bridge::Initialize();
-
-    if (!netplay::InstallHooks())
+    bool startupCompleted = false;
+    __try
     {
-        mod::Log("InstallHooks failed");
+        netplay::mod_settings::Reload();
+        mod::InitializeLogger(
+            moduleHandle,
+            netplay::mod_settings::IsConsoleEnabled(),
+            netplay::mod_settings::IsFileLoggingEnabled());
+        mod::InstallCrashHandlers(moduleHandle, false);
+        mod::Log("Module attached at %p", moduleHandle);
+
+        if (!netplay::bridge::Initialize())
+        {
+            mod::Log(
+                "Bridge initialization stayed passive; skipping all game/UI hooks");
+            InterlockedExchange(&g_passiveInitialization, 1);
+            mod::UninstallCrashHandlers();
+            mod::ShutdownLogger();
+            return 0;
+        }
+
+        const bool hooksInstalled = netplay::InstallHooks();
+        if (!hooksInstalled)
+        {
+            mod::Log("InstallHooks failed");
+        }
+        else
+        {
+            mod::Log("InstallHooks succeeded");
+        }
+        if (!netplay::bridge::CompleteLauncherUiAttachment(hooksInstalled))
+        {
+            mod::Log(
+                "Launcher UI attachment boundary completion failed");
+        }
+        // Mod-interop overlay palettes (gated by OnlineCustomColors; Stage-1
+        // loopback additionally gated by ModInteropLoopback). Inert no-op when
+        // the flags are off.
+        (void)netplay::interop::charselect::Install();
+        startupCompleted = true;
     }
-    else
+    __finally
     {
-        mod::Log("InstallHooks succeeded");
+        if (!startupCompleted)
+        {
+            // A blind timeout is unsafe while title code may be mid-patch.
+            // The worker's SEH termination handler is the only asynchronous
+            // release authority: it publishes managed recovery first, then
+            // atomically quarantines a still-pending adopted tick.
+            netplay::bridge::EmergencyQuarantineLauncherUiAttachment();
+        }
     }
 
     return 0;
@@ -46,6 +86,21 @@ DWORD WINAPI InitializeInjectedThread(LPVOID moduleHandleRaw)
     mod::InstallCrashHandlers(moduleHandle, true);
     mod::Log("Module attached in EfzRevival.exe (injected takeover mode)");
     netplay::bridge::InitializeInjectedProcess();
+    // Helper-side piggyback for the mod-interop overlay channel. Gated by
+    // OnlineCustomColors; observe-only on RX so it cannot disturb Revival's netcode.
+    (void)netplay::interop::helper_hooks::Install();
+    return 0;
+}
+
+// External-launcher guard process = EfzRevival.exe (it owns the netcode socket),
+// but it takes the guard path in DllMain and skips InitializeInjectedThread - so
+// the online-custom-colors piggyback hooks would never install there (spectators
+// and any externally-launched player). Load settings + install off the loader
+// lock. helper_hooks::Install() self-gates on OnlineCustomColors + IsRevival.
+DWORD WINAPI GuardHelperInstallThread(LPVOID /*moduleHandleRaw*/)
+{
+    netplay::mod_settings::Reload();
+    (void)netplay::interop::helper_hooks::Install();
     return 0;
 }
 
@@ -71,11 +126,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
     {
         DisableThreadLibraryCalls(hModule);
 
+        // An externally launched, mod-owned Revival session injects this DLL
+        // back into its verified parent solely to neutralize one exact cleanup
+        // TerminateProcess call. Detect that marker before Wine's broad IAT
+        // patch or the ordinary injected-helper bootstrap can run.
+        if (netplay::bridge::takeover::TryStartExternalLauncherGuardProcess())
+        {
+            // This guard process is EfzRevival.exe (the netcode socket owner). The
+            // normal injected-helper path is skipped here, so install the online-
+            // custom-colors piggyback hooks on a worker thread (never in DllMain).
+            HANDLE guardInstall = CreateThread(
+                nullptr, 0, GuardHelperInstallThread, hModule, 0, nullptr);
+            if (guardInstall != nullptr)
+            {
+                CloseHandle(guardInstall);
+            }
+            break;
+        }
+
         if (netplay::bridge::IsCurrentProcessRevival())
         {
             // Under Wine/Proton the helper process is NOT created suspended,
             // so main() will start as soon as the loader lock is released.
-            // Patch the EXE's IAT right here — inside DllMain — so all
+            // Patch the EXE's IAT right here - inside DllMain - so all
             // import entries point to our stubs BEFORE main() can call
             // ReadConsoleA, CreateProcessA, etc. through the original IAT.
             // This eliminates the race between main() and the host-side
@@ -93,6 +166,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
             break;
         }
 
+        // In launcher-first mode, native Revival installs its Tournament EXE
+        // hooks immediately after this DllMain returns. Preserve the actual
+        // preimage now so later managed cleanup restores prior mod ownership
+        // instead of guessing stock bytes.
+        netplay::bridge::takeover::
+            CaptureTournamentExePreimageAtProcessAttach();
+
         HANDLE thread = CreateThread(nullptr, 0, InitializeModThread, hModule, 0, nullptr);
         if (thread != nullptr)
         {
@@ -101,11 +181,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
         break;
     }
     case DLL_PROCESS_DETACH:
+        if (netplay::bridge::takeover::IsExternalLauncherGuardProcess())
+        {
+            netplay::bridge::takeover::ShutdownExternalLauncherGuardProcess();
+            break;
+        }
+
         if (netplay::bridge::IsCurrentProcessRevival())
         {
             netplay::bridge::ShutdownInjectedProcess();
             mod::UninstallCrashHandlers();
             mod::ShutdownLogger();
+            break;
+        }
+
+        // A fail-closed launcher admission already unwound the transient
+        // logger/crash-handler setup and installed no game/UI hooks.
+        if (InterlockedCompareExchange(
+                &g_passiveInitialization, 0, 0) != 0)
+        {
             break;
         }
 

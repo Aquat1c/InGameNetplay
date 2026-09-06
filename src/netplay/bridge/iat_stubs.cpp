@@ -1,6 +1,8 @@
 // IAT stub implementations and extern "C" nb_stub_* wrappers.
 
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
 #include "crash_handler.h"
 
 #include <array>
@@ -131,6 +133,140 @@ static bool HasLogEfzBaseNameW(LPCWSTR path)
     return _wcsicmp(baseName, L"logEfz.txt") == 0;
 }
 
+static bool HasLogNetBaseNameA(LPCSTR path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+
+    const char* baseName = path;
+    for (const char* p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "logNet.txt") == 0;
+}
+
+static bool HasLogNetBaseNameW(LPCWSTR path)
+{
+    if (path == nullptr || path[0] == L'\0')
+    {
+        return false;
+    }
+
+    const wchar_t* baseName = path;
+    for (const wchar_t* p = path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _wcsicmp(baseName, L"logNet.txt") == 0;
+}
+
+static HANDLE RegisterCreatedConsoleFileA(HANDLE handle, LPCSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != '\0')
+    {
+        captureAsTextLog = IsLikelyRevivalDiskLogPath(std::string(path));
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
+static HANDLE RegisterCreatedConsoleFileW(HANDLE handle, LPCWSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != L'\0')
+    {
+        const int utf8Bytes = WideCharToMultiByte(
+            CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Bytes > 1)
+        {
+            std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+            if (WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    path,
+                    -1,
+                    utf8.data(),
+                    utf8Bytes,
+                    nullptr,
+                    nullptr) > 0)
+            {
+                utf8.resize(static_cast<size_t>(utf8Bytes - 1));
+                captureAsTextLog = IsLikelyRevivalDiskLogPath(utf8);
+            }
+        }
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
+// The helper EXE opens logNet.txt with a truncating disposition at every
+// session start, so each session erases the previous one's network log.
+// Detect a truncating write open of logNet.txt and convert it to an
+// appending one: same path and access, OPEN_ALWAYS instead of truncate,
+// file pointer moved to end, plus a separator line so sessions stay
+// readable.  Only the disposition changes - the mod's WriteFile capture
+// keys on the handle/path and is unaffected.
+static bool IsTruncatingWriteOpen(DWORD desiredAccess, DWORD creationDisposition)
+{
+    const bool wantsWrite =
+        (desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    const bool truncates =
+        creationDisposition == CREATE_ALWAYS
+        || creationDisposition == TRUNCATE_EXISTING;
+    return wantsWrite && truncates;
+}
+
+static void SeekEndAndWriteLogNetSessionSeparator(HANDLE handle)
+{
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    const DWORD endPos = SetFilePointer(handle, 0, nullptr, FILE_END);
+    if (endPos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
+    {
+        return;
+    }
+    if (endPos == 0)
+    {
+        // Fresh file - no separator needed.
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    char separator[128] = {};
+    const int len = std::snprintf(
+        separator,
+        sizeof(separator),
+        "\r\n===== new session %04u-%02u-%02u %02u:%02u:%02u pid=%lu =====\r\n",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned long>(GetCurrentProcessId()));
+    if (len > 0)
+    {
+        DWORD written = 0;
+        (void)WriteFile(handle, separator, static_cast<DWORD>(len), &written, nullptr);
+    }
+}
+
 static std::string GetNativeShadowLogEfzPathA()
 {
     const std::string dir = GetTakeoverModuleDirectoryA();
@@ -140,7 +276,12 @@ static std::string GetNativeShadowLogEfzPathA()
     }
 
     const char* const subdir = IsCurrentProcessRevival() ? "native_revival" : "native_host";
-    const std::string shadowDir = dir + "\\" + subdir;
+    const std::string logsDir = dir + "\\logs";
+    if (!EnsureDirectoryExistsA(logsDir))
+    {
+        return {};
+    }
+    const std::string shadowDir = logsDir + "\\" + subdir;
     if (!EnsureDirectoryExistsA(shadowDir))
     {
         return {};
@@ -158,7 +299,12 @@ static std::wstring GetNativeShadowLogEfzPathW()
     }
 
     const wchar_t* const subdir = IsCurrentProcessRevival() ? L"native_revival" : L"native_host";
-    const std::wstring shadowDir = dir + L"\\" + subdir;
+    const std::wstring logsDir = dir + L"\\logs";
+    if (!EnsureDirectoryExistsW(logsDir))
+    {
+        return {};
+    }
+    const std::wstring shadowDir = logsDir + L"\\" + subdir;
     if (!EnsureDirectoryExistsW(shadowDir))
     {
         return {};
@@ -214,14 +360,30 @@ __declspec(naked) static void DummyVtableRet8()
 }
 
 #else
-// Fallback for non-MSVC or x64 — should never be reached in practice.
+// Fallback for non-MSVC or x64 - should never be reached in practice.
 static int  __cdecl DummyVtableRet()    { return 0; }
 static int  __cdecl DummyVtableRet4()   { return 0; }
 static int  __cdecl DummyVtableRet8()   { return 0; }
 #endif
 
-static uintptr_t g_revivalDummyVtable[9] = { 0 };
+static uintptr_t g_revivalLegacyDummyVtable[9] = { 0 };
+static uintptr_t g_revival102jDummyVtable[10] = { 0 };
+static uintptr_t g_revival102jCompactDummyVtable[10] = { 0 };
 static bool g_dummyVtableInitialized = false;
+
+// The session and its original vtable must survive vtable neutralization.
+// DestroyCurrentSession consumes this identity before choosing a deleting
+// destructor.  Pointer exchanges are atomic on both supported Win32 and
+// diagnostic x64 builds.
+static PVOID volatile g_neutralizedSession = nullptr;
+static PVOID volatile g_neutralizedOriginalVtable = nullptr;
+
+static bool IsActiveRevival102jForVtable()
+{
+    return g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
+}
 
 static void EnsureDummyVtable()
 {
@@ -234,21 +396,62 @@ static void EnsureDummyVtable()
     const uintptr_t ret4 = reinterpret_cast<uintptr_t>(DummyVtableRet4);
     const uintptr_t ret8 = reinterpret_cast<uintptr_t>(DummyVtableRet8);
 
-    g_revivalDummyVtable[0] = ret4; // [0] destructor
-    g_revivalDummyVtable[1] = ret;  // [1] init
-    g_revivalDummyVtable[2] = ret;  // [2] tick
-    g_revivalDummyVtable[3] = ret4; // [3] hotkey
-    g_revivalDummyVtable[4] = ret8; // [4] input
-    g_revivalDummyVtable[5] = ret4; // [5] net data
-    g_revivalDummyVtable[6] = ret8; // [6] character
-    g_revivalDummyVtable[7] = ret8; // [7] action
-    g_revivalDummyVtable[8] = ret4; // [8] action
+    g_revivalLegacyDummyVtable[0] = ret4; // [0] deleting destructor
+    g_revivalLegacyDummyVtable[1] = ret;  // [1] init
+    g_revivalLegacyDummyVtable[2] = ret;  // [2] tick
+    g_revivalLegacyDummyVtable[3] = ret4; // [3] hotkey
+    g_revivalLegacyDummyVtable[4] = ret8; // [4] input
+    g_revivalLegacyDummyVtable[5] = ret4; // [5] net data
+    g_revivalLegacyDummyVtable[6] = ret8; // [6] character
+    g_revivalLegacyDummyVtable[7] = ret8; // [7] action
+    g_revivalLegacyDummyVtable[8] = ret4; // [8] action
+
+    // MinGW 1.02j inserted separate full/deleting destructor slots.  Its
+    // post-init and tick methods take no stack arguments; the remaining
+    // logical methods are the legacy slots shifted by one.
+    g_revival102jDummyVtable[0] = ret;  // [0] full destructor
+    g_revival102jDummyVtable[1] = ret;  // [1] deleting destructor
+    g_revival102jDummyVtable[2] = ret;  // [2] post-init
+    g_revival102jDummyVtable[3] = ret;  // [3] tick
+    g_revival102jDummyVtable[4] = ret4; // [4] hotkey
+    g_revival102jDummyVtable[5] = ret8; // [5] input
+    g_revival102jDummyVtable[6] = ret4; // [6] net data
+    g_revival102jDummyVtable[7] = ret8; // [7] character
+    g_revival102jDummyVtable[8] = ret8; // [8] action
+    g_revival102jDummyVtable[9] = ret4; // [9] action
+
+    std::memcpy(
+        g_revival102jCompactDummyVtable,
+        g_revival102jDummyVtable,
+        sizeof(g_revival102jCompactDummyVtable));
+    // Compact routes slots 7 and 8 through one-argument stdcall thunks at
+    // RVAs 0x64610/0x64630; the other J roles use two-argument methods.
+    g_revival102jCompactDummyVtable[7] = ret4;
+    g_revival102jCompactDummyVtable[8] = ret4;
 
     g_dummyVtableInitialized = true;
 }
 
+static uintptr_t* ActiveDummyVtable(
+    uintptr_t originalVtable,
+    uintptr_t revivalBase)
+{
+    if (!IsActiveRevival102jForVtable())
+    {
+        return &g_revivalLegacyDummyVtable[0];
+    }
+    if (g_activeRevival != nullptr
+        && g_activeRevival->tournamentSessionVtableRva != 0
+        && originalVtable
+            == revivalBase + g_activeRevival->tournamentSessionVtableRva)
+    {
+        return &g_revival102jCompactDummyVtable[0];
+    }
+    return &g_revival102jDummyVtable[0];
+}
+
 // ---------------------------------------------------------------------------
-// NeutralizeRevivalSessionVtable — overwrite the Revival DLL's active session
+// NeutralizeRevivalSessionVtable - overwrite the Revival DLL's active session
 // object vtable pointer with the dummy vtable.  This makes every per-frame
 // dispatch a harmless no-op, preventing further ExitProcess triggers.
 // ---------------------------------------------------------------------------
@@ -257,6 +460,10 @@ void NeutralizeRevivalSessionVtable()
     EnsureDummyVtable();
 
     HMODULE revival = g_localRevivalModule;
+    if (revival == nullptr)
+    {
+        revival = GetModuleHandleA("EfzRevival.dll");
+    }
     if (revival == nullptr)
     {
         return;
@@ -275,16 +482,109 @@ void NeutralizeRevivalSessionVtable()
         return;
     }
 
-    // The first DWORD of the session object is the vtable pointer.
-    // A single aligned 4-byte write is atomic on x86.
+    // The first DWORD of the session object is the vtable pointer.  Preserve
+    // the original before replacing it; otherwise cleanup sees only the mod
+    // table and cannot select the real deleting destructor.
     auto* vtableSlot = reinterpret_cast<uintptr_t*>(sessionPtr);
-    *vtableSlot = reinterpret_cast<uintptr_t>(&g_revivalDummyVtable[0]);
+    const uintptr_t originalVtable = *vtableSlot;
+    const uintptr_t dummyVtable =
+        reinterpret_cast<uintptr_t>(ActiveDummyVtable(originalVtable, base));
+    if (originalVtable == dummyVtable
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jCompactDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revivalLegacyDummyVtable[0]))
+    {
+        return;
+    }
+
+    const uintptr_t pendingSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (pendingSession != 0 && pendingSession != sessionPtr)
+    {
+        mod::Log(
+            "NeutralizeRevivalSessionVtable: replacing unconsumed identity "
+            "oldSession=0x%08lX newSession=0x%08lX",
+            static_cast<unsigned long>(pendingSession),
+            static_cast<unsigned long>(sessionPtr));
+    }
+
+    InterlockedExchangePointer(
+        &g_neutralizedOriginalVtable,
+        reinterpret_cast<PVOID>(originalVtable));
+    MemoryBarrier();
+    InterlockedExchangePointer(
+        &g_neutralizedSession,
+        reinterpret_cast<PVOID>(sessionPtr));
+    *vtableSlot = dummyVtable;
+
+    mod::Log(
+        "NeutralizeRevivalSessionVtable: captured session=0x%08lX "
+        "originalVtable=0x%08lX dummyVtable=0x%08lX abi=%s",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable),
+        static_cast<unsigned long>(dummyVtable),
+        IsActiveRevival102jForVtable() ? "mingw10" : "msvc9");
+}
+
+bool RestoreNeutralizedSessionVtableForCleanup(
+    uintptr_t sessionPtr,
+    uintptr_t* outOriginalVtable)
+{
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = 0;
+    }
+    if (sessionPtr == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t capturedSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (capturedSession != sessionPtr)
+    {
+        return false;
+    }
+
+    const uintptr_t originalVtable = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(
+            &g_neutralizedOriginalVtable,
+            nullptr,
+            nullptr));
+    if (originalVtable == 0
+        || !IsWritableRange(reinterpret_cast<void*>(sessionPtr), sizeof(uintptr_t)))
+    {
+        mod::Log(
+            "RestoreNeutralizedSessionVtableForCleanup: invalid capture "
+            "session=0x%08lX originalVtable=0x%08lX",
+            static_cast<unsigned long>(sessionPtr),
+            static_cast<unsigned long>(originalVtable));
+        return false;
+    }
+
+    *reinterpret_cast<uintptr_t*>(sessionPtr) = originalVtable;
+    MemoryBarrier();
+    InterlockedExchangePointer(&g_neutralizedSession, nullptr);
+    InterlockedExchangePointer(&g_neutralizedOriginalVtable, nullptr);
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = originalVtable;
+    }
+    mod::Log(
+        "RestoreNeutralizedSessionVtableForCleanup: restored "
+        "session=0x%08lX originalVtable=0x%08lX",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// ExitProcess interception — installed into EfzRevival.dll's IAT.
+// ExitProcess interception - installed into EfzRevival.dll's IAT.
 //
-// ExitProcess is __noreturn — the compiler emits no valid code past the call.
+// ExitProcess is __noreturn - the compiler emits no valid code past the call.
 // The primary defense against ExitProcess is patching the conditional-jump
 // bytes guarding each call site in the DLL binary (see
 // SaveAndApplyDllExitProcessPatches).  This makes the calls unreachable.
@@ -295,17 +595,23 @@ void NeutralizeRevivalSessionVtable()
 
 typedef VOID (WINAPI *ExitProcessFn)(UINT uExitCode);
 static ExitProcessFn g_realExitProcess = nullptr;
+static ULONG_PTR* g_revivalExitProcessIatSlot = nullptr;
 
 bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
 {
-    HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Quit");
+    const char* const quitWireName = RevivalWireName("Quit");
+    HANDLE hMap = OpenFileMappingA(
+        FILE_MAP_ALL_ACCESS,
+        FALSE,
+        quitWireName);
     if (hMap == nullptr)
     {
         mod::Log(
             "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
-            "OpenFileMappingA('Quit') failed err=%lu",
+            "OpenFileMappingA('%s') failed err=%lu",
             contextTag != nullptr ? contextTag : "",
             static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
             static_cast<unsigned long>(GetLastError()));
         return false;
     }
@@ -318,9 +624,10 @@ bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
         CloseHandle(hMap);
         mod::Log(
             "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
-            "MapViewOfFile('Quit') failed err=%lu",
+            "MapViewOfFile('%s') failed err=%lu",
             contextTag != nullptr ? contextTag : "",
             static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
             static_cast<unsigned long>(mapErr));
         return false;
     }
@@ -381,6 +688,26 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         SafeReadInt(
             reinterpret_cast<const void*>(g_activeRevival->addrGameModeCurrentIndex),
             &currentScreenIndex);
+    }
+
+    // A user-initiated window close (flagged by NetplayWindowProc on
+    // WM_CLOSE/WM_DESTROY, cleared only at the next session start) means this
+    // ExitProcess is a legitimate quit - NOT a peer-death interception. Neutral-
+    // izing it here would suspend this thread forever, leaving a zombie EFZ.exe
+    // (window gone, process dangling, injected consoles never exiting) and
+    // skipping DLL_PROCESS_DETACH cleanup. Pass through to the real ExitProcess
+    // so the process terminates cleanly.
+    if (IsLocalProcessCloseForGameplayStallActive() && g_realExitProcess != nullptr)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: user-initiated close (code=%u role=%d screen=%d "
+            "caller=%s+0x%lX) - passing through to real ExitProcess for clean shutdown",
+            uExitCode, g_localRoleFlag, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva));
+        mod::FlushLoggerSync();
+        g_realExitProcess(uExitCode);
+        // g_realExitProcess is __noreturn; if it ever returns, fall through to
+        // the normal neutralization path below as a safety net.
     }
 
     // First interception: neutralize the session vtable and capture the role.
@@ -444,10 +771,12 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     // set a setjmp recovery point, use longjmp to escape without freezing the
     // main thread.  The title-screen hook will then consume the interception
     // flag and re-enter the netplay menu on the next mode-0 frame.
-    if (g_netplayFrameJmpActive)
+    const DWORD currentThreadId = GetCurrentThreadId();
+    if (g_netplayFrameJmpActive
+        && g_netplayFrameJmpOwnerThreadId == currentThreadId)
     {
         mod::Log(
-            "NeutralizeExitProcess: longjmp — returning control to game "
+            "NeutralizeExitProcess: longjmp - returning control to game "
             "thread (role=%d)",
             g_localRoleFlag);
         g_netplayFrameJmpActive = false;
@@ -460,10 +789,11 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     // error paths, or early desync during charselect), use the UI-update
     // recovery context instead of returning into unknown compiler-generated
     // post-call code.
-    if (g_netplayUiJmpActive)
+    if (g_netplayUiJmpActive
+        && g_netplayUiJmpOwnerThreadId == currentThreadId)
     {
         mod::Log(
-            "NeutralizeExitProcess: ui longjmp — escaping title/menu path "
+            "NeutralizeExitProcess: ui longjmp - escaping title/menu path "
             "(role=%d)",
             g_localRoleFlag);
         g_netplayUiJmpActive = false;
@@ -471,10 +801,31 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         // longjmp does not return.
     }
 
+    // A jmp_buf is thread-affine. Revival normally reaches ExitProcess from
+    // the EFZ game-loop thread, but never longjmp through another thread's
+    // active frame/title boundary if an unexpected worker calls it. The
+    // interception flag wakes the game-thread recovery path; this noreturn
+    // caller remains parked instead of corrupting the owner's stack.
+    if ((g_netplayFrameJmpActive
+            && g_netplayFrameJmpOwnerThreadId != currentThreadId)
+        || (g_netplayUiJmpActive
+            && g_netplayUiJmpOwnerThreadId != currentThreadId))
+    {
+        mod::Log(
+            "NeutralizeExitProcess: refusing cross-thread longjmp currentTid=%lu frameOwner=%lu uiOwner=%lu",
+            static_cast<unsigned long>(currentThreadId),
+            static_cast<unsigned long>(g_netplayFrameJmpOwnerThreadId),
+            static_cast<unsigned long>(g_netplayUiJmpOwnerThreadId));
+        while (true)
+        {
+            Sleep(INFINITE);
+        }
+    }
+
     // For online/spectate: if neither longjmp context is active, ExitProcess
     // was called from a DLL code path that isn't covered by any setjmp
     // (e.g. a direct vtable call from the EXE game loop during a state
-    // transition, BEFORE HookedCharSelectUpdateImpl runs for the first time).
+    // transition outside the title or active Revival-tick recovery scopes).
     //
     // All ExitProcess call sites in the DLL should be made unreachable by
     // SaveAndApplyDllExitProcessPatches.  If we reach here, there is an
@@ -487,9 +838,22 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     {
         mod::Log(
             "NeutralizeExitProcess: no jmp recovery for online role=%d screen=%d "
-            "caller=%s+0x%lX (%p) — performing inline cleanup (TOCTOU last resort)",
+            "caller=%s+0x%lX (%p) - performing inline cleanup (TOCTOU last resort)",
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+        {
+            mod::Log(
+                "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=neutralize_exitprocess_toctou inProgress=%d pendingMenu=%d completed=%d origin=%s",
+                netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+                netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+                netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            (void)SuppressDeferredCancelCleanupAfterGameplayRecovery(
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            Sleep(INFINITE);
+        }
 
         // Step 1: Reinstate a live local-play session so the game loop has
         // a valid vtable for subsequent frame dispatches.
@@ -501,10 +865,10 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         // Step 2: Terminate the dead helper process and close its handle.
         if (g_revivalProcess != nullptr)
         {
-            const BOOL termOk = TerminateProcess(g_revivalProcess, 0);
-            CloseHandle(g_revivalProcess);
-            g_revivalProcess = nullptr;
-            g_revivalProcessId = 0;
+            const BOOL termOk = TerminatePeerProcessIfOwned(
+                0, "exitprocess_toctou");
+            (void)ReleasePeerProcessAfterTerminationAttempt(
+                termOk, nullptr, "exitprocess_toctou");
             mod::Log(
                 "NeutralizeExitProcess: TOCTOU step 2 helper terminated=%d",
                 termOk ? 1 : 0);
@@ -516,8 +880,12 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
             "NeutralizeExitProcess: TOCTOU step 3 RestoreDllExitProcessPatches=%d",
             patchOk ? 1 : 0);
 
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
+        // Step 4: Reset stale text renderer state.
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "exitprocess_toctou");
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 4 ResetRevivalTextRenderingAfterCleanup=%d",
+            textOk ? 1 : 0);
 
         // Step 5: Reset VEH one-shot guard.
         mod::ResetCrashRecoveryState();
@@ -527,6 +895,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
         mod::Log(
             "NeutralizeExitProcess: TOCTOU step 6 ForceGameModeToTitle=%d",
             modeOk ? 1 : 0);
+        (void)RestoreExeDispatchHookForTitle("NeutralizeExitProcess_TOCTOU");
 
         // ExitProcess is __noreturn.  The DLL code after `call ExitProcess`
         // is a compiler-emitted unreachable marker (HLT / privileged insn).
@@ -553,58 +922,29 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
     if (currentRole == kLocalRoleTournament)
     {
         mod::Log(
-            "NeutralizeExitProcess: tournament fallback cleanup — no jmp "
+            "NeutralizeExitProcess: tournament fallback cleanup - no jmp "
             "recovery role=%d screen=%d caller=%s+0x%lX (%p)",
             currentRole, currentScreenIndex,
             callerModule, static_cast<unsigned long>(callerRva), callerAddr);
 
-        // Step 1: Restore DLL Jcc patches (prevents recursive ExitProcess
-        // during the ForceLocalPlayInit below).
-        const bool patchOk = RestoreDllExitProcessPatches();
+        // ExitProcess is noreturn and this callback may be running on a worker
+        // or an unknown native stack.  Never restore executing Jcc/EXE bytes or
+        // destroy the role-3 object inline.  The installed game-thread tick
+        // boundary owns the exact EXE -> destructor/init -> DLL transaction.
+        InterlockedExchange(
+            &g_revivalExitMode,
+            static_cast<LONG>(kLocalRoleTournament));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+        ArmTournamentReturnCleanup("exitprocess_no_boundary");
         mod::Log(
-            "NeutralizeExitProcess: tournament step 1 RestoreDllExitProcessPatches=%d",
-            patchOk ? 1 : 0);
-
-        // Step 2: Restore tournament-specific EXE patches.
-        const bool exeOk = RestoreTournamentExePatches();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 2 RestoreTournamentExePatches=%d",
-            exeOk ? 1 : 0);
-
-        // Step 3: Reinstate a live local-play session.
-        const bool initOk = ForceLocalPlayInit();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 3 ForceLocalPlayInit=%d",
-            initOk ? 1 : 0);
-
-        // Step 4: Disable stale text overlays.
-        DisableRevivalTextRendering();
-
-        // Step 5: Reset VEH one-shot guard and game-mode validation.
-        mod::ResetCrashRecoveryState();
-        ResetGameModeValidation();
-
-        // Step 6: Force game mode to title screen.
-        const bool modeOk = ForceGameModeToTitle();
-        mod::Log(
-            "NeutralizeExitProcess: tournament step 6 ForceGameModeToTitle=%d",
-            modeOk ? 1 : 0);
-
-        // Reset tournament role so the title-screen code doesn't think
-        // we're still in tournament mode.
-        g_localRoleFlag = kLocalRoleLocalPlay;
-
-        mod::Log(
-            "NeutralizeExitProcess: tournament cleanup complete, "
-            "suspending thread (role=%d)",
+            "NeutralizeExitProcess: tournament cleanup delegated to post-tick owner; suspending noreturn caller (role=%d)",
             currentRole);
-        SuspendThread(GetCurrentThread());
         while (true) { Sleep(INFINITE); }
     }
 
-    // Truly unguarded path — unknown role or unexpected state.
+    // Truly unguarded path - unknown role or unexpected state.
     mod::Log(
-        "NeutralizeExitProcess: no longjmp recovery point active — "
+        "NeutralizeExitProcess: no longjmp recovery point active - "
         "suspending thread (role=%d screen=%d caller=%s+0x%lX, safety fallback)",
         currentRole, currentScreenIndex,
         callerModule, static_cast<unsigned long>(callerRva));
@@ -612,7 +952,7 @@ static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
 }
 
 // ---------------------------------------------------------------------------
-// PatchRevivalDllExitProcess — walk the Revival DLL's PE import table and
+// PatchRevivalDllExitProcess - walk the Revival DLL's PE import table and
 // redirect its ExitProcess IAT entry to NeutralizeExitProcess.
 // ---------------------------------------------------------------------------
 bool PatchRevivalDllExitProcess()
@@ -676,8 +1016,52 @@ bool PatchRevivalDllExitProcess()
                 continue;
             }
 
-            // Save the original resolved address.
-            g_realExitProcess = reinterpret_cast<ExitProcessFn>(iatThunk->u1.Function);
+            const auto current = reinterpret_cast<ExitProcessFn>(
+                iatThunk->u1.Function);
+            if (current == NeutralizeExitProcess)
+            {
+                g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
+                const bool originalIsUsable = g_realExitProcess != nullptr
+                    && g_realExitProcess != NeutralizeExitProcess;
+                mod::Log(
+                    "PatchRevivalDllExitProcess: already patched original=0x%p valid=%d",
+                    reinterpret_cast<void*>(g_realExitProcess),
+                    originalIsUsable ? 1 : 0);
+                return originalIsUsable;
+            }
+
+            HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+            const auto nativeExitProcess = kernel32 != nullptr
+                ? reinterpret_cast<ExitProcessFn>(
+                    GetProcAddress(kernel32, "ExitProcess"))
+                : nullptr;
+            if (nativeExitProcess == nullptr
+                || (g_realExitProcess == nullptr
+                    && current != nativeExitProcess))
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: unrecognized initial IAT owner current=0x%p native=0x%p; refusing to overwrite",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(nativeExitProcess));
+                return false;
+            }
+
+            // Preserve the first real target.  Re-installation is expected
+            // across title/session transitions; it must never replace the
+            // saved noreturn API with our own interceptor or a different,
+            // unverified hook target.
+            if (g_realExitProcess != nullptr && g_realExitProcess != current)
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: IAT ownership changed current=0x%p saved=0x%p; refusing",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(g_realExitProcess));
+                return false;
+            }
+            if (g_realExitProcess == nullptr)
+            {
+                g_realExitProcess = current;
+            }
 
             // Overwrite the IAT entry with our interceptor.
             DWORD oldProtect = 0;
@@ -687,18 +1071,116 @@ bool PatchRevivalDllExitProcess()
                 return false;
             }
             iatThunk->u1.Function = reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
-            VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
+            BOOL protectRestored = FALSE;
+            DWORD protectRestoreError = ERROR_SUCCESS;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                DWORD ignored = 0;
+                if (VirtualProtect(
+                        &iatThunk->u1.Function,
+                        sizeof(uintptr_t),
+                        oldProtect,
+                        &ignored))
+                {
+                    protectRestored = TRUE;
+                    break;
+                }
+                protectRestoreError = GetLastError();
+            }
+            g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
 
             mod::Log(
-                "PatchRevivalDllExitProcess: patched IAT entry orig=0x%p stub=0x%p",
+                "PatchRevivalDllExitProcess: patched IAT entry orig=0x%p stub=0x%p protectRestored=%d err=%lu",
                 reinterpret_cast<void*>(g_realExitProcess),
-                reinterpret_cast<void*>(NeutralizeExitProcess));
+                reinterpret_cast<void*>(NeutralizeExitProcess),
+                protectRestored ? 1 : 0,
+                static_cast<unsigned long>(protectRestoreError));
             return true;
         }
     }
 
     mod::Log("PatchRevivalDllExitProcess: ExitProcess import not found in kernel32 descriptor");
     return false;
+}
+
+bool IsRevivalDllExitProcessIatPatched()
+{
+    return g_revivalExitProcessIatSlot != nullptr
+        && g_realExitProcess != nullptr
+        && g_realExitProcess != NeutralizeExitProcess
+        && *g_revivalExitProcessIatSlot
+            == reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+}
+
+bool RestoreRevivalDllExitProcessIat()
+{
+    if (g_revivalExitProcessIatSlot == nullptr || g_realExitProcess == nullptr)
+    {
+        return true;
+    }
+
+    const ULONG_PTR interceptor =
+        reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+    const ULONG_PTR original = reinterpret_cast<ULONG_PTR>(g_realExitProcess);
+    const ULONG_PTR current = *g_revivalExitProcessIatSlot;
+    if (current == original)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+        return true;
+    }
+    if (current != interceptor)
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: ownership changed current=0x%p expected=0x%p; refusing",
+            reinterpret_cast<void*>(current),
+            reinterpret_cast<void*>(interceptor));
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            g_revivalExitProcessIatSlot,
+            sizeof(*g_revivalExitProcessIatSlot),
+            PAGE_READWRITE,
+            &oldProtect))
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: VirtualProtect failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    *g_revivalExitProcessIatSlot = original;
+    BOOL protectRestored = FALSE;
+    DWORD protectRestoreError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        DWORD ignored = 0;
+        if (VirtualProtect(
+                g_revivalExitProcessIatSlot,
+                sizeof(*g_revivalExitProcessIatSlot),
+                oldProtect,
+                &ignored))
+        {
+            protectRestored = TRUE;
+            break;
+        }
+        protectRestoreError = GetLastError();
+    }
+    const bool restored = *g_revivalExitProcessIatSlot == original;
+    if (restored)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+    }
+    mod::Log(
+        "RestoreRevivalDllExitProcessIat: restored=%d protectRestored=%d err=%lu original=0x%p",
+        restored ? 1 : 0,
+        protectRestored ? 1 : 0,
+        static_cast<unsigned long>(protectRestoreError),
+        reinterpret_cast<void*>(original));
+    // Byte ownership is the lifecycle-critical result. If the original IAT
+    // target is restored, do not report a live interceptor merely because a
+    // best-effort page-protection retry failed; the failure is logged above.
+    return restored;
 }
 
 constexpr DWORD kRedirectProcessAccess =
@@ -738,6 +1220,303 @@ static bool ShouldRedirectCreateProcessA(LPCSTR lpApplicationName, LPCSTR lpComm
 {
     return ContainsInsensitiveAscii(lpApplicationName, "efz.exe")
         || ContainsInsensitiveAscii(lpCommandLine, "efz.exe");
+}
+
+static bool LooksLikePauseChildLaunchA(LPCSTR lpApplicationName, LPCSTR lpCommandLine)
+{
+    return ContainsInsensitiveAscii(lpApplicationName, "pause")
+        || ContainsInsensitiveAscii(lpCommandLine, "pause")
+        || ContainsInsensitiveAscii(lpApplicationName, "cmd.exe")
+        || ContainsInsensitiveAscii(lpCommandLine, "cmd.exe");
+}
+
+struct PendingConsoleSourceView
+{
+    const char* tag;
+    const std::string* text;
+};
+
+static bool TryMapBlockedChildConsoleErrorText(const std::string& text, std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty())
+    {
+        return false;
+    }
+
+    if (ContainsCaseInsensitive(trimmed, "Connection timed out"))
+    {
+        *outText = "Connection timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Source quit or timed out"))
+    {
+        *outText = "Source quit or timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Host timed out"))
+    {
+        *outText = "Host timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Remote timed out"))
+    {
+        *outText = "Remote timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Only one net instance allowed"))
+    {
+        *outText = "Only one net instance allowed";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Spectators have been disabled"))
+    {
+        *outText = "Spectators have been disabled by the host";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Socket error"))
+    {
+        *outText = trimmed.substr(0, 120);
+        return true;
+    }
+
+    return false;
+}
+
+static bool TryReadBlockedChildConsoleScreenText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    HANDLE hConsoleOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hConsoleOutput == nullptr || hConsoleOutput == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    CONSOLE_SCREEN_BUFFER_INFO info = {};
+    if (!GetConsoleScreenBufferInfo(hConsoleOutput, &info))
+    {
+        return false;
+    }
+
+    if (info.dwSize.X <= 0)
+    {
+        return false;
+    }
+
+    SHORT startY = static_cast<SHORT>(info.dwCursorPosition.Y - 4);
+    if (startY < info.srWindow.Top)
+    {
+        startY = info.srWindow.Top;
+    }
+
+    SHORT endY = info.dwCursorPosition.Y;
+    if (endY > info.srWindow.Bottom)
+    {
+        endY = info.srWindow.Bottom;
+    }
+
+    if (startY > endY)
+    {
+        return false;
+    }
+
+    std::string snapshot;
+    for (SHORT row = startY; row <= endY; ++row)
+    {
+        std::wstring wideLine(static_cast<size_t>(info.dwSize.X), L'\0');
+        DWORD charsRead = 0;
+        COORD readCoord = {0, row};
+        if (!ReadConsoleOutputCharacterW(
+                hConsoleOutput,
+                wideLine.data(),
+                static_cast<DWORD>(wideLine.size()),
+                readCoord,
+                &charsRead)
+            || charsRead == 0)
+        {
+            continue;
+        }
+
+        wideLine.resize(static_cast<size_t>(charsRead));
+
+        int utf8Bytes = WideCharToMultiByte(CP_UTF8, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        UINT codePage = CP_UTF8;
+        if (utf8Bytes <= 0)
+        {
+            codePage = CP_ACP;
+            utf8Bytes = WideCharToMultiByte(codePage, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        }
+        if (utf8Bytes <= 0)
+        {
+            continue;
+        }
+
+        std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+        if (WideCharToMultiByte(
+                codePage,
+                0,
+                wideLine.data(),
+                static_cast<int>(wideLine.size()),
+                utf8.data(),
+                utf8Bytes,
+                nullptr,
+                nullptr)
+            <= 0)
+        {
+            continue;
+        }
+
+        const std::string trimmed = TrimAscii(utf8);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!snapshot.empty())
+        {
+            snapshot.push_back('\n');
+        }
+        snapshot.append(trimmed);
+    }
+
+    if (snapshot.empty())
+    {
+        return false;
+    }
+
+    *outText = snapshot;
+    return true;
+}
+
+static std::string DescribeBlockedChildConsoleScreenText()
+{
+    std::string snapshot;
+    if (!TryReadBlockedChildConsoleScreenText(&snapshot))
+    {
+        return {};
+    }
+
+    const std::string trimmed = TrimAscii(snapshot);
+    if (trimmed.size() <= 120)
+    {
+        return trimmed;
+    }
+
+    return trimmed.substr(0, 120) + "...";
+}
+
+static bool TryExtractBlockedChildPendingConsoleErrorText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    std::string screenSnapshot;
+    if (TryReadBlockedChildConsoleScreenText(&screenSnapshot)
+        && TryMapBlockedChildConsoleErrorText(screenSnapshot, outText))
+    {
+        return true;
+    }
+
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string bestRawText;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (TryMapBlockedChildConsoleErrorText(trimmed, outText))
+        {
+            return true;
+        }
+
+        if (trimmed.size() > bestRawText.size())
+        {
+            bestRawText = trimmed;
+        }
+    }
+
+    if (bestRawText.empty())
+    {
+        return false;
+    }
+
+    *outText = bestRawText.substr(0, 120);
+    return true;
+}
+
+static std::string DescribeBlockedChildPendingConsoleText()
+{
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string summary;
+    constexpr size_t kMaxPreviewLen = 80;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!summary.empty())
+        {
+            summary.append(" | ");
+        }
+        summary.append(source.tag);
+        summary.push_back('=');
+        summary.push_back('\'');
+        if (trimmed.size() > kMaxPreviewLen)
+        {
+            summary.append(trimmed.substr(0, kMaxPreviewLen));
+            summary.append("...");
+        }
+        else
+        {
+            summary.append(trimmed);
+        }
+        summary.push_back('\'');
+    }
+
+    return summary;
 }
 
 enum class RedirectHostSource
@@ -813,6 +1592,23 @@ static bool ResolveHostProcessForRedirect(HANDLE* outProcessHandle, uint32_t* ou
         *outSource = RedirectHostSource::TempIpc;
     }
     return true;
+}
+
+static LONG PeekPublishedConsoleErrorSerial()
+{
+    if (g_injectedBlock != nullptr)
+    {
+        return InterlockedCompareExchange(&g_injectedBlock->consoleErrorSerial, 0, 0);
+    }
+
+    TempIpcContext temp = {};
+    LONG serial = 0;
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        serial = InterlockedCompareExchange(&temp.block->consoleErrorSerial, 0, 0);
+    }
+    CloseTempIpcContext(&temp);
+    return serial;
 }
 
 static uintptr_t ResolveInjectedInitAddress()
@@ -929,17 +1725,73 @@ BOOL StubCreateProcessA(
 
     if (!ShouldRedirectCreateProcessA(lpApplicationName, lpCommandLine))
     {
-        return CreateProcessA(
-            lpApplicationName,
-            lpCommandLine,
-            lpProcessAttributes,
-            lpThreadAttributes,
-            bInheritHandles,
-            dwCreationFlags,
-            lpEnvironment,
-            lpCurrentDirectory,
-            lpStartupInfo,
-            lpProcessInformation);
+        const LONG errorSerialBefore = PeekPublishedConsoleErrorSerial();
+        const std::string pendingErrorTextBeforeFlush = []() {
+            std::string text;
+            TryExtractBlockedChildPendingConsoleErrorText(&text);
+            return text;
+        }();
+        const std::string screenPreviewBeforeFlush = DescribeBlockedChildConsoleScreenText();
+        const std::string pendingPreviewBeforeFlush = DescribeBlockedChildPendingConsoleText();
+        const bool remoteTimeoutEvidence =
+            ContainsCaseInsensitive(
+                pendingErrorTextBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                screenPreviewBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                pendingPreviewBeforeFlush,
+                "Remote timed out");
+        bool heldDelayTimeout =
+            remoteTimeoutEvidence
+            && TryPublishHeldHostDelayTimeout();
+        FlushPendingConsoleOutput("before_CreateProcessA_system");
+        LONG errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        const bool looksLikePause = LooksLikePauseChildLaunchA(lpApplicationName, lpCommandLine);
+        if (!heldDelayTimeout && HasPendingHeldHostDelayTimeout())
+        {
+            heldDelayTimeout = true;
+        }
+        if (errorSerialAfter <= errorSerialBefore)
+        {
+            if (heldDelayTimeout)
+            {
+                MOD_LIFECYCLE_TRACE(
+                    "NATIVE_DELAY_TIMEOUT_CHILD_BLOCKED errorSerial=%ld "
+                    "cleanup=pending",
+                    static_cast<long>(errorSerialAfter));
+            }
+            else if (!pendingErrorTextBeforeFlush.empty())
+            {
+                PublishConsoleError(pendingErrorTextBeforeFlush.c_str());
+            }
+            else
+            {
+                PublishConsoleError(
+                    looksLikePause
+                        ? "Revival entered a lasolasse prompt"
+                        : "Revival attempted an unexpected child process");
+            }
+            errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        }
+
+        mod::Log(
+            "nb_stub_CreateProcessA: blocked helper child process app='%s' cmd='%s' "
+            "pause=%d heldDelayTimeout=%d consoleErrorBefore=%ld "
+            "consoleErrorAfter=%ld pendingError='%s' screenPreview='%s' "
+            "pendingPreview=%s",
+            lpApplicationName != nullptr ? lpApplicationName : "",
+            lpCommandLine != nullptr ? lpCommandLine : "",
+            looksLikePause ? 1 : 0,
+            heldDelayTimeout ? 1 : 0,
+            static_cast<long>(errorSerialBefore),
+            static_cast<long>(errorSerialAfter),
+            pendingErrorTextBeforeFlush.c_str(),
+            screenPreviewBeforeFlush.c_str(),
+            pendingPreviewBeforeFlush.empty() ? "<empty>" : pendingPreviewBeforeFlush.c_str());
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
     }
 
     if (lpProcessInformation == nullptr)
@@ -1179,6 +2031,13 @@ BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuf
                     {
                         SetEvent(temp.initEvent);
                     }
+                    LogRevival102jDeepStep(
+                        "Helper.WriteProcessMemory.fallback_init_event_signaled");
+                    LogRevival102jDeepBytes(
+                        "Helper.WriteProcessMemory.fallback",
+                        "init.params",
+                        reinterpret_cast<uintptr_t>(vals),
+                        sizeof(vals));
                     mod::Log(
                         "nb_stub_WriteProcessMemory: fallback captured init params mode=%d magic=%d",
                         vals[0],
@@ -1244,6 +2103,13 @@ BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuf
             g_injectedBlock->initParams[1] = vals[1];
             InterlockedIncrement(&g_injectedBlock->initSerial);
             SetEvent(g_injectedInitEvent);
+            LogRevival102jDeepStep(
+                "Helper.WriteProcessMemory.init_event_signaled");
+            LogRevival102jDeepBytes(
+                "Helper.WriteProcessMemory",
+                "init.params",
+                reinterpret_cast<uintptr_t>(vals),
+                sizeof(vals));
             g_initCapturedFromWrite = true;
             mod::Log(
                 "nb_stub_WriteProcessMemory: captured init params via write mode=%d magic=%d",
@@ -1307,6 +2173,18 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
                 temp.block->initParams[1] = paramMagic;
                 InterlockedIncrement(&temp.block->initSerial);
                 SetEvent(temp.initEvent);
+                LogRevival102jDeepStep(
+                    "Helper.CreateRemoteThread.fallback_init_event_signaled");
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.mode",
+                    reinterpret_cast<uintptr_t>(&paramMode),
+                    sizeof(paramMode));
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.magic",
+                    reinterpret_cast<uintptr_t>(&paramMagic),
+                    sizeof(paramMagic));
                 mod::Log(
                     "nb_stub_CreateRemoteThread: fallback captured init params mode=%d magic=%d start=0x%p call=%ld",
                     paramMode,
@@ -1347,6 +2225,13 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
         g_injectedBlock->initParams[1] = params[1];
         InterlockedIncrement(&g_injectedBlock->initSerial);
         SetEvent(g_injectedInitEvent);
+        LogRevival102jDeepStep(
+            "Helper.CreateRemoteThread.init_event_signaled");
+        LogRevival102jDeepBytes(
+            "Helper.CreateRemoteThread",
+            "init.params",
+            reinterpret_cast<uintptr_t>(params),
+            sizeof(params));
         fakeExitCode = 1;
         mod::Log(
             "nb_stub_CreateRemoteThread: captured init params mode=%d magic=%d start=0x%p call=%ld",
@@ -1367,12 +2252,31 @@ HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAtt
     return CreateFakeThread(fakeExitCode);
 }
 
-BOOL StubTerminateProcess(HANDLE hProcess, UINT uExitCode)
+BOOL StubTerminateProcess(
+    HANDLE hProcess,
+    UINT uExitCode,
+    const void* callerReturnAddress)
 {
     if (hProcess == nullptr)
     {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
+    }
+
+    // The external-launcher guard is deliberately disjoint from the ordinary
+    // injected-helper context. Block only the exact cleanup call/child pair;
+    // unknown handles and callers go directly to the real API without lazy
+    // IPC bootstrap or logging.
+    const ExternalLauncherTerminateDecision externalDecision =
+        EvaluateExternalLauncherTerminate(hProcess, callerReturnAddress);
+    if (externalDecision == ExternalLauncherTerminateDecision::Block)
+    {
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    if (externalDecision == ExternalLauncherTerminateDecision::PassThrough)
+    {
+        return TerminateProcess(hProcess, uExitCode);
     }
 
     if (!HasInjectedContext())
@@ -1444,10 +2348,177 @@ HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProce
     return OpenProcess(requestedAccess, bInheritHandle, dwProcessId);
 }
 
+static volatile LONG g_consoleReadGeneration = 0;
+
+BOOL StubWriteConsoleInputA(
+    HANDLE hConsoleInput,
+    const INPUT_RECORD* lpBuffer,
+    DWORD nLength,
+    LPDWORD lpNumberOfEventsWritten)
+{
+    INPUT_RECORD record = {};
+    const bool recordReadable =
+        lpBuffer != nullptr
+        && nLength == 1
+        && IsReadableRange(lpBuffer, sizeof(record));
+    if (recordReadable)
+    {
+        std::memcpy(&record, lpBuffer, sizeof(record));
+    }
+
+    const bool exactControlWake =
+        recordReadable
+        && console_handoff::IsExactBelControlWake(record, nLength);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_WRITE shape=%s count=%lu eventType=%u "
+        "keyDown=%ld repeat=%u vk=0x%04X scan=0x%04X ascii=0x%02X "
+        "control=0x%08lX",
+        exactControlWake ? "exact" : "passthrough",
+        static_cast<unsigned long>(nLength),
+        recordReadable ? static_cast<unsigned>(record.EventType) : 0u,
+        recordReadable
+            ? static_cast<long>(record.Event.KeyEvent.bKeyDown)
+            : 0l,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wRepeatCount)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualKeyCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualScanCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(
+                static_cast<unsigned char>(
+                    record.Event.KeyEvent.uChar.AsciiChar))
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned long>(
+                record.Event.KeyEvent.dwControlKeyState)
+            : 0ul);
+
+    const bool eventsWrittenWritable =
+        lpNumberOfEventsWritten != nullptr
+        && IsWritableRange(
+            lpNumberOfEventsWritten,
+            sizeof(*lpNumberOfEventsWritten));
+    if (exactControlWake && eventsWrittenWritable)
+    {
+        if (!HasInjectedContext())
+        {
+            (void)EnsureInjectedContextFast();
+        }
+
+        auto relay = [&](SharedBlock* block, HANDLE consoleEvent, const char* sourceTag) -> bool
+        {
+            if (block == nullptr
+                || block->magic != kIpcMagic
+                || block->version != kIpcVersion
+                || block->hostPid == 0
+                || InterlockedCompareExchange(
+                    &block->isHostSession,
+                    0,
+                    0) == 0)
+            {
+                return false;
+            }
+
+            const LONG requestSerial =
+                InterlockedIncrement(
+                    &block->consoleControlWakeRequestSerial);
+            SetLastError(ERROR_SUCCESS);
+            const BOOL signalResult =
+                consoleEvent != nullptr ? SetEvent(consoleEvent) : FALSE;
+            const DWORD signalError =
+                signalResult != FALSE
+                    ? ERROR_SUCCESS
+                    : (consoleEvent != nullptr
+                        ? GetLastError()
+                        : ERROR_NOT_READY);
+            *lpNumberOfEventsWritten = 1;
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_REQUEST serial=%ld source=%s "
+                "signalAttempted=%d signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                consoleEvent != nullptr ? 1 : 0,
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            mod::Log(
+                "Takeover: native console control wake requested serial=%ld "
+                "source=%s signal=%d err=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_RESULT serial=%ld result=1 written=1 "
+                "signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        };
+
+        if (HasInjectedContext()
+            && relay(
+                g_injectedBlock,
+                g_injectedConsoleEvent,
+                "injected"))
+        {
+            return TRUE;
+        }
+
+        TempIpcContext temp = {};
+        const bool relayed =
+            OpenTempIpcContext(&temp, false, true)
+            && relay(temp.block, temp.consoleEvent, "fallback");
+        CloseTempIpcContext(&temp);
+        if (relayed)
+        {
+            return TRUE;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const BOOL nativeResult = WriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
+    const DWORD nativeError =
+        nativeResult != FALSE ? ERROR_SUCCESS : GetLastError();
+    const DWORD nativeWritten =
+        lpNumberOfEventsWritten != nullptr && eventsWrittenWritable
+            ? *lpNumberOfEventsWritten
+            : 0;
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_NATIVE_RESULT exact=%d result=%d written=%lu "
+        "error=%lu",
+        exactControlWake ? 1 : 0,
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeWritten),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
+    return nativeResult;
+}
+
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
 {
     (void)hConsoleInput;
     (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=A generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
     FlushPendingConsoleOutput("before_ReadConsoleA");
 
     auto copyInputOut = [&](const char* input) -> BOOL {
@@ -1515,6 +2586,8 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             return FALSE;
         }
 
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
         for (;;)
         {
             const LONG serial = block->consoleSerial;
@@ -1522,7 +2595,102 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             if (serial > 0 && serial != servedSerial)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=A generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
                 return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=A "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=A generation=%ld "
+                            "serial=%ld bytes=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
@@ -1580,7 +2748,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                             {
                                 InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPS);
                                 InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPS);
-                                mod::Log("Takeover: aux auto-answered spectate confirm — synced servedSerial=%ld", static_cast<long>(scPS));
+                                mod::Log("Takeover: aux auto-answered spectate confirm - synced servedSerial=%ld", static_cast<long>(scPS));
                             }
                         }
 
@@ -1664,7 +2832,11 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (delayInputSerial > delayInputServedSerial)
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
                     {
                         const int delayValue = block->delayInputValue;
                         char delayLine[16] = {};
@@ -1672,44 +2844,85 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
                         InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
                         InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                        g_injectedDelayPromptWaitStartTick = 0;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=A generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
                         return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
                     }
 
-                    const DWORD nowTick = GetTickCount();
-                    if (g_injectedDelayPromptWaitStartTick == 0)
+                    if (!delayWaitLogged)
                     {
-                        g_injectedDelayPromptWaitStartTick = nowTick;
-                        mod::Log(
-                            "Takeover: delay prompt waiting for overlay selection promptSerial=%ld",
-                            static_cast<long>(promptSerial));
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=A generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
                     }
-                    if (nowTick - g_injectedDelayPromptWaitStartTick < kPromptDelayInputWaitTimeoutMs)
+                    if (consoleEvent != nullptr)
                     {
-                        if (consoleEvent != nullptr)
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
                         {
-                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
-                            if (wait == WAIT_FAILED)
-                            {
-                                break;
-                            }
+                            break;
                         }
-                        else
-                        {
-                            Sleep(10);
-                        }
-                        continue;
                     }
-
-                    InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
-                    InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                    g_injectedDelayPromptWaitStartTick = 0;
-                    mod::Log(
-                        "Takeover: delay prompt timed out; falling back to default promptSerial=%ld",
-                        static_cast<long>(promptSerial));
-                    return serveScriptedInput(block, "\r\n", sourceTag, "prompt_delay_default", promptSerial, true);
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
                 }
-                return FALSE;
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=A generation=%ld "
+                        "state=host_native_wait control=%ld/%ld "
+                        "prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeRequestSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
             }
 
             if (consoleEvent != nullptr)
@@ -1753,11 +2966,21 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
     const DWORD nativeError = GetLastError();
     const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
     mod::Log(
-        "nb_stub_ReadConsoleA: passthrough (ready=%d result=%d read=%lu err=%lu)",
+        "nb_stub_ReadConsoleA: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
         HasInjectedContext() ? 1 : 0,
         nativeResult ? 1 : 0,
         static_cast<unsigned long>(nativeRead),
         static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=A generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
     return nativeResult;
 }
 
@@ -1765,6 +2988,16 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 {
     (void)hConsoleInput;
     (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=W generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
     FlushPendingConsoleOutput("before_ReadConsoleW");
 
     auto copyInputOut = [&](const char* input) -> BOOL {
@@ -1845,6 +3078,8 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             return FALSE;
         }
 
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
         for (;;)
         {
             const LONG serial = block->consoleSerial;
@@ -1852,7 +3087,102 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             if (serial > 0 && serial != servedSerial)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=W generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
                 return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=W "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=W generation=%ld "
+                            "serial=%ld chars=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld api=W",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
@@ -1978,7 +3308,11 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (delayInputSerial > delayInputServedSerial)
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
                     {
                         const int delayValue = block->delayInputValue;
                         char delayLine[16] = {};
@@ -1986,44 +3320,74 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
                         InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
                         InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                        g_injectedDelayPromptWaitStartTick = 0;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=W generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
                         return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
                     }
 
-                    const DWORD nowTick = GetTickCount();
-                    if (g_injectedDelayPromptWaitStartTick == 0)
+                    if (!delayWaitLogged)
                     {
-                        g_injectedDelayPromptWaitStartTick = nowTick;
-                        mod::Log(
-                            "Takeover: delay prompt waiting for overlay selection promptSerial=%ld",
-                            static_cast<long>(promptSerial));
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=W generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
                     }
-                    if (nowTick - g_injectedDelayPromptWaitStartTick < kPromptDelayInputWaitTimeoutMs)
+                    if (consoleEvent != nullptr)
                     {
-                        if (consoleEvent != nullptr)
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
                         {
-                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
-                            if (wait == WAIT_FAILED)
-                            {
-                                break;
-                            }
+                            break;
                         }
-                        else
-                        {
-                            Sleep(10);
-                        }
-                        continue;
                     }
-
-                    InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
-                    InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
-                    g_injectedDelayPromptWaitStartTick = 0;
-                    mod::Log(
-                        "Takeover: delay prompt timed out; falling back to default promptSerial=%ld",
-                        static_cast<long>(promptSerial));
-                    return serveScriptedInput(block, "\r\n", sourceTag, "prompt_delay_default", promptSerial, true);
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
                 }
-                return FALSE;
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=W generation=%ld "
+                        "state=host_native_wait prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
             }
 
             if (consoleEvent != nullptr)
@@ -2067,18 +3431,48 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
     const DWORD nativeError = GetLastError();
     const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
     mod::Log(
-        "nb_stub_ReadConsoleW: passthrough (ready=%d result=%d read=%lu err=%lu)",
+        "nb_stub_ReadConsoleW: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
         HasInjectedContext() ? 1 : 0,
         nativeResult ? 1 : 0,
         static_cast<unsigned long>(nativeRead),
         static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=W generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
     return nativeResult;
 }
 
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
-    MaybeLogConsoleOutputChunk(hFile, lpBuffer, nNumberOfBytesToWrite);
+    const DWORD nativeError = GetLastError();
+    DWORD capturedBytes = 0;
+    if (result && lpOverlapped == nullptr)
+    {
+        capturedBytes =
+            lpNumberOfBytesWritten != nullptr
+                ? *lpNumberOfBytesWritten
+                : nNumberOfBytesToWrite;
+    }
+    // A failed, pending, or overlapped write has no reliable completed-byte
+    // count at this interception point. Capturing it here would invent output
+    // (and may touch a rejected buffer); Revival's log handles are synchronous.
+    if (capturedBytes != 0)
+    {
+        MaybeLogConsoleOutputChunk(hFile, lpBuffer, capturedBytes);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
@@ -2101,25 +3495,50 @@ HANDLE StubCreateFileA(
                 "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
                 lpFileName,
                 redirectPath.c_str());
-            return CreateFileA(
-                redirectPath.c_str(),
-                dwDesiredAccess,
-                redirectShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile);
+            return RegisterCreatedConsoleFileA(
+                CreateFileA(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
         }
     }
 
-    return CreateFileA(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    if (HasLogNetBaseNameA(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                lpFileName);
+            return RegisterCreatedConsoleFileA(handle, lpFileName);
+        }
+    }
+
+    return RegisterCreatedConsoleFileA(
+        CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
 }
 
 HANDLE StubCreateFileW(
@@ -2145,63 +3564,150 @@ HANDLE StubCreateFileW(
                 "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' redirect='%s'",
                 originalUtf8,
                 redirectUtf8);
-            return CreateFileW(
-                redirectPath.c_str(),
-                dwDesiredAccess,
-                redirectShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile);
+            return RegisterCreatedConsoleFileW(
+                CreateFileW(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
         }
     }
 
-    return CreateFileW(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    if (HasLogNetBaseNameW(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            char originalUtf8[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                originalUtf8);
+            return RegisterCreatedConsoleFileW(handle, lpFileName);
+        }
+    }
+
+    return RegisterCreatedConsoleFileW(
+        CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
 }
 
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
-    MaybeLogConsoleWriteAChunk(lpBuffer, nNumberOfCharsToWrite);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteAChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
-    MaybeLogConsoleWriteWChunk(lpBuffer, nNumberOfCharsToWrite);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteWChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterAChunk(lpCharacter, nLength, dwWriteCoord);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterAChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     const BOOL result = WriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
-    MaybeLogConsoleOutputCharacterWChunk(lpCharacter, nLength, dwWriteCoord);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterWChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
     return result;
 }
 
 VOID StubOutputDebugStringA(LPCSTR lpOutputString)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     OutputDebugStringA(lpOutputString);
     MaybeLogOutputDebugStringA(lpOutputString);
 }
 
 VOID StubOutputDebugStringW(LPCWSTR lpOutputString)
 {
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
     OutputDebugStringW(lpOutputString);
     MaybeLogOutputDebugStringW(lpOutputString);
 }
@@ -2296,7 +3802,14 @@ extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateRemoteThread(HANDLE
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_TerminateProcess(HANDLE hProcess, UINT uExitCode)
 {
-    return netplay::bridge::takeover::StubTerminateProcess(hProcess, uExitCode);
+    // Capture this in the exported IAT target.  Capturing it in the C++
+    // implementation would yield this wrapper's return address inside the
+    // mod rather than the exact EfzRevival.exe cleanup call site.
+    const void* const callerReturnAddress = _ReturnAddress();
+    return netplay::bridge::takeover::StubTerminateProcess(
+        hProcess,
+        uExitCode,
+        callerReturnAddress);
 }
 
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
@@ -2312,6 +3825,15 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE hConsol
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
 {
     return netplay::bridge::takeover::StubReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten)
+{
+    return netplay::bridge::takeover::StubWriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)

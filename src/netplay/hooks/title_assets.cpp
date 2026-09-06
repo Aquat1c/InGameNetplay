@@ -2,6 +2,7 @@
 
 #include "logger.h"
 #include "netplay/assets/assets.h"
+#include "netplay/core/network_endpoint.h"
 #include "netplay/core/validation.h"
 
 #include <array>
@@ -22,11 +23,22 @@ using netplay::assets::ResolveNetplayBackgroundPath;
 using netplay::assets::ResolveNetplayObjectsPath;
 using netplay::assets::ResolveTitleObjectsPath;
 using netplay::assets::NetplayObjectProfile;
+using netplay::network::FamilyName;
+using netplay::network::NetworkFamily;
+using netplay::network::ParseRemoteHostInput;
+using netplay::network::RemoteHostInput;
+using netplay::network::TryParseFamilyName;
 using netplay::validation::IsValidNickname;
 using netplay::validation::ParsePort;
 
 namespace
 {
+enum class FrontendSurfaceSlot
+{
+    Background,
+    Objects,
+};
+
 const char* NetplayMenuThemeToString(NetplayMenuTheme theme)
 {
     switch (theme)
@@ -67,6 +79,97 @@ bool TryParseNetplayMenuTheme(const std::string& text, NetplayMenuTheme* outThem
     }
 
     return false;
+}
+
+const char* FrontendSurfaceSlotName(FrontendSurfaceSlot slot)
+{
+    switch (slot)
+    {
+    case FrontendSurfaceSlot::Background:
+        return "background";
+    case FrontendSurfaceSlot::Objects:
+        return "objects";
+    default:
+        return "unknown";
+    }
+}
+
+uint32_t FrontendSurfaceSlotOffset(FrontendSurfaceSlot slot)
+{
+    switch (slot)
+    {
+    case FrontendSurfaceSlot::Background:
+        return kOffsetBackgroundSurface;
+    case FrontendSurfaceSlot::Objects:
+        return kOffsetObjectsSurface;
+    default:
+        return 0;
+    }
+}
+
+bool ReleaseFrontendSurfaceSlot(uint32_t screenContext, FrontendSurfaceSlot slot, const char* owner)
+{
+    const uint32_t offset = FrontendSurfaceSlotOffset(slot);
+    if (offset == 0)
+    {
+        return false;
+    }
+
+    auto* const surfacePtr = reinterpret_cast<uint32_t*>(screenContext + offset);
+    uint32_t oldSurface = 0;
+    bool released = false;
+    bool faulted = false;
+    __try
+    {
+        oldSurface = *surfacePtr;
+        if (oldSurface != 0)
+        {
+            auto** const vtable = *reinterpret_cast<void***>(oldSurface);
+            auto const release = reinterpret_cast<ULONG(__stdcall*)(uint32_t)>(vtable[2]);
+            (void)release(oldSurface);
+            *surfacePtr = 0;
+            released = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        faulted = true;
+    }
+
+    mod::Log(
+        "FRONTEND_SURFACE_SLOT_RELEASE owner=%s slot=%s old=0x%08lX released=%d faulted=%d",
+        owner != nullptr ? owner : "unknown",
+        FrontendSurfaceSlotName(slot),
+        static_cast<unsigned long>(oldSurface),
+        released ? 1 : 0,
+        faulted ? 1 : 0);
+    return released && !faulted;
+}
+
+uint32_t ReadFrontendSurfaceSlot(uint32_t screenContext, FrontendSurfaceSlot slot)
+{
+    const uint32_t offset = FrontendSurfaceSlotOffset(slot);
+    if (offset == 0)
+    {
+        return 0;
+    }
+
+    uint32_t surface = 0;
+    __try
+    {
+        surface = *reinterpret_cast<uint32_t*>(screenContext + offset);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        surface = 0;
+    }
+    return surface;
+}
+
+void ReleaseFrontendSurfaceSlots(uint32_t screenContext, const char* owner)
+{
+    (void)ReleaseFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background, owner);
+    (void)ReleaseFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects, owner);
 }
 
 std::string TrimAscii(std::string value)
@@ -203,30 +306,6 @@ std::string ReadIniValueUtf8(
     return TrimAscii(WideToUtf8(std::wstring(buffer.data())));
 }
 
-bool IsValidStoredJoinAddress(const std::string& address)
-{
-    if (address.empty() || address.size() > 127)
-    {
-        return false;
-    }
-
-    for (char c : address)
-    {
-        const bool ok =
-            std::isalnum(static_cast<unsigned char>(c)) != 0
-            || c == '.'
-            || c == ':'
-            || c == '-'
-            || c == '_'
-            || c == '['
-            || c == ']';
-        if (!ok)
-        {
-            return false;
-        }
-    }
-    return true;
-}
 } // namespace
 
 HMODULE ResolveCurrentModule()
@@ -336,9 +415,14 @@ bool LoadTitleAssets(uint32_t screenContext)
     auto const readPixelValue = reinterpret_cast<ReadPixelValueFn>(RuntimeAddress(kVaReadPixelValue));
     auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
 
-    // Resolve title_ob.dat — prefer mod folder override, fallback to vanilla.
+    // Resolve title_ob.dat - prefer mod folder override, fallback to vanilla.
     const std::string titleObjPath = ResolveTitleObjectsPath(g_moduleDirectory);
     const char* titleObjPathC = titleObjPath.c_str();
+    const uint32_t oldBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t oldObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
+    ReleaseFrontendSurfaceSlots(screenContext, "title_assets");
 
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
@@ -352,6 +436,18 @@ bool LoadTitleAssets(uint32_t screenContext)
         titleObjPathC,
         0,
         193);
+    const uint32_t loadedTitleBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t loadedTitleObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
+    if (loadedTitleBackgroundSurface == 0 || loadedTitleObjectsSurface == 0)
+    {
+        mod::Log(
+            "FRONTEND_SURFACE_LOAD_FAILED owner=title_assets bg=0x%08lX obj=0x%08lX",
+            static_cast<unsigned long>(loadedTitleBackgroundSurface),
+            static_cast<unsigned long>(loadedTitleObjectsSurface));
+        return false;
+    }
 
     const bool bgPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), "system\\title.dat", 0, 1, 192) != 0;
     const bool objPaletteOk = loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), titleObjPathC, 0, 193, 48) != 0;
@@ -359,21 +455,34 @@ bool LoadTitleAssets(uint32_t screenContext)
     *reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor) = static_cast<uint8_t>(readPixelValue(*reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface)));
     setPalette(GetGraphicsContext(screenContext), static_cast<int>(screenContext + kOffsetPalette));
 
+    const uint32_t newBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t newObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
     mod::Log(
         "LoadTitleAssets: done bgPalette=%d objPalette=%d transparent=%u",
         bgPaletteOk,
         objPaletteOk,
         static_cast<unsigned>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor)));
+    mod::Log(
+        "FRONTEND_SURFACE_OWNERSHIP_LOAD owner=title_assets bgOld=0x%08lX objOld=0x%08lX bgNew=0x%08lX objNew=0x%08lX paletteSet=1",
+        static_cast<unsigned long>(oldBackgroundSurface),
+        static_cast<unsigned long>(oldObjectsSurface),
+        static_cast<unsigned long>(newBackgroundSurface),
+        static_cast<unsigned long>(newObjectsSurface));
     return bgPaletteOk && objPaletteOk;
 }
 
 void LoadNetplayMenuSettingsFromIni()
 {
+    g_netplayMenuState.hostFamily = NetworkFamily::IPv4;
+
     const std::wstring wideIniPath = ResolveRevivalIniPathWide();
     const std::string iniPath = WideToUtf8(wideIniPath).empty() ? "EfzRevival.ini" : WideToUtf8(wideIniPath);
     if (GetFileAttributesW(wideIniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         mod::Log("LoadNetplayMenuSettingsFromIni: ini not found path='%s' (using in-memory defaults)", iniPath.c_str());
+        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Protocol missing (defaulting 'IPv4')");
         return;
     }
 
@@ -401,6 +510,29 @@ void LoadNetplayMenuSettingsFromIni()
         mod::Log(
             "LoadNetplayMenuSettingsFromIni: NetplayMenu.Theme missing/empty (keeping '%s')",
             NetplayMenuThemeToString(g_netplayMenuState.theme));
+    }
+
+    const std::string protocolText = ReadIniValueUtf8(wideIniPath, L"Network", L"Protocol");
+    if (!protocolText.empty())
+    {
+        NetworkFamily parsedFamily = NetworkFamily::IPv4;
+        if (TryParseFamilyName(protocolText, &parsedFamily))
+        {
+            g_netplayMenuState.hostFamily = parsedFamily;
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: loaded Network.Protocol='%s'",
+                FamilyName(g_netplayMenuState.hostFamily));
+        }
+        else
+        {
+            mod::Log(
+                "LoadNetplayMenuSettingsFromIni: invalid Network.Protocol='%s' (defaulting 'IPv4')",
+                protocolText.c_str());
+        }
+    }
+    else
+    {
+        mod::Log("LoadNetplayMenuSettingsFromIni: Network.Protocol missing/empty (defaulting 'IPv4')");
     }
 
     const std::string nickname = ReadIniValueUtf8(wideIniPath, L"Network", L"Name");
@@ -435,9 +567,10 @@ void LoadNetplayMenuSettingsFromIni()
     const std::string joinAddress = ReadIniValueUtf8(wideIniPath, L"Network", L"Address");
     if (!joinAddress.empty())
     {
-        if (IsValidStoredJoinAddress(joinAddress))
+        RemoteHostInput parsedInput;
+        if (ParseRemoteHostInput(joinAddress, &parsedInput))
         {
-            g_netplayMenuState.joinAddress = joinAddress;
+            g_netplayMenuState.joinAddress = parsedInput.host;
             mod::Log("LoadNetplayMenuSettingsFromIni: loaded Network.Address='%s'", g_netplayMenuState.joinAddress.c_str());
         }
         else
@@ -494,7 +627,8 @@ void SaveNetplayJoinAddressToIni()
         return;
     }
 
-    if (!IsValidStoredJoinAddress(joinAddress))
+    RemoteHostInput parsedInput;
+    if (!ParseRemoteHostInput(joinAddress, &parsedInput))
     {
         mod::Log(
             "SaveNetplayJoinAddressToIni: invalid Network.Address='%s' (skipping write path='%s')",
@@ -503,7 +637,7 @@ void SaveNetplayJoinAddressToIni()
         return;
     }
 
-    const std::wstring wideJoinAddress = Utf8ToWide(joinAddress);
+    const std::wstring wideJoinAddress = Utf8ToWide(parsedInput.host);
     if (WritePrivateProfileStringW(
             L"Network",
             L"Address",
@@ -513,15 +647,16 @@ void SaveNetplayJoinAddressToIni()
     {
         mod::Log(
             "SaveNetplayJoinAddressToIni: failed Network.Address='%s' path='%s' err=%lu",
-            joinAddress.c_str(),
+            parsedInput.host.c_str(),
             iniPath.c_str(),
             static_cast<unsigned long>(GetLastError()));
         return;
     }
 
+    g_netplayMenuState.joinAddress = parsedInput.host;
     mod::Log(
         "SaveNetplayJoinAddressToIni: wrote Network.Address='%s' path='%s'",
-        joinAddress.c_str(),
+        g_netplayMenuState.joinAddress.c_str(),
         iniPath.c_str());
 }
 
@@ -625,6 +760,11 @@ bool LoadNetplayAssets(uint32_t screenContext)
     auto const loadBgrColorsFromRawFile = reinterpret_cast<LoadBgrColorsFromRawFileFn>(RuntimeAddress(kVaLoadBgrColorsFromRawFile));
     auto const readPixelValue = reinterpret_cast<ReadPixelValueFn>(RuntimeAddress(kVaReadPixelValue));
     auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
+    const uint32_t oldBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t oldObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
+    ReleaseFrontendSurfaceSlots(screenContext, "netplay_assets");
 
     loadCompressedImageFile(
         GetGraphicsManager(screenContext),
@@ -638,6 +778,18 @@ bool LoadNetplayAssets(uint32_t screenContext)
         objectsPath,
         0,
         objectProfile.colorOffset);
+    const uint32_t loadedNetplayBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t loadedNetplayObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
+    if (loadedNetplayBackgroundSurface == 0 || loadedNetplayObjectsSurface == 0)
+    {
+        mod::Log(
+            "FRONTEND_SURFACE_LOAD_FAILED owner=netplay_assets bg=0x%08lX obj=0x%08lX",
+            static_cast<unsigned long>(loadedNetplayBackgroundSurface),
+            static_cast<unsigned long>(loadedNetplayObjectsSurface));
+        return false;
+    }
 
     const bool bgPaletteOk =
         loadBgrColorsFromRawFile(static_cast<int>(screenContext + kOffsetPalette), bgPath.c_str(), 0, 1, 192) != 0;
@@ -670,6 +822,17 @@ bool LoadNetplayAssets(uint32_t screenContext)
         bgPaletteOk,
         objPaletteOk,
         static_cast<unsigned>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor)));
+    const uint32_t newBackgroundSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Background);
+    const uint32_t newObjectsSurface =
+        ReadFrontendSurfaceSlot(screenContext, FrontendSurfaceSlot::Objects);
+    mod::Log(
+        "FRONTEND_SURFACE_OWNERSHIP_LOAD owner=netplay_assets bgOld=0x%08lX objOld=0x%08lX bgNew=0x%08lX objNew=0x%08lX paletteSet=1 configStyle=%d",
+        static_cast<unsigned long>(oldBackgroundSurface),
+        static_cast<unsigned long>(oldObjectsSurface),
+        static_cast<unsigned long>(newBackgroundSurface),
+        static_cast<unsigned long>(newObjectsSurface),
+        g_netplayMenuState.useConfigStyleRender ? 1 : 0);
     mod::Log(
         "LoadNetplayAssets: object profile colorOffset=%u paletteStart=%d paletteCount=%d configStyle=%d optionCount=%d backIndex=%d bgSize=%dx%d bgScrollSupported=%d",
         static_cast<unsigned>(objectProfile.colorOffset),

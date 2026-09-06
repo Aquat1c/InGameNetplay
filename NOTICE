@@ -9,3 +9,38 @@ license text with it.
 This repository also contains excluded third-party, reverse-engineered, and
 game-derived material. See `LICENSE` and the individual files/directories for
 their respective ownership and licensing status.
+
+
+Bundled fonts (assets/)
+-----------------------
+
+The mod ships font files in `assets/` (deployed to `<mod>/assets/`) and embeds
+one of them in the DLL as a last-resort fallback. These fonts are NOT covered
+by this project's MIT license - they keep their own:
+
+  * NotoSansCJKjp-Regular.ttf, NotoSansMonoCJKjp-Regular.ttf
+    Noto Sans CJK JP / Noto Sans Mono CJK JP.
+    Copyright (c) The Noto Project Authors (https://github.com/notofonts).
+    Licensed under the SIL Open Font License, Version 1.1 - see
+    https://openfontlicense.org. These are freely redistributable; the OFL
+    text must accompany the font files when redistributed. (Converted from the
+    upstream CFF/OTF to TrueType outlines with fontTools/cu2qu for stb_truetype
+    compatibility; the outlines are re-quantized but the design is unchanged.)
+
+  * Meiryo.ttf, yugothib.ttf (Yu Gothic Bold)
+    Copyright (c) Microsoft Corporation. Proprietary - NOT under an open
+    license and NOT granted by this project. They are included here as
+    legally-obtained copies for convenience; redistributing them is the
+    responsibility of whoever ships this mod, subject to Microsoft's font
+    licensing. Remove them from `assets/` (and `assets/deploy/`) if you are not
+    entitled to redistribute Microsoft fonts - the mod falls back to the
+    OFL-licensed Noto fonts automatically.
+
+  * ITC Bolt/ITC Bolt.ttf  (+ ITC Bolt/License.txt)
+    A TrueType build of ITC Bolt from OnlineWebFonts.Com, licensed under
+    Creative Commons Attribution 4.0 (CC BY 4.0) - see the bundled
+    `ITC Bolt/License.txt`. Attribution required: credit OnlineWebFonts.Com
+    ("Web Fonts"). Opt-in Latin display face (not an automatic fallback;
+    Japanese/Cyrillic are supplied by the merged fallback font).
+    The older "ITC Bolt Bold Regular.otf" (repo `assets/` only) is CFF/OTF,
+    which stb_truetype cannot load - kept for reference, NOT deployed.

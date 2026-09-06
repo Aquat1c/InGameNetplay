@@ -99,7 +99,14 @@ const netplay::menu::NetplayMenuSpec* GetMenuSpec();
 void ResetState();
 bool EnterMenu();
 void LeaveMenu();
-void ShutdownRenderOverlay();
+// Disables/removes the shared EndScene detour. Returns false if MinHook could
+// not verify that the interposition is inactive; callers entering online
+// simulation must treat failure as a blocked handoff.
+bool ShutdownRenderOverlay();
+// Ensures the shared Direct3D9 EndScene overlay hook is installed. Used by the
+// battle-log overlay, the async-host in-gameplay indicator, and the ImGui debug
+// overlay. Idempotent and cheap after the first successful install.
+bool EnsureGameplayOverlayHook();
 
 std::string BuildRowLabel(netplay::menu::NetplayMenuAction action);
 std::string BuildRowPrimaryText(netplay::menu::NetplayMenuAction action);
@@ -114,4 +121,16 @@ bool ExecuteAction(uint32_t screenContext, netplay::menu::NetplayMenuAction acti
 bool DrawOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 uint8_t GetMenuDetailForStateExport();
+
+// Live-tunable positional nudge for the character icons (browser + detail
+// views), exposed so the ImGui debug panel can dial in a layout offset for
+// future adjustments. offsetX/offsetY are in 320x240 logical pixels; scale
+// multiplies the icon size. Applied on top of the computed per-slot layout.
+struct IconAdjust
+{
+    int offsetX = 0;
+    int offsetY = 0;
+    float scale = 1.0f;
+};
+IconAdjust& GetIconAdjust();
 }

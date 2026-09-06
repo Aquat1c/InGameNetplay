@@ -1,5 +1,7 @@
 #include "netplay/core/mod_settings.h"
 
+#include "logger.h"
+
 #include <windows.h>
 
 #include <cwchar>
@@ -115,6 +117,29 @@ bool TryReadBoolValue(
     *outValue = ReadBoolValue(sectionName, keyName, false, iniPath);
     return true;
 }
+
+// Write key=value only when the key is ABSENT, so the setting becomes visible
+// and editable in the ini on first run without clobbering a user's own value.
+void SeedIniKeyIfMissing(
+    const wchar_t* sectionName,
+    const wchar_t* keyName,
+    const wchar_t* defaultValue,
+    const std::wstring& iniPath)
+{
+    wchar_t buffer[16] = {};
+    static constexpr wchar_t kMissing[] = L"__missing__";
+    GetPrivateProfileStringW(
+        sectionName, keyName, kMissing, buffer,
+        static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])),
+        iniPath.c_str());
+    // A value longer than the buffer is truncated but still != kMissing, so a
+    // present key is correctly detected regardless of its length.
+    if (std::wcscmp(buffer, kMissing) == 0)
+    {
+        (void)WritePrivateProfileStringW(
+            sectionName, keyName, defaultValue, iniPath.c_str());
+    }
+}
 } // namespace
 
 void Reload()
@@ -145,10 +170,92 @@ void Reload()
         ReadBoolValue(L"Others", L"EnableConsole", false, iniPath);
     loaded.enableDebugMenu =
         ReadBoolValue(L"Others", L"EnableDebugMenu", false, iniPath);
+    if (!TryReadBoolValue(
+            L"Others",
+            L"VerboseBridgePatchLogging",
+            &loaded.verboseBridgePatchLogging,
+            iniPath))
+    {
+        loaded.verboseBridgePatchLogging =
+            ReadBoolValue(L"Others", L"EnableBridgePatchDiagnostics", false, iniPath);
+    }
+    if (!TryReadBoolValue(
+            L"Others",
+            L"VerboseSyncDiagnostics",
+            &loaded.verboseSyncDiagnostics,
+            iniPath))
+    {
+        loaded.verboseSyncDiagnostics =
+            ReadBoolValue(L"Others", L"EnableSyncDiagnostics", false, iniPath);
+    }
+    loaded.verboseRevival102jLifecycleLogging =
+        ReadBoolValue(
+            L"Others",
+            L"VerboseRevival102jLifecycleLogging",
+            false,
+            iniPath);
     loaded.hideEmptySetsInBattleLog =
         ReadBoolValue(L"Others", L"HideEmptySetsInBattleLog", true, iniPath);
+    // Console capture is unconditionally deferred by its fixed ingress ring.
+    // Rollback-batch timing injection was retired entirely: changing the batch
+    // decision's wall-clock position is not a safe synchronization mechanism.
+
+#if !MOD_LIFECYCLE_TRACE_COMPILED
+    loaded.verboseBridgePatchLogging = false;
+    loaded.verboseSyncDiagnostics = false;
+    loaded.verboseRevival102jLifecycleLogging = false;
+#endif
+    loaded.menuTtfText =
+        ReadBoolValue(L"Others", L"MenuTtfText", true, iniPath);
+    loaded.menuTtfFontFace =
+        ReadStringValue(L"Others", L"MenuTtfFont", L"Yu Gothic", iniPath);
+    if (loaded.menuTtfFontFace.empty())
+    {
+        loaded.menuTtfFontFace = "Yu Gothic";
+    }
+    loaded.hostingTipFontFace =
+        ReadStringValue(L"Others", L"HostingTipFont", L"Yu Gothic", iniPath);
+    if (loaded.hostingTipFontFace.empty())
+    {
+        loaded.hostingTipFontFace = "Yu Gothic";
+    }
+    loaded.asyncHostReturnKey =
+        ReadStringValue(L"Others", L"AsyncHostReturnKey", L"DIK_F1", iniPath);
+    if (loaded.asyncHostReturnKey.empty())
+    {
+        loaded.asyncHostReturnKey = "DIK_F1";
+    }
+    // On by default: live-proven; piggybacks Revival's own socket, vanilla-safe.
+    loaded.onlineCustomColors =
+        ReadBoolValue(L"Others", L"OnlineCustomColors", true, iniPath);
+    loaded.checkForUpdates =
+        ReadBoolValue(L"Others", L"CheckForUpdates", true, iniPath);
+    loaded.modInteropLoopback =
+        ReadBoolValue(L"Others", L"ModInteropLoopback", false, iniPath);
+    loaded.modInteropPeer =
+        ReadStringValue(L"Others", L"ModInteropPeer", L"", iniPath);
+    loaded.modInteropPort = static_cast<uint16_t>(
+        GetPrivateProfileIntW(
+            L"Others", L"ModInteropPort", 10801, iniPath.c_str()));
+    loaded.modInteropSide = (GetPrivateProfileIntW(
+        L"Others", L"ModInteropSide", 0, iniPath.c_str()) != 0) ? 1 : 0;
+
+    // Seed only the single user-facing gate (default ON). Everything else
+    // (piggyback transport, side derived from the session role) is automatic, so
+    // the ModInterop* keys are hidden dev overrides - read if present, never seeded.
+    SeedIniKeyIfMissing(L"Others", L"OnlineCustomColors", L"1", iniPath);
+    SeedIniKeyIfMissing(L"Others", L"CheckForUpdates", L"1", iniPath);
 
     g_settings = loaded;
+
+#if defined(EFZ_LIFECYCLE_TRACE)
+    // Investigation trace runtime toggle. Compiled in only for trace builds
+    // (xp-trace preset) and enabled by default there so a diagnostic DLL cannot
+    // silently omit the evidence it was built to collect. An explicit
+    // LifecycleTrace=0 can still quiet it. Ignored entirely in end-user builds.
+    mod::SetLifecycleTraceEnabled(
+        ReadBoolValue(L"Others", L"LifecycleTrace", true, iniPath));
+#endif
 }
 
 const Settings& Get()
@@ -186,8 +293,85 @@ bool IsDebugMenuEnabled()
     return g_settings.enableDebugMenu;
 }
 
+bool AreOnlineCustomColorsEnabled()
+{
+    return g_settings.onlineCustomColors;
+}
+
+void SetOnlineCustomColorsEnabled(bool enabled)
+{
+    g_settings.onlineCustomColors = enabled;
+}
+
+bool IsUpdateCheckEnabled()
+{
+    return g_settings.checkForUpdates;
+}
+
+bool IsModInteropLoopbackEnabled()
+{
+    return g_settings.modInteropLoopback;
+}
+
+const std::string& ModInteropPeer()
+{
+    return g_settings.modInteropPeer;
+}
+
+uint16_t ModInteropPort()
+{
+    return g_settings.modInteropPort;
+}
+
+int ModInteropSide()
+{
+    return g_settings.modInteropSide;
+}
+
+bool IsVerboseBridgePatchLoggingEnabled()
+{
+    return g_settings.verboseBridgePatchLogging;
+}
+
+bool IsVerboseSyncDiagnosticsEnabled()
+{
+    return g_settings.verboseSyncDiagnostics;
+}
+
+bool IsVerboseRevival102jLifecycleLoggingEnabled()
+{
+    return g_settings.verboseRevival102jLifecycleLogging;
+}
+
+bool AreAllVerboseLogsEnabled()
+{
+    return g_settings.verboseBridgePatchLogging
+        && g_settings.verboseSyncDiagnostics
+        && g_settings.verboseRevival102jLifecycleLogging;
+}
+
 bool HideEmptySetsInBattleLogByDefault()
 {
     return g_settings.hideEmptySetsInBattleLog;
+}
+
+bool IsMenuTtfTextEnabled()
+{
+    return g_settings.menuTtfText;
+}
+
+const std::string& MenuTtfFontFace()
+{
+    return g_settings.menuTtfFontFace;
+}
+
+const std::string& HostingTipFontFace()
+{
+    return g_settings.hostingTipFontFace;
+}
+
+const std::string& AsyncHostReturnKeyBinding()
+{
+    return g_settings.asyncHostReturnKey;
 }
 } // namespace netplay::mod_settings

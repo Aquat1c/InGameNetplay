@@ -1,6 +1,7 @@
 #include "crash_handler.h"
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/core/mod_settings.h"
 
 #include "logger.h"
 
@@ -139,12 +140,15 @@ std::string BuildArtifactPath(const char* extension)
         extension);
 
     std::string path = g_moduleDirectory[0] != '\0' ? g_moduleDirectory : ".";
+    path += "\\logs";
+    // Lazy: the folder only appears when a crash artifact is actually written.
+    (void)CreateDirectoryA(path.c_str(), nullptr);
     path += "\\";
     path += fileName;
     return path;
 }
 
-// Read a DWORD safely using SEH — returns 0xDEADBEEF on fault.
+// Read a DWORD safely using SEH - returns 0xDEADBEEF on fault.
 // Isolated in its own function to avoid __try / C++ object unwinding conflict.
 static uintptr_t SafeReadDword(uintptr_t addr)
 {
@@ -154,7 +158,11 @@ static uintptr_t SafeReadDword(uintptr_t addr)
     return val;
 }
 
-void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reason, const char* dumpPath)
+void WriteCrashInfoText(
+    EXCEPTION_POINTERS* exceptionPointers,
+    const char* reason,
+    const char* dumpPath,
+    bool detailed)
 {
     const std::string txtPath = BuildArtifactPath("txt");
     FILE* file = nullptr;
@@ -182,6 +190,7 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
     std::fprintf(file, "exception_code=0x%08lX\n", static_cast<unsigned long>(exceptionCode));
     std::fprintf(file, "exception_address=0x%p\n", reinterpret_cast<void*>(exceptionAddress));
     std::fprintf(file, "minidump=%s\n", dumpPath != nullptr ? dumpPath : "");
+    std::fprintf(file, "detailed=%d\n", detailed ? 1 : 0);
 
     // Module context: identify which module the crash address belongs to.
     {
@@ -200,44 +209,10 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
             std::fprintf(file, "crash_module_base=0x%08lX\n", static_cast<unsigned long>(modBase));
             std::fprintf(file, "crash_rva=0x%08lX\n", static_cast<unsigned long>(rva));
         }
+    }
 
-        // Revival DLL state.
-        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
-        if (revival != nullptr)
-        {
-            const uintptr_t revBase = reinterpret_cast<uintptr_t>(revival);
-            std::fprintf(file, "revival_base=0x%08lX\n", static_cast<unsigned long>(revBase));
-
-            // Dump the render context global using the active version profile.
-            const uintptr_t renderCtxOffset = netplay::bridge::GetRevivalRenderContextOffset();
-            const uintptr_t renderCtxAddr = (renderCtxOffset != 0) ? revBase + renderCtxOffset : 0;
-            const uintptr_t renderCtxVal = (renderCtxAddr != 0) ? SafeReadDword(renderCtxAddr) : 0;
-            std::fprintf(file, "revival_renderCtx_addr=0x%08lX\n", static_cast<unsigned long>(renderCtxAddr));
-            std::fprintf(file, "revival_renderCtx_value=0x%08lX\n", static_cast<unsigned long>(renderCtxVal));
-
-            // Dump the session pointer using the active version profile.
-            const uintptr_t sessionPtrOffset = netplay::bridge::GetRevivalSessionPtrOffset();
-            const uintptr_t sessionAddr = (sessionPtrOffset != 0) ? revBase + sessionPtrOffset : 0;
-            const uintptr_t sessionVal = (sessionAddr != 0) ? SafeReadDword(sessionAddr) : 0;
-            std::fprintf(file, "revival_session_addr=0x%08lX\n", static_cast<unsigned long>(sessionAddr));
-            std::fprintf(file, "revival_session_value=0x%08lX\n", static_cast<unsigned long>(sessionVal));
-
-            // If session pointer is readable, dump its vtable.
-            if (sessionVal != 0 && sessionVal != 0xDEADBEEFu)
-            {
-                const uintptr_t vtableVal = SafeReadDword(sessionVal);
-                std::fprintf(file, "revival_session_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
-            }
-
-            // If renderCtx pointer is readable, dump its vtable.
-            if (renderCtxVal != 0 && renderCtxVal != 0xDEADBEEFu)
-            {
-                const uintptr_t vtableVal = SafeReadDword(renderCtxVal);
-                std::fprintf(file, "revival_renderCtx_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
-            }
-        }
-
-        // Our mod DLL.
+    // Our mod DLL.
+    {
         HMODULE ourMod = GetModuleHandleA("efz_netplay_mod.dll");
         if (ourMod != nullptr)
         {
@@ -246,72 +221,113 @@ void WriteCrashInfoText(EXCEPTION_POINTERS* exceptionPointers, const char* reaso
         }
     }
 
-    // -----------------------------------------------------------------------
-    // EFZ.exe game mode struct table dump
-    //
-    // The game mode struct table at 0x790110 holds up to 14 object pointers.
-    // 0x790148 holds the current index.  EFZ_GameMode_InvokeAdvance() calls
-    // vtable[1] on table[curIdx] — if corrupt, this is the crash site.
-    // -----------------------------------------------------------------------
+    if (detailed)
     {
-        constexpr uintptr_t kTableAddr = 0x00790110u;
-        constexpr uintptr_t kIndexAddr = 0x00790148u;
-        constexpr int kMaxEntries = 14;
-
-        const uintptr_t curIdx = SafeReadDword(kIndexAddr);
-        std::fprintf(file, "\n=== Game Mode Struct Table ===\n");
-        std::fprintf(file, "game_mode_index=0x%08lX (%ld)\n",
-                     static_cast<unsigned long>(curIdx),
-                     static_cast<long>(static_cast<int>(curIdx)));
-
-        HMODULE revival = GetModuleHandleA("EfzRevival.dll");
-        const uintptr_t revBase = revival
-            ? reinterpret_cast<uintptr_t>(revival) : 0;
-
-        for (int i = 0; i < kMaxEntries; ++i)
+        // Module context: dump Revival-specific globals only for full reports.
         {
-            const uintptr_t entry = SafeReadDword(kTableAddr + 4u * i);
-            if (entry == 0 || entry == 0xDEADBEEFu)
-                continue;
-
-            const uintptr_t vtable = SafeReadDword(entry);
-            const uintptr_t vt0 = SafeReadDword(vtable);
-            const uintptr_t vt1 = SafeReadDword(vtable + 4);
-            const uintptr_t vt2 = SafeReadDword(vtable + 8);
-
-            const uintptr_t vtRva = (revBase != 0 && vtable >= revBase
-                                     && vtable < (revBase + 0x100000u))
-                                        ? (vtable - revBase) : 0;
-
-            std::fprintf(file,
-                "game_mode_table[%d]=0x%08lX vtable=0x%08lX (RVA=0x%lX) "
-                "vt[0]=0x%08lX vt[1]=0x%08lX vt[2]=0x%08lX%s\n",
-                i,
-                static_cast<unsigned long>(entry),
-                static_cast<unsigned long>(vtable),
-                static_cast<unsigned long>(vtRva),
-                static_cast<unsigned long>(vt0),
-                static_cast<unsigned long>(vt1),
-                static_cast<unsigned long>(vt2),
-                (static_cast<unsigned>(i) == (curIdx & 0xFFu)) ? " <<<CURRENT" : "");
-
-            // Dump first 64 bytes of the current game mode object for analysis.
-            if (static_cast<unsigned>(i) == (curIdx & 0xFFu))
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            if (revival != nullptr)
             {
-                std::fprintf(file, "  object_hex_dump:\n");
-                for (int off = 0; off < 64; off += 16)
+                const uintptr_t revBase = reinterpret_cast<uintptr_t>(revival);
+                std::fprintf(file, "revival_base=0x%08lX\n", static_cast<unsigned long>(revBase));
+
+                // Dump the render context global using the active version profile.
+                const uintptr_t renderCtxOffset = netplay::bridge::GetRevivalRenderContextOffset();
+                const uintptr_t renderCtxAddr = (renderCtxOffset != 0) ? revBase + renderCtxOffset : 0;
+                const uintptr_t renderCtxVal = (renderCtxAddr != 0) ? SafeReadDword(renderCtxAddr) : 0;
+                std::fprintf(file, "revival_renderCtx_addr=0x%08lX\n", static_cast<unsigned long>(renderCtxAddr));
+                std::fprintf(file, "revival_renderCtx_value=0x%08lX\n", static_cast<unsigned long>(renderCtxVal));
+
+                // Dump the session pointer using the active version profile.
+                const uintptr_t sessionPtrOffset = netplay::bridge::GetRevivalSessionPtrOffset();
+                const uintptr_t sessionAddr = (sessionPtrOffset != 0) ? revBase + sessionPtrOffset : 0;
+                const uintptr_t sessionVal = (sessionAddr != 0) ? SafeReadDword(sessionAddr) : 0;
+                std::fprintf(file, "revival_session_addr=0x%08lX\n", static_cast<unsigned long>(sessionAddr));
+                std::fprintf(file, "revival_session_value=0x%08lX\n", static_cast<unsigned long>(sessionVal));
+
+                // If session pointer is readable, dump its vtable.
+                if (sessionVal != 0 && sessionVal != 0xDEADBEEFu)
                 {
-                    const uintptr_t d0 = SafeReadDword(entry + off);
-                    const uintptr_t d1 = SafeReadDword(entry + off + 4);
-                    const uintptr_t d2 = SafeReadDword(entry + off + 8);
-                    const uintptr_t d3 = SafeReadDword(entry + off + 12);
-                    std::fprintf(file,
-                        "    +0x%02X: %08lX %08lX %08lX %08lX\n",
-                        off,
-                        static_cast<unsigned long>(d0),
-                        static_cast<unsigned long>(d1),
-                        static_cast<unsigned long>(d2),
-                        static_cast<unsigned long>(d3));
+                    const uintptr_t vtableVal = SafeReadDword(sessionVal);
+                    std::fprintf(file, "revival_session_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
+                }
+
+                // If renderCtx pointer is readable, dump its vtable.
+                if (renderCtxVal != 0 && renderCtxVal != 0xDEADBEEFu)
+                {
+                    const uintptr_t vtableVal = SafeReadDword(renderCtxVal);
+                    std::fprintf(file, "revival_renderCtx_vtable=0x%08lX\n", static_cast<unsigned long>(vtableVal));
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // EFZ.exe game mode struct table dump
+        //
+        // The game mode struct table at 0x790110 holds up to 14 object pointers.
+        // 0x790148 holds the current index.  EFZ_GameMode_InvokeAdvance() calls
+        // vtable[1] on table[curIdx] - if corrupt, this is the crash site.
+        // -----------------------------------------------------------------------
+        {
+            constexpr uintptr_t kTableAddr = 0x00790110u;
+            constexpr uintptr_t kIndexAddr = 0x00790148u;
+            constexpr int kMaxEntries = 14;
+
+            const uintptr_t curIdx = SafeReadDword(kIndexAddr);
+            std::fprintf(file, "\n=== Game Mode Struct Table ===\n");
+            std::fprintf(file, "game_mode_index=0x%08lX (%ld)\n",
+                         static_cast<unsigned long>(curIdx),
+                         static_cast<long>(static_cast<int>(curIdx)));
+
+            HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+            const uintptr_t revBase = revival
+                ? reinterpret_cast<uintptr_t>(revival) : 0;
+
+            for (int i = 0; i < kMaxEntries; ++i)
+            {
+                const uintptr_t entry = SafeReadDword(kTableAddr + 4u * i);
+                if (entry == 0 || entry == 0xDEADBEEFu)
+                    continue;
+
+                const uintptr_t vtable = SafeReadDword(entry);
+                const uintptr_t vt0 = SafeReadDword(vtable);
+                const uintptr_t vt1 = SafeReadDword(vtable + 4);
+                const uintptr_t vt2 = SafeReadDword(vtable + 8);
+
+                const uintptr_t vtRva = (revBase != 0 && vtable >= revBase
+                                         && vtable < (revBase + 0x100000u))
+                                            ? (vtable - revBase) : 0;
+
+                std::fprintf(file,
+                    "game_mode_table[%d]=0x%08lX vtable=0x%08lX (RVA=0x%lX) "
+                    "vt[0]=0x%08lX vt[1]=0x%08lX vt[2]=0x%08lX%s\n",
+                    i,
+                    static_cast<unsigned long>(entry),
+                    static_cast<unsigned long>(vtable),
+                    static_cast<unsigned long>(vtRva),
+                    static_cast<unsigned long>(vt0),
+                    static_cast<unsigned long>(vt1),
+                    static_cast<unsigned long>(vt2),
+                    (static_cast<unsigned>(i) == (curIdx & 0xFFu)) ? " <<<CURRENT" : "");
+
+                // Dump first 64 bytes of the current game mode object for analysis.
+                if (static_cast<unsigned>(i) == (curIdx & 0xFFu))
+                {
+                    std::fprintf(file, "  object_hex_dump:\n");
+                    for (int off = 0; off < 64; off += 16)
+                    {
+                        const uintptr_t d0 = SafeReadDword(entry + off);
+                        const uintptr_t d1 = SafeReadDword(entry + off + 4);
+                        const uintptr_t d2 = SafeReadDword(entry + off + 8);
+                        const uintptr_t d3 = SafeReadDword(entry + off + 12);
+                        std::fprintf(file,
+                            "    +0x%02X: %08lX %08lX %08lX %08lX\n",
+                            off,
+                            static_cast<unsigned long>(d0),
+                            static_cast<unsigned long>(d1),
+                            static_cast<unsigned long>(d2),
+                            static_cast<unsigned long>(d3));
+                    }
                 }
             }
         }
@@ -356,6 +372,7 @@ void WriteCrashArtifacts(EXCEPTION_POINTERS* exceptionPointers, const char* reas
         return;
     }
 
+    const bool detailed = netplay::mod_settings::AreAllVerboseLogsEnabled();
     const std::string dmpPath = BuildArtifactPath("dmp");
     HANDLE dumpFile = CreateFileA(
         dmpPath.c_str(),
@@ -376,12 +393,16 @@ void WriteCrashArtifacts(EXCEPTION_POINTERS* exceptionPointers, const char* reas
 
         if (ResolveMiniDumpWriteDump())
         {
-            const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
-                MiniDumpWithDataSegs |
-                MiniDumpWithHandleData |
-                MiniDumpWithThreadInfo |
-                MiniDumpWithIndirectlyReferencedMemory |
-                MiniDumpScanMemory);
+            const MINIDUMP_TYPE dumpType = detailed
+                ? static_cast<MINIDUMP_TYPE>(
+                    MiniDumpWithDataSegs |
+                    MiniDumpWithHandleData |
+                    MiniDumpWithThreadInfo |
+                    MiniDumpWithIndirectlyReferencedMemory |
+                    MiniDumpScanMemory)
+                : static_cast<MINIDUMP_TYPE>(
+                    MiniDumpNormal |
+                    MiniDumpWithThreadInfo);
 
             dumpOk = g_miniDumpWriteDump(
                 GetCurrentProcess(),
@@ -398,7 +419,7 @@ void WriteCrashArtifacts(EXCEPTION_POINTERS* exceptionPointers, const char* reas
     }
 
     mod::Log(
-        "CrashHandler: captured exception reason=%s code=0x%08lX addr=0x%p dump=%d path='%s'",
+        "CrashHandler: captured exception reason=%s code=0x%08lX addr=0x%p dump=%d detailed=%d path='%s'",
         reason != nullptr ? reason : "unknown",
         static_cast<unsigned long>(
             (exceptionPointers != nullptr && exceptionPointers->ExceptionRecord != nullptr)
@@ -408,13 +429,14 @@ void WriteCrashArtifacts(EXCEPTION_POINTERS* exceptionPointers, const char* reas
             ? exceptionPointers->ExceptionRecord->ExceptionAddress
             : nullptr,
         dumpOk ? 1 : 0,
+        detailed ? 1 : 0,
         dmpPath.c_str());
 
     // Drain the async logger's queue before the process dies so recent
     // Log() output lands on disk alongside the minidump and crash text.
     mod::FlushLoggerSync();
 
-    WriteCrashInfoText(exceptionPointers, reason, dumpOk ? dmpPath.c_str() : "");
+    WriteCrashInfoText(exceptionPointers, reason, dumpOk ? dmpPath.c_str() : "", detailed);
 }
 
 LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
@@ -436,11 +458,11 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
     // Scenario: IsPeerProcessAlive() returned true so we returned global state=1
     // to EFZ.exe; the peer died between that check and EFZ.exe calling the DLL
     // rollback tick in state-4 (VS Human in-game).  NeutralizeExitProcess ran on
-    // the main thread (frameJmpActive=0 — game-state-4 dispatches DLL sessions
+    // the main thread (frameJmpActive=0 - game-state-4 dispatches DLL sessions
     // via a direct vtable call, not through 0x401582/OurFrameDispatch), neutralised
     // the session vtable, and returned.  The instruction after 'call ExitProcess'
     // in EFZ_Main_RollbackLoopTick is a privileged instruction placed by the
-    // compiler as unreachable marker code — executing it raises
+    // compiler as unreachable marker code - executing it raises
     // STATUS_PRIV_INSTRUCTION (0xC0000096).
     //
     // Recovery: simulate 'leave; ret' from the crashing function, returning
@@ -511,7 +533,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                         if (!retInRevival)
                         {
                             // This frame's return address is outside
-                            // EfzRevival.dll — it's EFZ.exe (or our mod DLL).
+                            // EfzRevival.dll - it's EFZ.exe (or our mod DLL).
                             foundRet = curRet;
                             foundEbp = curSavedEbp;
                             foundEsp = walkEbp + 8; // EBP+4 = retaddr, +4 = size
@@ -525,7 +547,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                     if (foundExeFrame)
                     {
                         mod::Log(
-                            "CrashHandler: TOCTOU netplay recovery — "
+                            "CrashHandler: TOCTOU netplay recovery - "
                             "walked %d DLL frame(s) from RVA 0x%lX, "
                             "resuming at EXE addr 0x%08lX "
                             "(EBP 0x%08lX ESP 0x%08lX)",
@@ -557,9 +579,11 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                         // end naturally.
                         const bool modeForced = netplay::bridge::ForceGameModeToTitle();
                         mod::Log(
-                            "CrashHandler: TOCTOU recovery — ForceGameModeToTitle "
+                            "CrashHandler: TOCTOU recovery - ForceGameModeToTitle "
                             "result=%d",
                             modeForced ? 1 : 0);
+                        (void)netplay::bridge::RestoreRevivalTitleDispatchForRecovery(
+                            "CrashHandler_TOCTOU");
 
                         ctx->Eip = static_cast<DWORD>(foundRet);
                         ctx->Esp = static_cast<DWORD>(foundEsp);
@@ -569,7 +593,7 @@ LONG WINAPI VectoredExceptionThunk(EXCEPTION_POINTERS* exceptionPointers)
                     }
 
                     mod::Log(
-                        "CrashHandler: TOCTOU netplay recovery — "
+                        "CrashHandler: TOCTOU netplay recovery - "
                         "could not find EXE frame after %d steps "
                         "(crashRVA=0x%lX EBP=0x%08lX), falling through",
                         depth,
@@ -660,5 +684,29 @@ void ResetCrashRecoveryState()
 {
     g_toctouRecoveryFired.store(false);
     mod::Log("CrashHandler: TOCTOU recovery guard reset");
+}
+
+void RearmCrashArtifacts()
+{
+    // Re-arm the once-per-process artifact latch at each session boundary so a
+    // crash in a later session (the 2nd/3rd-session desync being hunted) still
+    // produces a minidump + text log.  The latch exists to avoid re-entrant
+    // double-dumps within a single crash, not to permanently silence later
+    // sessions.
+    //
+    // Flip the latch under g_crashMutex, then release BEFORE logging: mod::Log
+    // takes the logger queue mutex, so logging under g_crashMutex would create
+    // a g_crashMutex -> g_queueMutex order, the inverse of the crash path
+    // (a fault while holding g_queueMutex runs the handler, which takes
+    // g_crashMutex).  Keeping g_crashMutex a pure leaf lock avoids that edge.
+    bool rearmed;
+    {
+        std::lock_guard<std::mutex> lock(g_crashMutex);
+        rearmed = g_dumpWritten.exchange(false);
+    }
+    if (rearmed)
+    {
+        mod::Log("CrashHandler: artifact latch re-armed for new session");
+    }
 }
 } // namespace mod
