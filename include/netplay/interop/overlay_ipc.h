@@ -72,7 +72,7 @@ struct OverlayIpcBlock
     // Peer endpoint the helper captured from Revival's own WSASendTo (network
     // byte order). socketValid flips to 1 once the helper has a socket + peer to
     // send on; until then the game may still queue into toHelper harmlessly.
-    volatile std::uint32_t peerAddrBE;      // IPv4, network order
+    volatile std::uint32_t peerAddrBE;      // IPv4, network order (0 for IPv6)
     volatile std::uint16_t peerPortBE;      // network order
     volatile std::uint16_t reserved0;
     volatile std::uint32_t socketValid;

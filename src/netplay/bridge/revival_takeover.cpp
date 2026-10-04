@@ -3570,6 +3570,11 @@ bool InitializeHost()
         return false;
     }
 
+    // Self-gating, so start it for every launch disposition: the spectate role
+    // is assigned directly (init handshake / launcher adoption), never via
+    // SetLocalRoleFlag.
+    StartSpectatorEscWatcher();
+
     if (g_launchDisposition
         == revival_launch::LaunchDisposition::AttachExistingTournament)
     {

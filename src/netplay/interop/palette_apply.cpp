@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <cstring>
+
 #include "logger.h"
 #include "netplay/interop/palette_remap.h"
 #include "netplay/interop/palette_source.h"
@@ -46,10 +48,10 @@ bool ApplyRowToCharSelectPortrait(std::uint32_t csObj, int side,
     }
 
     remap::PortraitColor colors[remap::kMaxPortraitColors];
+    // Re-applied every char-select frame, so success is not logged (the caller
+    // logs the custom edge once).
     const std::size_t n = remap::RemapSpriteToPortrait(
         row.rawBgr, folder, colors, remap::kMaxPortraitColors);
-    mod::Log("PaletteApply: side=%d char=%u folder=%s remapColors=%u",
-             side, row.charId, folder, static_cast<unsigned>(n));
     if (n == 0)
     {
         return false;
@@ -86,9 +88,6 @@ bool ApplyRowToCharSelectPortrait(std::uint32_t csObj, int side,
             static_cast<unsigned char>(40 * side - 81);   // 175 / 215
         (void)setPaletteRange(graphicsCtx, static_cast<int>(paletteBuffer),
                               firstEntry, kColorCount);
-        mod::Log("PaletteApply: wrote %u colors, setPaletteRange gfx=%p first=%u",
-                 static_cast<unsigned>(n), graphicsCtx,
-                 static_cast<unsigned>(firstEntry));
         applied = true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -184,5 +183,53 @@ bool PushCharSelectPortraitRange(std::uint32_t csObj, int side)
         ok = false;
     }
     return ok;
+}
+
+bool CapturePortraitEntries(std::uint32_t csObj, int side,
+                            std::uint32_t out[kPortraitEntries])
+{
+    if (csObj == 0 || (side != 0 && side != 1) || out == nullptr)
+    {
+        return false;
+    }
+    bool ok = false;
+    __try
+    {
+        std::memcpy(out,
+                    reinterpret_cast<const void*>(
+                        csObj + kPortraitBufferOffset
+                        + 4u * static_cast<std::uint32_t>(kPortraitDestBase + 40 * side)),
+                    sizeof(std::uint32_t) * kPortraitEntries);
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok;
+}
+
+bool RestorePortraitEntries(std::uint32_t csObj, int side,
+                            const std::uint32_t entries[kPortraitEntries])
+{
+    if (csObj == 0 || (side != 0 && side != 1) || entries == nullptr)
+    {
+        return false;
+    }
+    bool ok = false;
+    __try
+    {
+        std::memcpy(reinterpret_cast<void*>(
+                        csObj + kPortraitBufferOffset
+                        + 4u * static_cast<std::uint32_t>(kPortraitDestBase + 40 * side)),
+                    entries,
+                    sizeof(std::uint32_t) * kPortraitEntries);
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok && PushCharSelectPortraitRange(csObj, side);
 }
 } // namespace netplay::interop::apply

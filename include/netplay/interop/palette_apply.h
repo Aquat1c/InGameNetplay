@@ -35,6 +35,19 @@ bool ApplyRowToCharSelectPortrait(std::uint32_t csObj, int side,
 // to a color with no custom row. SEH-guarded.
 bool PushCharSelectPortraitRange(std::uint32_t csObj, int side);
 
+// The 40 RGBX entries of the `side` portrait range in the char-select buffer.
+constexpr int kPortraitEntries = 40;
+
+// Copy the `side` portrait entries out of the buffer (call right after the
+// game's own reload, while they are stock). SEH-guarded.
+bool CapturePortraitEntries(std::uint32_t csObj, int side,
+                            std::uint32_t out[kPortraitEntries]);
+
+// Write previously captured entries back and push them to hardware - a revert
+// that never runs the game's reload. SEH-guarded.
+bool RestorePortraitEntries(std::uint32_t csObj, int side,
+                            const std::uint32_t entries[kPortraitEntries]);
+
 // Apply the winner's cached custom row onto the win (result) screen portrait.
 // gameData = *(resultScreenCtx + 28); buffer = gameData + 3893; dest index base
 // = 40*winnerSide + 95. Unlike char-select, the game renders the win portrait

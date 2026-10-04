@@ -365,8 +365,10 @@ bool ReadRevivalSyncFlags(RevivalSyncFlags* outFlags);
 void RefreshRuntimeStatus(NetbridgeStatus* ioStatus);
 bool SetLocalRoleFlag(int roleFlag, const char* reason);
 bool SetRoleFlagDirect(int roleFlag, const char* reason);
-// Stops the off-sim-thread spectator Esc-exit watcher (started lazily by
-// SetLocalRoleFlag on a spectate role).  No-op if it was never started.
+// Off-sim-thread spectator Esc-exit watcher (self-gates on the spectate role).
+// Start is idempotent (called once from InitializeHost); Stop is a no-op if it
+// was never started.
+void StartSpectatorEscWatcher();
 void StopSpectatorEscWatcher();
 bool NeutralizeTournamentAutoNav();
 bool SaveTournamentExePatches();

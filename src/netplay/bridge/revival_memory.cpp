@@ -5,6 +5,7 @@
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/interop/palette_charselect.h"
 #include "crash_handler.h"
 
 #include <cmath>
@@ -1192,12 +1193,25 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
 // spectator-specific poll the doppel parity-island fix (6f0a674) never covered.
 // A post-native syscall on the sim thread perturbs the next frame's scheduling
 // and reproduced the RNG-only doppel desync while spectating.  The poll now
-// lives on its own thread; on the Esc rising edge it hands the sim thread the
-// exact same thread-safe recovery request (Interlocked-guarded) it already
-// drains for every role, so the sim thread gains zero new work.
+// lives on its own thread and only raises g_spectatorEscRequested; the sim
+// thread consumes it post-native and runs the recovery there, like every
+// other gameplay exit (BeginGameplayExitRecovery runs its whole continuation
+// synchronously, so it must never run on this thread).
 static HANDLE        g_spectatorEscWatcherThread  = nullptr;
 static volatile LONG g_spectatorEscWatcherStarted = 0;
 static volatile LONG g_spectatorEscWatcherStop    = 0;
+static volatile LONG g_spectatorEscRequested      = 0;
+
+// GetAsyncKeyState is global: without this, Esc pressed in another window
+// would end the spectate session.
+static bool IsCurrentProcessForeground()
+{
+    DWORD foregroundPid = 0;
+    const HWND foreground = GetForegroundWindow();
+    return foreground != nullptr
+        && GetWindowThreadProcessId(foreground, &foregroundPid) != 0
+        && foregroundPid == GetCurrentProcessId();
+}
 
 static DWORD WINAPI SpectatorEscWatcherThreadProc(LPVOID /*unused*/)
 {
@@ -1208,33 +1222,34 @@ static DWORD WINAPI SpectatorEscWatcherThreadProc(LPVOID /*unused*/)
         // no GetAsyncKeyState at all - so host/client/local play is untouched.
         if (g_localRoleFlag == kLocalRoleSpectate && g_dllExitProcessPatchesSaved)
         {
-            const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+            const bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0
+                && IsCurrentProcessForeground();
             const bool escRisingEdge = escDown && !escWasDown;
             escWasDown = escDown;
-            if (escRisingEdge)
+            if (escRisingEdge
+                && InterlockedExchange(&g_spectatorEscRequested, 1) == 0)
             {
                 mod::Log(
-                    "SPECTATOR_ESC_WATCHER: *** ESC EXIT (off sim thread) *** "
-                    "role=%d pid=%lu - user requested spectate disconnect",
+                    "SPECTATOR_ESC_WATCHER: Esc pressed role=%d pid=%lu - "
+                    "spectate exit queued for the sim thread",
                     g_localRoleFlag,
                     static_cast<unsigned long>(g_revivalProcessId));
-                (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
-                    netplay::bridge::recovery::GameplayExitOrigin::SpectatorEsc);
             }
         }
         else
         {
-            escWasDown = false;   // reset edge state between sessions
+            // Reset between sessions; never carry a request into another one.
+            escWasDown = false;
+            InterlockedExchange(&g_spectatorEscRequested, 0);
         }
         Sleep(16);   // ~60 Hz on our own thread: no game-clock impact
     }
     return 0;
 }
 
-// Idempotent: create the process-lifetime watcher exactly once, the first time
-// a spectate role is selected.  Cheap to leave running (idle Sleep + a role
-// check) across later host/client sessions.
-static void EnsureSpectatorEscWatcherStarted()
+// Idempotent: create the process-lifetime watcher once, at host init.  Cheap to
+// leave running (idle Sleep + a role check) outside spectate sessions.
+void StartSpectatorEscWatcher()
 {
     if (InterlockedCompareExchange(&g_spectatorEscWatcherStarted, 1, 0) != 0)
     {
@@ -1279,14 +1294,6 @@ bool SetLocalRoleFlag(int roleFlag, const char* reason)
     if (roleFlag < 0 || roleFlag > 3)
     {
         return false;
-    }
-
-    // A spectate session detects Esc-to-leave on a dedicated OFF-sim-thread
-    // watcher (never a per-frame poll on the sim thread - that reproduced the
-    // doppel desync).  Idempotent: starts the process-lifetime watcher once.
-    if (roleFlag == kLocalRoleSpectate)
-    {
-        EnsureSpectatorEscWatcherStarted();
     }
 
     if (g_localRoleFlag == roleFlag)
@@ -8543,6 +8550,7 @@ static bool NeedsPostNativeControlPath(bool nativeTickSkippedForFatalError)
         || InterlockedCompareExchange(
                &g_gameplayStallLocalProcessCloseActive, 0, 0) != 0
         || InterlockedCompareExchange(&g_revivalExitIntercepted, 0, 0) != 0
+        || InterlockedCompareExchange(&g_spectatorEscRequested, 0, 0) != 0
         || HasPeerProcessExitSignal()
         || HasExternalLauncherTerminateBlockedSignal())
     {
@@ -8583,7 +8591,12 @@ static bool NeedsPostNativeControlPath(bool nativeTickSkippedForFatalError)
         return screen == 0;
     }
 
-    if (g_localRoleFlag != kLocalRoleOnline
+    // Spectators replay the same battle: give them the online players' bounded
+    // path too, or every replayed frame would pay for the full control plane
+    // (status lock, stall tracker, GetExitCodeProcess watchdog). Their only
+    // in-battle duty, the Esc exit, is an event latch above.
+    if ((g_localRoleFlag != kLocalRoleOnline
+         && g_localRoleFlag != kLocalRoleSpectate)
         || !g_localInitAppliedForSession
         || !g_dllExitProcessPatchesSaved)
     {
@@ -8775,6 +8788,9 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     g_fpsDropPrevQpcValid = true;
 
     MonitorScreenIndexChange();
+    // Online custom colours, on the game thread after the game's own update
+    // (no-op in battle and when the feature is off).
+    netplay::interop::charselect::TickGameThread();
 
     const uintptr_t exeThisAddr = reinterpret_cast<uintptr_t>(exeThis);
     const uintptr_t currentSession = ReadSessionPtrRaw();
@@ -10026,17 +10042,38 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void* /*edx*/)
     }
 
     // -----------------------------------------------------------------------
-    // Spectator ESC exit - intentionally NOT handled here on the sim thread.
+    // Spectator ESC exit
     // -----------------------------------------------------------------------
-    // A per-frame GetAsyncKeyState() poll used to live here.  It was the one
-    // spectator-specific poll the doppel parity-island fix (6f0a674) never
-    // covered: a post-native syscall on the sim thread perturbs the next
-    // frame's scheduling and reproduced the RNG-only doppel desync while
-    // spectating.  Detection now runs on a dedicated off-sim-thread watcher
-    // (SpectatorEscWatcherThreadProc, started from SetLocalRoleFlag) which
-    // routes the identical thread-safe BeginGameplayExitRecovery request the
-    // recovery machine already drains for every role.  Keep the sim thread clean.
+    // While spectating, Revival's input replay consumes all local keyboard
+    // input, so the game's own Esc handler never fires. The key is polled off
+    // the sim thread (SpectatorEscWatcherThreadProc): a per-frame
+    // GetAsyncKeyState() here was the post-native syscall that reproduced the
+    // doppel desync while spectating. Here the sim thread only consumes the
+    // watcher's latch and runs the recovery, like every other gameplay exit.
     // -----------------------------------------------------------------------
+    if (g_spectatorEscRequested != 0
+        && InterlockedExchange(&g_spectatorEscRequested, 0) != 0
+        && g_localRoleFlag == kLocalRoleSpectate
+        && g_dllExitProcessPatchesSaved)
+    {
+        const int deadRole = g_localRoleFlag;
+        const DWORD deadPid = g_revivalProcessId;
+        LogSessionDiagnosticState("TickHook_spectatorEsc_entry");
+        LogRevival102jDeepSnapshot("FrameHookSpectatorEsc.01.entry");
+        mod::Log(
+            "TICK_HOOK: *** SPECTATOR ESC EXIT *** frameTick=%u "
+            "role=%d pid=%lu - user requested spectate disconnect",
+            g_frameTick,
+            deadRole,
+            static_cast<unsigned long>(deadPid));
+
+        (void)netplay::bridge::recovery::BeginGameplayExitRecovery(
+            netplay::bridge::recovery::GameplayExitOrigin::SpectatorEsc);
+        LogSessionDiagnosticState("TickHook_spectatorEsc_exit");
+        LogRevival102jDeepSnapshot("FrameHookSpectatorEsc.99.exit");
+
+        return 0;
+    }
 
     // ---- Hard-fallback watchdog -------------------------------------------
     // Detect Revival child process death that slipped past ExitProcess

@@ -4,10 +4,7 @@
 
 #include <MinHook.h>
 
-#include <atomic>
 #include <cstring>
-#include <mutex>
-#include <thread>
 
 #include "logger.h"
 #include "netplay/bridge/session_bridge.h"
@@ -31,6 +28,7 @@ constexpr std::uintptr_t kRvaInitCharacterSelect = 0x003598D0u;
 constexpr std::uintptr_t kRvaInitResultScreen = 0x00374B00u;   // win screen
 constexpr std::uintptr_t kVaCurrentScreenIndex = 0x00790148u;
 constexpr int kScreenCharSelect = 1;
+constexpr int kScreenBattle = 3;
 
 // Result-screen field offsets (gameData = *(resultScreenCtx + 28)).
 constexpr std::uint32_t kWinnerIndexOffset = 4940u;   // 0 = P1 won, 1 = P2 won
@@ -151,23 +149,46 @@ bool SideIsLocal(int side)
     }
 }
 
-// Polling thread (matches the original mod): reloadCharacterPalette does NOT
-// fire while EDIT COLOR is active, so a 60Hz thread drives the exchange + apply
-// during char-select. g_csObj is the current char-select object (from the init
-// hook). g_paletteMutex serializes channel + palette writes between this thread
-// and the reload hook. g_lastCustom tracks per-side custom state so we revert to
-// stock exactly once on the custom->stock edge.
-std::atomic<std::uint32_t> g_csObj{0};
-std::mutex g_paletteMutex;
-std::thread g_pollThread;
-std::atomic<bool> g_pollStop{false};
-std::atomic<bool> g_pollRunning{false};
+// Everything in this module runs on the GAME thread: the three hooks, and the
+// per-frame TickGameThread() driven from the per-frame tick hook's post-native
+// path. A 60Hz polling thread used to do the exchange + apply and raced the
+// game's own palette and character-object work (client crash at the second
+// char-select, 2026-10-03). g_lastCustom tracks per-side custom state so we
+// revert to stock exactly once on the custom->stock edge.
+//
+// g_csObj is the char-select object PUBLISHED to the per-frame driver: non-zero
+// only from the end of the game's own init (HookInit) until the screen leaves
+// char-select. The game re-initializes the SAME object on every entry and the
+// result screen frees both character objects it points at, so it must never be
+// used across a match.
+std::uint32_t g_csObj = 0;
 bool g_lastCustom[2] = {false, false};
+
+// Stock portrait entries per side, captured in HookReload right after the game
+// rebuilt them (reloadCharacterPalette is the only writer of 175-254 during
+// char-select). A revert restores these rather than re-running the game's
+// reload, which dereferences the character objects.
+std::uint32_t g_stock[2][apply::kPortraitEntries] = {};
+bool g_stockValid[2] = {false, false};
+
+// Last custom row loaded from disk per side while EDIT COLOR is held: the .pal
+// is re-read when the selection changes or every kLocalRowRefreshMs (so an
+// edited file still shows), not every frame on the game thread.
+constexpr DWORD kLocalRowRefreshMs = 250;
+struct LocalRowCache
+{
+    bool valid;
+    std::uint8_t charId;
+    std::uint8_t colorSlot;
+    DWORD loadedTick;
+    P::PaletteBlobBody row;
+};
+LocalRowCache g_localRowCache[2] = {};
 
 // Confirmed custom row per side, cached from char-select and held through the
 // match so the win screen can apply the winner's palette. Flushed at the next
-// char-select init (i.e. after the win screen ends, for the next game). Guarded
-// by g_paletteMutex. A CLEAR row (slotByte==0) means "no custom" -> no win apply.
+// char-select init (i.e. after the win screen ends, for the next game). A
+// CLEAR row (slotByte==0) means "no custom" -> no win apply.
 P::PaletteBlobBody g_matchRow[2] = {};
 
 using ReloadPalette_t = int(__thiscall*)(void* gameContext, char playerIndex);
@@ -263,6 +284,22 @@ void PiggybackPoll(OverlayChannel& ch)
     }
 }
 
+// Drop every frame still queued from the helper. Called at char-select init,
+// before Begin(): whatever is there predates this session. A peer only sends
+// rows after OUR new Hello/Ack confirmed it (and it re-sends Hellos anyway),
+// while a leftover row from the last session would beat the fresh ones on the
+// per-side seq check (every sender restarts its seq at 1 per char-select).
+void DiscardInboundFrames()
+{
+    ipc::OverlayIpcBlock* b = ipc::Block();
+    if (b == nullptr) return;
+    std::uint8_t frame[P::kMaxFrameBytes];
+    for (std::uint32_t i = 0; i < ipc::kRingSlots; ++i)
+    {
+        (void)ipc::Pop(b->toGame, frame, sizeof(frame));
+    }
+}
+
 bool ReadCharAndColor(std::uint32_t csObj, int side,
                       std::uint8_t* charId, std::uint8_t* colorSlot)
 {
@@ -305,20 +342,6 @@ bool ReadEditColorFlag(std::uint32_t csObj, int side)
         on = false;
     }
     return on;
-}
-
-// Char object pointer for a side (gameContext[side+3] = *(csObj+12+4*side)).
-// Guards the revert reload so it never derefs an unselected char object.
-bool CharObjValid(std::uint32_t csObj, int side)
-{
-    bool valid = false;
-    __try
-    {
-        valid = *reinterpret_cast<const std::uint32_t*>(
-                    csObj + 12u + 4u * static_cast<std::uint32_t>(side)) != 0;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { valid = false; }
-    return valid;
 }
 
 int ReadCurrentScreen()
@@ -396,11 +419,31 @@ CsDiag ReadCsDiag(std::uint32_t csObj)
     return d;
 }
 
+// The local side's row while EDIT COLOR is held, from the per-side cache.
+P::PaletteBlobBody LoadLocalRowCached(int side, std::uint8_t charId,
+                                      std::uint8_t colorSlot)
+{
+    LocalRowCache& c = g_localRowCache[side];
+    const DWORD now = GetTickCount();
+    if (!c.valid || c.charId != charId || c.colorSlot != colorSlot
+        || now - c.loadedTick >= kLocalRowRefreshMs)
+    {
+        c.row = P::PaletteBlobBody{};
+        (void)source::LoadLocalRow(std::string(), static_cast<std::uint8_t>(side),
+                                   charId, colorSlot, &c.row);
+        c.valid = true;
+        c.charId = charId;
+        c.colorSlot = colorSlot;
+        c.loadedTick = now;
+    }
+    return c.row;
+}
+
 // Process one side: broadcast our row, apply the custom palette (ours or the
-// peer's), or revert to stock on the custom->stock edge. Caller holds
-// g_paletteMutex. origAlreadyRan: true from the reload hook (orig built stock);
-// false from the poll thread (must rebuild stock itself to revert).
-void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
+// peer's), or revert to stock on the custom->stock edge. origAlreadyRan: true
+// from the reload hook (orig just built stock); false from the per-frame driver
+// (restores the captured stock entries itself to revert).
+void ProcessSide(std::uint32_t csObj, int side, bool origAlreadyRan)
 {
     OverlayChannel& ch = OverlayChannel::Instance();
     if (!ch.IsActive() || csObj == 0 || (side != 0 && side != 1))
@@ -430,18 +473,10 @@ void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
         if (ReadCharAndColor(csObj, side, &charId, &colorSlot)
             && source::CharFolderName(charId) != nullptr)
         {
-            P::PaletteBlobBody local{};
-            if (editColor)
-            {
-                (void)source::LoadLocalRow(std::string(),
-                                           static_cast<std::uint8_t>(side),
-                                           charId, colorSlot, &local);
-            }
-            else
-            {
-                local = source::AssembleRow(static_cast<std::uint8_t>(side),
-                                            charId, colorSlot, false, nullptr);
-            }
+            const P::PaletteBlobBody local = editColor
+                ? LoadLocalRowCached(side, charId, colorSlot)
+                : source::AssembleRow(static_cast<std::uint8_t>(side),
+                                      charId, colorSlot, false, nullptr);
             // Broadcast ONLY our own online side to the peer; offline (and the
             // second local side) has no peer to advertise a row to.
             if (side == g_localSide)
@@ -478,12 +513,15 @@ void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
     else
     {
         // custom->stock edge: revert. The hook path already ran orig (stock
-        // stands); the poll path must rebuild stock itself (guarded).
-        if (g_lastCustom[side] && !origAlreadyRan && CharObjValid(csObj, side))
+        // stands); the per-frame path restores the captured stock entries.
+        // Without a capture this side keeps the custom colours until the
+        // game's next reload (cosmetic only).
+        if (g_lastCustom[side] && !origAlreadyRan)
         {
-            (void)g_origReload(reinterpret_cast<void*>(csObj),
-                               static_cast<char>(side));
-            mod::Log("PaletteCharSelect: revert side=%d", side);
+            const bool reverted = g_stockValid[side]
+                && apply::RestorePortraitEntries(csObj, side, g_stock[side]);
+            mod::Log("PaletteCharSelect: revert side=%d%s", side,
+                     reverted ? "" : " skipped (no stock capture)");
         }
         g_lastCustom[side] = false;
     }
@@ -492,89 +530,26 @@ void ProcessSideLocked(std::uint32_t csObj, int side, bool origAlreadyRan)
 int __fastcall HookReload(void* gameContext, void* /*edx*/, char playerIndex)
 {
     const int result = g_origReload(gameContext, playerIndex);
-    if (OverlayChannel::Instance().IsActive())
+    const int side = static_cast<int>(playerIndex);
+    if (g_csObj != 0 && (side == 0 || side == 1))
     {
-        std::lock_guard<std::mutex> lock(g_paletteMutex);
-        ProcessSideLocked(reinterpret_cast<std::uint32_t>(gameContext),
-                          static_cast<int>(playerIndex), true);
+        const std::uint32_t csObj = reinterpret_cast<std::uint32_t>(gameContext);
+        g_stockValid[side] =
+            apply::CapturePortraitEntries(csObj, side, g_stock[side]);
+        if (OverlayChannel::Instance().IsActive())
+        {
+            ProcessSide(csObj, side, true);
+        }
     }
     return result;
 }
 
-// 60Hz driver: reloadCharacterPalette does not fire while EDIT COLOR is active,
-// so this thread runs the exchange + apply during char-select (matches the
-// original mod's polling thread).
-void PollThreadMain()
-{
-    mod::Log("PaletteCharSelect: poll thread started");
-    while (!g_pollStop.load(std::memory_order_acquire))
-    {
-        // Helper-hook visibility (~2 Hz), independent of screen, so we can see
-        // whether the helper hooks installed and stayed transparent even while a
-        // session is stuck pre-char-select. The helper cannot write the game-held
-        // log, so this IPC-block readback is our only window into it.
-        if (g_transport == Transport::Piggyback)
-        {
-            static unsigned s_hdiag = 0;
-            if ((++s_hdiag % 125u) == 1u)
-            {
-                if (ipc::OverlayIpcBlock* b = ipc::Block())
-                {
-                    mod::Log("OverlayHelperDiag: installed=%u reason=%u iatMask=0x%X "
-                             "sendToSeen=%u recvCompletions=%u rxObserved=%u "
-                             "txFlushed=%u peerValid=%u",
-                             b->helperInstalled, b->helperInstallReason,
-                             b->helperIatMask, b->sendToSeen, b->recvCompletions,
-                             b->rxObserved, b->txFlushed, b->socketValid);
-                }
-            }
-        }
-
-        const std::uint32_t csObj = g_csObj.load(std::memory_order_acquire);
-        if (csObj != 0 && ReadCurrentScreen() == kScreenCharSelect
-            && OverlayChannel::Instance().IsActive())
-        {
-            std::lock_guard<std::mutex> lock(g_paletteMutex);
-            OverlayChannel& ch = OverlayChannel::Instance();
-            if (g_transport == Transport::Socket)
-            {
-                socket_transport::Poll(ch);
-            }
-            else if (g_transport == Transport::Piggyback)
-            {
-                PiggybackPoll(ch);
-            }
-            ch.Tick(static_cast<std::uint32_t>(GetTickCount()));
-
-            // ~2 Hz diagnostic: ground-truth for the gate decisions + peer rows.
-            static unsigned s_diag = 0;
-            if ((++s_diag % 30u) == 1u)
-            {
-                const CsDiag d = ReadCsDiag(csObj);
-                P::PaletteBlobBody pr0{}, pr1{};
-                const bool has0 = ch.GetPeerPaletteRow(0, &pr0);
-                const bool has1 = ch.GetPeerPaletteRow(1, &pr1);
-                mod::Log("PaletteDiag: state=[%u,%u] exit=%u stageGate=%d leaveGate=%d "
-                         "localSide=%d src=%s peer0(has=%d slot=%u) peer1(has=%d slot=%u)",
-                         d.s0, d.s1, d.exitFlag,
-                         InStageFlow(csObj) ? 1 : 0,
-                         ScreenLeavingCharSelect(csObj) ? 1 : 0, g_localSide,
-                         SideSourceName(g_sideSource),
-                         has0 ? 1 : 0, pr0.slotByte, has1 ? 1 : 0, pr1.slotByte);
-            }
-
-            ProcessSideLocked(csObj, 0, false);
-            ProcessSideLocked(csObj, 1, false);
-        }
-        Sleep(16);
-    }
-    mod::Log("PaletteCharSelect: poll thread stopped");
-}
-
 int __fastcall HookInit(void* screenContext, void* /*edx*/)
 {
+    // The game is about to rebuild this object: nothing may use it until the
+    // original init has finished (republished below).
+    g_csObj = 0;
     const int result = g_origInit(screenContext);
-    std::lock_guard<std::mutex> lock(g_paletteMutex);
     OverlayChannel& ch = OverlayChannel::Instance();
     ch.End();                       // fresh session per char-select entry
     // Loopback/socket are dev test paths that deliberately want the "one side is
@@ -589,6 +564,7 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
         break;
     case Transport::Piggyback:
         ch.SetSendSink(&PiggybackSink, nullptr);
+        DiscardInboundFrames();
         // The session is up by char-select, so classify it from the live role.
         DeriveSideSource();
         break;
@@ -600,12 +576,15 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     ch.ResetPaletteExchangeForRematch();
     g_lastCustom[0] = false;
     g_lastCustom[1] = false;
+    g_stockValid[0] = false;        // captures belong to the previous characters
+    g_stockValid[1] = false;
+    g_localRowCache[0].valid = false;
+    g_localRowCache[1].valid = false;
     // Flush the match palette cache now (the previous game's win screen, if any,
     // has already consumed it) so this game starts from a clean stock baseline.
     g_matchRow[0] = P::PaletteBlobBody{};
     g_matchRow[1] = P::PaletteBlobBody{};
-    g_csObj.store(reinterpret_cast<std::uint32_t>(screenContext),
-                  std::memory_order_release);
+    g_csObj = reinterpret_cast<std::uint32_t>(screenContext);
     mod::Log("PaletteCharSelect: char-select init, armed active=%d side=%d "
              "src=%s transport=%s ipcAttached=%d",
              ch.IsActive() ? 1 : 0, g_localSide,
@@ -654,11 +633,7 @@ int __fastcall HookResult(void* screenContext, void* /*edx*/)
         int winner = -1;
         if (ReadWinner(screenContext, &gameData, &winner))
         {
-            P::PaletteBlobBody row{};
-            {
-                std::lock_guard<std::mutex> lock(g_paletteMutex);
-                row = g_matchRow[winner];
-            }
+            const P::PaletteBlobBody row = g_matchRow[winner];
             if (row.slotByte != 0)
             {
                 (void)apply::ApplyRowToWinScreen(gameData, winner, row);
@@ -744,12 +719,6 @@ bool Install()
         return false;
     }
 
-    // Start the 60Hz poll driver (idle until g_csObj is set + we are in
-    // char-select).
-    g_pollStop.store(false, std::memory_order_release);
-    g_pollThread = std::thread(&PollThreadMain);
-    g_pollRunning.store(true, std::memory_order_release);
-
     g_installed = true;
     mod::Log("PaletteCharSelect: hooks installed transport=%s side=%d "
              "reload=%p init=%p result=%p", TransportName(g_transport),
@@ -757,31 +726,86 @@ bool Install()
     return true;
 }
 
-void Uninstall()
+void TickGameThread()
 {
-    // Stop the poll thread first so it cannot touch the channel/socket mid-teardown.
-    if (g_pollRunning.load(std::memory_order_acquire))
-    {
-        g_pollStop.store(true, std::memory_order_release);
-        if (g_pollThread.joinable())
-        {
-            g_pollThread.join();
-        }
-        g_pollRunning.store(false, std::memory_order_release);
-    }
-    OverlayChannel::Instance().End();
-    socket_transport::Stop();
-    if (g_transport == Transport::Piggyback && ipc::IsAttached())
-    {
-        ipc::Detach(/*asHelper=*/false);
-    }
     if (!g_installed)
     {
         return;
     }
-    if (g_reloadTarget != nullptr) MH_DisableHook(g_reloadTarget);
-    if (g_initTarget != nullptr) MH_DisableHook(g_initTarget);
-    if (g_resultTarget != nullptr) MH_DisableHook(g_resultTarget);
-    g_installed = false;
+    const int screen = ReadCurrentScreen();
+    if (screen == kScreenBattle)
+    {
+        return;   // never any work during a battle (rollback parity island)
+    }
+
+    // Helper-hook visibility (~every 2 s) on every non-battle screen, so we can
+    // see whether the helper hooks installed and stayed transparent even while
+    // a session is stuck pre-char-select. The helper cannot write the game-held
+    // log, so this IPC-block readback is our only window into it.
+    if (g_transport == Transport::Piggyback)
+    {
+        static unsigned s_hdiag = 0;
+        if ((++s_hdiag % 125u) == 1u)
+        {
+            if (ipc::OverlayIpcBlock* b = ipc::Block())
+            {
+                mod::Log("OverlayHelperDiag: installed=%u reason=%u iatMask=0x%X "
+                         "sendToSeen=%u recvCompletions=%u rxObserved=%u "
+                         "txFlushed=%u peerValid=%u",
+                         b->helperInstalled, b->helperInstallReason,
+                         b->helperIatMask, b->sendToSeen, b->recvCompletions,
+                         b->rxObserved, b->txFlushed, b->socketValid);
+            }
+        }
+    }
+
+    const std::uint32_t csObj = g_csObj;
+    if (csObj == 0)
+    {
+        return;
+    }
+    if (screen != kScreenCharSelect)
+    {
+        // Char-select is over: unpublish until HookInit republishes after the
+        // game's next init. g_matchRow stays for the win screen.
+        g_csObj = 0;
+        g_lastCustom[0] = false;
+        g_lastCustom[1] = false;
+        return;
+    }
+    OverlayChannel& ch = OverlayChannel::Instance();
+    if (!ch.IsActive())
+    {
+        return;
+    }
+    if (g_transport == Transport::Socket)
+    {
+        socket_transport::Poll(ch);
+    }
+    else if (g_transport == Transport::Piggyback)
+    {
+        PiggybackPoll(ch);
+    }
+    ch.Tick(static_cast<std::uint32_t>(GetTickCount()));
+
+    // ~2 Hz diagnostic: ground-truth for the gate decisions + peer rows.
+    static unsigned s_diag = 0;
+    if ((++s_diag % 30u) == 1u)
+    {
+        const CsDiag d = ReadCsDiag(csObj);
+        P::PaletteBlobBody pr0{}, pr1{};
+        const bool has0 = ch.GetPeerPaletteRow(0, &pr0);
+        const bool has1 = ch.GetPeerPaletteRow(1, &pr1);
+        mod::Log("PaletteDiag: state=[%u,%u] exit=%u stageGate=%d leaveGate=%d "
+                 "localSide=%d src=%s peer0(has=%d slot=%u) peer1(has=%d slot=%u)",
+                 d.s0, d.s1, d.exitFlag,
+                 InStageFlow(csObj) ? 1 : 0,
+                 ScreenLeavingCharSelect(csObj) ? 1 : 0, g_localSide,
+                 SideSourceName(g_sideSource),
+                 has0 ? 1 : 0, pr0.slotByte, has1 ? 1 : 0, pr1.slotByte);
+    }
+
+    ProcessSide(csObj, 0, false);
+    ProcessSide(csObj, 1, false);
 }
 } // namespace netplay::interop::charselect

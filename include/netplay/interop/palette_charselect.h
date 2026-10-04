@@ -17,6 +17,9 @@ namespace netplay::interop::charselect
 // the master interop flag is set. Call once at mod init after InstallHooks().
 bool Install();
 
-// Remove the hooks and end any active session (idempotent).
-void Uninstall();
+// Per-frame driver, GAME THREAD ONLY: called from the per-frame tick hook's
+// post-native path, after the game's own update. Runs the exchange + portrait
+// apply during char-select (reloadCharacterPalette does not fire while EDIT
+// COLOR is held, so the hooks alone miss it). Returns at once during a battle.
+void TickGameThread();
 } // namespace netplay::interop::charselect

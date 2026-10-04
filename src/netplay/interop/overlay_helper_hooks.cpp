@@ -40,9 +40,13 @@ SOCKET g_capturedSocket = INVALID_SOCKET;
 CRITICAL_SECTION g_cs;
 bool g_csReady = false;
 
-// overlapped -> recv buffer map, populated at WSARecvFrom and read at the
-// completion. Small fixed array (asio keeps only a handful of recvs pending);
-// the magic check downstream makes a stale/wrong entry harmless anyway.
+// overlapped -> recv buffer map: an entry lives from WSARecvFrom (recorded
+// BEFORE the real call, so another IOCP worker can never dequeue the
+// completion first) until GQCS dequeues that completion. Small fixed array
+// (asio keeps only a handful of recvs pending). A full map overwrites the
+// oldest slot, so entries whose completion we never see (APC routine, no IOCP)
+// cannot stop RX observation; the magic check downstream makes a stale/wrong
+// entry harmless anyway.
 struct RecvEntry
 {
     LPWSAOVERLAPPED ov;
@@ -51,23 +55,29 @@ struct RecvEntry
 };
 constexpr int kRecvMapSize = 32;
 RecvEntry g_recvMap[kRecvMapSize] = {};
+int g_recvEvictNext = 0;
 
 void RecordRecv(LPWSAOVERLAPPED ov, char* buf, ULONG len)
 {
     if (ov == nullptr || buf == nullptr) return;
     EnterCriticalSection(&g_cs);
-    int free = -1;
+    int slot = -1;
     for (int i = 0; i < kRecvMapSize; ++i)
     {
-        if (g_recvMap[i].ov == ov) { g_recvMap[i].buf = buf; g_recvMap[i].len = len;
-                                     LeaveCriticalSection(&g_cs); return; }
-        if (free < 0 && g_recvMap[i].ov == nullptr) free = i;
+        if (g_recvMap[i].ov == ov) { slot = i; break; }
+        if (slot < 0 && g_recvMap[i].ov == nullptr) slot = i;
     }
-    if (free >= 0) { g_recvMap[free] = RecvEntry{ov, buf, len}; }
+    if (slot < 0)
+    {
+        slot = g_recvEvictNext;
+        g_recvEvictNext = (g_recvEvictNext + 1) % kRecvMapSize;
+    }
+    g_recvMap[slot] = RecvEntry{ov, buf, len};
     LeaveCriticalSection(&g_cs);
 }
 
-bool LookupRecv(LPOVERLAPPED ov, char** bufOut, ULONG* lenOut)
+// Remove the entry for a dequeued completion, returning its buffer.
+bool TakeRecv(LPOVERLAPPED ov, char** bufOut, ULONG* lenOut)
 {
     bool found = false;
     EnterCriticalSection(&g_cs);
@@ -77,6 +87,7 @@ bool LookupRecv(LPOVERLAPPED ov, char** bufOut, ULONG* lenOut)
         {
             *bufOut = g_recvMap[i].buf;
             *lenOut = g_recvMap[i].len;
+            g_recvMap[i] = RecvEntry{};
             found = true;
             break;
         }
@@ -101,13 +112,15 @@ void PushToGameLocked(const std::uint8_t* data, std::uint32_t len)
     LeaveCriticalSection(&g_cs);
 }
 
-// Copy the recv buffer's bytes out under SEH (POD-only region), then classify +
-// enqueue outside the __try (LooksLikeOverlayFrame / Push touch C++ objects).
+// Every dequeued completion retires its map entry (failed and empty ones too);
+// only a successful recv of >= 4 bytes is inspected. Copy the recv buffer's
+// bytes out under SEH (POD-only region), then classify + enqueue outside the
+// __try (LooksLikeOverlayFrame / Push touch C++ objects).
 void ObserveRecvCompletion(LPOVERLAPPED ov, DWORD bytes)
 {
-    if (bytes < 4u) return;
     char* buf = nullptr; ULONG bufLen = 0;
-    if (!LookupRecv(ov, &buf, &bufLen) || buf == nullptr) return;
+    if (!TakeRecv(ov, &buf, &bufLen) || buf == nullptr) return;
+    if (bytes < 4u) return;
     if (ipc::Block() != nullptr) Bump(&ipc::Block()->recvCompletions);
     ULONG n = bytes;
     if (n > bufLen) n = bufLen;
@@ -140,23 +153,46 @@ void ObserveRecvCompletion(LPOVERLAPPED ov, DWORD bytes)
 // client, or a host with no spectators) the set is {that peer} -> byte-identical
 // to the old single-peer flush. Freshness drops departed peers + one-shot setup
 // endpoints (STUN); the reserved typeId makes a stray frame harmless anyway.
+// Endpoints are IPv4 or IPv6 (Revival hosts over either; HostProtocol).
 struct PeerEndpoint
 {
-    std::uint32_t addrBE;
-    std::uint16_t portBE;      // 0 = empty slot
+    sockaddr_in6  addr;        // AF_INET or AF_INET6 (a sockaddr_in fits)
+    int           len;         // 0 = empty slot
     DWORD         lastSeenTick;
 };
 constexpr int   kMaxPeers    = 8;
 constexpr DWORD kPeerFreshMs  = 5000;   // exclude peers not sent to in this window
 PeerEndpoint    g_peers[kMaxPeers] = {};
 
+int EndpointLen(const sockaddr* to)
+{
+    return to->sa_family == AF_INET6 ? static_cast<int>(sizeof(sockaddr_in6))
+                                     : static_cast<int>(sizeof(sockaddr_in));
+}
+
+bool SameEndpoint(const sockaddr* a, const sockaddr* b)
+{
+    if (a->sa_family != b->sa_family) return false;
+    if (a->sa_family == AF_INET)
+    {
+        const auto* x = reinterpret_cast<const sockaddr_in*>(a);
+        const auto* y = reinterpret_cast<const sockaddr_in*>(b);
+        return x->sin_port == y->sin_port && x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+    const auto* x = reinterpret_cast<const sockaddr_in6*>(a);
+    const auto* y = reinterpret_cast<const sockaddr_in6*>(b);
+    return x->sin6_port == y->sin6_port && x->sin6_scope_id == y->sin6_scope_id
+        && std::memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
+}
+
 // Refresh an existing peer or insert it (empty slot, else evict the stalest).
 // Caller holds g_cs. Two passes so an empty slot never shadows a later match.
-void TouchPeerLocked(std::uint32_t addrBE, std::uint16_t portBE, DWORD now)
+void TouchPeerLocked(const sockaddr* to, DWORD now)
 {
     for (int i = 0; i < kMaxPeers; ++i)
     {
-        if (g_peers[i].portBE == portBE && g_peers[i].addrBE == addrBE)
+        if (g_peers[i].len != 0
+            && SameEndpoint(reinterpret_cast<const sockaddr*>(&g_peers[i].addr), to))
         {
             g_peers[i].lastSeenTick = now;
             return;
@@ -166,15 +202,19 @@ void TouchPeerLocked(std::uint32_t addrBE, std::uint16_t portBE, DWORD now)
     DWORD evictAge = 0;
     for (int i = 0; i < kMaxPeers; ++i)
     {
-        if (g_peers[i].portBE == 0)
+        if (g_peers[i].len == 0)
         {
-            g_peers[i] = PeerEndpoint{addrBE, portBE, now};
-            return;
+            evict = i;
+            break;
         }
         const DWORD age = now - g_peers[i].lastSeenTick;
         if (age >= evictAge) { evictAge = age; evict = i; }
     }
-    g_peers[evict] = PeerEndpoint{addrBE, portBE, now};
+    PeerEndpoint& p = g_peers[evict];
+    p = PeerEndpoint{};
+    p.len = EndpointLen(to);
+    std::memcpy(&p.addr, to, static_cast<std::size_t>(p.len));
+    p.lastSeenTick = now;
 }
 
 // Copy the currently-fresh peers into out[] (capacity kMaxPeers). Caller holds
@@ -184,7 +224,7 @@ int SnapshotFreshPeersLocked(PeerEndpoint* out, DWORD now)
     int n = 0;
     for (int i = 0; i < kMaxPeers; ++i)
     {
-        if (g_peers[i].portBE != 0
+        if (g_peers[i].len != 0
             && (now - g_peers[i].lastSeenTick) <= kPeerFreshMs)
         {
             out[n++] = g_peers[i];
@@ -193,25 +233,25 @@ int SnapshotFreshPeersLocked(PeerEndpoint* out, DWORD now)
     return n;
 }
 
-void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int /*tolen*/)
+void CapturePeerAndFlush(SOCKET s, const sockaddr* to)
 {
     ipc::OverlayIpcBlock* b = ipc::Block();
     if (b == nullptr) return;
 
     Bump(&b->sendToSeen);
     g_capturedSocket = s;
-    const std::uint32_t addrBE = sin->sin_addr.s_addr;
-    const std::uint16_t portBE = sin->sin_port;
     // Keep the single-peer fields (most-recent peer) for the game's diagnostics.
-    b->peerAddrBE = addrBE;
-    b->peerPortBE = portBE;
+    // sin_port and sin6_port share an offset; the address field is IPv4-only.
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(to);
+    b->peerAddrBE = to->sa_family == AF_INET ? sin->sin_addr.s_addr : 0u;
+    b->peerPortBE = sin->sin_port;
     b->socketValid = 1u;
 
     const DWORD now = GetTickCount();
     PeerEndpoint fresh[kMaxPeers];
     int nFresh = 0;
     EnterCriticalSection(&g_cs);
-    TouchPeerLocked(addrBE, portBE, now);
+    TouchPeerLocked(to, now);
     nFresh = SnapshotFreshPeersLocked(fresh, now);
     LeaveCriticalSection(&g_cs);
     if (nFresh <= 0) return;
@@ -234,15 +274,14 @@ void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int /*tolen*/)
         wb.len = len;
         for (int i = 0; i < nFresh; ++i)
         {
-            sockaddr_in dst = {};
-            dst.sin_family = AF_INET;
-            dst.sin_addr.s_addr = fresh[i].addrBE;
-            dst.sin_port = fresh[i].portBE;
+            // Only peers of this socket's family (a stale peer from a previous
+            // session on the other protocol cannot be reached through it).
+            if (fresh[i].addr.sin6_family != to->sa_family) continue;
             DWORD sent = 0;
             (void)g_origWSASendTo(
                 s, &wb, 1, &sent, 0,
-                reinterpret_cast<const sockaddr*>(&dst),
-                static_cast<int>(sizeof(dst)), nullptr, nullptr);
+                reinterpret_cast<const sockaddr*>(&fresh[i].addr),
+                fresh[i].len, nullptr, nullptr);
             Bump(&b->txFlushed);
         }
         ++framesSent;
@@ -259,17 +298,21 @@ void CapturePeerAndFlush(SOCKET s, const sockaddr_in* sin, int /*tolen*/)
     }
 }
 
+// Every hook hands Revival the last-error of ITS call: asio reads it right
+// after each one (WSA_IO_PENDING from WSARecvFrom, a failed send's code, and
+// GetLastError() after GQCS as the operation result), so nothing of ours runs
+// after the real call, or the error is saved and restored around our work.
 int WSAAPI Hook_WSARecvFrom(SOCKET s, LPWSABUF bufs, DWORD cnt, LPDWORD recvd,
                             LPDWORD flags, struct sockaddr* from, LPINT fromlen,
                             LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr)
 {
-    const int r = g_origWSARecvFrom(s, bufs, cnt, recvd, flags, from, fromlen, ov, cr);
-    // Only overlapped IOCP recvs reach us via the completion hook.
+    // Only overlapped IOCP recvs reach us via the completion hook. Recorded
+    // before the call: its completion can be dequeued before the call returns.
     if (ov != nullptr && bufs != nullptr && cnt >= 1u)
     {
         RecordRecv(ov, bufs[0].buf, bufs[0].len);
     }
-    return r;
+    return g_origWSARecvFrom(s, bufs, cnt, recvd, flags, from, fromlen, ov, cr);
 }
 
 int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF bufs, DWORD cnt, LPDWORD sent,
@@ -277,11 +320,15 @@ int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF bufs, DWORD cnt, LPDWORD sent,
                           LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr)
 {
     const int r = g_origWSASendTo(s, bufs, cnt, sent, flags, to, tolen, ov, cr);
+    const DWORD err = GetLastError();
     if (to != nullptr && tolen >= static_cast<int>(sizeof(sockaddr_in))
-        && to->sa_family == AF_INET)
+        && (to->sa_family == AF_INET
+            || (to->sa_family == AF_INET6
+                && tolen >= static_cast<int>(sizeof(sockaddr_in6)))))
     {
-        CapturePeerAndFlush(s, reinterpret_cast<const sockaddr_in*>(to), tolen);
+        CapturePeerAndFlush(s, to);
     }
+    SetLastError(err);
     return r;
 }
 
@@ -289,11 +336,50 @@ BOOL WINAPI Hook_GQCS(HANDLE port, LPDWORD bytes, PULONG_PTR key,
                       LPOVERLAPPED* ov, DWORD ms)
 {
     const BOOL ok = g_origGQCS(port, bytes, key, ov, ms);
-    if (ok && ov != nullptr && *ov != nullptr && bytes != nullptr)
+    const DWORD err = GetLastError();
+    if (ov != nullptr && *ov != nullptr)
     {
-        ObserveRecvCompletion(*ov, *bytes);
+        ObserveRecvCompletion(*ov, (ok && bytes != nullptr) ? *bytes : 0u);
     }
+    SetLastError(err);
     return ok;
+}
+
+// Swap one IAT slot. Another patcher can flip this page back to read-only
+// between our VirtualProtect and the write (the game's remote IAT patch right
+// after injection, or the launcher guard's TerminateProcess patch, both on
+// neighbouring slots), so the write is SEH-guarded and retried instead of
+// faulting the helper. POD-only for __try.
+bool SwapIatSlot(void** slot, void* hook, void** origOut)
+{
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        DWORD old = 0;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
+        {
+            return false;
+        }
+        bool written = false;
+        __try
+        {
+            // Store the original BEFORE the hook goes live (Revival's threads
+            // call through the slot concurrently); the exchange is the barrier.
+            *origOut = *slot;
+            (void)InterlockedExchangePointer(slot, hook);
+            written = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            written = false;
+        }
+        VirtualProtect(slot, sizeof(void*), old, &old);
+        if (written)
+        {
+            return true;
+        }
+        Sleep(1);
+    }
+    return false;
 }
 
 // Patch one named import in `module`'s IAT. Returns true and stores the original
@@ -329,14 +415,8 @@ bool PatchIatImport(HMODULE module, const char* dllName, const char* funcName,
             if (std::strcmp(reinterpret_cast<const char*>(byName->Name), funcName) != 0)
                 continue;
 
-            void** slot = reinterpret_cast<void**>(&iat->u1.Function);
-            DWORD old = 0;
-            if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
-                return false;
-            *origOut = *slot;
-            *slot = hook;
-            VirtualProtect(slot, sizeof(void*), old, &old);
-            return true;
+            return SwapIatSlot(reinterpret_cast<void**>(&iat->u1.Function),
+                               hook, origOut);
         }
     }
     return false;
