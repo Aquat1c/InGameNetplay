@@ -1870,6 +1870,8 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
         return false;
     }
 
+    if (device->TestCooperativeLevel() != D3D_OK) return false;
+
     IDirect3DSurface9* renderTarget = nullptr;
     if (FAILED(device->GetRenderTarget(0, &renderTarget)) || renderTarget == nullptr)
     {
@@ -2492,7 +2494,10 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
             g_d3dOverlay.netplayMenuObserved = false;
             netplay::debug_overlay::ClearRtText();
         }
-        (void)RenderBrowserIconsD3d9(device);
+        {
+            netplay::debug_overlay::DeviceRenderScope render(device);
+            if (render.Admitted()) (void)RenderBrowserIconsD3d9(device);
+        }
         // ImGui debug overlay + async-host in-gameplay indicator (renders on any
         // screen; no-op unless something is active).
         netplay::debug_overlay::Render(device);

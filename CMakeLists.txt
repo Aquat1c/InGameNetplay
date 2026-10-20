@@ -242,6 +242,18 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(overlay_reset_gate_tests tests/overlay_reset_gate_tests.cpp)
+    target_include_directories(overlay_reset_gate_tests PRIVATE include)
+    target_compile_features(overlay_reset_gate_tests PRIVATE cxx_std_17)
+    add_test(NAME overlay_reset_gate_tests COMMAND overlay_reset_gate_tests)
+    add_executable(overlay_context_scope_tests
+        tests/overlay_context_scope_tests.cpp
+        third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+    target_include_directories(overlay_context_scope_tests PRIVATE include third_party/imgui)
+    target_compile_features(overlay_context_scope_tests PRIVATE cxx_std_17)
+    add_test(NAME overlay_context_scope_tests COMMAND overlay_context_scope_tests)
+
     add_executable(revival_launch_policy_tests
         tests/revival_launch_policy_tests.cpp)
     target_include_directories(revival_launch_policy_tests PRIVATE include)

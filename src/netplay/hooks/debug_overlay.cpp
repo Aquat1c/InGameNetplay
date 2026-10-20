@@ -1,4 +1,6 @@
 #include "netplay/hooks/debug_overlay.h"
+#include "compat/overlay_reset_api.h"
+#include "compat/overlay_context_scope.h"
 
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/core/battle_log_menu.h"
@@ -29,10 +31,58 @@ namespace netplay::debug_overlay
 namespace
 {
 bool g_inited = false;
+ImGuiContext* g_context = nullptr;
+DWORD g_contextThread = 0;
+EfzOverlayResetGate g_resetGate;
 IDirect3DDevice9* g_device = nullptr;
 HWND g_hwnd = nullptr;
 WNDPROC g_prevWndProc = nullptr;
 bool g_panelOpen = false;
+
+HRESULT ResetGateResult(EfzOverlayResetGate::Result result) {
+    switch (result) {
+    case EfzOverlayResetGate::Result::Ok: return S_OK;
+    case EfzOverlayResetGate::Result::InvalidArgument: return E_INVALIDARG;
+    case EfzOverlayResetGate::Result::WrongThread: return RPC_E_WRONG_THREAD;
+    default: return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+}
+
+HRESULT __cdecl BeforeOverlayReset(void* device, uint32_t epoch) {
+    EfzOverlayResetGate::Access access(g_resetGate);
+    if (!access.Acquired()) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    bool invalidate = false;
+    const auto result = g_resetGate.BeforeReset(device, epoch, GetCurrentThreadId(), invalidate);
+    if (result != EfzOverlayResetGate::Result::Ok) return ResetGateResult(result);
+    if (invalidate) {
+        if (!g_context || !g_inited) return E_UNEXPECTED;
+        EfzScopedImGuiContext context(g_context);
+        ImGui_ImplDX9_InvalidateDeviceObjects();
+        g_resetGate.DidInvalidateBackend();
+    }
+    return S_OK;
+}
+
+HRESULT __cdecl AfterOverlayReset(void* device, uint32_t epoch, uint32_t ready) {
+    EfzOverlayResetGate::Access access(g_resetGate);
+    if (!access.Acquired()) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if (ready > 1) return E_INVALIDARG;
+    const auto result = g_resetGate.AfterReset(device, epoch, GetCurrentThreadId(), 0);
+    if (result != EfzOverlayResetGate::Result::Ok) return ResetGateResult(result);
+    if (!ready) return S_OK;
+    if (g_resetGate.BoundDevice() == device) {
+        if (!g_resetGate.BackendInvalidatedFor(device)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (!g_context || !g_inited) return E_UNEXPECTED;
+        const HRESULT cooperative = static_cast<IDirect3DDevice9*>(device)->TestCooperativeLevel();
+        if (cooperative != D3D_OK) return cooperative;
+        EfzScopedImGuiContext context(g_context);
+        if (!ImGui_ImplDX9_CreateDeviceObjects()) {
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+            return E_FAIL;
+        }
+    }
+    return ResetGateResult(g_resetGate.AfterReset(device, epoch, GetCurrentThreadId(), 1));
+}
 
 // Crisp badge font, loaded from a system TTF at a fixed native pixel size so the
 // text is not a scaled-up bitmap (the ImGui default font blurs when scaled).
@@ -204,12 +254,6 @@ float RtFontPxFor(RtTextProfile profile)
 // exactly how efz-training-mode picks the correct surface.)
 constexpr int kGameRtW = 640;
 constexpr int kGameRtH = 480;
-
-// Backbuffer dimensions last seen - used to detect a device RESET (window
-// resize / borderless-fullscreen toggle), which invalidates ImGui's
-// D3DPOOL_DEFAULT resources and makes the overlay vanish until rebuilt.
-int g_lastBackBufferW = 0;
-int g_lastBackBufferH = 0;
 
 // Tunable async-host in-battle indicator parameters. Adjust live in the panel,
 // then hardcode the chosen defaults here.
@@ -727,7 +771,8 @@ void LoadRtFonts()
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (g_inited)
+    DeviceRenderScope input;
+    if (input.Admitted() && g_inited)
     {
         // Toggle key: backslash ("\", next to Enter) = VK_OEM_5. DELETE is
         // already used elsewhere in the game.
@@ -749,6 +794,7 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
     }
 
+    input.Release();
     if (g_prevWndProc != nullptr)
     {
         return CallWindowProcA(g_prevWndProc, hwnd, msg, wParam, lParam);
@@ -824,9 +870,12 @@ bool ShutdownImGui()
         }
     }
 
-    ImGui_ImplDX9_Shutdown();
+    if (g_device) ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
+    ImGui::DestroyContext(g_context);
+    g_context = nullptr;
+    g_contextThread = 0;
+    g_resetGate.UnbindBackend();
     g_inited = false;
     g_device = nullptr;
     g_hwnd = nullptr;
@@ -836,8 +885,6 @@ bool ShutdownImGui()
         g_rtProfileFonts[i] = nullptr;
     }
     InterlockedExchange(&g_rtFontRebuildRequested, 0);
-    g_lastBackBufferW = 0;
-    g_lastBackBufferH = 0;
 
     // Only forget our predecessor once we actually detached from the chain. If
     // DebugWndProc might still be chained below another proc (we did not own the
@@ -870,28 +917,9 @@ void GetRenderTargetSize(IDirect3DDevice9* device, int* outW, int* outH)
     }
 }
 
-// Returns the swap chain's backbuffer (window) size, or {0,0} on failure. Unlike
-// the 640x480 render target, this changes on window resize / fullscreen toggle,
-// so it is what we use to detect a device reset (ImGui object rebuild).
-void GetSwapChainBackBufferSize(IDirect3DDevice9* device, int* outW, int* outH)
-{
-    *outW = 0;
-    *outH = 0;
-    IDirect3DSwapChain9* sc = nullptr;
-    if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc != nullptr)
-    {
-        D3DPRESENT_PARAMETERS pp = {};
-        if (SUCCEEDED(sc->GetPresentParameters(&pp)))
-        {
-            *outW = static_cast<int>(pp.BackBufferWidth);
-            *outH = static_cast<int>(pp.BackBufferHeight);
-        }
-        sc->Release();
-    }
-}
-
 bool EnsureInited(IDirect3DDevice9* device)
 {
+    if (!g_resetGate.CanRender(device, GetCurrentThreadId())) return false;
     if (g_inited && g_device == device)
     {
         return true;
@@ -913,7 +941,9 @@ bool EnsureInited(IDirect3DDevice9* device)
         }
         if (replacementHwnd == g_hwnd)
         {
-            ImGui_ImplDX9_Shutdown();
+            if (g_device) ImGui_ImplDX9_Shutdown();
+            g_resetGate.UnbindBackend();
+            g_device = nullptr;
             if (!ImGui_ImplDX9_Init(device))
             {
                 mod::Log(
@@ -922,8 +952,7 @@ bool EnsureInited(IDirect3DDevice9* device)
                 return false;
             }
             g_device = device;
-            g_lastBackBufferW = 0;
-            g_lastBackBufferH = 0;
+            g_resetGate.BindBackend(device, GetCurrentThreadId());
             mod::Log(
                 "DebugOverlay: DX9 backend rebound device=%p hwnd=%p",
                 device,
@@ -954,7 +983,9 @@ bool EnsureInited(IDirect3DDevice9* device)
     }
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    g_context = ImGui::CreateContext();
+    g_contextThread = GetCurrentThreadId();
+    ImGui::SetCurrentContext(g_context);
     ImGui::GetIO().IniFilename = nullptr; // do not write imgui.ini
     ImGui::StyleColorsDark();
 
@@ -963,13 +994,17 @@ bool EnsureInited(IDirect3DDevice9* device)
 
     if (!ImGui_ImplWin32_Init(hwnd))
     {
-        ImGui::DestroyContext();
+        ImGui::DestroyContext(g_context);
+        g_context = nullptr;
+        g_contextThread = 0;
         return false;
     }
     if (!ImGui_ImplDX9_Init(device))
     {
         ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
+        ImGui::DestroyContext(g_context);
+        g_context = nullptr;
+        g_contextThread = 0;
         return false;
     }
 
@@ -982,6 +1017,7 @@ bool EnsureInited(IDirect3DDevice9* device)
     g_hwnd = hwnd;
     g_device = device;
     g_inited = true;
+    g_resetGate.BindBackend(device, GetCurrentThreadId());
     mod::Log("DebugOverlay: ImGui initialised hwnd=0x%p device=0x%p", hwnd, device);
     return true;
 }
@@ -1217,10 +1253,51 @@ void DrawDebugPanel()
 }
 } // namespace
 
+DeviceRenderScope::DeviceRenderScope(IDirect3DDevice9* device)
+    : access_(g_resetGate) {
+    if (!access_.Acquired()) return;
+    if (!device) device = g_device;
+    if (!g_resetGate.CanRender(device, GetCurrentThreadId())
+        || (g_context && g_contextThread != GetCurrentThreadId())) {
+        access_.Release();
+        return;
+    }
+    previousContext_ = ImGui::GetCurrentContext();
+    ownedContextAtEntry_ = g_context;
+    if (g_context) ImGui::SetCurrentContext(g_context);
+    admitted_ = true;
+}
+
+DeviceRenderScope::~DeviceRenderScope() { Release(); }
+
+void DeviceRenderScope::Release() {
+    if (admitted_) {
+        // EnsureInited can replace a host, destroying the old owned context.
+        if (previousContext_ == ownedContextAtEntry_ && g_context != ownedContextAtEntry_)
+            previousContext_ = nullptr;
+        ImGui::SetCurrentContext(previousContext_);
+        admitted_ = false;
+    }
+    access_.Release();
+}
+
+const EfzOverlayResetApiV1* QueryResetApi() {
+    static const EfzOverlayResetApiV1 api = {
+        sizeof(EfzOverlayResetApiV1), 1, &BeforeOverlayReset, &AfterOverlayReset
+    };
+    return &api;
+}
+
 bool SuspendForOnlineSimulation()
 {
+    EfzOverlayResetGate::Access access(g_resetGate);
+    if (!access.Acquired()
+        || (g_context && g_contextThread != GetCurrentThreadId()))
+        return false;
+    EfzScopedImGuiContext context(g_context);
     ClearRtText();
     g_panelOpen = false;
+    context.ForgetDestroyed(g_context);
     return ShutdownImGui();
 }
 
@@ -1274,6 +1351,9 @@ void Render(IDirect3DDevice9* device)
         return;
     }
 
+    DeviceRenderScope render(device);
+    if (!render.Admitted()) return;
+
     namespace ah = netplay::bridge::async_host;
     const bool debugAvailable = netplay::mod_settings::IsDebugMenuEnabled();
     const bool wantIndicator =
@@ -1295,6 +1375,9 @@ void Render(IDirect3DDevice9* device)
     {
         return;
     }
+
+    // No normal device queries are legal while loss/recovery is pending.
+    if (device->TestCooperativeLevel() != D3D_OK) return;
 
     // Surface filter - only draw on the 640x480 game render target. EndScene also
     // fires for Revival's window-backbuffer present (different size); drawing there
@@ -1353,28 +1436,8 @@ void Render(IDirect3DDevice9* device)
         return;
     }
 
-    // Device-RESET detection: when EFZ resizes the window or toggles
-    // borderless-fullscreen it Reset()s the device, which silently destroys
-    // ImGui's D3DPOOL_DEFAULT resources (font texture + vertex/index buffers) and
-    // makes the overlay vanish. The 640x480 render target never changes, so we
-    // watch the swap-chain (window) backbuffer size and rebuild on a change.
-    {
-        int bbW = 0;
-        int bbH = 0;
-        GetSwapChainBackBufferSize(device, &bbW, &bbH);
-        if (bbW > 0 && bbH > 0 && (bbW != g_lastBackBufferW || bbH != g_lastBackBufferH))
-        {
-            if (g_lastBackBufferW != 0 || g_lastBackBufferH != 0)
-            {
-                mod::Log(
-                    "DebugOverlay: window backbuffer %dx%d -> %dx%d (device reset) - rebuilding ImGui objects",
-                    g_lastBackBufferW, g_lastBackBufferH, bbW, bbH);
-                ImGui_ImplDX9_InvalidateDeviceObjects();
-            }
-            g_lastBackBufferW = bbW;
-            g_lastBackBufferH = bbH;
-        }
-    }
+    // Reset is an explicit owner lifecycle; backbuffer dimensions cannot
+    // detect same-size resets or release resources before the Reset call.
 
     if (!wantPanel && !wantIndicator && !wantRtText)
     {
@@ -1546,3 +1609,8 @@ void ClearRtText()
     InterlockedExchange(&g_rtTextPublished, 0);
 }
 } // namespace netplay::debug_overlay
+
+extern "C" __declspec(dllexport) const EfzOverlayResetApiV1* __cdecl
+EFZ_QueryOverlayResetApiV1(void) {
+    return netplay::debug_overlay::QueryResetApi();
+}

@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <windows.h>
+#include "compat/overlay_reset_gate.h"
 
 struct IDirect3DDevice9;
+struct ImGuiContext;
 
 // ImGui-based debug overlay, rendered through the game's Direct3D9 EndScene hook.
 // Two jobs:
@@ -16,6 +18,23 @@ struct IDirect3DDevice9;
 // Availability is gated by the "debug menu" mod option (IsDebugMenuEnabled).
 namespace netplay::debug_overlay
 {
+// Admission for every game-device overlay operation, including battle-log
+// icons. A null device selects the current backend for Win32 input handling.
+class DeviceRenderScope {
+public:
+    explicit DeviceRenderScope(IDirect3DDevice9* device = nullptr);
+    ~DeviceRenderScope();
+    DeviceRenderScope(const DeviceRenderScope&) = delete;
+    DeviceRenderScope& operator=(const DeviceRenderScope&) = delete;
+    bool Admitted() const { return admitted_; }
+    void Release();
+private:
+    EfzOverlayResetGate::Access access_;
+    ImGuiContext* previousContext_ = nullptr;
+    ImGuiContext* ownedContextAtEntry_ = nullptr;
+    bool admitted_ = false;
+};
+
 // Called once per D3D9 EndScene (from the battle-log EndScene hook). Lazily
 // initialises ImGui (DX9 + Win32 + a chained wndproc hook) and renders whatever
 // is active. Cheap no-op when nothing needs drawing.
