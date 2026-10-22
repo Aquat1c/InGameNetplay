@@ -1,0 +1,610 @@
+#include "netplay/hooks/internal/shared.h"
+#include "netplay/core/battle_log_menu.h"
+#include "netplay/core/mod_settings.h"
+#include "netplay/core/options_menu.h"
+#include "netplay/hooks/debug_overlay.h"
+
+#include "logger.h"
+
+#include <cctype>
+#include <string>
+
+namespace netplay::hooks::internal
+{
+using namespace netplay::constants;
+using SpriteGlyph = netplay::fontmap::SpriteGlyph;
+using NetplayObRow = netplay::menu::NetplayObRow;
+using NetplayMenuAction = netplay::menu::NetplayMenuAction;
+using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
+using NetplayMenuId = netplay::menu::NetplayMenuId;
+using netplay::menu::GetMenuEntries;
+using netplay::menu::RowToIndex;
+
+namespace
+{
+constexpr int kNetplayBackgroundWidth = 320;
+constexpr int kNetplayBackgroundHeight = 240;
+constexpr double kNetplayBackgroundScrollPixelsPerSecond = 12.5;
+
+bool BeginMenuRtTextFrame()
+{
+    if (!netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        return false;
+    }
+    netplay::debug_overlay::BeginRtTextFrame();
+    return true;
+}
+
+void CommitMenuRtTextFrame(bool began)
+{
+    if (began)
+    {
+        netplay::debug_overlay::CommitRtTextFrame();
+    }
+}
+
+bool UseScrollingNetplayBackground()
+{
+    return g_netplayMenuState.theme == NetplayMenuTheme::Scroll
+        && g_netplayMenuState.backgroundSupportsScroll;
+}
+
+void ResetNetplayBackgroundAnimation()
+{
+    g_netplayMenuState.backgroundScrollOffset = 0.0;
+    g_netplayMenuState.backgroundScrollTick = 0;
+}
+
+void AdvanceNetplayBackgroundAnimation()
+{
+    if (!UseScrollingNetplayBackground())
+    {
+        ResetNetplayBackgroundAnimation();
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (g_netplayMenuState.backgroundScrollTick == 0)
+    {
+        g_netplayMenuState.backgroundScrollTick = now;
+        return;
+    }
+
+    DWORD elapsedMs = now - g_netplayMenuState.backgroundScrollTick;
+    if (elapsedMs > 250)
+    {
+        elapsedMs = 250;
+    }
+    g_netplayMenuState.backgroundScrollTick = now;
+
+    g_netplayMenuState.backgroundScrollOffset +=
+        (static_cast<double>(elapsedMs) * kNetplayBackgroundScrollPixelsPerSecond) / 1000.0;
+    while (g_netplayMenuState.backgroundScrollOffset >= kNetplayBackgroundWidth)
+    {
+        g_netplayMenuState.backgroundScrollOffset -= kNetplayBackgroundWidth;
+    }
+}
+
+void LogRecoveryConfigFullFrameIfNeeded(BOOL presentResult, const char* path)
+{
+    (void)presentResult;
+    (void)path;
+    if (!kEnableGameplayExitRecoveryRenderDiagnostics
+        || g_recoveryRenderTraceFramesRemaining <= 0)
+    {
+        return;
+    }
+
+    mod::Log(
+        "NETPLAY_RENDER_CONFIG_FULL_FRAME bgDraw=1 bgDest=0,0,320,240 present=%d path=%s",
+        presentResult ? 1 : 0,
+        path != nullptr ? path : "unknown");
+}
+
+void DrawNetplayBackgroundSurface(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int backgroundSurface = *reinterpret_cast<int*>(screenContext + kOffsetBackgroundSurface);
+
+    if (!UseScrollingNetplayBackground())
+    {
+        (void)blit(
+            graphicsContext,
+            0,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            0,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+        return;
+    }
+
+    AdvanceNetplayBackgroundAnimation();
+    const int scrollX = static_cast<int>(g_netplayMenuState.backgroundScrollOffset);
+    const int firstSliceWidth = kNetplayBackgroundWidth - scrollX;
+    if (firstSliceWidth > 0)
+    {
+        (void)blit(
+            graphicsContext,
+            0,
+            0,
+            firstSliceWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            scrollX,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+    }
+
+    if (scrollX > 0)
+    {
+        (void)blit(
+            graphicsContext,
+            firstSliceWidth,
+            0,
+            kNetplayBackgroundWidth,
+            kNetplayBackgroundHeight,
+            backgroundSurface,
+            0,
+            0,
+            scrollX,
+            kNetplayBackgroundHeight,
+            0,
+            0);
+    }
+}
+} // namespace
+
+void DrawSpriteText(
+    uint32_t screenContext,
+    int startX,
+    int startY,
+    const std::string& text,
+    int maxWidth,
+    bool upperCaseText)
+{
+    if (!g_spriteFont.loaded)
+    {
+        return;
+    }
+
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int objectsSurface = *reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface);
+    const char transparentColor = static_cast<char>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor));
+
+    int x = startX;
+    int y = startY;
+    for (char raw : text)
+    {
+        char c = raw;
+        if (g_spriteFont.uppercaseInput || upperCaseText)
+        {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+
+        if (c == '\n')
+        {
+            x = startX;
+            y += g_spriteFont.lineHeight;
+            continue;
+        }
+
+        if (c == ' ')
+        {
+            x += g_spriteFont.lineHeight / 2;
+            continue;
+        }
+
+        auto it = g_spriteFont.glyphs.find(c);
+        if (it == g_spriteFont.glyphs.end())
+        {
+            x += g_spriteFont.lineHeight / 2;
+            continue;
+        }
+
+        const SpriteGlyph& glyph = it->second;
+        if (maxWidth > 0 && x + glyph.width > startX + maxWidth)
+        {
+            break;
+        }
+
+        (void)blit(
+            graphicsContext,
+            x,
+            y,
+            x + glyph.width,
+            y + glyph.height,
+            objectsSurface,
+            glyph.srcX,
+            glyph.srcY,
+            glyph.srcX + glyph.width,
+            glyph.srcY + glyph.height,
+            transparentColor,
+            0);
+        x += glyph.advance + g_spriteFont.letterSpacing;
+    }
+}
+
+void DrawRuntimeSpriteOverlay(uint32_t screenContext)
+{
+    if (!g_useRuntimeTextOverlay || !g_netplayMenuState.active || !g_spriteFont.loaded)
+    {
+        return;
+    }
+
+    const int panelLeft = 152;
+    const int panelRight = 316;
+    const int titleY = 18;
+    const int rowTextOffsetY = 1;
+
+    DrawSpriteText(screenContext, panelLeft, titleY, BuildMenuHeaderText(), panelRight - panelLeft, true);
+
+    int count = 0;
+    const NetplayMenuEntry* entries = GetMenuEntries(g_netplayMenuState.menuId, &count);
+    if (entries != nullptr && count > 0)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            const int rowIndex = entries[i].renderRow;
+            if (rowIndex < 0 || rowIndex >= kNetplayConfigOptionCount)
+            {
+                continue;
+            }
+
+            if (g_netplayMenuState.menuId == NetplayMenuId::Main)
+            {
+                const std::string badge = BuildRowBadgeText(entries[i]);
+                if (!badge.empty())
+                {
+                    const int badgeY =
+                        g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)]
+                        + rowTextOffsetY;
+                    DrawSpriteText(screenContext, panelRight - 30, badgeY, badge, 30, false);
+                }
+                continue;
+            }
+
+            const bool isLobbyNicknameRow =
+                g_netplayMenuState.menuId == NetplayMenuId::Lobby
+                && entries[i].action >= NetplayMenuAction::LobbySlot0
+                && entries[i].action <= NetplayMenuAction::LobbyPlaying0;
+            if (isLobbyNicknameRow)
+            {
+                continue;
+            }
+
+            const int y = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)] + rowTextOffsetY;
+            DrawSpriteText(screenContext, panelLeft, y, BuildRowLabel(entries[i]), panelRight - panelLeft, false);
+        }
+    }
+
+}
+
+void BlitMenuRowClipped(
+    BlitSurfaceWithTransparencyFn blit,
+    void** graphicsContext,
+    int objectsSurface,
+    char transparentColor,
+    int srcX,
+    int srcY,
+    int width,
+    int height,
+    int destX,
+    int destY)
+{
+    int clippedLeft = destX;
+    int clippedRight = destX + width;
+    if (clippedLeft < 0)
+    {
+        clippedLeft = 0;
+    }
+    if (clippedRight > 320)
+    {
+        clippedRight = 320;
+    }
+    if (clippedRight <= clippedLeft || height <= 0)
+    {
+        return;
+    }
+
+    const int clippedWidth = clippedRight - clippedLeft;
+    const int srcLeft = srcX + (clippedLeft - destX);
+    const int srcRight = srcLeft + clippedWidth;
+    (void)blit(
+        graphicsContext,
+        clippedLeft,
+        destY,
+        clippedRight,
+        destY + height,
+        objectsSurface,
+        srcLeft,
+        srcY,
+        srcRight,
+        srcY + height,
+        transparentColor,
+        0);
+}
+
+void DrawCompactMenuRows(
+    uint32_t screenContext,
+    NetplayMenuId menuId,
+    int logicalSelection,
+    int offsetX)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int objectsSurface = *reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface);
+    const char transparentColor = static_cast<char>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor));
+
+    int count = 0;
+    const NetplayMenuEntry* entries = GetMenuEntries(menuId, &count);
+    if (entries == nullptr || count <= 0)
+    {
+        return;
+    }
+
+    const int clampedSelection = (logicalSelection < 0) ? 0 : ((logicalSelection >= count) ? (count - 1) : logicalSelection);
+    const int height = g_netplayMenuState.renderLayout.highlightHeight;
+    const int srcX = g_netplayMenuState.renderLayout.highlightSourceX;
+    const int widthDefault = 320;
+    const int slideY = GetScaledNativeSlideY(screenContext);
+
+    for (int i = 0; i < count; ++i)
+    {
+        const int rowIndex = entries[i].renderRow;
+        if (rowIndex < 0 || rowIndex >= kNetplayConfigOptionCount)
+        {
+            continue;
+        }
+
+        const bool isSelected = (i == clampedSelection);
+        const int srcY = isSelected
+            ? g_netplayMenuState.renderLayout.highlightSourceY[static_cast<size_t>(rowIndex)]
+            : g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(rowIndex)];
+        const int width = g_netplayMenuState.renderLayout.highlightWidth[static_cast<size_t>(rowIndex)] > 0
+            ? g_netplayMenuState.renderLayout.highlightWidth[static_cast<size_t>(rowIndex)]
+            : widthDefault;
+        const int destY = kNetplayCompactMenuTopY + i * kNetplayCompactMenuRowStep + slideY;
+
+        BlitMenuRowClipped(
+            blit,
+            graphicsContext,
+            objectsSurface,
+            transparentColor,
+            srcX,
+            srcY,
+            width,
+            height,
+            offsetX,
+            destY);
+    }
+}
+
+void DrawCompactMenuTitle(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int objectsSurface = *reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface);
+    const char transparentColor = static_cast<char>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor));
+    constexpr int titleY = 0;
+    BlitMenuRowClipped(
+        blit,
+        graphicsContext,
+        objectsSurface,
+        transparentColor,
+        0,
+        0,
+        320,
+        14,
+        0,
+        titleY);
+}
+
+bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc)
+{
+    const int optionsSlideOffsetX =
+        (g_netplayMenuState.menuId == NetplayMenuId::Options)
+            ? netplay::options::GetOptionsSlideOffsetX()
+            : 0;
+    const netplay::render::DynamicFieldOverlayState state = {
+        g_netplayMenuState.active,
+        g_useRuntimeTextOverlay,
+        IsMenuSlideTransitionActive(),
+        netplay::options::IsSaveOverlayActive(),
+        g_netplayMenuState.menuId,
+        g_netplayMenuState.renderLayout.highlightHeight,
+        g_netplayMenuState.paletteStart,
+        g_netplayMenuState.paletteCount,
+        optionsSlideOffsetX,
+    };
+    return netplay::render::DrawDynamicFieldValuesGdi(GetOverlayCallbacks(), state, screenContext, allowWindowDc);
+}
+
+void DrawAnimatedCompactMenuLayer(uint32_t screenContext)
+{
+    DrawNetplayBackgroundSurface(screenContext);
+    DrawCompactMenuTitle(screenContext);
+    const int logicalSelection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+    DrawCompactMenuRows(screenContext, g_netplayMenuState.menuId, logicalSelection, 0);
+}
+
+void DrawNetplayBackgroundOnly(uint32_t screenContext)
+{
+    DrawNetplayBackgroundSurface(screenContext);
+}
+
+void DrawNetplayBaseLayer(uint32_t screenContext)
+{
+    auto const blit = reinterpret_cast<BlitSurfaceWithTransparencyFn>(RuntimeAddress(kVaBlitSurfaceWithTransparency));
+
+    auto* const graphicsContext = GetGraphicsContext(screenContext);
+    const int objectsSurface = *reinterpret_cast<int*>(screenContext + kOffsetObjectsSurface);
+    const char transparentColor = static_cast<char>(*reinterpret_cast<uint8_t*>(screenContext + kOffsetTransparentColor));
+
+    DrawNetplayBackgroundSurface(screenContext);
+    (void)blit(graphicsContext, 0, 0, 320, 240, objectsSurface, 0, 0, 320, 240, transparentColor, 0);
+
+    {
+        constexpr int kBlankRowIndex = RowToIndex(NetplayObRow::Blank);
+        if (kBlankRowIndex >= 0 && kBlankRowIndex < kNetplayConfigOptionCount)
+        {
+            const int blankSrcY = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(kBlankRowIndex)];
+            const int blankSrcX = g_netplayMenuState.renderLayout.highlightDestX;
+            const int blankHeight = g_netplayMenuState.renderLayout.highlightHeight;
+            const int blankWidth = g_netplayMenuState.renderLayout.highlightWidth[static_cast<size_t>(kBlankRowIndex)];
+
+            for (int row = 0; row < kNetplayConfigOptionCount; ++row)
+            {
+                if (IsRenderRowUsedByMenu(g_netplayMenuState.menuId, row))
+                {
+                    continue;
+                }
+
+                const int dstY = g_netplayMenuState.renderLayout.highlightDestY[static_cast<size_t>(row)];
+                const int dstX = g_netplayMenuState.renderLayout.highlightDestX;
+                const int rowWidth = g_netplayMenuState.renderLayout.highlightWidth[static_cast<size_t>(row)];
+                const int drawWidth = (rowWidth < blankWidth) ? rowWidth : blankWidth;
+
+                (void)blit(
+                    graphicsContext,
+                    dstX,
+                    dstY,
+                    dstX + drawWidth,
+                    dstY + blankHeight,
+                    objectsSurface,
+                    blankSrcX,
+                    blankSrcY,
+                    blankSrcX + drawWidth,
+                    blankSrcY + blankHeight,
+                    transparentColor,
+                    0);
+            }
+        }
+    }
+
+    const int logicalSelection = ClampSelectionToCurrentMenu(static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + kOffsetMenuSelection)));
+    const int rowIndex = GetRenderRowForSelection(logicalSelection);
+    if (rowIndex >= 0 && rowIndex < static_cast<int>(g_netplayMenuState.renderLayout.highlightSourceY.size()))
+    {
+        const int srcY = g_netplayMenuState.renderLayout.highlightSourceY[rowIndex];
+        const int dstY = g_netplayMenuState.renderLayout.highlightDestY[rowIndex];
+        const int width = g_netplayMenuState.renderLayout.highlightWidth[rowIndex];
+        const int srcX = g_netplayMenuState.renderLayout.highlightSourceX;
+        const int dstX = g_netplayMenuState.renderLayout.highlightDestX;
+        const int height = g_netplayMenuState.renderLayout.highlightHeight;
+        (void)blit(
+            graphicsContext,
+            dstX,
+            dstY,
+            dstX + width,
+            dstY + height,
+            objectsSurface,
+            srcX,
+            srcY,
+            srcX + width,
+            srcY + height,
+            transparentColor,
+            0);
+    }
+}
+
+BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
+{
+    auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    const bool rtTextFrame = BeginMenuRtTextFrame();
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawStopHostingConfirmGdi(screenContext);
+        (void)DrawDebugOverlay(screenContext);
+        CommitMenuRtTextFrame(rtTextFrame);
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime_battlelog");
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
+    }
+    DrawNetplayBaseLayer(screenContext);
+    DrawRuntimeSpriteOverlay(screenContext);
+    const bool forceGdi = (g_netplayMenuState.menuId == NetplayMenuId::Lobby);
+    if (!g_spriteFont.loaded || forceGdi)
+    {
+        (void)DrawRuntimeTextOverlayGdi(screenContext, false);
+    }
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawStopHostingConfirmGdi(screenContext);
+    (void)DrawDebugOverlay(screenContext);
+    CommitMenuRtTextFrame(rtTextFrame);
+    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    LogRecoveryConfigFullFrameIfNeeded(presentResult, "runtime");
+    return presentResult;
+}
+
+BOOL RenderNetplayMenuConfigStyle(uint32_t screenContext)
+{
+    auto const present = reinterpret_cast<PresentFrameToScreenFn>(RuntimeAddress(kVaPresentFrameToScreen));
+    const bool rtTextFrame = BeginMenuRtTextFrame();
+    if (g_netplayMenuState.menuId == NetplayMenuId::BattleLog)
+    {
+        DrawNetplayBackgroundOnly(screenContext);
+        (void)netplay::battle_log::DrawOverlayGdi(screenContext, false);
+        const bool drewBattleLogImages = netplay::battle_log::DrawImageOverlayGdi(screenContext, false);
+        (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+        (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+        (void)DrawDelaySetupOverlayGdi(screenContext, false);
+        (void)DrawHostingOverlayGdi(screenContext, false);
+        (void)DrawJoiningOverlayGdi(screenContext, false);
+        (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+        (void)DrawStopHostingConfirmGdi(screenContext);
+        (void)DrawDebugOverlay(screenContext);
+        CommitMenuRtTextFrame(rtTextFrame);
+        const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+        LogRecoveryConfigFullFrameIfNeeded(presentResult, "config_battlelog");
+        if (!drewBattleLogImages)
+        {
+            (void)netplay::battle_log::DrawImageOverlayGdi(screenContext, true);
+        }
+        return presentResult;
+    }
+    DrawAnimatedCompactMenuLayer(screenContext);
+    (void)DrawDynamicFieldValuesGdi(screenContext, false);
+    (void)DrawFooterTooltipOverlayGdi(screenContext, false);
+    (void)netplay::options::DrawSaveOverlayGdi(screenContext, false);
+    (void)DrawDelaySetupOverlayGdi(screenContext, false);
+    (void)DrawHostingOverlayGdi(screenContext, false);
+    (void)DrawJoiningOverlayGdi(screenContext, false);
+    (void)DrawSpectateConfirmOverlayGdi(screenContext, false);
+    (void)DrawStopHostingConfirmGdi(screenContext);
+    (void)DrawDebugOverlay(screenContext);
+    CommitMenuRtTextFrame(rtTextFrame);
+    const BOOL presentResult = present(*reinterpret_cast<int*>(screenContext + kOffsetGraphicsContext));
+    LogRecoveryConfigFullFrameIfNeeded(presentResult, "config");
+    return presentResult;
+}
+} // namespace netplay::hooks::internal

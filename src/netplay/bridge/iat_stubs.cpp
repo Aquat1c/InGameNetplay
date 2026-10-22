@@ -1,0 +1,3781 @@
+// IAT stub implementations and extern "C" nb_stub_* wrappers.
+
+#include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/gameplay_exit_recovery.h"
+#include "crash_handler.h"
+
+#include <array>
+#include <cctype>
+#include <cstring>
+#include <intrin.h>
+#include <string>
+#include <cwchar>
+
+#include <windows.h>
+
+namespace netplay::bridge::takeover
+{
+
+static std::string GetTakeoverModuleDirectoryA()
+{
+    char modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&GetTakeoverModuleDirectoryA),
+        &selfModule);
+    if (selfModule == nullptr || GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+
+    std::string dir(modulePath);
+    const size_t slash = dir.find_last_of("\\/");
+    if (slash == std::string::npos)
+    {
+        return {};
+    }
+    dir.resize(slash);
+    return dir;
+}
+
+static std::wstring GetTakeoverModuleDirectoryW()
+{
+    wchar_t modulePath[MAX_PATH] = {};
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&GetTakeoverModuleDirectoryW),
+        &selfModule);
+    if (selfModule == nullptr || GetModuleFileNameW(selfModule, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+
+    std::wstring dir(modulePath);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+    dir.resize(slash);
+    return dir;
+}
+
+static bool EnsureDirectoryExistsA(const std::string& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    if (CreateDirectoryA(path.c_str(), nullptr) != FALSE)
+    {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    return error == ERROR_ALREADY_EXISTS;
+}
+
+static bool EnsureDirectoryExistsW(const std::wstring& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr) != FALSE)
+    {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    return error == ERROR_ALREADY_EXISTS;
+}
+
+static bool HasLogEfzBaseNameA(LPCSTR path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+
+    const char* baseName = path;
+    for (const char* p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "logEfz.txt") == 0;
+}
+
+static bool HasLogEfzBaseNameW(LPCWSTR path)
+{
+    if (path == nullptr || path[0] == L'\0')
+    {
+        return false;
+    }
+
+    const wchar_t* baseName = path;
+    for (const wchar_t* p = path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _wcsicmp(baseName, L"logEfz.txt") == 0;
+}
+
+static bool HasLogNetBaseNameA(LPCSTR path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+
+    const char* baseName = path;
+    for (const char* p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _stricmp(baseName, "logNet.txt") == 0;
+}
+
+static bool HasLogNetBaseNameW(LPCWSTR path)
+{
+    if (path == nullptr || path[0] == L'\0')
+    {
+        return false;
+    }
+
+    const wchar_t* baseName = path;
+    for (const wchar_t* p = path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+        {
+            baseName = p + 1;
+        }
+    }
+
+    return _wcsicmp(baseName, L"logNet.txt") == 0;
+}
+
+static HANDLE RegisterCreatedConsoleFileA(HANDLE handle, LPCSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != '\0')
+    {
+        captureAsTextLog = IsLikelyRevivalDiskLogPath(std::string(path));
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
+static HANDLE RegisterCreatedConsoleFileW(HANDLE handle, LPCWSTR path)
+{
+    bool captureAsTextLog = false;
+    if (path != nullptr && path[0] != L'\0')
+    {
+        const int utf8Bytes = WideCharToMultiByte(
+            CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Bytes > 1)
+        {
+            std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+            if (WideCharToMultiByte(
+                    CP_UTF8,
+                    0,
+                    path,
+                    -1,
+                    utf8.data(),
+                    utf8Bytes,
+                    nullptr,
+                    nullptr) > 0)
+            {
+                utf8.resize(static_cast<size_t>(utf8Bytes - 1));
+                captureAsTextLog = IsLikelyRevivalDiskLogPath(utf8);
+            }
+        }
+    }
+    RegisterConsoleCaptureFileHandle(handle, captureAsTextLog);
+    return handle;
+}
+
+static bool IsTruncatingWriteOpen(DWORD desiredAccess, DWORD creationDisposition)
+{
+    const bool wantsWrite =
+        (desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    const bool truncates =
+        creationDisposition == CREATE_ALWAYS
+        || creationDisposition == TRUNCATE_EXISTING;
+    return wantsWrite && truncates;
+}
+
+static void SeekEndAndWriteLogNetSessionSeparator(HANDLE handle)
+{
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    const DWORD endPos = SetFilePointer(handle, 0, nullptr, FILE_END);
+    if (endPos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
+    {
+        return;
+    }
+    if (endPos == 0)
+    {
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    char separator[128] = {};
+    const int len = std::snprintf(
+        separator,
+        sizeof(separator),
+        "\r\n===== new session %04u-%02u-%02u %02u:%02u:%02u pid=%lu =====\r\n",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned long>(GetCurrentProcessId()));
+    if (len > 0)
+    {
+        DWORD written = 0;
+        (void)WriteFile(handle, separator, static_cast<DWORD>(len), &written, nullptr);
+    }
+}
+
+static std::string GetNativeShadowLogEfzPathA()
+{
+    const std::string dir = GetTakeoverModuleDirectoryA();
+    if (dir.empty())
+    {
+        return {};
+    }
+
+    const char* const subdir = IsCurrentProcessRevival() ? "native_revival" : "native_host";
+    const std::string logsDir = dir + "\\logs";
+    if (!EnsureDirectoryExistsA(logsDir))
+    {
+        return {};
+    }
+    const std::string shadowDir = logsDir + "\\" + subdir;
+    if (!EnsureDirectoryExistsA(shadowDir))
+    {
+        return {};
+    }
+
+    return shadowDir + "\\logEfz.txt";
+}
+
+static std::wstring GetNativeShadowLogEfzPathW()
+{
+    const std::wstring dir = GetTakeoverModuleDirectoryW();
+    if (dir.empty())
+    {
+        return {};
+    }
+
+    const wchar_t* const subdir = IsCurrentProcessRevival() ? L"native_revival" : L"native_host";
+    const std::wstring logsDir = dir + L"\\logs";
+    if (!EnsureDirectoryExistsW(logsDir))
+    {
+        return {};
+    }
+    const std::wstring shadowDir = logsDir + L"\\" + subdir;
+    if (!EnsureDirectoryExistsW(shadowDir))
+    {
+        return {};
+    }
+
+    return shadowDir + L"\\logEfz.txt";
+}
+
+// Dummy vtable slots (decompiled Revival DLLs); each slot's ret N must match
+// the original method's stack cleanup or the stack corrupts.
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+
+__declspec(naked) static void DummyVtableRet()
+{
+    __asm {
+        xor eax, eax
+        ret
+    }
+}
+
+__declspec(naked) static void DummyVtableRet4()
+{
+    __asm {
+        xor eax, eax
+        ret 4
+    }
+}
+
+__declspec(naked) static void DummyVtableRet8()
+{
+    __asm {
+        xor eax, eax
+        ret 8
+    }
+}
+
+#else
+static int  __cdecl DummyVtableRet()    { return 0; }
+static int  __cdecl DummyVtableRet4()   { return 0; }
+static int  __cdecl DummyVtableRet8()   { return 0; }
+#endif
+
+static uintptr_t g_revivalLegacyDummyVtable[9] = { 0 };
+static uintptr_t g_revival102jDummyVtable[10] = { 0 };
+static uintptr_t g_revival102jCompactDummyVtable[10] = { 0 };
+static bool g_dummyVtableInitialized = false;
+
+// DestroyCurrentSession consumes this identity to choose the real deleting destructor.
+static PVOID volatile g_neutralizedSession = nullptr;
+static PVOID volatile g_neutralizedOriginalVtable = nullptr;
+
+static bool IsActiveRevival102jForVtable()
+{
+    return g_activeRevival != nullptr
+        && g_activeRevival->versionTag != nullptr
+        && std::strcmp(g_activeRevival->versionTag, "1.02j") == 0;
+}
+
+static void EnsureDummyVtable()
+{
+    if (g_dummyVtableInitialized)
+    {
+        return;
+    }
+
+    const uintptr_t ret  = reinterpret_cast<uintptr_t>(DummyVtableRet);
+    const uintptr_t ret4 = reinterpret_cast<uintptr_t>(DummyVtableRet4);
+    const uintptr_t ret8 = reinterpret_cast<uintptr_t>(DummyVtableRet8);
+
+    g_revivalLegacyDummyVtable[0] = ret4; // [0] deleting destructor
+    g_revivalLegacyDummyVtable[1] = ret;  // [1] init
+    g_revivalLegacyDummyVtable[2] = ret;  // [2] tick
+    g_revivalLegacyDummyVtable[3] = ret4; // [3] hotkey
+    g_revivalLegacyDummyVtable[4] = ret8; // [4] input
+    g_revivalLegacyDummyVtable[5] = ret4; // [5] net data
+    g_revivalLegacyDummyVtable[6] = ret8; // [6] character
+    g_revivalLegacyDummyVtable[7] = ret8; // [7] action
+    g_revivalLegacyDummyVtable[8] = ret4; // [8] action
+
+    // MinGW 1.02j: separate full/deleting destructor slots shift the rest by one.
+    g_revival102jDummyVtable[0] = ret;  // [0] full destructor
+    g_revival102jDummyVtable[1] = ret;  // [1] deleting destructor
+    g_revival102jDummyVtable[2] = ret;  // [2] post-init
+    g_revival102jDummyVtable[3] = ret;  // [3] tick
+    g_revival102jDummyVtable[4] = ret4; // [4] hotkey
+    g_revival102jDummyVtable[5] = ret8; // [5] input
+    g_revival102jDummyVtable[6] = ret4; // [6] net data
+    g_revival102jDummyVtable[7] = ret8; // [7] character
+    g_revival102jDummyVtable[8] = ret8; // [8] action
+    g_revival102jDummyVtable[9] = ret4; // [9] action
+
+    std::memcpy(
+        g_revival102jCompactDummyVtable,
+        g_revival102jDummyVtable,
+        sizeof(g_revival102jCompactDummyVtable));
+    // Compact: slots 7/8 route through one-arg stdcall thunks (RVA 0x64610/0x64630).
+    g_revival102jCompactDummyVtable[7] = ret4;
+    g_revival102jCompactDummyVtable[8] = ret4;
+
+    g_dummyVtableInitialized = true;
+}
+
+static uintptr_t* ActiveDummyVtable(
+    uintptr_t originalVtable,
+    uintptr_t revivalBase)
+{
+    if (!IsActiveRevival102jForVtable())
+    {
+        return &g_revivalLegacyDummyVtable[0];
+    }
+    if (g_activeRevival != nullptr
+        && g_activeRevival->tournamentSessionVtableRva != 0
+        && originalVtable
+            == revivalBase + g_activeRevival->tournamentSessionVtableRva)
+    {
+        return &g_revival102jCompactDummyVtable[0];
+    }
+    return &g_revival102jDummyVtable[0];
+}
+
+void NeutralizeRevivalSessionVtable()
+{
+    EnsureDummyVtable();
+
+    HMODULE revival = g_localRevivalModule;
+    if (revival == nullptr)
+    {
+        revival = GetModuleHandleA("EfzRevival.dll");
+    }
+    if (revival == nullptr)
+    {
+        return;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+    if (g_activeRevival == nullptr || g_activeRevival->sessionPtrOffsetCount == 0)
+    {
+        return;
+    }
+
+    const uintptr_t sessionGlobalAddr = base + g_activeRevival->sessionPtrOffsets[0];
+    uintptr_t sessionPtr = 0;
+    if (!SafeReadPtr(reinterpret_cast<const void*>(sessionGlobalAddr), &sessionPtr) || sessionPtr == 0)
+    {
+        return;
+    }
+
+    auto* vtableSlot = reinterpret_cast<uintptr_t*>(sessionPtr);
+    const uintptr_t originalVtable = *vtableSlot;
+    const uintptr_t dummyVtable =
+        reinterpret_cast<uintptr_t>(ActiveDummyVtable(originalVtable, base));
+    if (originalVtable == dummyVtable
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revival102jCompactDummyVtable[0])
+        || originalVtable == reinterpret_cast<uintptr_t>(
+            &g_revivalLegacyDummyVtable[0]))
+    {
+        return;
+    }
+
+    const uintptr_t pendingSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (pendingSession != 0 && pendingSession != sessionPtr)
+    {
+        mod::Log(
+            "NeutralizeRevivalSessionVtable: replacing unconsumed identity "
+            "oldSession=0x%08lX newSession=0x%08lX",
+            static_cast<unsigned long>(pendingSession),
+            static_cast<unsigned long>(sessionPtr));
+    }
+
+    InterlockedExchangePointer(
+        &g_neutralizedOriginalVtable,
+        reinterpret_cast<PVOID>(originalVtable));
+    MemoryBarrier();
+    InterlockedExchangePointer(
+        &g_neutralizedSession,
+        reinterpret_cast<PVOID>(sessionPtr));
+    *vtableSlot = dummyVtable;
+
+    mod::Log(
+        "NeutralizeRevivalSessionVtable: captured session=0x%08lX "
+        "originalVtable=0x%08lX dummyVtable=0x%08lX abi=%s",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable),
+        static_cast<unsigned long>(dummyVtable),
+        IsActiveRevival102jForVtable() ? "mingw10" : "msvc9");
+}
+
+bool RestoreNeutralizedSessionVtableForCleanup(
+    uintptr_t sessionPtr,
+    uintptr_t* outOriginalVtable)
+{
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = 0;
+    }
+    if (sessionPtr == 0)
+    {
+        return false;
+    }
+
+    const uintptr_t capturedSession = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(&g_neutralizedSession, nullptr, nullptr));
+    if (capturedSession != sessionPtr)
+    {
+        return false;
+    }
+
+    const uintptr_t originalVtable = reinterpret_cast<uintptr_t>(
+        InterlockedCompareExchangePointer(
+            &g_neutralizedOriginalVtable,
+            nullptr,
+            nullptr));
+    if (originalVtable == 0
+        || !IsWritableRange(reinterpret_cast<void*>(sessionPtr), sizeof(uintptr_t)))
+    {
+        mod::Log(
+            "RestoreNeutralizedSessionVtableForCleanup: invalid capture "
+            "session=0x%08lX originalVtable=0x%08lX",
+            static_cast<unsigned long>(sessionPtr),
+            static_cast<unsigned long>(originalVtable));
+        return false;
+    }
+
+    *reinterpret_cast<uintptr_t*>(sessionPtr) = originalVtable;
+    MemoryBarrier();
+    InterlockedExchangePointer(&g_neutralizedSession, nullptr);
+    InterlockedExchangePointer(&g_neutralizedOriginalVtable, nullptr);
+    if (outOriginalVtable != nullptr)
+    {
+        *outOriginalVtable = originalVtable;
+    }
+    mod::Log(
+        "RestoreNeutralizedSessionVtableForCleanup: restored "
+        "session=0x%08lX originalVtable=0x%08lX",
+        static_cast<unsigned long>(sessionPtr),
+        static_cast<unsigned long>(originalVtable));
+    return true;
+}
+
+// Safety net behind SaveAndApplyDllExitProcessPatches: if an unpatched DLL call
+// site still reaches ExitProcess, clean up and suspend instead of exiting.
+
+typedef VOID (WINAPI *ExitProcessFn)(UINT uExitCode);
+static ExitProcessFn g_realExitProcess = nullptr;
+static ULONG_PTR* g_revivalExitProcessIatSlot = nullptr;
+
+bool SignalGracefulQuitRing(const char* contextTag, uintptr_t callerRva)
+{
+    const char* const quitWireName = RevivalWireName("Quit");
+    HANDLE hMap = OpenFileMappingA(
+        FILE_MAP_ALL_ACCESS,
+        FALSE,
+        quitWireName);
+    if (hMap == nullptr)
+    {
+        mod::Log(
+            "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
+            "OpenFileMappingA('%s') failed err=%lu",
+            contextTag != nullptr ? contextTag : "",
+            static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    auto* view = static_cast<volatile uint8_t*>(
+        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 9));
+    if (view == nullptr)
+    {
+        const DWORD mapErr = GetLastError();
+        CloseHandle(hMap);
+        mod::Log(
+            "GracefulQuitRing: skipped (%s) callerRva=0x%lX "
+            "MapViewOfFile('%s') failed err=%lu",
+            contextTag != nullptr ? contextTag : "",
+            static_cast<unsigned long>(callerRva),
+            quitWireName != nullptr ? quitWireName : "",
+            static_cast<unsigned long>(mapErr));
+        return false;
+    }
+
+    auto* header = reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(view));
+    const LONG headBefore = header[0];
+    const LONG tailBefore = header[1];
+    const bool alreadyQueued = headBefore != tailBefore;
+
+    if (!alreadyQueued)
+    {
+        view[8] = 1;
+        MemoryBarrier();
+        InterlockedExchange(&header[1], tailBefore + 1);
+    }
+
+    const LONG headAfter = header[0];
+    const LONG tailAfter = header[1];
+
+    UnmapViewOfFile(const_cast<uint8_t*>(view));
+    CloseHandle(hMap);
+
+    mod::Log(
+        "GracefulQuitRing: %s (%s) callerRva=0x%lX "
+        "head=%ld->%ld tail=%ld->%ld",
+        alreadyQueued ? "already pending" : "queued",
+        contextTag != nullptr ? contextTag : "",
+        static_cast<unsigned long>(callerRva),
+        static_cast<long>(headBefore),
+        static_cast<long>(headAfter),
+        static_cast<long>(tailBefore),
+        static_cast<long>(tailAfter));
+    return true;
+}
+
+static VOID WINAPI NeutralizeExitProcess(UINT uExitCode)
+{
+    const void* callerAddr = _ReturnAddress();
+    uintptr_t callerRva = 0;
+    const char* callerModule = "unknown";
+    {
+        HMODULE revival = g_localRevivalModule;
+        if (revival != nullptr)
+        {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
+            const uintptr_t caller = reinterpret_cast<uintptr_t>(callerAddr);
+            if (caller >= base && caller < base + 0x200000u)
+            {
+                callerRva = caller - base;
+                callerModule = "EfzRevival.dll";
+            }
+        }
+    }
+    int currentScreenIndex = -1;
+    if (g_activeRevival != nullptr && g_activeRevival->addrGameModeCurrentIndex != 0)
+    {
+        SafeReadInt(
+            reinterpret_cast<const void*>(g_activeRevival->addrGameModeCurrentIndex),
+            &currentScreenIndex);
+    }
+
+    if (IsLocalProcessCloseForGameplayStallActive() && g_realExitProcess != nullptr)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: user-initiated close (code=%u role=%d screen=%d "
+            "caller=%s+0x%lX) - passing through to real ExitProcess for clean shutdown",
+            uExitCode, g_localRoleFlag, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva));
+        mod::FlushLoggerSync();
+        g_realExitProcess(uExitCode);
+    }
+
+    if (InterlockedExchange(&g_revivalExitIntercepted, 1) == 0)
+    {
+        const int role = g_localRoleFlag;
+        InterlockedExchange(&g_revivalExitMode, static_cast<LONG>(role));
+
+        mod::Log(
+            "NeutralizeExitProcess: intercepted code=%u role=%d screen=%d "
+            "caller=%s+0x%lX (%p) frameJmpActive=%d uiJmpActive=%d",
+            uExitCode, role, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr,
+            g_netplayFrameJmpActive ? 1 : 0,
+            g_netplayUiJmpActive ? 1 : 0);
+
+        if (ConsumeOnlineMatchEscGracefulQuit())
+        {
+            mod::Log(
+                "NeutralizeExitProcess: online match ESC broadcast request "
+                "role=%d screen=%d helperPid=%lu caller=%s+0x%lX",
+                role,
+                currentScreenIndex,
+                static_cast<unsigned long>(g_revivalProcessId),
+                callerModule,
+                static_cast<unsigned long>(callerRva));
+            const bool peerQuitSent =
+                RequestInjectedPeerQuitBroadcast("online_match_esc_late_fallback", 300u);
+            mod::Log(
+                "NeutralizeExitProcess: online match ESC peer-quit broadcast=%d "
+                "caller=%s+0x%lX",
+                peerQuitSent ? 1 : 0,
+                callerModule,
+                static_cast<unsigned long>(callerRva));
+            if (!peerQuitSent)
+            {
+                mod::Log(
+                    "NeutralizeExitProcess: online match ESC broadcast failed; "
+                    "continuing with local cleanup and helper teardown");
+            }
+        }
+
+        if (role == kLocalRoleTournament)
+        {
+            ClearRevivalText();
+        }
+
+        NeutralizeRevivalSessionVtable();
+        mod::Log(
+            "NeutralizeExitProcess: vtable neutralised code=%u role=%d",
+            uExitCode, role);
+    }
+
+    const DWORD currentThreadId = GetCurrentThreadId();
+    if (g_netplayFrameJmpActive
+        && g_netplayFrameJmpOwnerThreadId == currentThreadId)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: longjmp - returning control to game "
+            "thread (role=%d)",
+            g_localRoleFlag);
+        g_netplayFrameJmpActive = false;
+        longjmp(g_netplayFrameJmpBuf, 1);
+    }
+
+    if (g_netplayUiJmpActive
+        && g_netplayUiJmpOwnerThreadId == currentThreadId)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: ui longjmp - escaping title/menu path "
+            "(role=%d)",
+            g_localRoleFlag);
+        g_netplayUiJmpActive = false;
+        longjmp(g_netplayUiJmpBuf, 1);
+    }
+
+    // jmp_buf is thread-affine: never longjmp across threads; park this caller
+    // and let the game thread's recovery path run.
+    if ((g_netplayFrameJmpActive
+            && g_netplayFrameJmpOwnerThreadId != currentThreadId)
+        || (g_netplayUiJmpActive
+            && g_netplayUiJmpOwnerThreadId != currentThreadId))
+    {
+        mod::Log(
+            "NeutralizeExitProcess: refusing cross-thread longjmp currentTid=%lu frameOwner=%lu uiOwner=%lu",
+            static_cast<unsigned long>(currentThreadId),
+            static_cast<unsigned long>(g_netplayFrameJmpOwnerThreadId),
+            static_cast<unsigned long>(g_netplayUiJmpOwnerThreadId));
+        while (true)
+        {
+            Sleep(INFINITE);
+        }
+    }
+
+    const int currentRole = g_localRoleFlag;
+    if (currentRole == kLocalRoleOnline || currentRole == kLocalRoleSpectate)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: no jmp recovery for online role=%d screen=%d "
+            "caller=%s+0x%lX (%p) - performing inline cleanup (TOCTOU last resort)",
+            currentRole, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        if (netplay::bridge::recovery::ShouldSuppressLegacyGameplayExitCleanup())
+        {
+            mod::Log(
+                "GAMEPLAY_EXIT_RECOVERY_SUPPRESS_OLD_TEARDOWN reason=neutralize_exitprocess_toctou inProgress=%d pendingMenu=%d completed=%d origin=%s",
+                netplay::bridge::recovery::IsGameplayExitRecoveryInProgress() ? 1 : 0,
+                netplay::bridge::recovery::HasPendingGameplayExitMenuEntry() ? 1 : 0,
+                netplay::bridge::recovery::WasGameplayExitRecoveryCompleted() ? 1 : 0,
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            (void)SuppressDeferredCancelCleanupAfterGameplayRecovery(
+                netplay::bridge::recovery::CurrentGameplayExitRecoveryOrigin());
+            Sleep(INFINITE);
+        }
+
+        const bool initOk = ForceLocalPlayInit();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 1 ForceLocalPlayInit result=%d",
+            initOk ? 1 : 0);
+
+        if (g_revivalProcess != nullptr)
+        {
+            const BOOL termOk = TerminatePeerProcessIfOwned(
+                0, "exitprocess_toctou");
+            (void)ReleasePeerProcessAfterTerminationAttempt(
+                termOk, nullptr, "exitprocess_toctou");
+            mod::Log(
+                "NeutralizeExitProcess: TOCTOU step 2 helper terminated=%d",
+                termOk ? 1 : 0);
+        }
+
+        const bool patchOk = RestoreDllExitProcessPatches();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 3 RestoreDllExitProcessPatches=%d",
+            patchOk ? 1 : 0);
+
+        const bool textOk = ResetRevivalTextRenderingAfterCleanup(
+            "exitprocess_toctou");
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 4 ResetRevivalTextRenderingAfterCleanup=%d",
+            textOk ? 1 : 0);
+
+        mod::ResetCrashRecoveryState();
+
+        const bool modeOk = ForceGameModeToTitle();
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU step 6 ForceGameModeToTitle=%d",
+            modeOk ? 1 : 0);
+        (void)RestoreExeDispatchHookForTitle("NeutralizeExitProcess_TOCTOU");
+
+        mod::Log(
+            "NeutralizeExitProcess: TOCTOU cleanup complete, suspending thread "
+            "(role=%d)",
+            currentRole);
+        SuspendThread(GetCurrentThread());
+        while (true) { Sleep(INFINITE); }
+    }
+    if (currentRole == kLocalRoleTournament)
+    {
+        mod::Log(
+            "NeutralizeExitProcess: tournament fallback cleanup - no jmp "
+            "recovery role=%d screen=%d caller=%s+0x%lX (%p)",
+            currentRole, currentScreenIndex,
+            callerModule, static_cast<unsigned long>(callerRva), callerAddr);
+
+        // Never destroy the tournament object or restore executing bytes on this
+        // unknown stack; the game-thread tick boundary owns that transaction.
+        InterlockedExchange(
+            &g_revivalExitMode,
+            static_cast<LONG>(kLocalRoleTournament));
+        InterlockedExchange(&g_revivalExitIntercepted, 1);
+        ArmTournamentReturnCleanup("exitprocess_no_boundary");
+        mod::Log(
+            "NeutralizeExitProcess: tournament cleanup delegated to post-tick owner; suspending noreturn caller (role=%d)",
+            currentRole);
+        while (true) { Sleep(INFINITE); }
+    }
+
+    mod::Log(
+        "NeutralizeExitProcess: no longjmp recovery point active - "
+        "suspending thread (role=%d screen=%d caller=%s+0x%lX, safety fallback)",
+        currentRole, currentScreenIndex,
+        callerModule, static_cast<unsigned long>(callerRva));
+    while (true) { Sleep(INFINITE); }
+}
+
+bool PatchRevivalDllExitProcess()
+{
+    HMODULE module = g_localRevivalModule;
+    if (module == nullptr)
+    {
+        return false;
+    }
+
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        mod::Log("PatchRevivalDllExitProcess: bad DOS signature");
+        return false;
+    }
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+    {
+        mod::Log("PatchRevivalDllExitProcess: bad NT signature");
+        return false;
+    }
+
+    const DWORD importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    const DWORD importSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+    if (importDir == 0 || importSize == 0)
+    {
+        mod::Log("PatchRevivalDllExitProcess: no import directory");
+        return false;
+    }
+
+    auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importDir);
+    for (; importDesc->Name != 0; ++importDesc)
+    {
+        const char* dllName = reinterpret_cast<const char*>(base + importDesc->Name);
+        if (_stricmp(dllName, "kernel32.dll") != 0)
+        {
+            continue;
+        }
+
+        if (importDesc->OriginalFirstThunk == 0)
+        {
+            continue;
+        }
+
+        auto* origThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + importDesc->OriginalFirstThunk);
+        auto* iatThunk  = reinterpret_cast<IMAGE_THUNK_DATA*>(base + importDesc->FirstThunk);
+
+        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal))
+            {
+                continue;
+            }
+
+            auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(importByName->Name), "ExitProcess") != 0)
+            {
+                continue;
+            }
+
+            const auto current = reinterpret_cast<ExitProcessFn>(
+                iatThunk->u1.Function);
+            if (current == NeutralizeExitProcess)
+            {
+                g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
+                const bool originalIsUsable = g_realExitProcess != nullptr
+                    && g_realExitProcess != NeutralizeExitProcess;
+                mod::Log(
+                    "PatchRevivalDllExitProcess: already patched original=0x%p valid=%d",
+                    reinterpret_cast<void*>(g_realExitProcess),
+                    originalIsUsable ? 1 : 0);
+                return originalIsUsable;
+            }
+
+            HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+            const auto nativeExitProcess = kernel32 != nullptr
+                ? reinterpret_cast<ExitProcessFn>(
+                    GetProcAddress(kernel32, "ExitProcess"))
+                : nullptr;
+            if (nativeExitProcess == nullptr
+                || (g_realExitProcess == nullptr
+                    && current != nativeExitProcess))
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: unrecognized initial IAT owner current=0x%p native=0x%p; refusing to overwrite",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(nativeExitProcess));
+                return false;
+            }
+
+            // Preserve the first real target across re-installations; never
+            // save our own interceptor as the real one.
+            if (g_realExitProcess != nullptr && g_realExitProcess != current)
+            {
+                mod::Log(
+                    "PatchRevivalDllExitProcess: IAT ownership changed current=0x%p saved=0x%p; refusing",
+                    reinterpret_cast<void*>(current),
+                    reinterpret_cast<void*>(g_realExitProcess));
+                return false;
+            }
+            if (g_realExitProcess == nullptr)
+            {
+                g_realExitProcess = current;
+            }
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect))
+            {
+                mod::Log("PatchRevivalDllExitProcess: VirtualProtect failed err=%lu", GetLastError());
+                return false;
+            }
+            iatThunk->u1.Function = reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+            BOOL protectRestored = FALSE;
+            DWORD protectRestoreError = ERROR_SUCCESS;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                DWORD ignored = 0;
+                if (VirtualProtect(
+                        &iatThunk->u1.Function,
+                        sizeof(uintptr_t),
+                        oldProtect,
+                        &ignored))
+                {
+                    protectRestored = TRUE;
+                    break;
+                }
+                protectRestoreError = GetLastError();
+            }
+            g_revivalExitProcessIatSlot = &iatThunk->u1.Function;
+
+            mod::Log(
+                "PatchRevivalDllExitProcess: patched IAT entry orig=0x%p stub=0x%p protectRestored=%d err=%lu",
+                reinterpret_cast<void*>(g_realExitProcess),
+                reinterpret_cast<void*>(NeutralizeExitProcess),
+                protectRestored ? 1 : 0,
+                static_cast<unsigned long>(protectRestoreError));
+            return true;
+        }
+    }
+
+    mod::Log("PatchRevivalDllExitProcess: ExitProcess import not found in kernel32 descriptor");
+    return false;
+}
+
+bool IsRevivalDllExitProcessIatPatched()
+{
+    return g_revivalExitProcessIatSlot != nullptr
+        && g_realExitProcess != nullptr
+        && g_realExitProcess != NeutralizeExitProcess
+        && *g_revivalExitProcessIatSlot
+            == reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+}
+
+bool RestoreRevivalDllExitProcessIat()
+{
+    if (g_revivalExitProcessIatSlot == nullptr || g_realExitProcess == nullptr)
+    {
+        return true;
+    }
+
+    const ULONG_PTR interceptor =
+        reinterpret_cast<ULONG_PTR>(NeutralizeExitProcess);
+    const ULONG_PTR original = reinterpret_cast<ULONG_PTR>(g_realExitProcess);
+    const ULONG_PTR current = *g_revivalExitProcessIatSlot;
+    if (current == original)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+        return true;
+    }
+    if (current != interceptor)
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: ownership changed current=0x%p expected=0x%p; refusing",
+            reinterpret_cast<void*>(current),
+            reinterpret_cast<void*>(interceptor));
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            g_revivalExitProcessIatSlot,
+            sizeof(*g_revivalExitProcessIatSlot),
+            PAGE_READWRITE,
+            &oldProtect))
+    {
+        mod::Log(
+            "RestoreRevivalDllExitProcessIat: VirtualProtect failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    *g_revivalExitProcessIatSlot = original;
+    BOOL protectRestored = FALSE;
+    DWORD protectRestoreError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        DWORD ignored = 0;
+        if (VirtualProtect(
+                g_revivalExitProcessIatSlot,
+                sizeof(*g_revivalExitProcessIatSlot),
+                oldProtect,
+                &ignored))
+        {
+            protectRestored = TRUE;
+            break;
+        }
+        protectRestoreError = GetLastError();
+    }
+    const bool restored = *g_revivalExitProcessIatSlot == original;
+    if (restored)
+    {
+        g_revivalExitProcessIatSlot = nullptr;
+    }
+    mod::Log(
+        "RestoreRevivalDllExitProcessIat: restored=%d protectRestored=%d err=%lu original=0x%p",
+        restored ? 1 : 0,
+        protectRestored ? 1 : 0,
+        static_cast<unsigned long>(protectRestoreError),
+        reinterpret_cast<void*>(original));
+    // Byte ownership is the lifecycle-critical result: a failed best-effort
+    // protection retry must not mask a restored target.
+    return restored;
+}
+
+constexpr DWORD kRedirectProcessAccess =
+    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD | SYNCHRONIZE;
+
+static bool ContainsInsensitiveAscii(const char* haystack, const char* needle)
+{
+    if (haystack == nullptr || needle == nullptr || needle[0] == '\0')
+    {
+        return false;
+    }
+
+    const size_t needleLen = std::strlen(needle);
+    for (size_t i = 0; haystack[i] != '\0'; ++i)
+    {
+        size_t j = 0;
+        while (j < needleLen && haystack[i + j] != '\0')
+        {
+            const unsigned char lhs = static_cast<unsigned char>(haystack[i + j]);
+            const unsigned char rhs = static_cast<unsigned char>(needle[j]);
+            if (std::tolower(lhs) != std::tolower(rhs))
+            {
+                break;
+            }
+            ++j;
+        }
+        if (j == needleLen)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ShouldRedirectCreateProcessA(LPCSTR lpApplicationName, LPCSTR lpCommandLine)
+{
+    return ContainsInsensitiveAscii(lpApplicationName, "efz.exe")
+        || ContainsInsensitiveAscii(lpCommandLine, "efz.exe");
+}
+
+static bool LooksLikePauseChildLaunchA(LPCSTR lpApplicationName, LPCSTR lpCommandLine)
+{
+    return ContainsInsensitiveAscii(lpApplicationName, "pause")
+        || ContainsInsensitiveAscii(lpCommandLine, "pause")
+        || ContainsInsensitiveAscii(lpApplicationName, "cmd.exe")
+        || ContainsInsensitiveAscii(lpCommandLine, "cmd.exe");
+}
+
+struct PendingConsoleSourceView
+{
+    const char* tag;
+    const std::string* text;
+};
+
+static bool TryMapBlockedChildConsoleErrorText(const std::string& text, std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty())
+    {
+        return false;
+    }
+
+    if (ContainsCaseInsensitive(trimmed, "Connection timed out"))
+    {
+        *outText = "Connection timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Source quit or timed out"))
+    {
+        *outText = "Source quit or timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Host timed out"))
+    {
+        *outText = "Host timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Remote timed out"))
+    {
+        *outText = "Remote timed out";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Only one net instance allowed"))
+    {
+        *outText = "Only one net instance allowed";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Spectators have been disabled"))
+    {
+        *outText = "Spectators have been disabled by the host";
+        return true;
+    }
+    if (ContainsCaseInsensitive(trimmed, "Socket error"))
+    {
+        *outText = trimmed.substr(0, 120);
+        return true;
+    }
+
+    return false;
+}
+
+static bool TryReadBlockedChildConsoleScreenText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    HANDLE hConsoleOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hConsoleOutput == nullptr || hConsoleOutput == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    CONSOLE_SCREEN_BUFFER_INFO info = {};
+    if (!GetConsoleScreenBufferInfo(hConsoleOutput, &info))
+    {
+        return false;
+    }
+
+    if (info.dwSize.X <= 0)
+    {
+        return false;
+    }
+
+    SHORT startY = static_cast<SHORT>(info.dwCursorPosition.Y - 4);
+    if (startY < info.srWindow.Top)
+    {
+        startY = info.srWindow.Top;
+    }
+
+    SHORT endY = info.dwCursorPosition.Y;
+    if (endY > info.srWindow.Bottom)
+    {
+        endY = info.srWindow.Bottom;
+    }
+
+    if (startY > endY)
+    {
+        return false;
+    }
+
+    std::string snapshot;
+    for (SHORT row = startY; row <= endY; ++row)
+    {
+        std::wstring wideLine(static_cast<size_t>(info.dwSize.X), L'\0');
+        DWORD charsRead = 0;
+        COORD readCoord = {0, row};
+        if (!ReadConsoleOutputCharacterW(
+                hConsoleOutput,
+                wideLine.data(),
+                static_cast<DWORD>(wideLine.size()),
+                readCoord,
+                &charsRead)
+            || charsRead == 0)
+        {
+            continue;
+        }
+
+        wideLine.resize(static_cast<size_t>(charsRead));
+
+        int utf8Bytes = WideCharToMultiByte(CP_UTF8, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        UINT codePage = CP_UTF8;
+        if (utf8Bytes <= 0)
+        {
+            codePage = CP_ACP;
+            utf8Bytes = WideCharToMultiByte(codePage, 0, wideLine.data(), static_cast<int>(wideLine.size()), nullptr, 0, nullptr, nullptr);
+        }
+        if (utf8Bytes <= 0)
+        {
+            continue;
+        }
+
+        std::string utf8(static_cast<size_t>(utf8Bytes), '\0');
+        if (WideCharToMultiByte(
+                codePage,
+                0,
+                wideLine.data(),
+                static_cast<int>(wideLine.size()),
+                utf8.data(),
+                utf8Bytes,
+                nullptr,
+                nullptr)
+            <= 0)
+        {
+            continue;
+        }
+
+        const std::string trimmed = TrimAscii(utf8);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!snapshot.empty())
+        {
+            snapshot.push_back('\n');
+        }
+        snapshot.append(trimmed);
+    }
+
+    if (snapshot.empty())
+    {
+        return false;
+    }
+
+    *outText = snapshot;
+    return true;
+}
+
+static std::string DescribeBlockedChildConsoleScreenText()
+{
+    std::string snapshot;
+    if (!TryReadBlockedChildConsoleScreenText(&snapshot))
+    {
+        return {};
+    }
+
+    const std::string trimmed = TrimAscii(snapshot);
+    if (trimmed.size() <= 120)
+    {
+        return trimmed;
+    }
+
+    return trimmed.substr(0, 120) + "...";
+}
+
+static bool TryExtractBlockedChildPendingConsoleErrorText(std::string* outText)
+{
+    if (outText == nullptr)
+    {
+        return false;
+    }
+
+    outText->clear();
+
+    std::string screenSnapshot;
+    if (TryReadBlockedChildConsoleScreenText(&screenSnapshot)
+        && TryMapBlockedChildConsoleErrorText(screenSnapshot, outText))
+    {
+        return true;
+    }
+
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string bestRawText;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (TryMapBlockedChildConsoleErrorText(trimmed, outText))
+        {
+            return true;
+        }
+
+        if (trimmed.size() > bestRawText.size())
+        {
+            bestRawText = trimmed;
+        }
+    }
+
+    if (bestRawText.empty())
+    {
+        return false;
+    }
+
+    *outText = bestRawText.substr(0, 120);
+    return true;
+}
+
+static std::string DescribeBlockedChildPendingConsoleText()
+{
+    const PendingConsoleSourceView sources[] = {
+        {"WriteFile", &g_consolePendingWriteFile},
+        {"WriteFileDisk", &g_consolePendingWriteFileDisk},
+        {"WriteConsoleA", &g_consolePendingWriteConsoleA},
+        {"WriteConsoleW", &g_consolePendingWriteConsoleW},
+        {"WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA},
+        {"WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW},
+        {"OutputDebugStringA", &g_consolePendingOutputDebugStringA},
+        {"OutputDebugStringW", &g_consolePendingOutputDebugStringW},
+    };
+
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    std::string summary;
+    constexpr size_t kMaxPreviewLen = 80;
+    for (const PendingConsoleSourceView& source : sources)
+    {
+        const std::string trimmed = TrimAscii(*source.text);
+        if (trimmed.empty())
+        {
+            continue;
+        }
+
+        if (!summary.empty())
+        {
+            summary.append(" | ");
+        }
+        summary.append(source.tag);
+        summary.push_back('=');
+        summary.push_back('\'');
+        if (trimmed.size() > kMaxPreviewLen)
+        {
+            summary.append(trimmed.substr(0, kMaxPreviewLen));
+            summary.append("...");
+        }
+        else
+        {
+            summary.append(trimmed);
+        }
+        summary.push_back('\'');
+    }
+
+    return summary;
+}
+
+enum class RedirectHostSource
+{
+    InjectedBlock,
+    TempIpc,
+};
+
+static bool TryOpenHostProcessByPid(uint32_t hostPid, HANDLE* outProcessHandle)
+{
+    if (hostPid == 0 || outProcessHandle == nullptr)
+    {
+        return false;
+    }
+
+    const HANDLE processHandle = OpenProcess(kRedirectProcessAccess, FALSE, hostPid);
+    if (processHandle == nullptr)
+    {
+        return false;
+    }
+
+    *outProcessHandle = processHandle;
+    return true;
+}
+
+static bool ResolveHostProcessForRedirect(HANDLE* outProcessHandle, uint32_t* outHostPid, RedirectHostSource* outSource)
+{
+    if (outProcessHandle == nullptr || outHostPid == nullptr)
+    {
+        return false;
+    }
+
+    *outProcessHandle = nullptr;
+    *outHostPid = 0;
+
+    if (g_injectedBlock != nullptr)
+    {
+        if (TryOpenHostProcessByPid(g_injectedBlock->hostPid, outProcessHandle))
+        {
+            *outHostPid = g_injectedBlock->hostPid;
+            if (outSource != nullptr)
+            {
+                *outSource = RedirectHostSource::InjectedBlock;
+            }
+            return true;
+        }
+    }
+
+    TempIpcContext temp = {};
+    if (!OpenTempIpcContext(&temp, false, false) || temp.block == nullptr)
+    {
+        CloseTempIpcContext(&temp);
+        return false;
+    }
+
+    InterlockedIncrement(&temp.block->dbgCreateProcessHits);
+    const uint32_t tempHostPid = temp.block->hostPid;
+    const bool opened = TryOpenHostProcessByPid(tempHostPid, outProcessHandle);
+    CloseTempIpcContext(&temp);
+    if (!opened)
+    {
+        return false;
+    }
+
+    if (g_injectedBlock != nullptr && g_injectedBlock->hostPid != tempHostPid)
+    {
+        g_injectedBlock->hostPid = tempHostPid;
+    }
+
+    *outHostPid = tempHostPid;
+    if (outSource != nullptr)
+    {
+        *outSource = RedirectHostSource::TempIpc;
+    }
+    return true;
+}
+
+static LONG PeekPublishedConsoleErrorSerial()
+{
+    if (g_injectedBlock != nullptr)
+    {
+        return InterlockedCompareExchange(&g_injectedBlock->consoleErrorSerial, 0, 0);
+    }
+
+    TempIpcContext temp = {};
+    LONG serial = 0;
+    if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+    {
+        serial = InterlockedCompareExchange(&temp.block->consoleErrorSerial, 0, 0);
+    }
+    CloseTempIpcContext(&temp);
+    return serial;
+}
+
+static uintptr_t ResolveInjectedInitAddress()
+{
+    if (g_injectedInitAddress != 0)
+    {
+        return g_injectedInitAddress;
+    }
+
+    HMODULE revival = GetModuleHandleA("EfzRevival.dll");
+    if (revival == nullptr)
+    {
+        return 0;
+    }
+
+    const FARPROC initProc = GetProcAddress(revival, "init");
+    g_injectedInitAddress = reinterpret_cast<uintptr_t>(initProc);
+    if (g_injectedInitAddress != 0)
+    {
+        mod::Log("Takeover: resolved injected init address=0x%p", reinterpret_cast<void*>(g_injectedInitAddress));
+    }
+    return g_injectedInitAddress;
+}
+
+static bool IsLikelyInitThreadCall(LPTHREAD_START_ROUTINE lpStartAddress, LONG callIndex)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(lpStartAddress);
+    const uintptr_t initAddress = ResolveInjectedInitAddress();
+    if (initAddress != 0 && start == initAddress)
+    {
+        return true;
+    }
+
+    if (initAddress != 0)
+    {
+        const uintptr_t localBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("EfzRevival.dll"));
+        if (localBase != 0 && initAddress >= localBase)
+        {
+            const uintptr_t initRva = initAddress - localBase;
+            uintptr_t remoteBase = ResolveInjectedExpectedRevivalBase();
+            if (remoteBase == 0)
+            {
+                remoteBase = static_cast<uintptr_t>(g_activeRevival->defaultImageBase);
+            }
+            const uintptr_t expectedRemoteInit = remoteBase + initRva;
+            if (start == expectedRemoteInit)
+            {
+                return true;
+            }
+        }
+    }
+
+    return callIndex >= 2;
+}
+
+static bool TryReadRemoteInitParams(LPVOID lpParameter, int* outMode, int* outMagic)
+{
+    if (lpParameter == nullptr || outMode == nullptr || outMagic == nullptr)
+    {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(lpParameter, &mbi, sizeof(mbi)) == 0)
+    {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT || mbi.Protect == PAGE_NOACCESS)
+    {
+        return false;
+    }
+
+    const DWORD protect = mbi.Protect & 0xFF;
+    const bool readable =
+        protect == PAGE_READONLY ||
+        protect == PAGE_READWRITE ||
+        protect == PAGE_WRITECOPY ||
+        protect == PAGE_EXECUTE_READ ||
+        protect == PAGE_EXECUTE_READWRITE ||
+        protect == PAGE_EXECUTE_WRITECOPY;
+    if (!readable)
+    {
+        return false;
+    }
+
+    int params[2] = {0, 0};
+    std::memcpy(params, lpParameter, sizeof(params));
+    *outMode = params[0];
+    *outMagic = params[1];
+    return true;
+}
+
+BOOL StubCreateProcessA(
+    LPCSTR lpApplicationName,
+    LPSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCSTR lpCurrentDirectory,
+    LPSTARTUPINFOA lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation)
+{
+    if (g_injectedBlock != nullptr)
+    {
+        InterlockedIncrement(&g_injectedBlock->dbgCreateProcessHits);
+    }
+
+    if (!ShouldRedirectCreateProcessA(lpApplicationName, lpCommandLine))
+    {
+        const LONG errorSerialBefore = PeekPublishedConsoleErrorSerial();
+        const std::string pendingErrorTextBeforeFlush = []() {
+            std::string text;
+            TryExtractBlockedChildPendingConsoleErrorText(&text);
+            return text;
+        }();
+        const std::string screenPreviewBeforeFlush = DescribeBlockedChildConsoleScreenText();
+        const std::string pendingPreviewBeforeFlush = DescribeBlockedChildPendingConsoleText();
+        const bool remoteTimeoutEvidence =
+            ContainsCaseInsensitive(
+                pendingErrorTextBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                screenPreviewBeforeFlush,
+                "Remote timed out")
+            || ContainsCaseInsensitive(
+                pendingPreviewBeforeFlush,
+                "Remote timed out");
+        bool heldDelayTimeout =
+            remoteTimeoutEvidence
+            && TryPublishHeldHostDelayTimeout();
+        FlushPendingConsoleOutput("before_CreateProcessA_system");
+        LONG errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        const bool looksLikePause = LooksLikePauseChildLaunchA(lpApplicationName, lpCommandLine);
+        if (!heldDelayTimeout && HasPendingHeldHostDelayTimeout())
+        {
+            heldDelayTimeout = true;
+        }
+        if (errorSerialAfter <= errorSerialBefore)
+        {
+            if (heldDelayTimeout)
+            {
+                MOD_LIFECYCLE_TRACE(
+                    "NATIVE_DELAY_TIMEOUT_CHILD_BLOCKED errorSerial=%ld "
+                    "cleanup=pending",
+                    static_cast<long>(errorSerialAfter));
+            }
+            else if (!pendingErrorTextBeforeFlush.empty())
+            {
+                PublishConsoleError(pendingErrorTextBeforeFlush.c_str());
+            }
+            else
+            {
+                PublishConsoleError(
+                    looksLikePause
+                        ? "Revival entered a lasolasse prompt"
+                        : "Revival attempted an unexpected child process");
+            }
+            errorSerialAfter = PeekPublishedConsoleErrorSerial();
+        }
+
+        mod::Log(
+            "nb_stub_CreateProcessA: blocked helper child process app='%s' cmd='%s' "
+            "pause=%d heldDelayTimeout=%d consoleErrorBefore=%ld "
+            "consoleErrorAfter=%ld pendingError='%s' screenPreview='%s' "
+            "pendingPreview=%s",
+            lpApplicationName != nullptr ? lpApplicationName : "",
+            lpCommandLine != nullptr ? lpCommandLine : "",
+            looksLikePause ? 1 : 0,
+            heldDelayTimeout ? 1 : 0,
+            static_cast<long>(errorSerialBefore),
+            static_cast<long>(errorSerialAfter),
+            pendingErrorTextBeforeFlush.c_str(),
+            screenPreviewBeforeFlush.c_str(),
+            pendingPreviewBeforeFlush.empty() ? "<empty>" : pendingPreviewBeforeFlush.c_str());
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+
+    if (lpProcessInformation == nullptr)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        mod::Log("nb_stub_CreateProcessA: redirect rejected (null PROCESS_INFORMATION)");
+        return FALSE;
+    }
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+
+    HANDLE processHandle = nullptr;
+    uint32_t hostPid = 0;
+    RedirectHostSource source = RedirectHostSource::InjectedBlock;
+    if (!ResolveHostProcessForRedirect(&processHandle, &hostPid, &source))
+    {
+        const uint32_t injectedHostPid = (g_injectedBlock != nullptr) ? g_injectedBlock->hostPid : 0u;
+        mod::Log(
+            "nb_stub_CreateProcessA: OpenProcess failed injectedHostPid=%lu err=%s",
+            static_cast<unsigned long>(injectedHostPid),
+            ErrorString(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    HANDLE threadHandle = CreateEventA(nullptr, TRUE, TRUE, nullptr);
+    if (threadHandle == nullptr)
+    {
+        mod::Log("nb_stub_CreateProcessA: failed to create fake process thread handle: %s", ErrorString(GetLastError()).c_str());
+        CloseHandle(processHandle);
+        return FALSE;
+    }
+
+    g_fakeProcessThreadHandle = threadHandle;
+
+    std::memset(lpProcessInformation, 0, sizeof(PROCESS_INFORMATION));
+    lpProcessInformation->hProcess = processHandle;
+    lpProcessInformation->hThread = threadHandle;
+    lpProcessInformation->dwProcessId = hostPid;
+    lpProcessInformation->dwThreadId = GetCurrentThreadId();
+    mod::Log(
+        "nb_stub_CreateProcessA: redirected to host pid=%lu source=%s",
+        static_cast<unsigned long>(lpProcessInformation->dwProcessId),
+        (source == RedirectHostSource::TempIpc) ? "temp_ipc" : "injected");
+    return TRUE;
+}
+
+BOOL StubReadProcessMemory(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead)
+{
+    const uintptr_t address = reinterpret_cast<uintptr_t>(lpBaseAddress);
+    if (address == 0x787237)
+    {
+        if (lpBuffer != nullptr && nSize > 0)
+        {
+            std::memset(lpBuffer, 0, nSize);
+        }
+        if (lpNumberOfBytesRead != nullptr)
+        {
+            *lpNumberOfBytesRead = nSize;
+        }
+        return TRUE;
+    }
+
+    if (address == 0x7871F4)
+    {
+        std::array<uint8_t, 4> bytes = {
+            static_cast<uint8_t>(g_activeRevival->efzFingerprint & 0xFF),
+            static_cast<uint8_t>((g_activeRevival->efzFingerprint >> 8) & 0xFF),
+            static_cast<uint8_t>((g_activeRevival->efzFingerprint >> 16) & 0xFF),
+            static_cast<uint8_t>((g_activeRevival->efzFingerprint >> 24) & 0xFF),
+        };
+        const SIZE_T copy = (std::min)(nSize, static_cast<SIZE_T>(bytes.size()));
+        if (lpBuffer != nullptr && copy > 0)
+        {
+            std::memcpy(lpBuffer, bytes.data(), copy);
+        }
+        if (lpNumberOfBytesRead != nullptr)
+        {
+            *lpNumberOfBytesRead = copy;
+        }
+        const LONG hits = InterlockedIncrement(&g_injectedFingerprintReadHits);
+        if (hits <= 8 || (hits % 64) == 0)
+        {
+            mod::Log(
+                "nb_stub_ReadProcessMemory: spoof addr=0x%08lX size=%zu value=0x%08lX count=%ld",
+                static_cast<unsigned long>(address),
+                static_cast<size_t>(nSize),
+                static_cast<unsigned long>(g_activeRevival->efzFingerprint),
+                static_cast<long>(hits));
+        }
+        return TRUE;
+    }
+
+    return ReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+}
+
+LPVOID StubVirtualAllocEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (!HasInjectedContext())
+    {
+        LPVOID local = VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+        if (local == nullptr)
+        {
+            mod::Log("nb_stub_VirtualAllocEx: fallback VirtualAlloc failed size=%zu err=%s", static_cast<size_t>(dwSize), ErrorString(GetLastError()).c_str());
+        }
+        else
+        {
+            RegisterRedirectAllocation(local, dwSize);
+            mod::Log("nb_stub_VirtualAllocEx: fallback local alloc size=%zu addr=0x%p", static_cast<size_t>(dwSize), local);
+        }
+        return local;
+    }
+
+    const LPVOID local = VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+    if (local == nullptr)
+    {
+        mod::Log("nb_stub_VirtualAllocEx: VirtualAlloc failed size=%zu err=%s", static_cast<size_t>(dwSize), ErrorString(GetLastError()).c_str());
+    }
+    else
+    {
+        RegisterRedirectAllocation(local, dwSize);
+    }
+    return local;
+}
+
+BOOL StubVirtualFreeEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (!HasInjectedContext())
+    {
+        if (lpAddress == nullptr)
+        {
+            return TRUE;
+        }
+        DWORD freeType = dwFreeType == 0 ? MEM_RELEASE : dwFreeType;
+        SIZE_T freeSize = (freeType == MEM_RELEASE) ? 0 : dwSize;
+        BOOL ok = VirtualFree(lpAddress, freeSize, freeType);
+        if (ok == FALSE && freeType == MEM_RELEASE)
+        {
+            ok = VirtualFree(lpAddress, 0, MEM_RELEASE);
+        }
+        if (ok != FALSE && freeType == MEM_RELEASE)
+        {
+            ForgetRedirectAllocation(lpAddress);
+        }
+        return ok;
+    }
+
+    if (lpAddress == nullptr)
+    {
+        return TRUE;
+    }
+
+    DWORD freeType = dwFreeType;
+    SIZE_T freeSize = dwSize;
+    if (freeType == 0)
+    {
+        freeType = MEM_RELEASE;
+        freeSize = 0;
+    }
+
+    BOOL ok = VirtualFree(lpAddress, freeSize, freeType);
+    if (ok == FALSE && freeType == MEM_RELEASE && freeSize != 0)
+    {
+        ok = VirtualFree(lpAddress, 0, MEM_RELEASE);
+    }
+    if (ok != FALSE && freeType == MEM_RELEASE)
+    {
+        ForgetRedirectAllocation(lpAddress);
+    }
+    return ok;
+}
+
+BOOL StubWriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten)
+{
+    if (g_injectedBlock != nullptr)
+    {
+        InterlockedIncrement(&g_injectedBlock->dbgWriteProcessHits);
+    }
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (!HasInjectedContext())
+    {
+        bool copied = true;
+        if (lpBaseAddress != nullptr && lpBuffer != nullptr && nSize > 0)
+        {
+            if (IsWithinRedirectAllocation(lpBaseAddress, nSize) && IsWritableRange(lpBaseAddress, nSize))
+            {
+                std::memcpy(lpBaseAddress, lpBuffer, nSize);
+            }
+            else
+            {
+                copied = false;
+                SetLastError(ERROR_NOACCESS);
+                const LONG blockedHits = InterlockedIncrement(&g_redirectWriteBlockedHits);
+                if (blockedHits <= 8 || (blockedHits % 64) == 0)
+                {
+                    mod::Log(
+                        "nb_stub_WriteProcessMemory: fallback write blocked addr=0x%p size=%zu tracked=%d count=%ld",
+                        lpBaseAddress,
+                        static_cast<size_t>(nSize),
+                        IsWithinRedirectAllocation(lpBaseAddress, nSize) ? 1 : 0,
+                        static_cast<long>(blockedHits));
+                }
+            }
+        }
+        if (lpNumberOfBytesWritten != nullptr)
+        {
+            *lpNumberOfBytesWritten = copied ? nSize : 0;
+        }
+
+        if (nSize == sizeof(int) * 2 && lpBuffer != nullptr)
+        {
+            const int* vals = reinterpret_cast<const int*>(lpBuffer);
+            TempIpcContext temp = {};
+            if (OpenTempIpcContext(&temp, true, false) && temp.block != nullptr)
+            {
+                InterlockedIncrement(&temp.block->dbgWriteProcessHits);
+                if (vals[1] == 102 && vals[0] >= 0 && vals[0] <= 3)
+                {
+                    temp.block->initParams[0] = vals[0];
+                    temp.block->initParams[1] = vals[1];
+                    InterlockedIncrement(&temp.block->initSerial);
+                    if (temp.initEvent != nullptr)
+                    {
+                        SetEvent(temp.initEvent);
+                    }
+                    LogRevival102jDeepStep(
+                        "Helper.WriteProcessMemory.fallback_init_event_signaled");
+                    LogRevival102jDeepBytes(
+                        "Helper.WriteProcessMemory.fallback",
+                        "init.params",
+                        reinterpret_cast<uintptr_t>(vals),
+                        sizeof(vals));
+                    mod::Log(
+                        "nb_stub_WriteProcessMemory: fallback captured init params mode=%d magic=%d",
+                        vals[0],
+                        vals[1]);
+                }
+            }
+            CloseTempIpcContext(&temp);
+        }
+        else
+        {
+            TempIpcContext temp = {};
+            if (OpenTempIpcContext(&temp, false, false) && temp.block != nullptr)
+            {
+                InterlockedIncrement(&temp.block->dbgWriteProcessHits);
+            }
+            CloseTempIpcContext(&temp);
+        }
+        return copied ? TRUE : FALSE;
+    }
+
+    bool copied = true;
+    if (lpBaseAddress != nullptr && lpBuffer != nullptr && nSize > 0)
+    {
+        if (IsWithinRedirectAllocation(lpBaseAddress, nSize) && IsWritableRange(lpBaseAddress, nSize))
+        {
+            std::memcpy(lpBaseAddress, lpBuffer, nSize);
+        }
+        else
+        {
+            copied = false;
+            SetLastError(ERROR_NOACCESS);
+            const LONG blockedHits = InterlockedIncrement(&g_redirectWriteBlockedHits);
+            if (blockedHits <= 8 || (blockedHits % 64) == 0)
+            {
+                mod::Log(
+                    "nb_stub_WriteProcessMemory: write blocked addr=0x%p size=%zu tracked=%d count=%ld",
+                    lpBaseAddress,
+                    static_cast<size_t>(nSize),
+                    IsWithinRedirectAllocation(lpBaseAddress, nSize) ? 1 : 0,
+                    static_cast<long>(blockedHits));
+            }
+        }
+    }
+
+    if (lpNumberOfBytesWritten != nullptr)
+    {
+        *lpNumberOfBytesWritten = copied ? nSize : 0;
+    }
+
+    if (nSize == sizeof(int) * 2)
+    {
+        const int* vals = reinterpret_cast<const int*>(lpBuffer);
+        mod::Log("nb_stub_WriteProcessMemory: observed init write mode=%d magic=%d dst=0x%p", vals[0], vals[1], lpBaseAddress);
+
+        if (!g_initCapturedFromWrite
+            && vals[1] == 102
+            && vals[0] >= 0
+            && vals[0] <= 3
+            && g_injectedBlock != nullptr
+            && g_injectedInitEvent != nullptr)
+        {
+            g_injectedBlock->initParams[0] = vals[0];
+            g_injectedBlock->initParams[1] = vals[1];
+            InterlockedIncrement(&g_injectedBlock->initSerial);
+            SetEvent(g_injectedInitEvent);
+            LogRevival102jDeepStep(
+                "Helper.WriteProcessMemory.init_event_signaled");
+            LogRevival102jDeepBytes(
+                "Helper.WriteProcessMemory",
+                "init.params",
+                reinterpret_cast<uintptr_t>(vals),
+                sizeof(vals));
+            g_initCapturedFromWrite = true;
+            mod::Log(
+                "nb_stub_WriteProcessMemory: captured init params via write mode=%d magic=%d",
+                vals[0],
+                vals[1]);
+        }
+    }
+
+    return copied ? TRUE : FALSE;
+}
+
+HANDLE StubCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId)
+{
+    (void)hProcess;
+    (void)lpThreadAttributes;
+    (void)dwStackSize;
+    (void)dwCreationFlags;
+
+    if (lpThreadId != nullptr)
+    {
+        *lpThreadId = GetCurrentThreadId();
+    }
+
+    if (g_injectedBlock != nullptr)
+    {
+        InterlockedIncrement(&g_injectedBlock->dbgCreateRemoteThreadHits);
+    }
+
+    const uintptr_t expectedRemoteBase = [&]() -> uintptr_t {
+        uintptr_t base = ResolveInjectedExpectedRevivalBase();
+        if (base == 0)
+        {
+            base = ResolveHostRevivalBase();
+        }
+        if (base == 0)
+        {
+            base = static_cast<uintptr_t>(g_activeRevival->defaultImageBase);
+        }
+        return base;
+    }();
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (!HasInjectedContext())
+    {
+        TempIpcContext temp = {};
+        const LONG callIndexFallback = InterlockedIncrement(&g_remoteThreadCallIndex);
+        int paramMode = 0;
+        int paramMagic = 0;
+        const bool hasParamHint = TryReadRemoteInitParams(lpParameter, &paramMode, &paramMagic);
+        const bool paramLooksLikeInit = hasParamHint && paramMagic == 102 && paramMode >= 0 && paramMode <= 3;
+
+        if (OpenTempIpcContext(&temp, true, false) && temp.block != nullptr)
+        {
+            InterlockedIncrement(&temp.block->dbgCreateRemoteThreadHits);
+            if (paramLooksLikeInit && temp.initEvent != nullptr)
+            {
+                temp.block->initParams[0] = paramMode;
+                temp.block->initParams[1] = paramMagic;
+                InterlockedIncrement(&temp.block->initSerial);
+                SetEvent(temp.initEvent);
+                LogRevival102jDeepStep(
+                    "Helper.CreateRemoteThread.fallback_init_event_signaled");
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.mode",
+                    reinterpret_cast<uintptr_t>(&paramMode),
+                    sizeof(paramMode));
+                LogRevival102jDeepBytes(
+                    "Helper.CreateRemoteThread.fallback",
+                    "init.magic",
+                    reinterpret_cast<uintptr_t>(&paramMagic),
+                    sizeof(paramMagic));
+                mod::Log(
+                    "nb_stub_CreateRemoteThread: fallback captured init params mode=%d magic=%d start=0x%p call=%ld",
+                    paramMode,
+                    paramMagic,
+                    reinterpret_cast<void*>(lpStartAddress),
+                    static_cast<long>(callIndexFallback));
+                CloseTempIpcContext(&temp);
+                return CreateFakeThread(1);
+            }
+        }
+        CloseTempIpcContext(&temp);
+
+        mod::Log("nb_stub_CreateRemoteThread: passthrough (ready=%d start=0x%p)", HasInjectedContext() ? 1 : 0, reinterpret_cast<void*>(lpStartAddress));
+        return CreateRemoteThread(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId);
+    }
+
+    const LONG callIndex = InterlockedIncrement(&g_remoteThreadCallIndex);
+    int paramMode = 0;
+    int paramMagic = 0;
+    const bool hasParamHint = TryReadRemoteInitParams(lpParameter, &paramMode, &paramMagic);
+    const bool paramLooksLikeInit = hasParamHint && paramMagic == 102 && paramMode >= 0 && paramMode <= 3;
+    const bool initCall = paramLooksLikeInit || IsLikelyInitThreadCall(lpStartAddress, callIndex);
+    DWORD fakeExitCode = static_cast<DWORD>(expectedRemoteBase);
+
+    if (initCall)
+    {
+        int params[2] = {0, 102};
+        if (hasParamHint)
+        {
+            params[0] = paramMode;
+            params[1] = paramMagic;
+        }
+        else if (lpParameter != nullptr)
+        {
+            std::memcpy(params, lpParameter, sizeof(params));
+        }
+        g_injectedBlock->initParams[0] = params[0];
+        g_injectedBlock->initParams[1] = params[1];
+        InterlockedIncrement(&g_injectedBlock->initSerial);
+        SetEvent(g_injectedInitEvent);
+        LogRevival102jDeepStep(
+            "Helper.CreateRemoteThread.init_event_signaled");
+        LogRevival102jDeepBytes(
+            "Helper.CreateRemoteThread",
+            "init.params",
+            reinterpret_cast<uintptr_t>(params),
+            sizeof(params));
+        fakeExitCode = 1;
+        mod::Log(
+            "nb_stub_CreateRemoteThread: captured init params mode=%d magic=%d start=0x%p call=%ld",
+            params[0],
+            params[1],
+            reinterpret_cast<void*>(lpStartAddress),
+            static_cast<long>(callIndex));
+    }
+    else
+    {
+        mod::Log(
+            "nb_stub_CreateRemoteThread: bypass call start=0x%p call=%ld base=0x%08lX",
+            reinterpret_cast<void*>(lpStartAddress),
+            static_cast<long>(callIndex),
+            static_cast<unsigned long>(fakeExitCode));
+    }
+
+    return CreateFakeThread(fakeExitCode);
+}
+
+BOOL StubTerminateProcess(
+    HANDLE hProcess,
+    UINT uExitCode,
+    const void* callerReturnAddress)
+{
+    if (hProcess == nullptr)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    const ExternalLauncherTerminateDecision externalDecision =
+        EvaluateExternalLauncherTerminate(hProcess, callerReturnAddress);
+    if (externalDecision == ExternalLauncherTerminateDecision::Block)
+    {
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    if (externalDecision == ExternalLauncherTerminateDecision::PassThrough)
+    {
+        return TerminateProcess(hProcess, uExitCode);
+    }
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+
+    uint32_t hostPid = 0;
+    if (g_injectedBlock != nullptr)
+    {
+        hostPid = g_injectedBlock->hostPid;
+    }
+
+    if (hostPid != 0)
+    {
+        const DWORD targetPid = GetProcessId(hProcess);
+        if (targetPid == 0)
+        {
+            const LONG hits = InterlockedIncrement(&g_injectedTerminateUnknownPidHits);
+            if (hits <= 8 || (hits % 64) == 0)
+            {
+                const DWORD pidError = GetLastError();
+                mod::Log(
+                    "nb_stub_TerminateProcess: unresolved target pid hostPid=%lu handle=0x%p err=%s (blocked) count=%ld",
+                    static_cast<unsigned long>(hostPid),
+                    hProcess,
+                    ErrorString(pidError).c_str(),
+                    static_cast<long>(hits));
+            }
+            return TRUE;
+        }
+        if (targetPid == hostPid)
+        {
+            mod::Log(
+                "nb_stub_TerminateProcess: blocked host termination pid=%lu exit=%u",
+                static_cast<unsigned long>(targetPid),
+                static_cast<unsigned>(uExitCode));
+            return TRUE;
+        }
+    }
+
+    return TerminateProcess(hProcess, uExitCode);
+}
+
+HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+
+    uint32_t hostPid = 0;
+    if (g_injectedBlock != nullptr)
+    {
+        hostPid = g_injectedBlock->hostPid;
+    }
+
+    DWORD requestedAccess = dwDesiredAccess;
+    if (hostPid != 0 && dwProcessId == hostPid && (requestedAccess & PROCESS_TERMINATE) != 0)
+    {
+        requestedAccess &= ~PROCESS_TERMINATE;
+        mod::Log(
+            "nb_stub_OpenProcess: stripped PROCESS_TERMINATE for host pid=%lu requested=0x%08lX effective=0x%08lX",
+            static_cast<unsigned long>(dwProcessId),
+            static_cast<unsigned long>(dwDesiredAccess),
+            static_cast<unsigned long>(requestedAccess));
+    }
+
+    return OpenProcess(requestedAccess, bInheritHandle, dwProcessId);
+}
+
+static volatile LONG g_consoleReadGeneration = 0;
+
+BOOL StubWriteConsoleInputA(
+    HANDLE hConsoleInput,
+    const INPUT_RECORD* lpBuffer,
+    DWORD nLength,
+    LPDWORD lpNumberOfEventsWritten)
+{
+    INPUT_RECORD record = {};
+    const bool recordReadable =
+        lpBuffer != nullptr
+        && nLength == 1
+        && IsReadableRange(lpBuffer, sizeof(record));
+    if (recordReadable)
+    {
+        std::memcpy(&record, lpBuffer, sizeof(record));
+    }
+
+    const bool exactControlWake =
+        recordReadable
+        && console_handoff::IsExactBelControlWake(record, nLength);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_WRITE shape=%s count=%lu eventType=%u "
+        "keyDown=%ld repeat=%u vk=0x%04X scan=0x%04X ascii=0x%02X "
+        "control=0x%08lX",
+        exactControlWake ? "exact" : "passthrough",
+        static_cast<unsigned long>(nLength),
+        recordReadable ? static_cast<unsigned>(record.EventType) : 0u,
+        recordReadable
+            ? static_cast<long>(record.Event.KeyEvent.bKeyDown)
+            : 0l,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wRepeatCount)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualKeyCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(record.Event.KeyEvent.wVirtualScanCode)
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned>(
+                static_cast<unsigned char>(
+                    record.Event.KeyEvent.uChar.AsciiChar))
+            : 0u,
+        recordReadable
+            ? static_cast<unsigned long>(
+                record.Event.KeyEvent.dwControlKeyState)
+            : 0ul);
+
+    const bool eventsWrittenWritable =
+        lpNumberOfEventsWritten != nullptr
+        && IsWritableRange(
+            lpNumberOfEventsWritten,
+            sizeof(*lpNumberOfEventsWritten));
+    if (exactControlWake && eventsWrittenWritable)
+    {
+        if (!HasInjectedContext())
+        {
+            (void)EnsureInjectedContextFast();
+        }
+
+        auto relay = [&](SharedBlock* block, HANDLE consoleEvent, const char* sourceTag) -> bool
+        {
+            if (block == nullptr
+                || block->magic != kIpcMagic
+                || block->version != kIpcVersion
+                || block->hostPid == 0
+                || InterlockedCompareExchange(
+                    &block->isHostSession,
+                    0,
+                    0) == 0)
+            {
+                return false;
+            }
+
+            const LONG requestSerial =
+                InterlockedIncrement(
+                    &block->consoleControlWakeRequestSerial);
+            SetLastError(ERROR_SUCCESS);
+            const BOOL signalResult =
+                consoleEvent != nullptr ? SetEvent(consoleEvent) : FALSE;
+            const DWORD signalError =
+                signalResult != FALSE
+                    ? ERROR_SUCCESS
+                    : (consoleEvent != nullptr
+                        ? GetLastError()
+                        : ERROR_NOT_READY);
+            *lpNumberOfEventsWritten = 1;
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_REQUEST serial=%ld source=%s "
+                "signalAttempted=%d signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                consoleEvent != nullptr ? 1 : 0,
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            mod::Log(
+                "Takeover: native console control wake requested serial=%ld "
+                "source=%s signal=%d err=%lu",
+                static_cast<long>(requestSerial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            MOD_LIFECYCLE_TRACE(
+                "CONSOLE_CONTROL_WAKE_RESULT serial=%ld result=1 written=1 "
+                "signalResult=%d signalError=%lu",
+                static_cast<long>(requestSerial),
+                signalResult != FALSE ? 1 : 0,
+                static_cast<unsigned long>(signalError));
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        };
+
+        if (HasInjectedContext()
+            && relay(
+                g_injectedBlock,
+                g_injectedConsoleEvent,
+                "injected"))
+        {
+            return TRUE;
+        }
+
+        TempIpcContext temp = {};
+        const bool relayed =
+            OpenTempIpcContext(&temp, false, true)
+            && relay(temp.block, temp.consoleEvent, "fallback");
+        CloseTempIpcContext(&temp);
+        if (relayed)
+        {
+            return TRUE;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const BOOL nativeResult = WriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
+    const DWORD nativeError =
+        nativeResult != FALSE ? ERROR_SUCCESS : GetLastError();
+    const DWORD nativeWritten =
+        lpNumberOfEventsWritten != nullptr && eventsWrittenWritable
+            ? *lpNumberOfEventsWritten
+            : 0;
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_CONTROL_WAKE_NATIVE_RESULT exact=%d result=%d written=%lu "
+        "error=%lu",
+        exactControlWake ? 1 : 0,
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeWritten),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
+    return nativeResult;
+}
+
+BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
+{
+    (void)hConsoleInput;
+    (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=A generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
+    FlushPendingConsoleOutput("before_ReadConsoleA");
+
+    auto copyInputOut = [&](const char* input) -> BOOL {
+        if (input == nullptr || input[0] == '\0')
+        {
+            input = "2\n";
+        }
+        const size_t len = std::strlen(input);
+        const DWORD copy = static_cast<DWORD>((std::min)(static_cast<size_t>(nNumberOfCharsToRead), len));
+        if (lpBuffer != nullptr && copy > 0)
+        {
+            std::memcpy(lpBuffer, input, copy);
+            if (copy < nNumberOfCharsToRead)
+            {
+                reinterpret_cast<char*>(lpBuffer)[copy] = '\0';
+            }
+        }
+        if (lpNumberOfCharsRead != nullptr)
+        {
+            *lpNumberOfCharsRead = copy;
+        }
+        return TRUE;
+    };
+
+    auto serveScriptedInput = [&](SharedBlock* block, const char* input, const char* sourceTag, const char* reason, LONG serial, bool autoInput) -> BOOL {
+        if (block != nullptr)
+        {
+            InterlockedIncrement(&block->dbgReadConsoleHits);
+            if (autoInput)
+            {
+                InterlockedIncrement(&block->dbgReadConsoleAutoHits);
+            }
+        }
+
+        const BOOL ok = copyInputOut(input);
+        if (autoInput)
+        {
+            const LONG fallbackCount = InterlockedIncrement(&g_injectedAutoConsoleFallbackCount);
+            if (fallbackCount <= 8 || (fallbackCount % 64) == 0)
+            {
+                mod::Log(
+                    "nb_stub_ReadConsoleA: auto input serial=%ld source=%s reason=%s read=%lu value='%s' count=%ld",
+                    static_cast<long>(serial),
+                    sourceTag != nullptr ? sourceTag : "unknown",
+                    reason != nullptr ? reason : "",
+                    static_cast<unsigned long>(nNumberOfCharsToRead),
+                    (input != nullptr) ? input : "",
+                    static_cast<long>(fallbackCount));
+            }
+        }
+        else
+        {
+            mod::Log(
+                "nb_stub_ReadConsoleA: served input serial=%ld source=%s value='%s'",
+                static_cast<long>(serial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                (input != nullptr) ? input : "");
+        }
+        return ok;
+    };
+
+    auto waitAndServe = [&](SharedBlock* block, HANDLE consoleEvent, const char* sourceTag) -> BOOL {
+        if (block == nullptr)
+        {
+            return FALSE;
+        }
+
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
+        for (;;)
+        {
+            const LONG serial = block->consoleSerial;
+            const LONG servedSerial = InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0);
+            if (serial > 0 && serial != servedSerial)
+            {
+                InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=A generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
+                return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=A "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=A generation=%ld "
+                            "serial=%ld bytes=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
+            }
+
+            const LONG auxSerial = block->consoleAuxSerial;
+            if (auxSerial > 0 && serial > 0 && serial == servedSerial && block->consoleInputAux[0] != '\0')
+            {
+                const int roleMode = block->initParams[0];
+                const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
+                const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
+                const bool delayPromptPending = promptSerial > 0 && promptSerial != promptServed;
+                const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
+                const bool auxNotServedYet = servedAuxSerial != auxSerial;
+                bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
+                if (!allowAuxNow && auxNotServedYet && (roleMode == kLocalRoleOnline || roleMode == kLocalRoleSpectate))
+                {
+                    allowAuxNow = true;
+                }
+                if (!allowAuxNow)
+                {
+                    goto maybe_default_input;
+                }
+
+                if (auxSerial != g_injectedActiveConsoleAuxSerial)
+                {
+                    InterlockedExchange(&g_injectedActiveConsoleAuxSerial, auxSerial);
+                    InterlockedExchange(&g_injectedConsoleAuxScriptOffset, 0);
+                    InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, 0);
+                }
+
+                if (servedAuxSerial != auxSerial)
+                {
+                    char auxLine[128] = {};
+                    LONG auxOffset = InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0);
+                    bool auxHasMore = false;
+                    if (ExtractConsoleScriptLine(
+                            block->consoleInputAux,
+                            &auxOffset,
+                            auxLine,
+                            sizeof(auxLine),
+                            &auxHasMore))
+                    {
+                        InterlockedExchange(&g_injectedConsoleAuxScriptOffset, auxOffset);
+                        if (!auxHasMore)
+                        {
+                            InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, auxSerial);
+                        }
+
+                        if (roleMode == kLocalRoleSpectate)
+                        {
+                            const LONG scPS = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
+                            if (scPS > 0)
+                            {
+                                InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPS);
+                                InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPS);
+                                mod::Log("Takeover: aux auto-answered spectate confirm - synced servedSerial=%ld", static_cast<long>(scPS));
+                            }
+                        }
+
+                        return serveScriptedInput(block, auxLine, sourceTag, "aux_line", auxSerial, true);
+                    }
+
+                    InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, auxSerial);
+                }
+            }
+
+        maybe_default_input:
+            if (serial > 0 && serial == servedSerial && nNumberOfCharsToRead <= 0x80u)
+            {
+                const LONG scPromptSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
+                const LONG scPromptServed = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
+                if (scPromptSerial > 0 && scPromptSerial != scPromptServed)
+                {
+                    const LONG scInputSerial = InterlockedCompareExchange(&block->spectateConfirmInputSerial, 0, 0);
+                    const LONG scInputServedSerial = InterlockedCompareExchange(&block->spectateConfirmInputServedSerial, 0, 0);
+                    if (scInputSerial > scInputServedSerial)
+                    {
+                        const int scValue = block->spectateConfirmInputValue;
+                        char scLine[16] = {};
+                        std::snprintf(scLine, sizeof(scLine), "%d\r\n", scValue);
+                        InterlockedExchange(&block->spectateConfirmInputServedSerial, scInputSerial);
+                        InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerial);
+                        InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerial);
+                        g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                        return serveScriptedInput(block, scLine, sourceTag, "prompt_spectate_confirm_selected", scInputSerial, true);
+                    }
+
+                    const DWORD nowTickSc = GetTickCount();
+                    if (g_injectedSpectateConfirmPromptWaitStartTick == 0)
+                    {
+                        g_injectedSpectateConfirmPromptWaitStartTick = nowTickSc;
+                        mod::Log(
+                            "Takeover: spectate confirm prompt waiting for overlay selection promptSerial=%ld",
+                            static_cast<long>(scPromptSerial));
+                    }
+                    if (nowTickSc - g_injectedSpectateConfirmPromptWaitStartTick < kPromptSpectateConfirmWaitTimeoutMs)
+                    {
+                        if (consoleEvent != nullptr)
+                        {
+                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                            if (wait == WAIT_FAILED)
+                            {
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            Sleep(10);
+                        }
+                        continue;
+                    }
+
+                    int defaultChoice = 2;
+                    const int promptKind = block->spectateConfirmPromptKind;
+                    if (promptKind == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoice = 3;
+                    }
+                    char defaultLine[16] = {};
+                    std::snprintf(defaultLine, sizeof(defaultLine), "%d\r\n", defaultChoice);
+                    InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerial);
+                    InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerial);
+                    g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                    mod::Log(
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoice,
+                        promptKind,
+                        static_cast<long>(scPromptSerial));
+                    return serveScriptedInput(block, defaultLine, sourceTag, "prompt_spectate_confirm_default", scPromptSerial, true);
+                }
+
+                const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
+                const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
+                if (promptSerial > 0 && promptSerial != promptServed)
+                {
+                    const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
+                    const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
+                    {
+                        const int delayValue = block->delayInputValue;
+                        char delayLine[16] = {};
+                        std::snprintf(delayLine, sizeof(delayLine), "%d\r\n", delayValue);
+                        InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
+                        InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
+                        InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=A generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
+                        return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
+                    }
+
+                    if (!delayWaitLogged)
+                    {
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=A generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
+                    }
+                    if (consoleEvent != nullptr)
+                    {
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
+                }
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=A generation=%ld "
+                        "state=host_native_wait control=%ld/%ld "
+                        "prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeRequestSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->consoleControlWakeServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
+            }
+
+            if (consoleEvent != nullptr)
+            {
+                const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                if (wait == WAIT_FAILED)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            Sleep(10);
+        }
+
+        return FALSE;
+    };
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (HasInjectedContext() && waitAndServe(g_injectedBlock, g_injectedConsoleEvent, "injected"))
+    {
+        return TRUE;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, true))
+    {
+        const BOOL ok = waitAndServe(temp.block, temp.consoleEvent, "fallback");
+        CloseTempIpcContext(&temp);
+        if (ok)
+        {
+            return TRUE;
+        }
+    }
+
+    SetLastError(NO_ERROR);
+    const BOOL nativeResult = ReadConsoleA(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+    const DWORD nativeError = GetLastError();
+    const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
+    mod::Log(
+        "nb_stub_ReadConsoleA: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
+        HasInjectedContext() ? 1 : 0,
+        nativeResult ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=A generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
+    return nativeResult;
+}
+
+BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
+{
+    (void)hConsoleInput;
+    (void)pInputControl;
+    const LONG readGeneration =
+        InterlockedIncrement(&g_consoleReadGeneration);
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_ENTER api=W generation=%ld chars=%lu buffer=0x%p "
+        "charsRead=0x%p injectedReady=%d",
+        static_cast<long>(readGeneration),
+        static_cast<unsigned long>(nNumberOfCharsToRead),
+        lpBuffer,
+        lpNumberOfCharsRead,
+        HasInjectedContext() ? 1 : 0);
+    FlushPendingConsoleOutput("before_ReadConsoleW");
+
+    auto copyInputOut = [&](const char* input) -> BOOL {
+        if (input == nullptr || input[0] == '\0')
+        {
+            input = "2\n";
+        }
+
+        wchar_t wide[256] = {};
+        const int converted =
+            MultiByteToWideChar(CP_ACP, 0, input, -1, wide, static_cast<int>(sizeof(wide) / sizeof(wide[0])));
+        if (converted <= 0)
+        {
+            if (lpNumberOfCharsRead != nullptr)
+            {
+                *lpNumberOfCharsRead = 0;
+            }
+            return FALSE;
+        }
+
+        const DWORD wideLen = static_cast<DWORD>((converted > 0) ? (converted - 1) : 0);
+        const DWORD copy = (std::min)(nNumberOfCharsToRead, wideLen);
+        if (lpBuffer != nullptr && copy > 0)
+        {
+            std::memcpy(lpBuffer, wide, static_cast<size_t>(copy) * sizeof(wchar_t));
+            if (copy < nNumberOfCharsToRead)
+            {
+                reinterpret_cast<wchar_t*>(lpBuffer)[copy] = L'\0';
+            }
+        }
+        if (lpNumberOfCharsRead != nullptr)
+        {
+            *lpNumberOfCharsRead = copy;
+        }
+        return TRUE;
+    };
+
+    auto serveScriptedInput = [&](SharedBlock* block, const char* input, const char* sourceTag, const char* reason, LONG serial, bool autoInput) -> BOOL {
+        if (block != nullptr)
+        {
+            InterlockedIncrement(&block->dbgReadConsoleHits);
+            if (autoInput)
+            {
+                InterlockedIncrement(&block->dbgReadConsoleAutoHits);
+            }
+        }
+
+        const BOOL ok = copyInputOut(input);
+        if (autoInput)
+        {
+            const LONG fallbackCount = InterlockedIncrement(&g_injectedAutoConsoleFallbackCount);
+            if (fallbackCount <= 8 || (fallbackCount % 64) == 0)
+            {
+                mod::Log(
+                    "nb_stub_ReadConsoleW: auto input serial=%ld source=%s reason=%s read=%lu value='%s' count=%ld",
+                    static_cast<long>(serial),
+                    sourceTag != nullptr ? sourceTag : "unknown",
+                    reason != nullptr ? reason : "",
+                    static_cast<unsigned long>(nNumberOfCharsToRead),
+                    (input != nullptr) ? input : "",
+                    static_cast<long>(fallbackCount));
+            }
+        }
+        else
+        {
+            mod::Log(
+                "nb_stub_ReadConsoleW: served input serial=%ld source=%s value='%s'",
+                static_cast<long>(serial),
+                sourceTag != nullptr ? sourceTag : "unknown",
+                (input != nullptr) ? input : "");
+        }
+        return ok;
+    };
+
+    auto waitAndServe = [&](SharedBlock* block, HANDLE consoleEvent, const char* sourceTag) -> BOOL {
+        if (block == nullptr)
+        {
+            return FALSE;
+        }
+
+        bool parkedLogged = false;
+        bool delayWaitLogged = false;
+        for (;;)
+        {
+            const LONG serial = block->consoleSerial;
+            const LONG servedSerial = InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0);
+            if (serial > 0 && serial != servedSerial)
+            {
+                InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
+                MOD_LIFECYCLE_TRACE(
+                    "CONSOLE_READ_DELIVER api=W generation=%ld state=primary "
+                    "serial=%ld",
+                    static_cast<long>(readGeneration),
+                    static_cast<long>(serial));
+                return serveScriptedInput(block, block->consoleInput, sourceTag, "primary", serial, false);
+            }
+
+            const bool currentBlock =
+                block->magic == kIpcMagic
+                && block->version == kIpcVersion
+                && block->hostPid != 0;
+            const bool hostReader =
+                currentBlock
+                && console_handoff::IsHostReader(
+                    InterlockedCompareExchange(
+                        &block->isHostSession,
+                        0,
+                        0) != 0,
+                    serial,
+                    servedSerial);
+            if (hostReader)
+            {
+                const LONG controlWakeRequest =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeRequestSerial,
+                        0,
+                        0);
+                const LONG controlWakeServed =
+                    InterlockedCompareExchange(
+                        &block->consoleControlWakeServedSerial,
+                        0,
+                        0);
+                if (controlWakeRequest > controlWakeServed)
+                {
+                    if (lpBuffer == nullptr || nNumberOfCharsToRead == 0)
+                    {
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER_FAILED api=W "
+                            "generation=%ld request=%ld served=%ld reason=buffer",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(controlWakeServed));
+                        return FALSE;
+                    }
+
+                    const BOOL copied = serveScriptedInput(
+                        block,
+                        "\a",
+                        sourceTag,
+                        "native_control_wake",
+                        controlWakeRequest,
+                        false);
+                    const DWORD copiedChars =
+                        lpNumberOfCharsRead != nullptr
+                            ? *lpNumberOfCharsRead
+                            : 1;
+                    if (copied != FALSE && copiedChars == 1)
+                    {
+                        InterlockedExchange(
+                            &block->consoleControlWakeServedSerial,
+                            controlWakeRequest);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_CONTROL_WAKE_DELIVER api=W generation=%ld "
+                            "serial=%ld chars=1 prompt=%ld/%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayPromptServedSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputSerial,
+                                    0,
+                                    0)),
+                            static_cast<long>(
+                                InterlockedCompareExchange(
+                                    &block->delayInputServedSerial,
+                                    0,
+                                    0)));
+                        mod::Log(
+                            "Takeover: native console control wake delivered "
+                            "serial=%ld generation=%ld api=W",
+                            static_cast<long>(controlWakeRequest),
+                            static_cast<long>(readGeneration));
+                        return TRUE;
+                    }
+                    return copied;
+                }
+            }
+
+            const LONG auxSerial = block->consoleAuxSerial;
+            if (auxSerial > 0 && serial > 0 && serial == servedSerial && block->consoleInputAux[0] != '\0')
+            {
+                const int roleMode = block->initParams[0];
+                const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
+                const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
+                const bool delayPromptPending = promptSerial > 0 && promptSerial != promptServed;
+                const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
+                const bool auxNotServedYet = servedAuxSerial != auxSerial;
+                bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
+                if (!allowAuxNow && auxNotServedYet && (roleMode == kLocalRoleOnline || roleMode == kLocalRoleSpectate))
+                {
+                    allowAuxNow = true;
+                }
+                if (!allowAuxNow)
+                {
+                    goto maybe_default_input_w;
+                }
+
+                if (auxSerial != g_injectedActiveConsoleAuxSerial)
+                {
+                    InterlockedExchange(&g_injectedActiveConsoleAuxSerial, auxSerial);
+                    InterlockedExchange(&g_injectedConsoleAuxScriptOffset, 0);
+                    InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, 0);
+                }
+
+                if (servedAuxSerial != auxSerial)
+                {
+                    char auxLine[128] = {};
+                    LONG auxOffset = InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0);
+                    bool auxHasMore = false;
+                    if (ExtractConsoleScriptLine(
+                            block->consoleInputAux,
+                            &auxOffset,
+                            auxLine,
+                            sizeof(auxLine),
+                            &auxHasMore))
+                    {
+                        InterlockedExchange(&g_injectedConsoleAuxScriptOffset, auxOffset);
+                        if (!auxHasMore)
+                        {
+                            InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, auxSerial);
+                        }
+                        return serveScriptedInput(block, auxLine, sourceTag, "aux_line", auxSerial, true);
+                    }
+
+                    InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, auxSerial);
+                }
+            }
+
+        maybe_default_input_w:
+            if (serial > 0 && serial == servedSerial && nNumberOfCharsToRead <= 0x80u)
+            {
+                const LONG scPromptSerialW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
+                const LONG scPromptServedW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
+                if (scPromptSerialW > 0 && scPromptSerialW != scPromptServedW)
+                {
+                    const LONG scInputSerialW = InterlockedCompareExchange(&block->spectateConfirmInputSerial, 0, 0);
+                    const LONG scInputServedSerialW = InterlockedCompareExchange(&block->spectateConfirmInputServedSerial, 0, 0);
+                    if (scInputSerialW > scInputServedSerialW)
+                    {
+                        const int scValueW = block->spectateConfirmInputValue;
+                        char scLineW[16] = {};
+                        std::snprintf(scLineW, sizeof(scLineW), "%d\r\n", scValueW);
+                        InterlockedExchange(&block->spectateConfirmInputServedSerial, scInputSerialW);
+                        InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerialW);
+                        InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerialW);
+                        g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                        return serveScriptedInput(block, scLineW, sourceTag, "prompt_spectate_confirm_selected", scInputSerialW, true);
+                    }
+
+                    const DWORD nowTickScW = GetTickCount();
+                    if (g_injectedSpectateConfirmPromptWaitStartTick == 0)
+                    {
+                        g_injectedSpectateConfirmPromptWaitStartTick = nowTickScW;
+                        mod::Log(
+                            "Takeover: spectate confirm prompt waiting for overlay selection promptSerial=%ld",
+                            static_cast<long>(scPromptSerialW));
+                    }
+                    if (nowTickScW - g_injectedSpectateConfirmPromptWaitStartTick < kPromptSpectateConfirmWaitTimeoutMs)
+                    {
+                        if (consoleEvent != nullptr)
+                        {
+                            const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                            if (wait == WAIT_FAILED)
+                            {
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            Sleep(10);
+                        }
+                        continue;
+                    }
+
+                    int defaultChoiceW = 2;
+                    const int promptKindW = block->spectateConfirmPromptKind;
+                    if (promptKindW == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying))
+                    {
+                        defaultChoiceW = 3;
+                    }
+                    char defaultLineW[16] = {};
+                    std::snprintf(defaultLineW, sizeof(defaultLineW), "%d\r\n", defaultChoiceW);
+                    InterlockedExchange(&g_injectedSpectateConfirmPromptServedSerial, scPromptSerialW);
+                    InterlockedExchange(&block->spectateConfirmPromptServedSerial, scPromptSerialW);
+                    g_injectedSpectateConfirmPromptWaitStartTick = 0;
+                    mod::Log(
+                        "Takeover: spectate confirm prompt timed out; falling back to choice=%d kind=%d promptSerial=%ld",
+                        defaultChoiceW,
+                        promptKindW,
+                        static_cast<long>(scPromptSerialW));
+                    return serveScriptedInput(block, defaultLineW, sourceTag, "prompt_spectate_confirm_default", scPromptSerialW, true);
+                }
+
+                const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
+                const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
+                if (promptSerial > 0 && promptSerial != promptServed)
+                {
+                    const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
+                    const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
+                    if (console_handoff::HasPendingExplicitDelayInput(
+                            promptSerial,
+                            promptServed,
+                            delayInputSerial,
+                            delayInputServedSerial))
+                    {
+                        const int delayValue = block->delayInputValue;
+                        char delayLine[16] = {};
+                        std::snprintf(delayLine, sizeof(delayLine), "%d\r\n", delayValue);
+                        InterlockedExchange(&block->delayInputServedSerial, delayInputSerial);
+                        InterlockedExchange(&g_injectedDelayPromptServedSerial, promptSerial);
+                        InterlockedExchange(&block->delayPromptServedSerial, promptSerial);
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_DELIVER api=W generation=%ld "
+                            "state=explicit_delay promptSerial=%ld "
+                            "inputSerial=%ld value=%d",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            delayValue);
+                        return serveScriptedInput(block, delayLine, sourceTag, "prompt_delay_selected", delayInputSerial, true);
+                    }
+
+                    if (!delayWaitLogged)
+                    {
+                        delayWaitLogged = true;
+                        MOD_LIFECYCLE_TRACE(
+                            "CONSOLE_READ_PARKED api=W generation=%ld "
+                            "state=delay_wait promptSerial=%ld input=%ld/%ld",
+                            static_cast<long>(readGeneration),
+                            static_cast<long>(promptSerial),
+                            static_cast<long>(delayInputSerial),
+                            static_cast<long>(delayInputServedSerial));
+                    }
+                    if (consoleEvent != nullptr)
+                    {
+                        const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                        if (wait == WAIT_FAILED)
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        Sleep(10);
+                    }
+                    continue;
+                }
+                if (!hostReader)
+                {
+                    return FALSE;
+                }
+                if (!parkedLogged)
+                {
+                    parkedLogged = true;
+                    MOD_LIFECYCLE_TRACE(
+                        "CONSOLE_READ_PARKED api=W generation=%ld "
+                        "state=host_native_wait prompt=%ld/%ld input=%ld/%ld",
+                        static_cast<long>(readGeneration),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayPromptServedSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputSerial,
+                                0,
+                                0)),
+                        static_cast<long>(
+                            InterlockedCompareExchange(
+                                &block->delayInputServedSerial,
+                                0,
+                                0)));
+                }
+            }
+
+            if (consoleEvent != nullptr)
+            {
+                const DWORD wait = WaitForSingleObject(consoleEvent, 200);
+                if (wait == WAIT_FAILED)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            Sleep(10);
+        }
+
+        return FALSE;
+    };
+
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (HasInjectedContext() && waitAndServe(g_injectedBlock, g_injectedConsoleEvent, "injected"))
+    {
+        return TRUE;
+    }
+
+    TempIpcContext temp = {};
+    if (OpenTempIpcContext(&temp, false, true))
+    {
+        const BOOL ok = waitAndServe(temp.block, temp.consoleEvent, "fallback");
+        CloseTempIpcContext(&temp);
+        if (ok)
+        {
+            return TRUE;
+        }
+    }
+
+    SetLastError(NO_ERROR);
+    const BOOL nativeResult = ReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+    const DWORD nativeError = GetLastError();
+    const DWORD nativeRead = (lpNumberOfCharsRead != nullptr) ? *lpNumberOfCharsRead : 0;
+    mod::Log(
+        "nb_stub_ReadConsoleW: passthrough (generation=%ld ready=%d "
+        "result=%d read=%lu err=%lu)",
+        static_cast<long>(readGeneration),
+        HasInjectedContext() ? 1 : 0,
+        nativeResult ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    MOD_LIFECYCLE_TRACE(
+        "CONSOLE_READ_NATIVE_RESULT api=W generation=%ld result=%d "
+        "read=%lu error=%lu",
+        static_cast<long>(readGeneration),
+        nativeResult != FALSE ? 1 : 0,
+        static_cast<unsigned long>(nativeRead),
+        static_cast<unsigned long>(nativeError));
+    SetLastError(nativeError);
+    return nativeResult;
+}
+
+BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    const BOOL result = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+    const DWORD nativeError = GetLastError();
+    DWORD capturedBytes = 0;
+    if (result && lpOverlapped == nullptr)
+    {
+        capturedBytes =
+            lpNumberOfBytesWritten != nullptr
+                ? *lpNumberOfBytesWritten
+                : nNumberOfBytesToWrite;
+    }
+    if (capturedBytes != 0)
+    {
+        MaybeLogConsoleOutputChunk(hFile, lpBuffer, capturedBytes);
+    }
+    SetLastError(nativeError);
+    return result;
+}
+
+HANDLE StubCreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    if (HasLogEfzBaseNameA(lpFileName))
+    {
+        const std::string redirectPath = GetNativeShadowLogEfzPathA();
+        if (!redirectPath.empty())
+        {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
+            mod::Log(
+                "CAPTURE_LOG: redirected native logEfz CreateFileA original='%s' redirect='%s'",
+                lpFileName,
+                redirectPath.c_str());
+            return RegisterCreatedConsoleFileA(
+                CreateFileA(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
+        }
+    }
+
+    if (HasLogNetBaseNameA(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                lpFileName);
+            return RegisterCreatedConsoleFileA(handle, lpFileName);
+        }
+    }
+
+    return RegisterCreatedConsoleFileA(
+        CreateFileA(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
+}
+
+HANDLE StubCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    if (HasLogEfzBaseNameW(lpFileName))
+    {
+        const std::wstring redirectPath = GetNativeShadowLogEfzPathW();
+        if (!redirectPath.empty())
+        {
+            const DWORD redirectShareMode = dwShareMode | FILE_SHARE_DELETE;
+            char originalUtf8[MAX_PATH * 2] = {};
+            char redirectUtf8[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, redirectPath.c_str(), -1, redirectUtf8, static_cast<int>(sizeof(redirectUtf8)), nullptr, nullptr);
+            mod::Log(
+                "CAPTURE_LOG: redirected native logEfz CreateFileW original='%s' redirect='%s'",
+                originalUtf8,
+                redirectUtf8);
+            return RegisterCreatedConsoleFileW(
+                CreateFileW(
+                    redirectPath.c_str(),
+                    dwDesiredAccess,
+                    redirectShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile),
+                redirectPath.c_str());
+        }
+    }
+
+    if (HasLogNetBaseNameW(lpFileName)
+        && IsTruncatingWriteOpen(dwDesiredAccess, dwCreationDisposition))
+    {
+        const HANDLE handle = CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode | FILE_SHARE_READ,
+            lpSecurityAttributes,
+            OPEN_ALWAYS,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            SeekEndAndWriteLogNetSessionSeparator(handle);
+            char originalUtf8[MAX_PATH * 2] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, originalUtf8, static_cast<int>(sizeof(originalUtf8)), nullptr, nullptr);
+            mod::Log(
+                "CAPTURE_LOG: converted truncating logNet open to append original='%s'",
+                originalUtf8);
+            return RegisterCreatedConsoleFileW(handle, lpFileName);
+        }
+    }
+
+    return RegisterCreatedConsoleFileW(
+        CreateFileW(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile),
+        lpFileName);
+}
+
+BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    const BOOL result = WriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteAChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
+    return result;
+}
+
+BOOL StubWriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    const BOOL result = WriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr
+            ? *lpNumberOfCharsWritten
+            : nNumberOfCharsToWrite)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleWriteWChunk(lpBuffer, capturedChars);
+    }
+    SetLastError(nativeError);
+    return result;
+}
+
+BOOL StubWriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    const BOOL result = WriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterAChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
+    return result;
+}
+
+BOOL StubWriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    const BOOL result = WriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+    const DWORD nativeError = GetLastError();
+    const DWORD capturedChars = result
+        ? (lpNumberOfCharsWritten != nullptr ? *lpNumberOfCharsWritten : nLength)
+        : 0;
+    if (capturedChars != 0)
+    {
+        MaybeLogConsoleOutputCharacterWChunk(lpCharacter, capturedChars, dwWriteCoord);
+    }
+    SetLastError(nativeError);
+    return result;
+}
+
+VOID StubOutputDebugStringA(LPCSTR lpOutputString)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    OutputDebugStringA(lpOutputString);
+    MaybeLogOutputDebugStringA(lpOutputString);
+}
+
+VOID StubOutputDebugStringW(LPCWSTR lpOutputString)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    OutputDebugStringW(lpOutputString);
+    MaybeLogOutputDebugStringW(lpOutputString);
+}
+
+DWORD StubWaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
+{
+    DWORD fakeExit = 0;
+    if (LookupFakeThread(hHandle, &fakeExit))
+    {
+        (void)fakeExit;
+        return WAIT_OBJECT_0;
+    }
+    return WaitForSingleObject(hHandle, dwMilliseconds);
+}
+
+BOOL StubGetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode)
+{
+    DWORD fakeExit = 0;
+    if (LookupFakeThread(hThread, &fakeExit))
+    {
+        if (lpExitCode != nullptr)
+        {
+            *lpExitCode = fakeExit;
+        }
+        return TRUE;
+    }
+    return GetExitCodeThread(hThread, lpExitCode);
+}
+
+DWORD StubResumeThread(HANDLE hThread)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    if (HasInjectedContext())
+    {
+        DWORD fakeExit = 0;
+        if (hThread == g_fakeProcessThreadHandle || LookupFakeThread(hThread, &fakeExit))
+        {
+            return 1;
+        }
+    }
+    return ResumeThread(hThread);
+}
+
+} // namespace netplay::bridge::takeover
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_CreateProcessA(
+    LPCSTR lpApplicationName,
+    LPSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCSTR lpCurrentDirectory,
+    LPSTARTUPINFOA lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation)
+{
+    return netplay::bridge::takeover::StubCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadProcessMemory(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead)
+{
+    return netplay::bridge::takeover::StubReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+}
+
+extern "C" __declspec(dllexport) LPVOID WINAPI nb_stub_VirtualAllocEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect)
+{
+    return netplay::bridge::takeover::StubVirtualAllocEx(hProcess, lpAddress, dwSize, flAllocationType, flProtect);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_VirtualFreeEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
+{
+    return netplay::bridge::takeover::StubVirtualFreeEx(hProcess, lpAddress, dwSize, dwFreeType);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten)
+{
+    return netplay::bridge::takeover::StubWriteProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId)
+{
+    return netplay::bridge::takeover::StubCreateRemoteThread(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_TerminateProcess(HANDLE hProcess, UINT uExitCode)
+{
+    // Must capture _ReturnAddress() in this outermost frame; mod frames below
+    // would hide the EfzRevival.exe cleanup call site.
+    const void* const callerReturnAddress = _ReturnAddress();
+    return netplay::bridge::takeover::StubTerminateProcess(
+        hProcess,
+        uExitCode,
+        callerReturnAddress);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
+{
+    return netplay::bridge::takeover::StubOpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
+{
+    return netplay::bridge::takeover::StubReadConsoleA(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
+{
+    return netplay::bridge::takeover::StubReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten)
+{
+    return netplay::bridge::takeover::StubWriteConsoleInputA(
+        hConsoleInput,
+        lpBuffer,
+        nLength,
+        lpNumberOfEventsWritten);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
+{
+    return netplay::bridge::takeover::StubWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileA(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    return netplay::bridge::takeover::StubCreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+{
+    return netplay::bridge::takeover::StubWriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleW(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+{
+    return netplay::bridge::takeover::StubWriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleOutputCharacterA(HANDLE hConsoleOutput, LPCSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
+{
+    return netplay::bridge::takeover::StubWriteConsoleOutputCharacterA(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleOutputCharacterW(HANDLE hConsoleOutput, LPCWSTR lpCharacter, DWORD nLength, COORD dwWriteCoord, LPDWORD lpNumberOfCharsWritten)
+{
+    return netplay::bridge::takeover::StubWriteConsoleOutputCharacterW(hConsoleOutput, lpCharacter, nLength, dwWriteCoord, lpNumberOfCharsWritten);
+}
+
+extern "C" __declspec(dllexport) VOID WINAPI nb_stub_OutputDebugStringA(LPCSTR lpOutputString)
+{
+    netplay::bridge::takeover::StubOutputDebugStringA(lpOutputString);
+}
+
+extern "C" __declspec(dllexport) VOID WINAPI nb_stub_OutputDebugStringW(LPCWSTR lpOutputString)
+{
+    netplay::bridge::takeover::StubOutputDebugStringW(lpOutputString);
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
+{
+    return netplay::bridge::takeover::StubWaitForSingleObject(hHandle, dwMilliseconds);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_GetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode)
+{
+    return netplay::bridge::takeover::StubGetExitCodeThread(hThread, lpExitCode);
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_ResumeThread(HANDLE hThread)
+{
+    return netplay::bridge::takeover::StubResumeThread(hThread);
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI nb_stub_RequestPeerQuitBroadcast(LPVOID)
+{
+    return netplay::bridge::takeover::RunInjectedPeerQuitBroadcast();
+}
