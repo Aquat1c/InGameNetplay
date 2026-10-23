@@ -48,16 +48,17 @@ void RecvThreadMain()
                 break;
             }
             const int err = WSAGetLastError();
-            if (err == WSAECONNRESET || err == WSAEINTR)
+            if (err == WSAECONNRESET || err == WSAEINTR || err == WSAEMSGSIZE)
             {
                 continue;
             }
             mod::Log("PaletteSocket: recvfrom error=%d, stopping recv", err);
             break;
         }
-        if (n < static_cast<int>(P::kEnvelopeBytes + sizeof(P::FrameHeader)))
+        if (n < static_cast<int>(P::kEnvelopeBytes + sizeof(P::FrameHeader))
+            || n > static_cast<int>(P::kMaxFrameBytes))
         {
-            continue;   // too small to be one of ours
+            continue;
         }
         if (!P::LooksLikeOverlayFrame(buf, static_cast<std::size_t>(n)))
         {

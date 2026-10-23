@@ -4,6 +4,8 @@
 
 #include <cstring>
 
+#include "logger.h"
+
 namespace netplay::interop::source
 {
 const char* CharFolderName(int charId)
@@ -50,7 +52,7 @@ std::uint32_t PackKeyDword(std::uint8_t charId, std::uint8_t sourceFlag,
 bool BuildPalRelPath(std::uint8_t charId, std::uint8_t slot, std::string* out)
 {
     const char* folder = CharFolderName(charId);
-    if (folder == nullptr || out == nullptr)
+    if (folder == nullptr || out == nullptr || slot >= 6)
     {
         return false;
     }
@@ -68,34 +70,43 @@ bool LoadRawPalFile(const char* absPath, std::uint8_t* out120)
     {
         return false;
     }
-    // EFZ .pal file: 120-byte 40-colour BGR body, optionally preceded by exactly one header byte (larger-than-body files have it, exact-size files do not).
     HANDLE h = CreateFileA(absPath, GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
     {
+        const DWORD error = GetLastError();
+        mod::Log("PaletteLoad: file='%s' result=stock openError=%lu",
+                 absPath, static_cast<unsigned long>(error));
         return false;
     }
+    // Larger files have one header byte; trailing bytes are never read.
     const DWORD fileSize = GetFileSize(h, nullptr);
     const DWORD headerSize =
         (fileSize != INVALID_FILE_SIZE && fileSize > protocol::kPaletteRawBytes)
-            ? 1u
-            : 0u;
+            ? 1u : 0u;
+    DWORD error = fileSize == INVALID_FILE_SIZE ? GetLastError() : ERROR_SUCCESS;
     bool ok = fileSize != INVALID_FILE_SIZE
         && fileSize >= headerSize + protocol::kPaletteRawBytes;
     if (ok && headerSize != 0)
     {
         ok = SetFilePointer(h, static_cast<LONG>(headerSize), nullptr, FILE_BEGIN)
             != INVALID_SET_FILE_POINTER;
+        if (!ok) error = GetLastError();
     }
     DWORD read = 0;
     if (ok)
     {
         ok = ReadFile(h, out120,
                       static_cast<DWORD>(protocol::kPaletteRawBytes),
-                      &read, nullptr) != FALSE
-            && read == protocol::kPaletteRawBytes;
+                      &read, nullptr) != FALSE;
+        if (!ok) error = GetLastError();
+        ok = ok && read == protocol::kPaletteRawBytes;
     }
     CloseHandle(h);
+    mod::Log("PaletteLoad: file='%s' size=%lu offset=%lu read=%lu result=%s error=%lu",
+             absPath, static_cast<unsigned long>(fileSize),
+             static_cast<unsigned long>(headerSize), static_cast<unsigned long>(read),
+             ok ? "custom" : "stock", static_cast<unsigned long>(error));
     return ok;
 }
 

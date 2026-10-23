@@ -28,6 +28,9 @@ void OverlayChannel::Begin(int localSide)
     m_helloCount = 0;
     m_lastPaletteSendMs = 0;
     m_localRowPending = false;
+    m_lastPaletteLogMs[0] = m_lastPaletteLogMs[1] = 0;
+    m_lastRejectLogMs = 0;
+    m_rejectedFrames = 0;
     m_palettes.Clear();
     mod::Log("OverlayChannel: begin localSide=%d nonce=0x%08lX",
              m_localSide, static_cast<unsigned long>(m_nonce));
@@ -121,6 +124,19 @@ void OverlayChannel::Tick(std::uint32_t nowMs)
     (void)nowMs;
 }
 
+void OverlayChannel::LogRejectedFrame(const char* reason, std::size_t len)
+{
+    if (m_rejectedFrames != UINT32_MAX) ++m_rejectedFrames;
+    const auto now = static_cast<std::uint32_t>(GetTickCount());
+    if (m_lastRejectLogMs == 0 || now - m_lastRejectLogMs >= 5000u)
+    {
+        mod::Log("OverlayChannel: rejected frame reason=%s bytes=%u total=%lu",
+                 reason, static_cast<unsigned>(len),
+                 static_cast<unsigned long>(m_rejectedFrames));
+        m_lastRejectLogMs = now != 0 ? now : 1u;
+    }
+}
+
 bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
                                        std::size_t len)
 {
@@ -131,8 +147,7 @@ bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
     protocol::Kind kind = protocol::Kind::Invalid;
     if (!protocol::ParseKind(datagram, len, &kind))
     {
-        // Malformed but addressed to us: swallow it so it never reaches
-        // Revival's parser.
+        LogRejectedFrame("header", len);
         return true;
     }
     switch (kind)
@@ -151,6 +166,7 @@ bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
                          static_cast<unsigned long>(hello.featureBits));
             }
         }
+        else LogRejectedFrame("hello", len);
         return true;
     }
     case protocol::Kind::Ack:
@@ -173,12 +189,18 @@ bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
         {
             if (m_palettes.AcceptInbound(blob))
             {
-                mod::Log("OverlayChannel: rx palette side=%u char=%u slot=%u "
-                         "src=%u seq=%u",
-                         blob.side, blob.charId, blob.colorSlot,
-                         blob.sourceFlag, blob.seq);
+                const auto now = static_cast<std::uint32_t>(GetTickCount());
+                auto& last = m_lastPaletteLogMs[blob.side];
+                if (last == 0 || now - last >= 1000u)
+                {
+                    mod::Log("OverlayChannel: rx palette side=%u char=%u slot=%u "
+                             "src=%u seq=%u", blob.side, blob.charId,
+                             blob.colorSlot, blob.sourceFlag, blob.seq);
+                    last = now != 0 ? now : 1u;
+                }
             }
         }
+        else LogRejectedFrame("palette", len);
         return true;
     }
     default:

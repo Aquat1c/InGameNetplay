@@ -129,6 +129,10 @@ those calls unreachable and recovers instead of dying:
   never without one, and the game is walked screen-by-screen back to title
   (`src/netplay/bridge/frontend_return.cpp`,
   `src/netplay/bridge/gameplay_exit_recovery.cpp`).
+- Local Practice and Tournament sessions are recognized by their exact
+  build-specific vtables (`src/netplay/bridge/revival_session_validation.cpp`).
+  They do not contain the online delay and ping fields; checking those fields
+  could reject a successfully rebuilt local session and stall Tournament exit.
 - `RequestInjectedPeerQuitBroadcast()` (revival_takeover.cpp) says goodbye
   to the peer while the helper can still send, so a healthy opponent never
   hangs waiting for us.
@@ -275,6 +279,33 @@ shown on both screens - character select, spectating, and the win screen:
   `include/netplay/interop/palette_mapping.h` and the color math in
   `src/netplay/interop/palette_remap.cpp`. Character select sits outside
   the rollback simulation, so these live writes cannot desync a match.
+- Launcher-first Practice uses the character-select render boundary when
+  Revival's frame hook is absent. It adds no polling thread or battle work.
+  Palette files stay cached until the character/color choice changes or
+  character select is entered again. Changes to the selection, EDIT COLOR,
+  or a received palette trigger updates; native portrait loads and color
+  reloads refresh the stock capture. Steady frames do not reread files, scan
+  portrait banks, remap colors, or write palettes.
+- Each side keeps its own restore state, including when the other side is an
+  Arcade CPU or temporarily enters stage selection. A failed restore retains
+  that state for a retry. Arcade's final custom-color confirmation is applied
+  once before the native fade starts; nested fade renders do no palette work.
+- Palette hooks can chain through an existing five-byte jump to executable
+  code in a loaded module when the remaining native entry bytes match. This
+  preserves Training Mode's fade/audio hook. Unrecognized entry patches keep
+  the palette hooks disabled and identify the affected function in the log.
+- Received frames must have the exact declared size, use the plain envelope,
+  and fit within 142 bytes. Palette rows require 120 color bytes and valid,
+  consistent player, character, slot, source, and key fields. Storage and
+  application check the row again; received bytes never select a file,
+  function, or write address. Oversized IPC frames are dropped whole.
+- `PaletteLoad` logs each actual file read attempt: filename, size, header
+  offset, bytes read, custom/stock result, and any Windows error. Missing files
+  log the open error. Character-select entry logs the working directory and
+  Windows code page. Cached frames produce no load logs. Received-palette
+  logs are limited to one per side per second; rejected-frame logs to one
+  per five seconds with a cumulative count. This validates data, not peer
+  identity; the palette channel does not authenticate UDP senders.
 - A loopback transport (`ModInteropLoopback`) exists for offline testing.
 
 ## State export for companion mods

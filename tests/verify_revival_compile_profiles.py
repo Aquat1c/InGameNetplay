@@ -163,7 +163,9 @@ if not (
 
 
 revival = read("src/netplay/bridge/revival_memory.cpp")
-likely_session = function_slice(revival, "bool IsLikelySessionPointer(")
+likely_session = function_slice(
+    read("src/netplay/bridge/revival_session_validation.cpp"),
+    "bool IsLikelySessionPointer(")
 for field in (
     "tournamentSessionVtableRva",
     "onlineSessionVtableRva",

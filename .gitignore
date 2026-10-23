@@ -15,6 +15,7 @@ build_*/
 *.pyc
 __pycache__/
 *.c
+/.serena/
 shared_documentation/
 decompilations/
 tools/

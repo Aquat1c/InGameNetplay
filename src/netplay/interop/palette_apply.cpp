@@ -35,7 +35,7 @@ bool ApplyRowToCharSelectPortrait(std::uint32_t csObj, int side,
     {
         return false;
     }
-    if (row.slotByte == 0)
+    if (!protocol::IsValidPaletteRow(row) || row.slotByte == 0)
     {
         return false;
     }
@@ -102,7 +102,7 @@ bool ApplyRowToWinScreen(std::uint32_t gameData, int winnerSide,
     {
         return false;
     }
-    if (row.slotByte == 0)
+    if (!protocol::IsValidPaletteRow(row) || row.slotByte == 0)
     {
         return false;
     }

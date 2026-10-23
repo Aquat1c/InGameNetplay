@@ -30,7 +30,7 @@ bool Store::SeqNewer(std::uint16_t incoming, std::uint16_t last)
 
 bool Store::AcceptInbound(const protocol::PaletteBlobBody& body)
 {
-    if (body.side > 1)
+    if (!protocol::IsValidPaletteRow(body))
     {
         return false;
     }
@@ -58,7 +58,7 @@ bool Store::GetRow(int side, protocol::PaletteBlobBody* out) const
 
 bool Store::SetLocalRow(protocol::PaletteBlobBody* body)
 {
-    if (body == nullptr || body->side > 1)
+    if (body == nullptr || !protocol::IsValidPaletteRow(*body))
     {
         return false;
     }

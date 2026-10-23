@@ -35,7 +35,7 @@ public:
 
     void Tick(std::uint32_t nowMs);
 
-    // Caller swallows the datagram either way to keep it out of Revival's parser.
+    // Handles a copied frame; Revival ignores its reserved type independently.
     bool OnInboundDatagram(const std::uint8_t* datagram, std::size_t len);
 
     void SubmitLocalPaletteRow(const protocol::PaletteBlobBody& row);
@@ -49,6 +49,7 @@ private:
     void Flush();
     void SendHello(std::uint32_t nowMs);
     void SendAck(std::uint32_t nonce);
+    void LogRejectedFrame(const char* reason, std::size_t len);
 
     bool           m_active = false;
     int            m_localSide = -1;
@@ -58,6 +59,9 @@ private:
     std::uint32_t  m_helloCount = 0;
     std::uint32_t  m_lastPaletteSendMs = 0;
     bool           m_localRowPending = false;
+    std::uint32_t  m_lastPaletteLogMs[2] = {};
+    std::uint32_t  m_lastRejectLogMs = 0;
+    std::uint32_t  m_rejectedFrames = 0;
 
     SendSink m_sink = nullptr;
     void*    m_sinkUser = nullptr;

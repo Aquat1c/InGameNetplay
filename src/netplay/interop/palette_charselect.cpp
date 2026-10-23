@@ -8,6 +8,7 @@
 
 #include "logger.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/interop/overlay_channel.h"
 #include "netplay/interop/overlay_ipc.h"
@@ -25,6 +26,9 @@ namespace P = netplay::interop::protocol;
 // efz.exe RVAs (version-invariant).
 constexpr std::uintptr_t kRvaReloadCharacterPalette = 0x003595D0u;
 constexpr std::uintptr_t kRvaInitCharacterSelect = 0x003598D0u;
+constexpr std::uintptr_t kRvaRenderCharacterSelect = 0x00355500u;
+constexpr std::uintptr_t kRvaInitializeSelectedCharacter = 0x003586B0u;
+constexpr std::uintptr_t kRvaFadeWithSound = 0x00359C90u;
 constexpr std::uintptr_t kRvaInitResultScreen = 0x00374B00u;   // win screen
 constexpr std::uintptr_t kVaCurrentScreenIndex = 0x00790148u;
 constexpr int kScreenCharSelect = 1;
@@ -120,15 +124,14 @@ std::uint32_t g_csObj = 0;
 bool g_lastCustom[2] = {false, false};
 
 std::uint32_t g_stock[2][apply::kPortraitEntries] = {};
+std::uint32_t g_applied[2][apply::kPortraitEntries] = {};
 bool g_stockValid[2] = {false, false};
 
-constexpr DWORD kLocalRowRefreshMs = 250;
 struct LocalRowCache
 {
     bool valid;
     std::uint8_t charId;
     std::uint8_t colorSlot;
-    DWORD loadedTick;
     P::PaletteBlobBody row;
 };
 LocalRowCache g_localRowCache[2] = {};
@@ -138,13 +141,22 @@ P::PaletteBlobBody g_matchRow[2] = {};
 using ReloadPalette_t = int(__thiscall*)(void* gameContext, char playerIndex);
 using InitCharSelect_t = int(__thiscall*)(void* screenContext);
 using InitResultScreen_t = int(__thiscall*)(void* screenContext);
+using InitializeSelected_t = int(__thiscall*)(void*, int, int, char);
+using FadeWithSound_t = int(__thiscall*)(void*, int, unsigned char, int, int);
 
 ReloadPalette_t g_origReload = nullptr;
 InitCharSelect_t g_origInit = nullptr;
+InitCharSelect_t g_origRender = nullptr;
 InitResultScreen_t g_origResult = nullptr;
+InitializeSelected_t g_origSelected = nullptr;
+FadeWithSound_t g_origFade = nullptr;
+bool g_fading = false;
 void* g_reloadTarget = nullptr;
 void* g_initTarget = nullptr;
+void* g_renderTarget = nullptr;
 void* g_resultTarget = nullptr;
+void* g_selectedTarget = nullptr;
+void* g_fadeTarget = nullptr;
 bool g_installed = false;
 bool g_minhookReady = false;
 
@@ -237,7 +249,7 @@ bool ReadCharAndColor(std::uint32_t csObj, int side,
     return ok;
 }
 
-// Must read before the original reload (it consumes/clears the flag); flag = *(csObj+28) + 4920 + 4*side.
+// EDIT COLOR = *(csObj+28) + 4920 + 4*side; native reload leaves it intact.
 bool ReadEditColorFlag(std::uint32_t csObj, int side)
 {
     bool on = false;
@@ -266,23 +278,21 @@ int ReadCurrentScreen()
     return screen;
 }
 
-// Player-state machine (csObj+1182+side): portrait phases {0,1,2,3,5,6}; stage
-// states {4,7,8,9,10} load the stage palette into 175-254, so portrait pushes
-// must stop once either side is stage (4 is CPU-player-only in offline modes).
-bool InStageFlow(std::uint32_t csObj)
+// State 4 can be an Arcade CPU while the other side still selects a portrait.
+bool InStageFlow(std::uint32_t csObj, int side)
 {
     bool inStage = true;
     __try
     {
-        const std::uint8_t s0 = *reinterpret_cast<const std::uint8_t*>(csObj + 1182u);
-        const std::uint8_t s1 = *reinterpret_cast<const std::uint8_t*>(csObj + 1183u);
-        inStage = (s0 == 4u || s0 >= 7u || s1 == 4u || s1 >= 7u);
+        const std::uint8_t state = *reinterpret_cast<const std::uint8_t*>(
+            csObj + 1182u + static_cast<std::uint32_t>(side));
+        inStage = (state == 4u || state >= 7u);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { inStage = true; }
     return inStage;
 }
 
-// csObj+45 goes non-zero as char-select starts fading out; re-pushing during the fade pins 175-254 at full brightness.
+// +45 covers cancellation; Arcade confirm enters its fade before setting exit flags.
 bool ScreenLeavingCharSelect(std::uint32_t csObj)
 {
     bool leaving = true;
@@ -313,9 +323,7 @@ P::PaletteBlobBody LoadLocalRowCached(int side, std::uint8_t charId,
                                       std::uint8_t colorSlot)
 {
     LocalRowCache& c = g_localRowCache[side];
-    const DWORD now = GetTickCount();
-    if (!c.valid || c.charId != charId || c.colorSlot != colorSlot
-        || now - c.loadedTick >= kLocalRowRefreshMs)
+    if (!c.valid || c.charId != charId || c.colorSlot != colorSlot)
     {
         c.row = P::PaletteBlobBody{};
         (void)source::LoadLocalRow(std::string(), static_cast<std::uint8_t>(side),
@@ -323,7 +331,6 @@ P::PaletteBlobBody LoadLocalRowCached(int side, std::uint8_t charId,
         c.valid = true;
         c.charId = charId;
         c.colorSlot = colorSlot;
-        c.loadedTick = now;
     }
     return c.row;
 }
@@ -336,10 +343,8 @@ void ProcessSide(std::uint32_t csObj, int side, bool origAlreadyRan)
     {
         return;
     }
-    if (InStageFlow(csObj) || ScreenLeavingCharSelect(csObj))
+    if (g_fading || InStageFlow(csObj, side) || ScreenLeavingCharSelect(csObj))
     {
-        g_lastCustom[0] = false;
-        g_lastCustom[1] = false;
         return;
     }
     P::PaletteBlobBody applyRow{};
@@ -368,28 +373,62 @@ void ProcessSide(std::uint32_t csObj, int side, bool origAlreadyRan)
         custom = ch.GetPeerPaletteRow(side, &applyRow) && applyRow.slotByte != 0;
     }
 
+    const bool changed = !g_lastCustom[side]
+        || g_matchRow[side].charId != applyRow.charId
+        || g_matchRow[side].colorSlot != applyRow.colorSlot
+        || std::memcmp(g_matchRow[side].rawBgr, applyRow.rawBgr,
+                       sizeof(applyRow.rawBgr)) != 0;
+    if (!origAlreadyRan && g_matchRow[side].charId != applyRow.charId)
+    {
+        g_stockValid[side] = false;
+    }
     g_matchRow[side] = applyRow;
 
     if (custom)
     {
-        (void)apply::ApplyRowToCharSelectPortrait(csObj, side, applyRow);
+        if (!origAlreadyRan && !changed)
+        {
+            return;
+        }
+        if (!g_stockValid[side])
+        {
+            g_stockValid[side] = apply::CapturePortraitEntries(csObj, side, g_stock[side]);
+            if (!g_stockValid[side])
+            {
+                return;
+            }
+        }
+        if (!apply::ApplyRowToCharSelectPortrait(csObj, side, applyRow))
+        {
+            g_lastCustom[side] = false;
+            return;
+        }
         if (!g_lastCustom[side])
         {
             mod::Log("PaletteCharSelect: apply side=%d char=%u slot=%u",
                      side, applyRow.charId, applyRow.colorSlot);
         }
-        g_lastCustom[side] = true;
+        g_lastCustom[side] =
+            apply::CapturePortraitEntries(csObj, side, g_applied[side]);
     }
     else
     {
         if (g_lastCustom[side] && !origAlreadyRan)
         {
-            const bool reverted = g_stockValid[side]
-                && apply::RestorePortraitEntries(csObj, side, g_stock[side]);
-            mod::Log("PaletteCharSelect: revert side=%d%s", side,
-                     reverted ? "" : " skipped (no stock capture)");
+            std::uint32_t current[apply::kPortraitEntries];
+            const bool captured = apply::CapturePortraitEntries(csObj, side, current);
+            const bool nativeRestored = captured
+                && std::memcmp(current, g_applied[side], sizeof(current)) != 0;
+            const bool reverted = nativeRestored || (captured && g_stockValid[side]
+                && apply::RestorePortraitEntries(csObj, side, g_stock[side]));
+            if (!reverted)
+            {
+                return;
+            }
+            mod::Log("PaletteCharSelect: revert side=%d", side);
         }
         g_lastCustom[side] = false;
+        g_stockValid[side] = false;
     }
 }
 
@@ -406,6 +445,42 @@ int __fastcall HookReload(void* gameContext, void* /*edx*/, char playerIndex)
         {
             ProcessSide(csObj, side, true);
         }
+    }
+    return result;
+}
+
+int __fastcall HookSelected(void* screenContext, void* /*edx*/,
+                            int player, int opponent, char playerIndex)
+{
+    const int result = g_origSelected(screenContext, player, opponent, playerIndex);
+    const int side = static_cast<int>(playerIndex);
+    const auto csObj = reinterpret_cast<std::uint32_t>(screenContext);
+    if (csObj == g_csObj && (side == 0 || side == 1))
+    {
+        g_lastCustom[side] = false;
+        g_stockValid[side] = apply::CapturePortraitEntries(csObj, side, g_stock[side]);
+    }
+    return result;
+}
+
+int __fastcall HookFade(void* screenContext, void* /*edx*/, int palette,
+                        unsigned char kind, int volume, int adjustment)
+{
+    if (reinterpret_cast<std::uint32_t>(screenContext) != g_csObj || g_fading)
+    {
+        return g_origFade(screenContext, palette, kind, volume, adjustment);
+    }
+    // Arcade's custom-confirm flag is set immediately before this call.
+    TickGameThread();
+    g_fading = true;
+    int result = 0;
+    __try
+    {
+        result = g_origFade(screenContext, palette, kind, volume, adjustment);
+    }
+    __finally
+    {
+        g_fading = false;
     }
     return result;
 }
@@ -435,19 +510,31 @@ int __fastcall HookInit(void* screenContext, void* /*edx*/)
     ch.ResetPaletteExchangeForRematch();
     g_lastCustom[0] = false;
     g_lastCustom[1] = false;
-    g_stockValid[0] = false;        // captures belong to the previous characters
+    g_stockValid[0] = false;
     g_stockValid[1] = false;
     g_localRowCache[0].valid = false;
     g_localRowCache[1].valid = false;
     g_matchRow[0] = P::PaletteBlobBody{};
     g_matchRow[1] = P::PaletteBlobBody{};
     g_csObj = reinterpret_cast<std::uint32_t>(screenContext);
+    char cwd[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwd) >= MAX_PATH) cwd[0] = '\0';
     mod::Log("PaletteCharSelect: char-select init, armed active=%d side=%d "
-             "src=%s transport=%s ipcAttached=%d",
+             "src=%s transport=%s ipcAttached=%d cwd='%s' acp=%u",
              ch.IsActive() ? 1 : 0, g_localSide,
              SideSourceName(g_sideSource),
-             TransportName(g_transport), ipc::IsAttached() ? 1 : 0);
+             TransportName(g_transport), ipc::IsAttached() ? 1 : 0, cwd, GetACP());
     return result;
+}
+
+int __fastcall HookRender(void* screenContext, void* /*edx*/)
+{
+    if (g_csObj == reinterpret_cast<std::uint32_t>(screenContext)
+        && !netplay::bridge::takeover::HasNetplayPerFrameTickHookInstalled())
+    {
+        TickGameThread();
+    }
+    return g_origRender(screenContext);
 }
 
 // gameData = *(screenContext+28); winner = *(gameData+4940) (0 = P1, 1 = P2).
@@ -472,6 +559,34 @@ bool ReadWinner(void* screenContext, std::uint32_t* gameDataOut, int* winnerOut)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
     return ok;
+}
+
+bool HasCompatibleHookPrologue(const char* name, const void* target,
+                               const unsigned char* expected, std::size_t size)
+{
+    if (std::memcmp(target, expected, size) == 0) return true;
+    const auto* code = static_cast<const unsigned char*>(target);
+    if (size > 5 && code[0] == 0xE9
+        && std::memcmp(code + 5, expected + 5, size - 5) == 0)
+    {
+        std::int32_t displacement = 0;
+        std::memcpy(&displacement, code + 1, sizeof(displacement));
+        const auto destination = reinterpret_cast<std::uintptr_t>(code + 5) + displacement;
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(destination), &region, sizeof(region)) != 0
+            && region.State == MEM_COMMIT && region.Type == MEM_IMAGE
+            && (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0
+            && (region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ
+                                 | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0)
+        {
+            // MinHook's trampoline preserves this existing five-byte jump.
+            mod::Log("PaletteCharSelect: chaining %s hook target=%p previous=%p owner=%p",
+                     name, target, reinterpret_cast<void*>(destination), region.AllocationBase);
+            return true;
+        }
+    }
+    mod::Log("PaletteCharSelect: unsupported %s hook entry at %p; install skipped", name, target);
+    return false;
 }
 
 int __fastcall HookResult(void* screenContext, void* /*edx*/)
@@ -544,12 +659,37 @@ bool Install()
         reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
     g_reloadTarget = reinterpret_cast<void*>(base + kRvaReloadCharacterPalette);
     g_initTarget = reinterpret_cast<void*>(base + kRvaInitCharacterSelect);
+    g_renderTarget = reinterpret_cast<void*>(base + kRvaRenderCharacterSelect);
+    g_selectedTarget = reinterpret_cast<void*>(base + kRvaInitializeSelectedCharacter);
+    g_fadeTarget = reinterpret_cast<void*>(base + kRvaFadeWithSound);
+    const unsigned char renderPrologue[] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x20, 0x08, 0x00, 0x00};
+    const unsigned char selectedPrologue[] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x04, 0x01, 0x00, 0x00};
+    const unsigned char fadePrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14, 0x89, 0x4D, 0xEC};
+    __try
+    {
+        if (!HasCompatibleHookPrologue("render", g_renderTarget, renderPrologue, sizeof(renderPrologue))
+            || !HasCompatibleHookPrologue("selected", g_selectedTarget, selectedPrologue, sizeof(selectedPrologue))
+            || !HasCompatibleHookPrologue("fade", g_fadeTarget, fadePrologue, sizeof(fadePrologue)))
+        {
+            return false;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
     g_resultTarget = reinterpret_cast<void*>(base + kRvaInitResultScreen);
 
     if (MH_CreateHook(g_reloadTarget, reinterpret_cast<void*>(&HookReload),
                       reinterpret_cast<void**>(&g_origReload)) != MH_OK
         || MH_CreateHook(g_initTarget, reinterpret_cast<void*>(&HookInit),
                          reinterpret_cast<void**>(&g_origInit)) != MH_OK
+        || MH_CreateHook(g_renderTarget, reinterpret_cast<void*>(&HookRender),
+                         reinterpret_cast<void**>(&g_origRender)) != MH_OK
+        || MH_CreateHook(g_selectedTarget, reinterpret_cast<void*>(&HookSelected),
+                         reinterpret_cast<void**>(&g_origSelected)) != MH_OK
+        || MH_CreateHook(g_fadeTarget, reinterpret_cast<void*>(&HookFade),
+                         reinterpret_cast<void**>(&g_origFade)) != MH_OK
         || MH_CreateHook(g_resultTarget, reinterpret_cast<void*>(&HookResult),
                          reinterpret_cast<void**>(&g_origResult)) != MH_OK)
     {
@@ -558,6 +698,9 @@ bool Install()
     }
     if (MH_EnableHook(g_reloadTarget) != MH_OK
         || MH_EnableHook(g_initTarget) != MH_OK
+        || MH_EnableHook(g_renderTarget) != MH_OK
+        || MH_EnableHook(g_selectedTarget) != MH_OK
+        || MH_EnableHook(g_fadeTarget) != MH_OK
         || MH_EnableHook(g_resultTarget) != MH_OK)
     {
         mod::Log("PaletteCharSelect: MH_EnableHook failed");
@@ -573,7 +716,7 @@ bool Install()
 
 void TickGameThread()
 {
-    if (!g_installed)
+    if (!g_installed || g_fading)
     {
         return;
     }
@@ -583,6 +726,7 @@ void TickGameThread()
         return;   // never any work during a battle (rollback parity island)
     }
 
+#if MOD_LIFECYCLE_TRACE_COMPILED
     if (g_transport == Transport::Piggyback)
     {
         static unsigned s_hdiag = 0;
@@ -599,6 +743,8 @@ void TickGameThread()
             }
         }
     }
+
+#endif
 
     const std::uint32_t csObj = g_csObj;
     if (csObj == 0)
@@ -617,16 +763,20 @@ void TickGameThread()
     {
         return;
     }
-    if (g_transport == Transport::Socket)
+    if (g_sideSource != SideSource::Offline)
     {
-        socket_transport::Poll(ch);
+        if (g_transport == Transport::Socket)
+        {
+            socket_transport::Poll(ch);
+        }
+        else if (g_transport == Transport::Piggyback)
+        {
+            PiggybackPoll(ch);
+        }
+        ch.Tick(static_cast<std::uint32_t>(GetTickCount()));
     }
-    else if (g_transport == Transport::Piggyback)
-    {
-        PiggybackPoll(ch);
-    }
-    ch.Tick(static_cast<std::uint32_t>(GetTickCount()));
 
+#if MOD_LIFECYCLE_TRACE_COMPILED
     static unsigned s_diag = 0;
     if ((++s_diag % 30u) == 1u)
     {
@@ -637,11 +787,13 @@ void TickGameThread()
         mod::Log("PaletteDiag: state=[%u,%u] exit=%u stageGate=%d leaveGate=%d "
                  "localSide=%d src=%s peer0(has=%d slot=%u) peer1(has=%d slot=%u)",
                  d.s0, d.s1, d.exitFlag,
-                 InStageFlow(csObj) ? 1 : 0,
+                 (InStageFlow(csObj, 0) && InStageFlow(csObj, 1)) ? 1 : 0,
                  ScreenLeavingCharSelect(csObj) ? 1 : 0, g_localSide,
                  SideSourceName(g_sideSource),
                  has0 ? 1 : 0, pr0.slotByte, has1 ? 1 : 0, pr1.slotByte);
     }
+
+#endif
 
     ProcessSide(csObj, 0, false);
     ProcessSide(csObj, 1, false);

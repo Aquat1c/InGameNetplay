@@ -161,15 +161,11 @@ std::uint32_t Pop(Ring& ring, std::uint8_t* out, std::uint32_t cap)
     }
     Slot& slot = ring.slots[tail & kRingMask];
     std::uint32_t len = slot.len;
-    if (len == 0u || len > kSlotBytes)
+    if (len == 0u || len > kSlotBytes || len > cap)
     {
         PublishBarrier();
         ring.tail = tail + 1u;
         return 0u;
-    }
-    if (len > cap)
-    {
-        len = cap;             // truncate into caller's buffer
     }
     std::memcpy(out, slot.data, len);
     PublishBarrier();

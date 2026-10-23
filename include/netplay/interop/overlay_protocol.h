@@ -54,7 +54,7 @@ inline constexpr std::size_t kPaletteRawBytes = 120u;   // 40 colors * 3 (BGR)
 struct PaletteBlobBody
 {
     std::uint8_t  side;        // 0 = P1, 1 = P2 (source side)
-    std::uint8_t  charId;      // engine char id 0..24
+    std::uint8_t  charId;      // supported engine char id 0..23
     std::uint8_t  colorSlot;   // 0..5
     std::uint8_t  sourceFlag;  // 0 = .dat (stock), 1 = .pal (custom)
     std::uint8_t  slotByte;    // 1 = apply custom, 0 = force stock
@@ -91,6 +91,8 @@ bool LooksLikeOverlayFrame(const std::uint8_t* datagram, std::size_t len);
 bool ParseKind(const std::uint8_t* datagram, std::size_t len, Kind* outKind);
 bool ParseHello(const std::uint8_t* datagram, std::size_t len, HelloBody* out);
 bool ParseAck(const std::uint8_t* datagram, std::size_t len, HelloBody* out);
+bool IsValidPaletteRow(const PaletteBlobBody& row);
+
 bool ParsePaletteBlob(const std::uint8_t* datagram, std::size_t len,
                       PaletteBlobBody* out);
 } // namespace netplay::interop::protocol

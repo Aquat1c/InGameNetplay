@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EFZInGameNetplayMod VERSION 0.1.0 LANGUAGES C CXX)
+project(EFZInGameNetplayMod VERSION 0.5.6 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -57,6 +57,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
     src/netplay/bridge/revival_memory.cpp
+    src/netplay/bridge/revival_session_validation.cpp
     src/netplay/bridge/revival_j_diagnostics.cpp
     src/netplay/bridge/revival_launcher_probe.cpp
     src/netplay/bridge/ipc_shared.cpp
@@ -282,6 +283,7 @@ if(BUILD_TESTING)
         src/netplay/interop/palette_store.cpp
         src/netplay/interop/palette_source.cpp
         src/netplay/interop/palette_remap.cpp
+        src/netplay/interop/palette_apply.cpp
         src/netplay/interop/overlay_channel.cpp
         src/netplay/interop/overlay_ipc.cpp
         src/netplay/core/version_compare.cpp)
@@ -311,6 +313,42 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME interop_tests COMMAND interop_tests)
+
+    if(WIN32)
+        add_executable(revival_session_validation_tests
+            tests/revival_session_validation_tests.cpp
+            src/netplay/bridge/revival_session_validation.cpp)
+        target_include_directories(revival_session_validation_tests PRIVATE include)
+        target_compile_features(revival_session_validation_tests PRIVATE cxx_std_17)
+        target_compile_definitions(revival_session_validation_tests PRIVATE NOMINMAX)
+        add_test(NAME revival_session_validation_tests COMMAND revival_session_validation_tests)
+
+        add_executable(palette_transport_tests
+            tests/palette_transport_tests.cpp
+            src/netplay/interop/overlay_protocol.cpp)
+        target_include_directories(palette_transport_tests PRIVATE include)
+        target_compile_features(palette_transport_tests PRIVATE cxx_std_17)
+        target_compile_definitions(palette_transport_tests PRIVATE NOMINMAX)
+        target_link_libraries(palette_transport_tests PRIVATE ws2_32)
+        add_test(NAME palette_transport_tests COMMAND palette_transport_tests)
+
+        add_executable(palette_charselect_tests
+            tests/palette_charselect_tests.cpp
+            src/netplay/interop/overlay_protocol.cpp
+            src/netplay/interop/palette_store.cpp
+            src/netplay/interop/palette_source.cpp
+            src/netplay/interop/overlay_channel.cpp
+            src/netplay/interop/overlay_ipc.cpp)
+        target_include_directories(palette_charselect_tests PRIVATE include)
+        target_compile_features(palette_charselect_tests PRIVATE cxx_std_17)
+        target_compile_definitions(palette_charselect_tests PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(palette_charselect_tests PRIVATE minhook)
+        if(MSVC)
+            # The fixture maps EFZ's fixed screen-index address at 0x790148.
+            target_link_options(palette_charselect_tests PRIVATE /DYNAMICBASE:NO /BASE:0x00400000)
+        endif()
+        add_test(NAME palette_charselect_tests COMMAND palette_charselect_tests)
+    endif()
 endif()
 
 if(BUILD_TESTING AND WIN32)

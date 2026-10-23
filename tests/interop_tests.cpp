@@ -4,10 +4,12 @@
 #include "netplay/interop/overlay_channel.h"
 #include "netplay/interop/palette_source.h"
 #include "netplay/interop/palette_remap.h"
+#include "netplay/interop/palette_apply.h"
 #include "netplay/interop/overlay_ipc.h"
 #include "netplay/core/version_compare.h"
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,7 +22,16 @@
 
 namespace mod
 {
-void Log(const char*, ...) {}
+std::vector<std::string> logLines;
+void Log(const char* format, ...)
+{
+    char line[2048];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    logLines.emplace_back(line);
+}
 }
 
 namespace netplay::mod_settings
@@ -57,7 +68,7 @@ P::PaletteBlobBody MakeRow(std::uint8_t side, std::uint8_t charId,
     b.slotByte = 1;
     b.rawLen = P::kPaletteRawBytes;
     b.seq = seq;
-    b.keyDword = 0x01020304u;
+    b.keyDword = source::PackKeyDword(charId, b.sourceFlag, slot);
     for (std::size_t i = 0; i < P::kPaletteRawBytes; ++i)
     {
         b.rawBgr[i] = static_cast<std::uint8_t>(i + charId);
@@ -151,8 +162,8 @@ void TestProtocol()
     std::uint8_t padded[128];
     std::memcpy(padded, buf, n);
     std::memset(padded + n, 0xAB, 40);
-    Expect(P::ParseHello(padded, n + 40, &hb) && hb.nonce == 5u,
-           "trailing padding tolerated");
+    Expect(!P::ParseHello(padded, n + 40, &hb),
+           "trailing bytes rejected");
 
     std::memcpy(tampered, buf, n);
     tampered[P::kEnvelopeBytes + 5] = 99;  // FrameHeader.kind
@@ -160,6 +171,119 @@ void TestProtocol()
                && static_cast<int>(k2) == 99,
            "unknown kind surfaces via ParseKind");
     Expect(!P::ParseHello(tampered, n, &hb), "unknown kind not a Hello");
+}
+
+void TestUntrustedPalettes()
+{
+    const P::PaletteBlobBody valid = MakeRow(1, 23, 5, 100);
+    std::uint8_t frame[256] = {};
+    const std::size_t size = P::BuildPaletteBlob(valid, frame, sizeof(frame));
+    P::PaletteBlobBody out{};
+    for (std::size_t len = 0; len <= sizeof(frame); ++len)
+    {
+        out = MakeRow(0, 0, 0, 7);
+        const auto before = out;
+        const bool accepted = P::ParsePaletteBlob(frame, len, &out);
+        Expect(accepted == (len == size), "palette requires exact datagram length");
+        if (!accepted) Expect(std::memcmp(&out, &before, sizeof(out)) == 0,
+                              "rejected frame leaves output unchanged");
+    }
+    for (unsigned flag = 1; flag <= 255; ++flag)
+    {
+        frame[0] = static_cast<std::uint8_t>(flag);
+        P::Kind kind{};
+        Expect(!P::ParsePaletteBlob(frame, size, &out)
+                   && !P::ParseKind(frame, size, &kind),
+               "non-plain envelope rejected");
+    }
+    frame[0] = 0;
+    for (int field = 0; field < 7; ++field)
+    {
+        auto bad = valid;
+        switch (field)
+        {
+        case 0: bad.side = 2; break;
+        case 1: bad.charId = 24; break;
+        case 2: bad.colorSlot = 6; break;
+        case 3: bad.sourceFlag = 2; break;
+        case 4: bad.slotByte = 2; break;
+        case 5: bad.rawLen = 119; break;
+        case 6: bad.keyDword ^= 0x100u; break;
+        }
+        P::BuildPaletteBlob(bad, frame, sizeof(frame));
+        out = valid;
+        Expect(!P::ParsePaletteBlob(frame, size, &out), "invalid row metadata rejected");
+        Expect(std::memcmp(&out, &valid, sizeof(out)) == 0,
+               "rejected metadata leaves output unchanged");
+        palette::Store store;
+        Expect(!store.AcceptInbound(bad), "store rejects invalid metadata before sequence update");
+        Expect(store.AcceptInbound(valid), "rejected row cannot poison sequence tracking");
+    }
+    auto inconsistent = valid;
+    inconsistent.slotByte = 0;
+    P::BuildPaletteBlob(inconsistent, frame, sizeof(frame));
+    Expect(!P::ParsePaletteBlob(frame, size, &out), "custom and stock flags must agree");
+    for (unsigned len = 0; len <= 255; ++len)
+    {
+        auto row = valid;
+        row.rawLen = static_cast<std::uint8_t>(len);
+        P::BuildPaletteBlob(row, frame, sizeof(frame));
+        Expect(P::ParsePaletteBlob(frame, size, &out) == (len == 120),
+               "raw color count must be exactly 120 bytes");
+    }
+    auto stock = source::AssembleRow(0, 23, 5, false, nullptr);
+    P::BuildPaletteBlob(stock, frame, sizeof(frame));
+    Expect(P::ParsePaletteBlob(frame, size, &out) && out.slotByte == 0,
+           "canonical stock clear remains accepted");
+}
+
+void TestPaletteWriteBounds()
+{
+    std::uint32_t random = 0x12345678u;
+    for (unsigned charId = 0; charId < 24; ++charId)
+    {
+        auto row = MakeRow(0, static_cast<std::uint8_t>(charId), 0, 1);
+        for (int sample = 0; sample < 64; ++sample)
+        {
+            for (auto& value : row.rawBgr)
+            {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                value = sample == 0 ? 0 : sample == 1 ? 255 : static_cast<std::uint8_t>(random);
+            }
+            struct {
+                std::uint32_t before;
+                remap::PortraitColor colors[remap::kMaxPortraitColors];
+                std::uint32_t after;
+            } mapped;
+            std::memset(&mapped, 0xCC, sizeof(mapped));
+            const std::size_t cap = sample % 2 == 0 ? 1 : remap::kMaxPortraitColors;
+            const auto n = remap::RemapSpriteToPortrait(row.rawBgr,
+                source::CharFolderName(charId), mapped.colors, cap);
+            Expect(n <= cap && mapped.before == 0xCCCCCCCCu && mapped.after == 0xCCCCCCCCu,
+                   "arbitrary colors cannot overrun mapping output");
+            for (std::size_t i = 0; i < n; ++i)
+                Expect(mapped.colors[i].portIdx >= 1 && mapped.colors[i].portIdx <= 40,
+                       "mapping destination stays inside portrait bank");
+            if (cap == 1)
+            {
+                const auto* remaining = reinterpret_cast<const std::uint8_t*>(&mapped.colors[1]);
+                bool untouched = true;
+                for (std::size_t i = 0; i < sizeof(mapped.colors) - sizeof(mapped.colors[0]); ++i)
+                    untouched = untouched && remaining[i] == 0xCC;
+                Expect(untouched, "mapping respects caller capacity");
+            }
+        }
+        std::uint8_t gameData[5000];
+        std::memset(gameData, 0xCC, sizeof(gameData));
+        row.keyDword ^= 0x100u;
+        Expect(!apply::ApplyRowToWinScreen(reinterpret_cast<std::uint32_t>(gameData), 0, row),
+               "application rejects malformed row even if parser bypassed");
+        bool untouched = true;
+        for (auto value : gameData) untouched = untouched && value == 0xCC;
+        Expect(untouched, "invalid row cannot modify engine palette memory");
+    }
 }
 
 void TestStore()
@@ -205,6 +329,8 @@ void TestStore()
     Expect(!lo.SetLocalRow(&L2), "unchanged local -> no send");
     Expect(L2.seq == 1, "unchanged keeps prior seq");
     L2.colorSlot = 4;  // content change
+    L2.keyDword = source::PackKeyDword(L2.charId, L2.sourceFlag, L2.colorSlot);
+    L2.keyDword = source::PackKeyDword(L2.charId, L2.sourceFlag, L2.colorSlot);
     Expect(lo.SetLocalRow(&L2) && L2.seq == 2, "changed local -> seq 2");
     P::PaletteBlobBody L3 = L2;
     L3.seq = 12345;
@@ -282,6 +408,7 @@ void TestChannel()
     ch.SubmitLocalPaletteRow(local);
     Expect(g_sent.size() == 1, "unchanged palette: no re-transmit");
     local.colorSlot = 5;
+    local.keyDword = source::PackKeyDword(local.charId, local.sourceFlag, local.colorSlot);
     ch.SubmitLocalPaletteRow(local);
     Expect(g_sent.size() == 1, "changed palette inside interval: coalesced");
     std::this_thread::sleep_for(
@@ -362,6 +489,34 @@ void TestChannel()
     ch.End();
     Expect(!ch.IsActive(), "double End safe");
 }
+
+void TestInboundFloodLogs()
+{
+    auto& ch = OverlayChannel::Instance();
+    SetFlag(true);
+    ArmChannel(ch, -1);
+    mod::logLines.clear();
+    std::uint8_t frame[P::kMaxFrameBytes];
+    auto row = MakeRow(1, 14, 0, 0);
+    for (unsigned i = 1; i <= 5000; ++i)
+    {
+        row.seq = static_cast<std::uint16_t>(i);
+        row.rawLen = 119;
+        auto n = P::BuildPaletteBlob(row, frame, sizeof(frame));
+        ch.OnInboundDatagram(frame, n);
+        P::PaletteBlobBody out{};
+        if (i == 1) Expect(!ch.GetPeerPaletteRow(1, &out), "invalid palette never cached");
+        row.rawLen = 120;
+        n = P::BuildPaletteBlob(row, frame, sizeof(frame));
+        ch.OnInboundDatagram(frame, n);
+    }
+    P::PaletteBlobBody out{};
+    Expect(ch.GetPeerPaletteRow(1, &out) && out.seq == 5000,
+           "spectator receives valid rows before handshake despite rejected traffic");
+    Expect(mod::logLines.size() >= 2 && mod::logLines.size() <= 4,
+           "received and rejected packet logs are rate limited");
+    ch.End();
+}
 void WriteBytes(const char* path, int count, int start, int step)
 {
     std::FILE* f = std::fopen(path, "wb");
@@ -416,6 +571,7 @@ void TestSource()
            "path nanase slot0 -> nanase1.pal");
     Expect(SRC::BuildPalRelPath(1, 5, &p) && p == "ayu\\ayu6.pal",
            "path ayu slot5 -> ayu6.pal (1-based on disk)");
+    Expect(!SRC::BuildPalRelPath(0, 6, &p), "out-of-range slot rejected");
     Expect(!SRC::BuildPalRelPath(99, 0, &p), "path unknown char -> false");
     Expect(!SRC::BuildPalRelPath(0, 0, nullptr), "path null out -> false");
 
@@ -682,6 +838,12 @@ void TestIpcRing()
     Expect(n1 == sizeof(f1) && std::memcmp(out, f1, n1) == 0,
            "ipc: round-trip content");
     Expect(R::Pop(*ring, out, sizeof(out)) == 0, "ipc: drained -> empty");
+    Expect(R::Push(*ring, f1, sizeof(f1)), "ipc: push larger than destination");
+    std::memset(out, 0xCC, sizeof(out));
+    Expect(R::Pop(*ring, out, sizeof(f1) - 1) == 0 && out[0] == 0xCC,
+           "ipc: oversized frame discarded without partial copy");
+    Expect(R::Push(*ring, f1, sizeof(f1)), "ipc: push after oversized frame");
+    Expect(R::Pop(*ring, out, sizeof(out)) == sizeof(f1), "ipc: recovers after oversized frame");
 
     Expect(!R::Push(*ring, nullptr, 4), "ipc: push null -> false");
     Expect(!R::Push(*ring, f1, 0), "ipc: push zero-len -> false");
@@ -764,10 +926,13 @@ void TestVersionCompare()
 int main()
 {
     TestProtocol();
+    TestUntrustedPalettes();
+    TestPaletteWriteBounds();
     TestStore();
     TestSource();
     TestRemap();
     TestChannel();
+    TestInboundFloodLogs();
     TestIpcRing();
     TestVersionCompare();
     if (g_failures != 0)

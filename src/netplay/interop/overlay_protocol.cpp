@@ -48,7 +48,8 @@ const std::uint8_t* ValidateFrame(const std::uint8_t* datagram, std::size_t len,
     }
     const std::size_t need =
         kEnvelopeBytes + sizeof(FrameHeader) + hdr.length;
-    if (len < need || hdr.length != expectBodyLen)
+    if (len != need || len > kMaxFrameBytes
+        || datagram[0] != kEnvelopeFlagPlain || hdr.length != expectBodyLen)
     {
         return nullptr;
     }
@@ -110,7 +111,8 @@ bool ParseKind(const std::uint8_t* datagram, std::size_t len, Kind* outKind)
     }
     const std::size_t need =
         kEnvelopeBytes + sizeof(FrameHeader) + hdr.length;
-    if (len < need)
+    if (len != need || len > kMaxFrameBytes
+        || datagram[0] != kEnvelopeFlagPlain)
     {
         return false;
     }
@@ -142,6 +144,16 @@ bool ParseAck(const std::uint8_t* datagram, std::size_t len, HelloBody* out)
     return true;
 }
 
+bool IsValidPaletteRow(const PaletteBlobBody& row)
+{
+    const std::uint32_t key = static_cast<std::uint32_t>(row.colorSlot)
+        | (static_cast<std::uint32_t>(row.sourceFlag) << 16)
+        | (static_cast<std::uint32_t>(row.charId) << 24);
+    return row.side < 2 && row.charId < 24 && row.colorSlot < 6
+        && row.sourceFlag <= 1 && row.slotByte == row.sourceFlag
+        && row.rawLen == kPaletteRawBytes && row.keyDword == key;
+}
+
 bool ParsePaletteBlob(const std::uint8_t* datagram, std::size_t len,
                       PaletteBlobBody* out)
 {
@@ -151,11 +163,13 @@ bool ParsePaletteBlob(const std::uint8_t* datagram, std::size_t len,
     {
         return false;
     }
-    std::memcpy(out, body, sizeof(PaletteBlobBody));
-    if (out->rawLen > kPaletteRawBytes)
+    PaletteBlobBody candidate;
+    std::memcpy(&candidate, body, sizeof(candidate));
+    if (!IsValidPaletteRow(candidate))
     {
         return false;
     }
+    *out = candidate;
     return true;
 }
 } // namespace netplay::interop::protocol
