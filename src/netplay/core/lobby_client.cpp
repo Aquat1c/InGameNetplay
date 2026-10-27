@@ -1,5 +1,6 @@
 #include "netplay/core/lobby_client.h"
 #include "netplay/core/network_endpoint.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/tls_http_client.h"
 
 #include "logger.h"
@@ -2202,7 +2203,7 @@ bool ListPublicRooms(std::vector<PublicRoomSummary>* outRooms, std::string* outE
     {
         if (outError != nullptr)
         {
-            *outError = "Public room list request failed";
+            *outError = I18N_KEY("Public room list request failed.");
         }
         outRooms->clear();
         return false;
@@ -2256,7 +2257,7 @@ bool JoinRoom(
     {
         if (outError != nullptr)
         {
-            *outError = "Join request failed";
+            *outError = I18N_KEY("Join request failed.");
         }
         return false;
     }
@@ -2266,7 +2267,7 @@ bool JoinRoom(
     {
         if (outError != nullptr)
         {
-            *outError = ExtractJsonMessage(body, "Join rejected by server");
+            *outError = ExtractJsonMessage(body, I18N_KEY("Join rejected by server"));
         }
         return false;
     }
@@ -2276,7 +2277,7 @@ bool JoinRoom(
     {
         if (outError != nullptr)
         {
-            *outError = "Failed to parse join response";
+            *outError = I18N_KEY("Failed to parse join response");
         }
         return false;
     }
@@ -2327,7 +2328,7 @@ bool CreateRoom(
     {
         if (outError != nullptr)
         {
-            *outError = "Create room request failed";
+            *outError = I18N_KEY("Create room request failed.");
         }
         return false;
     }
@@ -2337,7 +2338,7 @@ bool CreateRoom(
     {
         if (outError != nullptr)
         {
-            *outError = ExtractJsonMessage(body, "Create room rejected by server");
+            *outError = ExtractJsonMessage(body, I18N_KEY("Create room rejected by server"));
         }
         return false;
     }
@@ -2347,7 +2348,7 @@ bool CreateRoom(
     {
         if (outError != nullptr)
         {
-            *outError = "Failed to parse create response";
+            *outError = I18N_KEY("Failed to parse create response");
         }
         return false;
     }

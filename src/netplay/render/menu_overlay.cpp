@@ -69,9 +69,7 @@ void SubmitRowRt(
         item.clipX0 = static_cast<int16_t>(g_rowClipLeft);
         item.clipX1 = static_cast<int16_t>(g_rowClipRight);
     }
-    const size_t bytes = (std::min)(text.size(), sizeof(item.text) - 1);
-    std::memcpy(item.text, text.data(), bytes);
-    item.text[bytes] = '\0';
+    netplay::debug_overlay::SetRtText(item, text.data(), text.size());
     netplay::debug_overlay::SubmitRtText(item);
 }
 
@@ -297,7 +295,7 @@ bool DrawRuntimeTextOverlayGdi(
             {
                 DrawSplitRowText(
                     callbacks, sv, entries[i], panelLeft + 2, panelRight - 2, textY, 1, 1, color,
-                    !state.suppressRtText,
+                    true,
                     isSelected);
             }
             else
@@ -470,7 +468,7 @@ bool DrawDynamicFieldValuesGdi(
                         fontScaleX,
                         fontScaleY,
                         color,
-                        !state.suppressRtText,
+                        true,
                         i == selected);
                 }
                 else if (drawLeftAligned)

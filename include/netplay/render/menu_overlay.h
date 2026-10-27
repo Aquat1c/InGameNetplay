@@ -33,9 +33,6 @@ struct RuntimeOverlayState
     bool useRuntimeTextOverlay = false;
     bool netplayActive = false;
     bool enableGdiFallbackOverlay = false;
-    // RT text draws above indexed fills, so rows must not submit TTF text
-    // while a modal panel covers them (it would bleed through the panel).
-    bool suppressRtText = false;
     netplay::menu::NetplayMenuId menuId = netplay::menu::NetplayMenuId::Main;
     // Slide offset in logical px; 0 = none, positive enters from the right.
     int contentSlideOffsetX = 0;
@@ -46,7 +43,6 @@ struct DynamicFieldOverlayState
     bool netplayActive = false;
     bool useRuntimeTextOverlay = false;
     bool menuSlideActive = false;
-    bool suppressRtText = false;
     netplay::menu::NetplayMenuId menuId = netplay::menu::NetplayMenuId::Main;
     int highlightHeight = 14;
     uint8_t paletteStart = 193;

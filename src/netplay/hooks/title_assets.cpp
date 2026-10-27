@@ -4,6 +4,7 @@
 #include "netplay/assets/assets.h"
 #include "netplay/core/network_endpoint.h"
 #include "netplay/core/validation.h"
+#include "netplay/hooks/debug_overlay.h"
 
 #include <array>
 #include <cctype>
@@ -390,12 +391,14 @@ void RunTransitionFadeOut(uint32_t screenContext, int baseVolume, int volumeAdju
         static_cast<int>(screenContext + kOffsetPalette),
         baseVolume,
         volumeAdjustment);
+    netplay::debug_overlay::BeginRtTextFade(false);
     const int fadeResult = fadeWithSoundAdjustment(
         reinterpret_cast<void*>(screenContext),
         static_cast<int>(screenContext + kOffsetPalette),
         1u,
         baseVolume,
         volumeAdjustment);
+    netplay::debug_overlay::EndRtTextFade();
     mod::Log("RunTransitionFadeOut: complete result=%d", fadeResult);
 }
 
@@ -403,7 +406,9 @@ void RunTransitionFadeIn(uint32_t screenContext)
 {
     auto const fadeScreenEffect = reinterpret_cast<FadeScreenEffectFn>(RuntimeAddress(kVaFadeScreenEffect));
     mod::Log("RunTransitionFadeIn: begin palette=%d", static_cast<int>(screenContext + kOffsetPalette));
+    netplay::debug_overlay::BeginRtTextFade(true);
     const int fadeResult = fadeScreenEffect(reinterpret_cast<void*>(screenContext), static_cast<int>(screenContext + kOffsetPalette), 1u);
+    netplay::debug_overlay::EndRtTextFade();
     mod::Log("RunTransitionFadeIn: complete result=%d", fadeResult);
 }
 

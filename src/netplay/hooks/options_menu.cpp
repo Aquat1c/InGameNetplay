@@ -4,6 +4,7 @@
 #include "logger.h"
 #include "mod_version.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/update_check.h"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
@@ -36,6 +38,7 @@ using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
 using NetplayMenuId = netplay::menu::NetplayMenuId;
 using NetplayMenuSpec = netplay::menu::NetplayMenuSpec;
 namespace hooks = netplay::hooks::internal;
+using netplay::i18n::Tr;
 
 constexpr int kBackRow = netplay::menu::RowToIndex(netplay::menu::NetplayObRow::Blank);
 constexpr uint32_t kStatusDisplayMs = 1800;
@@ -329,7 +332,7 @@ void EnsureSpecInitialized()
     }
 
     g_state.spec.menuId = NetplayMenuId::Options;
-    g_state.spec.headerLabel = "OPTIONS";
+    g_state.spec.headerLabel = I18N_KEY("OPTIONS");
     g_state.spec.entries = g_state.entries.data();
     g_state.spec.entryCount = 1;
     g_state.spec.defaultSelection = 0;
@@ -736,164 +739,170 @@ std::string ResolveTooltipSummary(const std::string& sectionName, const std::str
 
     if (matches("Network", "HolePunchingServer"))
     {
-        return "Address of the UDP hole punching server used to help peers connect.";
+        return I18N_KEY("Address of the UDP hole punching server used to help peers connect.");
     }
     if (matches("Network", "IncreaseInputDelay"))
     {
-        return "Increase the match input delay. Higher delay reduces rollbacks but adds more input latency.";
+        return I18N_KEY("Increase the match input delay. Higher delay reduces rollbacks but adds more input latency.");
     }
     if (matches("Network", "DecreaseInputDelay"))
     {
-        return "Decrease the match input delay. Lower delay feels more responsive but may increase rollbacks.";
+        return I18N_KEY("Decrease the match input delay. Lower delay feels more responsive but may increase rollbacks.");
     }
     if (matches("Network", "IncreaseSpecSpeed"))
     {
-        return "Increase spectator catch-up speed while watching an online match.";
+        return I18N_KEY("Increase spectator catch-up speed while watching an online match.");
     }
     if (matches("Network", "DecreaseSpecSpeed"))
     {
-        return "Decrease spectator catch-up speed for smoother playback after you have caught up.";
+        return I18N_KEY("Decrease spectator catch-up speed for smoother playback after you have caught up.");
     }
     if (matches("Network", "ToggleRemotePalettes"))
     {
-        return "Toggle whether the opponent's selected palette is shown during netplay.";
+        return I18N_KEY("Toggle whether the opponent's selected palette is shown during netplay.");
     }
     if (matches("Network", "ReplayFolder"))
     {
-        return "Folder used when forced netplay replays are saved.";
+        return I18N_KEY("Folder used when forced netplay replays are saved.");
     }
     if (matches("Network", "BattleLogFile"))
     {
-        return "File name used to append online match results.";
+        return I18N_KEY("File name used to append online match results.");
     }
     if (matches("Practice", "Pause"))
     {
-        return "Pause the current local-play match.";
+        return I18N_KEY("Pause the current local-play match.");
     }
     if (matches("Practice", "StepFrame"))
     {
-        return "Advance the paused match by one frame.";
+        return I18N_KEY("Advance the paused match by one frame.");
     }
     if (matches("Practice", "Save"))
     {
-        return "Save the current local-play state.";
+        return I18N_KEY("Save the current local-play state.");
     }
     if (matches("Practice", "Load"))
     {
-        return "Load the previously saved local-play state.";
+        return I18N_KEY("Load the previously saved local-play state.");
     }
     if (matches("Practice", "ToggleRecord"))
     {
-        return "Start or stop recording the dummy's actions in the current buffer.";
+        return I18N_KEY("Start or stop recording the dummy's actions in the current buffer.");
     }
     if (matches("Practice", "ToggleReplay"))
     {
-        return "Start or stop replaying the current buffer.";
+        return I18N_KEY("Start or stop replaying the current buffer.");
     }
     if (matches("Practice", "SwitchStartCondition"))
     {
-        return "Change when record and replay begin in VS Player.";
+        return I18N_KEY("Change when record and replay begin in VS Player.");
     }
     if (sectionName == "Practice" && keyName.rfind("SetBuffer", 0) == 0)
     {
+        static const char* const kBufferTips[] = {
+            I18N_KEY("Select replay buffer 1 for recording and playback."),
+            I18N_KEY("Select replay buffer 2 for recording and playback."),
+            I18N_KEY("Select replay buffer 3 for recording and playback."),
+            I18N_KEY("Select replay buffer 4 for recording and playback."),
+            I18N_KEY("Select replay buffer 5 for recording and playback."),
+        };
         const std::string bufferIndex = keyName.substr(std::strlen("SetBuffer"));
+        if (bufferIndex.size() == 1 && bufferIndex[0] >= '1' && bufferIndex[0] <= '5')
+        {
+            return kBufferTips[bufferIndex[0] - '1'];
+        }
         return "Select replay buffer " + bufferIndex + " for recording and playback.";
     }
     if (matches("Practice", "ToggleReplayRandom"))
     {
-        return "Replay a random recorded buffer instead of the current one.";
+        return I18N_KEY("Replay a random recorded buffer instead of the current one.");
     }
     if (matches("Practice", "ToggleDisplay"))
     {
-        return "Show or hide the Revival practice overlay.";
+        return I18N_KEY("Show or hide the Revival practice overlay.");
     }
     if (matches("Practice", "ToggleHitBoxes"))
     {
-        return "Show or hide hitboxes.";
+        return I18N_KEY("Show or hide hitboxes.");
     }
     if (matches("Practice", "ToggleHurtBoxes"))
     {
-        return "Show or hide hurtboxes.";
+        return I18N_KEY("Show or hide hurtboxes.");
     }
     if (matches("Practice", "ToggleCollisionBoxes"))
     {
-        return "Show or hide collision boxes and the cross-up guide line.";
+        return I18N_KEY("Show or hide collision boxes and the cross-up guide line.");
     }
     if (matches("Practice", "SwitchPlayers"))
     {
-        return "Swap the player and dummy sides in VS Player.";
+        return I18N_KEY("Swap the player and dummy sides in VS Player.");
     }
     if (matches("Practice", "MirrorPlayers"))
     {
-        return "Mirror the player's position to practice the other side faster.";
+        return I18N_KEY("Mirror the player's position to practice the other side faster.");
     }
     if (matches("Practice", "IncreaseFPS"))
     {
-        return "Increase the local-play game speed in 16 FPS steps.";
+        return I18N_KEY("Increase the local-play game speed in 16 FPS steps.");
     }
     if (matches("Practice", "DecreaseFPS"))
     {
-        return "Decrease the local-play game speed in 16 FPS steps.";
+        return I18N_KEY("Decrease the local-play game speed in 16 FPS steps.");
     }
     if (matches("Practice", "ResetFPS"))
     {
-        return "Restore the local-play game speed to normal.";
+        return I18N_KEY("Restore the local-play game speed to normal.");
     }
     if (matches("Tournament", "P1_Name"))
     {
-        return "Set the tournament overlay name for player 1.";
+        return I18N_KEY("Set the tournament overlay name for player 1.");
     }
     if (matches("Tournament", "P2_Name"))
     {
-        return "Set the tournament overlay name for player 2.";
+        return I18N_KEY("Set the tournament overlay name for player 2.");
     }
     if (matches("Tournament", "TournamentFolder"))
     {
-        return "Folder used for tournament replays and the tournament log.";
+        return I18N_KEY("Folder used for tournament replays and the tournament log.");
     }
     if (matches("Global", "WindowX"))
     {
-        return "Horizontal window position at startup.";
+        return I18N_KEY("Horizontal window position at startup.");
     }
     if (matches("Global", "WindowY"))
     {
-        return "Vertical window position at startup.";
+        return I18N_KEY("Vertical window position at startup.");
     }
     if (matches("Global", "WindowWidth"))
     {
-        return "Window width at startup.";
+        return I18N_KEY("Window width at startup.");
     }
     if (matches("Global", "WindowHeight"))
     {
-        return "Window height at startup.";
+        return I18N_KEY("Window height at startup.");
     }
     if (matches("Global", "BackBufferWidth"))
     {
-        return "Internal backbuffer width used for rendering.";
+        return I18N_KEY("Internal backbuffer width used for rendering.");
     }
     if (matches("Global", "BackBufferHeight"))
     {
-        return "Internal backbuffer height used for rendering.";
+        return I18N_KEY("Internal backbuffer height used for rendering.");
     }
     if (matches("Global", "ToggleBGM"))
     {
-        return "Toggle the game's BGM on or off.";
+        return I18N_KEY("Toggle the game's BGM on or off.");
     }
     if (matches("Global", "MuteBGM"))
     {
-        return "Mute all in-game BGM by default.";
+        return I18N_KEY("Mute all in-game BGM by default.");
     }
     if (matches("Global", "BGMFolder"))
     {
-        return "Folder used for external BGM files when Revival loads custom music.";
+        return I18N_KEY("Folder used for external BGM files when Revival loads custom music.");
     }
 
-    if (!parsed.empty())
-    {
-        return parsed;
-    }
-
-    return "Adjust " + PrettyKeyLabel(keyName) + ".";
+    return parsed;
 }
 
 bool IsSectionHeader(const Item& item)
@@ -1169,7 +1178,7 @@ void RebuildMenuEntries()
     };
 
     g_state.spec.menuId = NetplayMenuId::Options;
-    g_state.spec.headerLabel = "OPTIONS";
+    g_state.spec.headerLabel = I18N_KEY("OPTIONS");
     g_state.spec.entries = g_state.entries.data();
     g_state.spec.entryCount = visibleCount + 1;
     g_state.spec.defaultSelection = SnapSlotToSelectable(0);
@@ -1266,7 +1275,7 @@ bool CommitExit(uint32_t screenContext, bool saveChanges)
         g_state.modal.errorMessage =
             !g_state.lastSaveError.empty()
             ? g_state.lastSaveError
-            : "Save failed.";
+            : I18N_KEY("Save failed.");
         return false;
     }
 
@@ -1326,11 +1335,21 @@ int FindBindingConflict(int itemIndex, const std::string& value)
     return -1;
 }
 
+std::string FormatText(const char* format, ...)
+{
+    char buffer[512] = {};
+    va_list args;
+    va_start(args, format);
+    (void)std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    return buffer;
+}
+
 std::string PrettySectionLabel(const std::string& sectionName)
 {
     if (sectionName.empty())
     {
-        return "Section";
+        return I18N_KEY("Section");
     }
     return sectionName;
 }
@@ -1339,7 +1358,7 @@ std::string PrettyKeyLabel(const std::string& key)
 {
     if (key.empty())
     {
-        return "Option";
+        return I18N_KEY("Option");
     }
 
     std::string label;
@@ -1372,16 +1391,30 @@ std::string PrettyKeyLabel(const std::string& key)
 
 std::string TruncateLabel(std::string text, size_t maxChars)
 {
-    if (text.size() <= maxChars)
+    const size_t keep = maxChars <= 3 ? maxChars : maxChars - 3;
+    size_t count = 0;
+    size_t cut = text.size();
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        if ((static_cast<unsigned char>(text[i]) & 0xC0u) == 0x80u)
+        {
+            continue;
+        }
+        if (count == keep)
+        {
+            cut = i;
+        }
+        ++count;
+    }
+    if (count <= maxChars)
     {
         return text;
     }
-    if (maxChars <= 3)
+    text.resize(cut);
+    if (maxChars > 3)
     {
-        return text.substr(0, maxChars);
+        text += "...";
     }
-    text.resize(maxChars - 3);
-    text += "...";
     return text;
 }
 
@@ -1395,25 +1428,49 @@ struct PageGroupDef
 const std::vector<PageGroupDef>& GetPageGroupDefs()
 {
     static const std::vector<PageGroupDef> kGroups = {
-        {"Network", "CONNECTION", {"Name", "MaxRollback", "Port", "Protocol", "HolePunchingServer", "Address"}},
-        {"Network", "MATCH", {"AllowPracticeKeys", "IncreaseInputDelay", "DecreaseInputDelay", "ToggleRemotePalettes", "DisplayScore", "LogScore"}},
-        {"Network", "SPECTATING", {"AllowSpectating", "IncreaseSpecSpeed", "DecreaseSpecSpeed"}},
-        {"Network", "REPLAYS", {"SaveAllReplays", "SavePreviousReplay", "ReplayFolder", "BattleLogFile", "SaveBattleLog"}},
-        {"Practice", "PLAYBACK", {"Pause", "StepFrame", "IncreaseFPS", "DecreaseFPS", "ResetFPS"}},
-        {"Practice", "RECORDING", {"Save", "Load", "ToggleRecord", "ToggleReplay", "ToggleReplayRandom", "SwitchStartCondition"}},
-        {"Practice", "BUFFERS", {"SetBuffer1", "SetBuffer2", "SetBuffer3", "SetBuffer4", "SetBuffer5"}},
-        {"Practice", "DISPLAY", {"ToggleDisplay", "ToggleHitBoxes", "ToggleHurtBoxes", "ToggleCollisionBoxes"}},
-        {"Practice", "PLAYERS", {"SwitchPlayers", "MirrorPlayers"}},
-        {"Global", "WINDOW", {"WindowX", "WindowY", "WindowWidth", "WindowHeight", "BackBufferWidth", "BackBufferHeight"}},
-        {"Global", "AUDIO", {"ToggleBGM", "MuteBGM", "BGMFolder"}},
-        {"Global", "SYSTEM", {"SoftwareRendering", "Debug"}},
-        {"Others", "INTERFACE", {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
-        {"Others", "GAMEPLAY", {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
-        {"Others", "LOGGING", {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
-        {"Others", "MOD", {"CheckForUpdates", "About"}},
+        {"Network", I18N_KEY("CONNECTION"), {"Name", "MaxRollback", "Port", "Protocol", "HolePunchingServer", "Address"}},
+        {"Network", I18N_KEY("MATCH"), {"AllowPracticeKeys", "IncreaseInputDelay", "DecreaseInputDelay", "ToggleRemotePalettes", "DisplayScore", "LogScore"}},
+        {"Network", I18N_KEY("SPECTATING"), {"AllowSpectating", "IncreaseSpecSpeed", "DecreaseSpecSpeed"}},
+        {"Network", I18N_KEY("REPLAYS"), {"SaveAllReplays", "SavePreviousReplay", "ReplayFolder", "BattleLogFile", "SaveBattleLog"}},
+        {"Practice", I18N_KEY("PLAYBACK"), {"Pause", "StepFrame", "IncreaseFPS", "DecreaseFPS", "ResetFPS"}},
+        {"Practice", I18N_KEY("RECORDING"), {"Save", "Load", "ToggleRecord", "ToggleReplay", "ToggleReplayRandom", "SwitchStartCondition"}},
+        {"Practice", I18N_KEY("BUFFERS"), {"SetBuffer1", "SetBuffer2", "SetBuffer3", "SetBuffer4", "SetBuffer5"}},
+        {"Practice", I18N_KEY("DISPLAY"), {"ToggleDisplay", "ToggleHitBoxes", "ToggleHurtBoxes", "ToggleCollisionBoxes"}},
+        {"Practice", I18N_KEY("PLAYERS"), {"SwitchPlayers", "MirrorPlayers"}},
+        {"Global", I18N_KEY("WINDOW"), {"WindowX", "WindowY", "WindowWidth", "WindowHeight", "BackBufferWidth", "BackBufferHeight"}},
+        {"Global", I18N_KEY("AUDIO"), {"ToggleBGM", "MuteBGM", "BGMFolder"}},
+        {"Global", I18N_KEY("SYSTEM"), {"SoftwareRendering", "Debug"}},
+        {"Others", I18N_KEY("INTERFACE"), {"Language", "MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
+        {"Others", I18N_KEY("GAMEPLAY"), {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
+        {"Others", I18N_KEY("LOGGING"), {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
+        {"Others", I18N_KEY("MOD"), {"CheckForUpdates", "About"}},
     };
     return kGroups;
 }
+
+// PrettyKeyLabel/PrettySectionLabel output for the keys and sections above.
+[[maybe_unused]] constexpr const char* kPrettyLabelKeys[] = {
+    I18N_KEY("Network"), I18N_KEY("Practice"), I18N_KEY("Global"), I18N_KEY("Others"),
+    I18N_KEY("Name"), I18N_KEY("Max Rollback"), I18N_KEY("Port"), I18N_KEY("Protocol"),
+    I18N_KEY("Hole Punching Server"), I18N_KEY("Address"), I18N_KEY("Allow Practice Keys"), I18N_KEY("Increase Input Delay"),
+    I18N_KEY("Decrease Input Delay"), I18N_KEY("Toggle Remote Palettes"), I18N_KEY("Display Score"), I18N_KEY("Log Score"),
+    I18N_KEY("Allow Spectating"), I18N_KEY("Increase Spec Speed"), I18N_KEY("Decrease Spec Speed"), I18N_KEY("Save All Replays"),
+    I18N_KEY("Save Previous Replay"), I18N_KEY("Replay Folder"), I18N_KEY("Battle Log File"), I18N_KEY("Save Battle Log"),
+    I18N_KEY("Pause"), I18N_KEY("Step Frame"), I18N_KEY("Increase FPS"), I18N_KEY("Decrease FPS"),
+    I18N_KEY("Reset FPS"), I18N_KEY("Save"), I18N_KEY("Load"), I18N_KEY("Toggle Record"),
+    I18N_KEY("Toggle Replay"), I18N_KEY("Toggle Replay Random"), I18N_KEY("Switch Start Condition"), I18N_KEY("Set Buffer1"),
+    I18N_KEY("Set Buffer2"), I18N_KEY("Set Buffer3"), I18N_KEY("Set Buffer4"), I18N_KEY("Set Buffer5"),
+    I18N_KEY("Toggle Display"), I18N_KEY("Toggle Hit Boxes"), I18N_KEY("Toggle Hurt Boxes"), I18N_KEY("Toggle Collision Boxes"),
+    I18N_KEY("Switch Players"), I18N_KEY("Mirror Players"), I18N_KEY("Window X"), I18N_KEY("Window Y"),
+    I18N_KEY("Window Width"), I18N_KEY("Window Height"), I18N_KEY("Back Buffer Width"), I18N_KEY("Back Buffer Height"),
+    I18N_KEY("Toggle BGM"), I18N_KEY("Mute BGM"), I18N_KEY("BGMFolder"), I18N_KEY("Software Rendering"),
+    I18N_KEY("Debug"), I18N_KEY("Language"), I18N_KEY("Menu Ttf Text"), I18N_KEY("Menu Ttf Font"),
+    I18N_KEY("Hosting Tip Font"), I18N_KEY("Enable Debug Menu"), I18N_KEY("Hide Empty Sets In Battle Log"), I18N_KEY("Offline Vs Human Mode"),
+    I18N_KEY("Async Host Return Key"), I18N_KEY("Online Custom Colors"), I18N_KEY("Write Log File"), I18N_KEY("Enable Console"),
+    I18N_KEY("Preserve Mod Log Across Launches"), I18N_KEY("Preserve Revival Logs Across Launches"), I18N_KEY("Verbose Bridge Patch Logging"), I18N_KEY("Verbose Sync Diagnostics"),
+    I18N_KEY("Verbose Revival102j Lifecycle Logging"), I18N_KEY("Check For Updates"), I18N_KEY("About"),
+    I18N_KEY("Tournament"), I18N_KEY("P1 Name"), I18N_KEY("P2 Name"), I18N_KEY("Tournament Folder"),
+};
 
 bool IsCurrentOthersSetting(const std::string& key)
 {
@@ -1501,7 +1558,7 @@ void BuildCategoryPageRows(Category& category)
         {
             PageRow header;
             header.header = true;
-            header.headerLabel = "MISC";
+            header.headerLabel = I18N_KEY("MISC");
             category.pageRows.push_back(header);
         }
         for (const int itemIndex : leftovers)
@@ -1528,7 +1585,7 @@ bool LoadItemsFromIni()
     ScopedOptionsIniAccess iniAccess(false);
     if (!iniAccess.Acquired())
     {
-        SetStatusMessage("EfzRevival.ini is temporarily busy.");
+        SetStatusMessage(I18N_KEY("EfzRevival.ini is temporarily busy."));
         mod::Log(
             "OptionsMenu: failed to acquire serialized INI read access");
         return false;
@@ -1540,7 +1597,7 @@ bool LoadItemsFromIni()
     FileEncoding encoding = FileEncoding::Utf16Le;
     if (!ReadWideTextFile(g_state.iniPath, &text, &encoding))
     {
-        SetStatusMessage("EfzRevival.ini not found.");
+        SetStatusMessage(I18N_KEY("EfzRevival.ini not found."));
         mod::Log("OptionsMenu: failed to load '%s'", g_state.iniPath.c_str());
         return false;
     }
@@ -1572,8 +1629,7 @@ bool LoadItemsFromIni()
             currentSection = WideToUtf8(TrimWide(std::wstring_view(trimmed).substr(1, trimmed.size() - 2)));
             Category category;
             category.sectionName = currentSection;
-            const std::string fallback = "Adjust " + PrettySectionLabel(currentSection) + " settings.";
-            category.tooltipSummary = SummarizeComments(commentLines, fallback.c_str());
+            category.tooltipSummary = SummarizeComments(commentLines, "");
             g_state.categories.push_back(std::move(category));
             currentCategoryIndex = static_cast<int>(g_state.categories.size()) - 1;
 
@@ -1683,7 +1739,7 @@ void AppendSyntheticItems()
     {
         Category category;
         category.sectionName = "Others";
-        category.tooltipSummary = "Mod-only settings used by efz_netplay_mod.";
+        category.tooltipSummary = I18N_KEY("Mod-only settings used by efz_netplay_mod.");
         g_state.categories.push_back(std::move(category));
         categoryIndex = static_cast<int>(g_state.categories.size()) - 1;
     }
@@ -1829,76 +1885,81 @@ void AppendSyntheticItems()
     upsertChoiceItem(
         "OfflineVsHumanMode",
         "Tournament",
-        {"Tournament", "VS Human"},
-        "Choose whether the title-screen VS Human option launches tournament mode or regular VS Human.");
+        {I18N_KEY("Tournament"), I18N_KEY("VS Human")},
+        I18N_KEY("Choose whether the title-screen VS Human option launches tournament mode or regular VS Human."));
     upsertBoolIntItem(
         "WriteLogFile",
         true,
-        "Write efz_netplay_mod.log to disk while the mod is running.");
+        I18N_KEY("Write efz_netplay_mod.log to disk while the mod is running."));
     upsertBoolIntItem(
         "PreserveModLogAcrossLaunches",
         false,
-        "Keep previous efz_netplay_mod.log content across full game relaunches. Off starts a fresh mod log each launch.");
+        I18N_KEY("Keep previous efz_netplay_mod.log content across full game relaunches. Off starts a fresh mod log each launch."));
     upsertBoolIntItem(
         "PreserveRevivalLogsAcrossLaunches",
         false,
-        "Keep previous Revival log content across full game relaunches. Off starts a fresh logEfz.txt each launch.");
+        I18N_KEY("Keep previous Revival log content across full game relaunches. Off starts a fresh logEfz.txt each launch."));
     upsertBoolIntItem(
         "EnableConsole",
         false,
-        "Open the logger console window automatically when the mod starts.");
+        I18N_KEY("Open the logger console window automatically when the mod starts."));
     upsertBoolIntItem(
         "EnableDebugMenu",
         false,
-        "Enable the ImGui debug overlay. Toggle it on any screen with the \\ (backslash) key.");
+        I18N_KEY("Enable the ImGui debug overlay. Toggle it on any screen with the \\ (backslash) key."));
     upsertBoolIntItem(
         "VerboseBridgePatchLogging",
         false,
-        "Log extra byte windows and vtable slots around Revival bridge patches.");
+        I18N_KEY("Log extra byte windows and vtable slots around Revival bridge patches."));
     upsertBoolIntItem(
         "VerboseSyncDiagnostics",
         false,
-        "Log detailed rollback session, ring, FPU, and sync-frame diagnostics.");
+        I18N_KEY("Log detailed rollback session, ring, FPU, and sync-frame diagnostics."));
     upsertBoolIntItem(
         "VerboseRevival102jLifecycleLogging",
         false,
-        "Log full 1.02j lifecycle checkpoints, IPC state, hooks, mappings, vtables, and session-object byte dumps.");
+        I18N_KEY("Log full 1.02j lifecycle checkpoints, IPC state, hooks, mappings, vtables, and session-object byte dumps."));
     upsertBoolIntItem(
         "HideEmptySetsInBattleLog",
         true,
-        "Hide empty 0-0 Battle Log sets by default.");
+        I18N_KEY("Hide empty 0-0 Battle Log sets by default."));
     upsertBoolIntItem(
         "OnlineCustomColors",
         true,
-        "Show your custom EDIT COLOR palette to your opponent in online matches, "
+        I18N_KEY("Show your custom EDIT COLOR palette to your opponent in online matches, "
         "and see theirs, on the character-select and win screens. Rides the "
-        "existing netplay connection; players without the mod are unaffected.");
+        "existing netplay connection; players without the mod are unaffected."));
     upsertBoolIntItem(
         "MenuTtfText",
         true,
-        "Draw supported menu text (Battle Log, footer tooltips) with a crisp TTF font instead of the pixel font. Falls back automatically if unavailable.");
+        I18N_KEY("Draw supported menu text (Battle Log, footer tooltips) with a crisp TTF font instead of the pixel font. Falls back automatically if unavailable."));
+    upsertChoiceItem(
+        "Language",
+        "English",
+        {I18N_KEY("English"), I18N_KEY("Japanese")},
+        I18N_KEY("Language of the mod's menus."));
     upsertChoiceItem(
         "MenuTtfFont",
         "Yu Gothic",
         {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
-        "TTF face for menu text. The Noto faces ship with the mod and always cover Japanese and Cyrillic; system faces fall back to them when missing glyphs.");
+        I18N_KEY("TTF face for menu text. The Noto faces ship with the mod and always cover Japanese and Cyrillic; system faces fall back to them when missing glyphs."));
     upsertChoiceItem(
         "HostingTipFont",
         "Yu Gothic",
         {"Yu Gothic", "Meiryo", "MS Gothic", "Noto Sans JP", "Noto Sans Mono", "Segoe UI", "Arial", "ITC Bolt"},
-        "TTF face for the in-game hosting-overlay tip ('Hosting... Press F1...'). Independent of the menu font so the tip can stand out.");
+        I18N_KEY("TTF face for the in-game hosting-overlay tip ('Hosting... Press F1...'). Independent of the menu font so the tip can stand out."));
     upsertKeybindItem(
         "AsyncHostReturnKey",
         "DIK_F1",
-        "Hotkey to return to the netplay menu (or rehost) while the hosting overlay is minimized in-game.");
+        I18N_KEY("Hotkey to return to the netplay menu (or rehost) while the hosting overlay is minimized in-game."));
     upsertBoolIntItem(
         "CheckForUpdates",
         true,
-        "Look up the newest mod release on GitHub once per launch (first netplay menu visit) "
-        "and mark OPTIONS / About with [!] while a newer version is out.");
+        I18N_KEY("Look up the newest mod release on GitHub once per launch (first netplay menu visit) "
+        "and mark OPTIONS / About with [!] while a newer version is out."));
     upsertActionItem(
         "About",
-        "Show the mod version and build information.");
+        I18N_KEY("Show the mod version and build information."));
 }
 
 void ApplyRuntimeNetplaySettings()
@@ -1958,6 +2019,7 @@ void ApplyRuntimeNetplaySettings()
     }
 
     netplay::mod_settings::Reload();
+    netplay::i18n::Reload();   // before the font rebuild: it bakes the table's glyphs
     netplay::debug_overlay::NotifyFontSettingsChanged();
 
     HMODULE moduleHandle = nullptr;
@@ -1980,7 +2042,7 @@ bool SaveItemsToDisk()
     g_state.lastSaveError.clear();
     if (g_state.iniPath.empty() || g_state.lines.empty())
     {
-        g_state.lastSaveError = "EfzRevival.ini is unavailable.";
+        g_state.lastSaveError = I18N_KEY("EfzRevival.ini is unavailable.");
         return false;
     }
 
@@ -1990,9 +2052,9 @@ bool SaveItemsToDisk()
         if (iniAccess.OverrideState().active)
         {
             g_state.lastSaveError =
-                "Host restart active. Wait, then save again.";
+                I18N_KEY("Host restart active. Wait, then save again.");
             SetStatusMessage(
-                "Host listener is restarting; settings were not saved.");
+                I18N_KEY("Host listener is restarting; settings were not saved."));
             mod::Log(
                 "OptionsMenu: save blocked "
                 "reason=temporary_host_protocol_override "
@@ -2005,7 +2067,7 @@ bool SaveItemsToDisk()
         else
         {
             g_state.lastSaveError =
-                "EfzRevival.ini is temporarily busy.";
+                I18N_KEY("EfzRevival.ini is temporarily busy.");
             mod::Log(
                 "OptionsMenu: save blocked "
                 "reason=serialized_ini_access_unavailable");
@@ -2113,7 +2175,7 @@ bool SaveItemsToDisk()
     const std::wstring joined = JoinLines(updatedLines);
     if (!WriteWideTextFile(g_state.iniPath, joined, g_state.encoding))
     {
-        g_state.lastSaveError = "Could not write EfzRevival.ini.";
+        g_state.lastSaveError = I18N_KEY("Could not write EfzRevival.ini.");
         mod::Log("OptionsMenu: failed to save '%s'", g_state.iniPath.c_str());
         return false;
     }
@@ -2129,7 +2191,7 @@ bool SaveItemsToDisk()
         item.originalValue = item.currentValue;
     }
     ApplyRuntimeNetplaySettings();
-    SetStatusMessage("Settings saved.");
+    SetStatusMessage(I18N_KEY("Settings saved."));
     mod::Log("OptionsMenu: saved '%s'", g_state.iniPath.c_str());
     return true;
 }
@@ -2184,20 +2246,24 @@ std::string FormatDisplayValue(const Item& item)
     case ItemKind::KeyBinding:
         return keybinds::FormatBindingValue(value);
     case ItemKind::BoolText:
-        return value == "True" ? "On" : "Off";
+        return value == "True" ? Tr("On") : Tr("Off");
     case ItemKind::BoolInt:
-        return value == "1" ? "On" : "Off";
+        return value == "1" ? Tr("On") : Tr("Off");
     case ItemKind::Choice:
-        return value.empty() ? "(empty)" : value;
+        if (value.empty())
+        {
+            return Tr("(empty)");
+        }
+        return (item.keyName == "OfflineVsHumanMode" || item.keyName == "Language") ? Tr(value) : value;
     case ItemKind::Protocol:
         return value;
     case ItemKind::Action:
-        return "Open";
+        return Tr("Open");
     case ItemKind::Integer:
     case ItemKind::String:
-        return value.empty() ? "(empty)" : value;
+        return value.empty() ? std::string(Tr("(empty)")) : value;
     case ItemKind::SectionHeader:
-        return "[" + PrettySectionLabel(item.sectionName) + "]";
+        return "[" + Tr(PrettySectionLabel(item.sectionName)) + "]";
     default:
         return value;
     }
@@ -2207,18 +2273,18 @@ std::string BuildCategoryLabel(int categoryIndex)
 {
     if (!IsValidCategoryIndex(categoryIndex))
     {
-        return "[Category]";
+        return Tr("[Category]");
     }
 
     const Category& category = g_state.categories[static_cast<size_t>(categoryIndex)];
     const std::string prefix = HasDirtyItemsInCategory(categoryIndex) ? "* " : "";
-    return prefix + "[" + PrettySectionLabel(category.sectionName) + "]";
+    return prefix + "[" + Tr(PrettySectionLabel(category.sectionName)) + "]";
 }
 
 std::string BuildSettingLabel(const Item& item)
 {
     const std::string prefix = IsDirty(item) ? "* " : "";
-    std::string label = prefix + PrettyKeyLabel(item.keyName);
+    std::string label = prefix + Tr(PrettyKeyLabel(item.keyName));
     if (item.kind == ItemKind::Action && item.keyName == "About")
     {
         const char* badge = netplay::update_check::BadgeText();
@@ -2562,13 +2628,13 @@ bool CommitEdit()
             uint16_t port = 0;
             if (!netplay::validation::ParsePort(value, &port))
             {
-                SetEditError("Invalid port");
+                SetEditError(I18N_KEY("Invalid port"));
                 return false;
             }
         }
         else if (!ValidateUnsignedInteger(value))
         {
-            SetEditError("Invalid number");
+            SetEditError(I18N_KEY("Invalid number"));
             return false;
         }
     }
@@ -2577,7 +2643,7 @@ bool CommitEdit()
         value = netplay::text::TrimAscii(value);
         if (!netplay::validation::IsValidNickname(value))
         {
-            SetEditError("Invalid nickname");
+            SetEditError(I18N_KEY("Invalid nickname"));
             return false;
         }
     }
@@ -2589,7 +2655,7 @@ bool CommitEdit()
                 value,
                 &hostInput))
         {
-            SetEditError("Invalid address");
+            SetEditError(I18N_KEY("Invalid address"));
             return false;
         }
         value = hostInput.host;
@@ -2893,7 +2959,7 @@ bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes,
         *inactivityCounter = 0;
         hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
         CloseModal();
-        SetStatusMessage("Binding unchanged.");
+        SetStatusMessage(I18N_KEY("Binding unchanged."));
         return true;
     }
 
@@ -2902,10 +2968,10 @@ bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes,
     {
         *inactivityCounter = 0;
         hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
-        g_state.modal.errorMessage =
-            reboundDisplay + " is already used by "
-            + TruncateLabel(PrettyKeyLabel(g_state.items[static_cast<size_t>(conflictIndex)].keyName), 14)
-            + ".";
+        g_state.modal.errorMessage = FormatText(
+            Tr("%s is already used by %s."),
+            reboundDisplay.c_str(),
+            TruncateLabel(Tr(PrettyKeyLabel(g_state.items[static_cast<size_t>(conflictIndex)].keyName)), 14).c_str());
         return true;
     }
 
@@ -2913,7 +2979,10 @@ bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes,
     *inactivityCounter = 0;
     hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
     CloseModal();
-    const std::string status = PrettyKeyLabel(item.keyName) + " set to " + reboundDisplay + ".";
+    const std::string status = FormatText(
+        Tr("%s set to %s."),
+        Tr(PrettyKeyLabel(item.keyName)).c_str(),
+        reboundDisplay.c_str());
     SetStatusMessage(status.c_str());
     mod::Log(
         "OptionsMenu: rebound section='%s' key='%s' value='%s'",
@@ -2966,12 +3035,12 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
             if (netplay::update_check::OpenReleasesPage())
             {
                 hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
-                SetStatusMessage("Opened the GitHub releases page in your browser.");
+                SetStatusMessage(I18N_KEY("Opened the GitHub releases page in your browser."));
             }
             else
             {
                 hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
-                SetStatusMessage("Could not open a browser. See the log for the URL.");
+                SetStatusMessage(I18N_KEY("Could not open a browser. See the log for the URL."));
             }
             return true;
         }
@@ -3075,7 +3144,7 @@ bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                 g_state.modal.errorMessage =
                     !g_state.lastSaveError.empty()
                     ? g_state.lastSaveError
-                    : "Save failed.";
+                    : I18N_KEY("Save failed.");
             }
         }
         else
@@ -3115,7 +3184,7 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
 {
     if (action == NetplayMenuAction::BackToMain)
     {
-        return "Back";
+        return Tr("Back");
     }
 
     const VisibleEntry visible = GetVisibleEntryForAction(action);
@@ -3125,7 +3194,7 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
     }
     if (visible.kind == VisibleEntryKind::Header)
     {
-        return visible.headerLabel != nullptr ? visible.headerLabel : "";
+        return visible.headerLabel != nullptr ? Tr(visible.headerLabel) : "";
     }
     if (visible.kind != VisibleEntryKind::Item
         || visible.itemIndex < 0
@@ -3188,7 +3257,7 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
 {
     if (!g_state.statusMessage.empty() && GetTickCount() < g_state.statusExpireTick)
     {
-        return g_state.statusMessage;
+        return Tr(g_state.statusMessage);
     }
 
     if (g_state.edit.active && g_state.edit.itemIndex >= 0 && g_state.edit.itemIndex < static_cast<int>(g_state.items.size()))
@@ -3196,15 +3265,13 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         const Item& item = g_state.items[static_cast<size_t>(g_state.edit.itemIndex)];
         if (!g_state.edit.errorMessage.empty() && GetTickCount() < g_state.edit.errorExpireTick)
         {
-            return g_state.edit.errorMessage + "\nEnter=Save Esc=Cancel";
+            return Tr(g_state.edit.errorMessage) + "\n" + Tr("Enter=Save Esc=Cancel");
         }
 
-        std::string actionText = "Enter=Save Esc=Cancel";
-        if (item.kind != ItemKind::Integer)
-        {
-            actionText += " Ctrl+V=Paste";
-        }
-        return "Edit " + PrettyKeyLabel(item.keyName) + "\n" + actionText;
+        const char* actionText = item.kind != ItemKind::Integer
+            ? Tr("Enter=Save Esc=Cancel Ctrl+V=Paste")
+            : Tr("Enter=Save Esc=Cancel");
+        return FormatText(Tr("Edit %s"), Tr(PrettyKeyLabel(item.keyName)).c_str()) + "\n" + actionText;
     }
 
     if (selectedAction == NetplayMenuAction::BackToMain)
@@ -3213,11 +3280,11 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         {
             if (HasUnsavedChanges())
             {
-                return "Exit the options menu.\nA/B=Prompt C=Revert D=Save";
+                return Tr("Exit the options menu.\nA/B=Prompt C=Revert D=Save");
             }
-            return "Exit the options menu.\nA/B=Exit C=Revert D=Save";
+            return Tr("Exit the options menu.\nA/B=Exit C=Revert D=Save");
         }
-        return "Return to category list.\nA/B=Back C=Revert D=Save";
+        return Tr("Return to category list.\nA/B=Back C=Revert D=Save");
     }
 
     const VisibleEntry visible = GetVisibleEntryForAction(selectedAction);
@@ -3226,18 +3293,21 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         std::string help;
         if (IsValidCategoryIndex(visible.categoryIndex))
         {
-            help = g_state.categories[static_cast<size_t>(visible.categoryIndex)].tooltipSummary;
+            const Category& category = g_state.categories[static_cast<size_t>(visible.categoryIndex)];
+            help = category.tooltipSummary.empty()
+                ? FormatText(Tr("Adjust %s settings."), Tr(PrettySectionLabel(category.sectionName)).c_str())
+                : Tr(category.tooltipSummary);
         }
         if (help.empty())
         {
-            help = "Open this category.";
+            help = Tr("Open this category.");
         }
-        return help + "\nA=Open C=Revert D=Save";
+        return help + "\n" + Tr("A=Open C=Revert D=Save");
     }
 
     if (visible.kind == VisibleEntryKind::Header)
     {
-        return "\nC=Revert D=Save";
+        return std::string("\n") + Tr("C=Revert D=Save");
     }
 
     if (visible.kind != VisibleEntryKind::Item
@@ -3248,28 +3318,27 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     }
 
     const Item& item = g_state.items[static_cast<size_t>(visible.itemIndex)];
-    std::string help = item.tooltipSummary;
-    if (help.empty())
-    {
-        help = "Adjust this setting.";
-    }
+    std::string help = item.tooltipSummary.empty()
+        ? FormatText(Tr("Adjust %s."), Tr(PrettyKeyLabel(item.keyName)).c_str())
+        : Tr(item.tooltipSummary);
     if (IsKeyBindingEditable(item))
     {
-        return help + " Pad bindings only work when that controller is assigned to a player.\nA=Rebind C=Revert D=Save";
+        return help + " " + Tr("Pad bindings only work when that controller is assigned to a player.")
+            + "\n" + Tr("A=Rebind C=Revert D=Save");
     }
     if (IsActionItem(item))
     {
         if (item.keyName == "About" && netplay::update_check::IsUpdateAvailable())
         {
-            help += " New release " + netplay::update_check::LatestVersion() + " is on GitHub.";
+            help += " " + FormatText(Tr("New release %s is on GitHub."), netplay::update_check::LatestVersion().c_str());
         }
-        return help + "\nA=Open C=Revert D=Save";
+        return help + "\n" + Tr("A=Open C=Revert D=Save");
     }
     if (IsToggleEditable(item))
     {
-        return help + "\nA=Change C=Revert D=Save";
+        return help + "\n" + Tr("A=Change C=Revert D=Save");
     }
-    return help + "\nA=Edit C=Revert D=Save";
+    return help + "\n" + Tr("A=Edit C=Revert D=Save");
 }
 
 bool HandleVerticalNavigation(int currentSelection, int delta, int* outNextSelection)
@@ -3384,7 +3453,7 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
             {
                 item.currentValue = item.originalValue;
             }
-            SetStatusMessage("Changes reverted.");
+            SetStatusMessage(I18N_KEY("Changes reverted."));
             hooks::PlayUiSound(screenContext, netplay::constants::kSfxConfirm);
             *inactivityCounter = 0;
             return true;
@@ -3537,6 +3606,7 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     const int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(panelX, panelY, panelW, panelH);
 
     const int textLeft = panelX + 6;
     const int textRight = panelX + panelW - 6;
@@ -3612,9 +3682,7 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             item.align = ov::RtTextAlign::Center;
             item.profile = ov::RtTextProfile::MenuRow;
             item.rgba = modalRgbaFor(color);
-            const size_t bytes = (std::min)(window.size(), sizeof(item.text) - 1);
-            std::memcpy(item.text, window.data(), bytes);
-            item.text[bytes] = '\0';
+            ov::SetRtText(item, window.data(), window.size());
             ov::SubmitRtText(item);
             return;
         }
@@ -3639,16 +3707,16 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     if (isAboutModal)
     {
-        drawModalText("ABOUT", textLeft, textRight, panelY + 6, titleColor);
+        drawModalText(Tr("ABOUT"), textLeft, textRight, panelY + 6, titleColor);
         drawModalText(netplay::build_info::kDisplayName, textLeft, textRight, panelY + 22, brightColor);
         drawModalText(
-            std::string("Version: ") + netplay::build_info::kVersion,
+            FormatText(Tr("Version: %s"), netplay::build_info::kVersion),
             textLeft,
             textRight,
             panelY + 38,
             textColor);
         drawModalText(
-            std::string("Build: ") + netplay::build_info::kBuildTimestamp,
+            FormatText(Tr("Build: %s"), netplay::build_info::kBuildTimestamp),
             textLeft,
             textRight,
             panelY + 54,
@@ -3657,38 +3725,38 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         if (aboutHasUpdate)
         {
             drawModalText(
-                "New release " + netplay::update_check::LatestVersion() + " on GitHub",
+                FormatText(Tr("New release %s on GitHub"), netplay::update_check::LatestVersion().c_str()),
                 textLeft,
                 textRight,
                 panelY + 70,
                 titleColor);
             closeY = panelY + 88;
         }
-        drawModalText("A/B/Esc=Close  D=Open GitHub", textLeft, textRight, closeY, dimColor);
+        drawModalText(Tr("A/B/Esc=Close  D=Open GitHub"), textLeft, textRight, closeY, dimColor);
     }
     else if (isRebindModal)
     {
-        std::string keyLabel = "Option";
-        std::string currentValue = "(empty)";
+        std::string keyLabel = Tr("Option");
+        std::string currentValue = Tr("(empty)");
         if (g_state.modal.itemIndex >= 0 && g_state.modal.itemIndex < static_cast<int>(g_state.items.size()))
         {
             const Item& item = g_state.items[static_cast<size_t>(g_state.modal.itemIndex)];
-            keyLabel = PrettyKeyLabel(item.keyName);
+            keyLabel = Tr(PrettyKeyLabel(item.keyName));
             currentValue = FormatDisplayValue(item);
         }
 
-        drawModalText("REBIND KEY", textLeft, textRight, panelY + 6, titleColor);
+        drawModalText(Tr("REBIND KEY"), textLeft, textRight, panelY + 6, titleColor);
         drawModalText(keyLabel, textLeft, textRight, panelY + 22, brightColor);
-        drawModalText("Press a key or pad button to rebind...", textLeft, textRight, panelY + 38, textColor);
-        drawModalText("Current: " + currentValue, textLeft, textRight, panelY + 52, dimColor);
-        drawModalText("Esc/B=Cancel", textLeft, textRight, panelY + 66, dimColor);
+        drawModalText(Tr("Press a key or pad button to rebind..."), textLeft, textRight, panelY + 38, textColor);
+        drawModalText(FormatText(Tr("Current: %s"), currentValue.c_str()), textLeft, textRight, panelY + 52, dimColor);
+        drawModalText(Tr("Esc/B=Cancel"), textLeft, textRight, panelY + 66, dimColor);
     }
     else
     {
-        drawModalText(isExitModal ? "EXIT OPTIONS?" : "SAVE CHANGES?", textLeft, textRight, panelY + 6, titleColor);
-        drawModalText(isExitModal ? "Save before returning?" : "Write EfzRevival.ini?", textLeft, textRight, panelY + 24, textColor);
+        drawModalText(isExitModal ? Tr("EXIT OPTIONS?") : Tr("SAVE CHANGES?"), textLeft, textRight, panelY + 6, titleColor);
+        drawModalText(isExitModal ? Tr("Save before returning?") : Tr("Write EfzRevival.ini?"), textLeft, textRight, panelY + 24, textColor);
 
-        const std::array<const char*, 3> labels = {"Yes", "No", "Cancel"};
+        const std::array<const char*, 3> labels = {Tr("Yes"), Tr("No"), Tr("Cancel")};
         const int baseY = panelY + 42;
         for (int optionIndex = 0; optionIndex < optionCount; ++optionIndex)
         {
@@ -3709,7 +3777,7 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     if (!g_state.modal.errorMessage.empty())
     {
-        drawModalText(g_state.modal.errorMessage, textLeft, textRight, panelY + panelH - 10, errorColor);
+        drawModalText(Tr(g_state.modal.errorMessage), textLeft, textRight, panelY + panelH - 10, errorColor);
     }
 
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);

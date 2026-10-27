@@ -4,6 +4,7 @@
 #include "logger.h"
 #include "netplay/assets/assets.h"
 #include "netplay/core/constants.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/text_utils.h"
@@ -40,6 +41,7 @@ using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
 using NetplayMenuId = netplay::menu::NetplayMenuId;
 using NetplayMenuSpec = netplay::menu::NetplayMenuSpec;
 namespace hooks = netplay::hooks::internal;
+using netplay::i18n::Tr;
 
 constexpr int kPanelX = 8;
 constexpr int kPanelY = 16;
@@ -392,29 +394,29 @@ struct CharacterSpriteFile
 };
 
 constexpr std::array<CharacterSpriteFile, 23> kCharacterSpriteFiles = {{
-    {"Akane", "akane.png"},
-    {"Akiko", "akiko.png"},
-    {"Ayu", "ayu.png"},
-    {"Doppel", "doppel.png"},
-    {"Ikumi", "ikumi.png"},
-    {"Kanna", "kanna.png"},
-    {"Kano", "kano.png"},
-    {"Kaori", "kaori.png"},
-    {"Mai", "mai.png"},
-    {"Makoto", "makoto.png"},
-    {"Mayu", "mayu.png"},
-    {"Minagi", "minagi.png"},
-    {"Mio", "mio.png"},
-    {"Misaki", "misaki.png"},
-    {"Mishio", "mishio.png"},
-    {"Misuzu", "misuzu.png"},
-    {"Nagamori", "nagamori.png"},
-    {"Nayuki (Awake)", "nayuki_awake.png"},
-    {"Nayuki (Sleepy)", "nayuki_sleepy.png"},
-    {"Rumi", "rumi.png"},
-    {"Sayuri", "sayuri.png"},
-    {"Shiori", "shiori.png"},
-    {"Unknown", "unknown.png"},
+    {I18N_KEY("Akane"), "akane.png"},
+    {I18N_KEY("Akiko"), "akiko.png"},
+    {I18N_KEY("Ayu"), "ayu.png"},
+    {I18N_KEY("Doppel"), "doppel.png"},
+    {I18N_KEY("Ikumi"), "ikumi.png"},
+    {I18N_KEY("Kanna"), "kanna.png"},
+    {I18N_KEY("Kano"), "kano.png"},
+    {I18N_KEY("Kaori"), "kaori.png"},
+    {I18N_KEY("Mai"), "mai.png"},
+    {I18N_KEY("Makoto"), "makoto.png"},
+    {I18N_KEY("Mayu"), "mayu.png"},
+    {I18N_KEY("Minagi"), "minagi.png"},
+    {I18N_KEY("Mio"), "mio.png"},
+    {I18N_KEY("Misaki"), "misaki.png"},
+    {I18N_KEY("Mishio"), "mishio.png"},
+    {I18N_KEY("Misuzu"), "misuzu.png"},
+    {I18N_KEY("Nagamori"), "nagamori.png"},
+    {I18N_KEY("Nayuki (Awake)"), "nayuki_awake.png"},
+    {I18N_KEY("Nayuki (Sleepy)"), "nayuki_sleepy.png"},
+    {I18N_KEY("Rumi"), "rumi.png"},
+    {I18N_KEY("Sayuri"), "sayuri.png"},
+    {I18N_KEY("Shiori"), "shiori.png"},
+    {I18N_KEY("Unknown"), "unknown.png"},
 }};
 
 std::wstring TrimWide(std::wstring_view value);
@@ -1128,9 +1130,7 @@ void SubmitMenuRtText(
     item.align = align;
     item.profile = profile;
     item.rgba = MenuTextRgbaFor(paletteColor);
-    const size_t bytes = (std::min)(text.size(), sizeof(item.text) - 1);
-    std::memcpy(item.text, text.data(), bytes);
-    item.text[bytes] = '\0';
+    netplay::debug_overlay::SetRtText(item, text.data(), text.size());
     netplay::debug_overlay::SubmitRtText(item);
 }
 
@@ -1207,19 +1207,17 @@ std::string FitTextToPixelWidth(const std::string& text, int maxWidth)
         return {};
     }
 
-    std::string fitted;
-    fitted.reserve(text.size());
-    for (char c : text)
+    size_t fittedBytes = 0;
+    while (fittedBytes < text.size())
     {
-        std::string trial = fitted;
-        trial.push_back(c);
-        if (MeasureMenuTextWidth(trial) > maxWidth)
+        const size_t next = NextUtf8Boundary(text, fittedBytes);
+        if (MeasureMenuTextWidth(text.substr(0, next)) > maxWidth)
         {
             break;
         }
-        fitted.push_back(c);
+        fittedBytes = next;
     }
-    return fitted;
+    return text.substr(0, fittedBytes);
 }
 
 void FitTwoTextsToPixelWidth(
@@ -3248,22 +3246,35 @@ std::string NormalizeCharacterToken(std::string token)
     token = netplay::text::TrimAscii(std::move(token));
     if (token == "NayukiA")
     {
-        return "Nayuki (Awake)";
+        return I18N_KEY("Nayuki (Awake)");
     }
     if (token == "NayukiS")
     {
-        return "Nayuki (Sleepy)";
+        return I18N_KEY("Nayuki (Sleepy)");
     }
     if (token == "BossUnknown")
     {
-        return "Unknown";
+        return I18N_KEY("Unknown");
     }
     return token;
 }
 
 std::string AbbreviateForDisplay(std::string text, size_t maxChars)
 {
-    if (text.size() <= maxChars)
+    size_t codepoints = 0;
+    size_t keepBytes = 0;
+    for (size_t index = 0; index < text.size(); ++index)
+    {
+        if ((static_cast<unsigned char>(text[index]) & 0xC0u) != 0x80u)
+        {
+            if (codepoints + 1 == maxChars)
+            {
+                keepBytes = index;
+            }
+            ++codepoints;
+        }
+    }
+    if (codepoints <= maxChars)
     {
         return text;
     }
@@ -3275,7 +3286,7 @@ std::string AbbreviateForDisplay(std::string text, size_t maxChars)
     {
         return ".";
     }
-    text.resize(maxChars - 1);
+    text.resize(keepBytes);
     text.push_back('.');
     return text;
 }
@@ -3485,7 +3496,7 @@ BattleLogDocument ParseBattleLogDocument(const std::string& path, bool saveEnabl
     BattleLogDocument document = {};
     document.sourcePath = path;
     document.saveBattleLogEnabled = saveEnabled;
-    document.characterOptions.push_back("All");
+    document.characterOptions.push_back(I18N_KEY("All"));
     int diagnosticCount = 0;
 
     const DWORD attrs = GetFileAttributesA(path.c_str());
@@ -3743,6 +3754,16 @@ std::string BuildMatchupLabel(const std::string& playerCharacter, const std::str
         + (opponentCharacter.empty() ? std::string("?") : opponentCharacter);
 }
 
+std::string TranslateMatchupLabel(const std::string& label)
+{
+    const size_t marker = label.find(" vs ");
+    if (marker == std::string::npos)
+    {
+        return Tr(label);
+    }
+    return Tr(label.substr(0, marker)) + " vs " + Tr(label.substr(marker + 4));
+}
+
 void FinalizeSummaryUsageCounts(
     BattleLogSummary* summary,
     const std::map<std::string, int>& characterCounts,
@@ -3915,7 +3936,7 @@ BattleLogSummary BuildSummaryForNickname(const BattleLogDocument& document, cons
 BattleLogSummary BuildSummaryForDocument(const BattleLogDocument& document)
 {
     BattleLogSummary summary = {};
-    summary.nickname = "All logged sets";
+    summary.nickname = I18N_KEY("All logged sets");
 
     int64_t latestSortKey = 0;
     std::map<std::string, int> characterCounts;
@@ -3948,7 +3969,7 @@ BattleLogSummary BuildSummaryForFilteredSessions(
         (!playerName.empty() && !opponentName.empty())
             ? opponentName
             : std::string();
-    summary.nickname = focusName.empty() ? "Filtered results" : focusName;
+    summary.nickname = focusName.empty() ? I18N_KEY("Filtered results") : focusName;
     summary.secondaryNickname = secondaryName;
     summary.isHeadToHead = !focusName.empty() && !secondaryName.empty();
 
@@ -4088,15 +4109,15 @@ const char* GetHeaderLabel()
     switch (g_state.view)
     {
     case View::Summary:
-        return "BATTLE LOG";
+        return I18N_KEY("BATTLE LOG");
     case View::Browser:
-        return "SET BROWSER";
+        return I18N_KEY("SET BROWSER");
     case View::Filters:
-        return "SEARCH";
+        return I18N_KEY("SEARCH");
     case View::SetDetail:
-        return "SET DETAILS";
+        return I18N_KEY("SET DETAILS");
     default:
-        return "BATTLE LOG";
+        return I18N_KEY("BATTLE LOG");
     }
 }
 
@@ -4286,19 +4307,19 @@ int GetDetailPageCount()
 
 const std::array<const char*, 3>& GetSetStatusOptions()
 {
-    static constexpr std::array<const char*, 3> kOptions = {"Any", "Played Only", "Empty Only"};
+    static constexpr std::array<const char*, 3> kOptions = {I18N_KEY("Any"), I18N_KEY("Played Only"), I18N_KEY("Empty Only")};
     return kOptions;
 }
 
 const std::array<const char*, 4>& GetGameCountFilterOptions()
 {
-    static constexpr std::array<const char*, 4> kOptions = {"Any", "1 Game", "2-3 Games", "4+ Games"};
+    static constexpr std::array<const char*, 4> kOptions = {I18N_KEY("Any"), I18N_KEY("1 Game"), I18N_KEY("2-3 Games"), I18N_KEY("4+ Games")};
     return kOptions;
 }
 
 const std::array<const char*, 3>& GetSwitchFilterOptions()
 {
-    static constexpr std::array<const char*, 3> kOptions = {"Any", "No Changes", "Has Changes"};
+    static constexpr std::array<const char*, 3> kOptions = {I18N_KEY("Any"), I18N_KEY("No Changes"), I18N_KEY("Has Changes")};
     return kOptions;
 }
 
@@ -4562,24 +4583,24 @@ void RefreshParsedDocument()
 
     if (!g_state.document.saveBattleLogEnabled)
     {
-        SetStatusMessage("SaveBattleLog is disabled in EfzRevival.ini.");
+        SetStatusMessage(I18N_KEY("SaveBattleLog is disabled in EfzRevival.ini."));
     }
     else if (!g_state.document.fileExists)
     {
-        SetStatusMessage("Battle log file was not found.");
+        SetStatusMessage(I18N_KEY("Battle log file was not found."));
     }
     else if (g_state.document.sourceEncoding == "unreadable")
     {
-        SetStatusMessage("Battle log file could not be read.");
+        SetStatusMessage(I18N_KEY("Battle log file could not be read."));
     }
     else
     {
-        char buffer[64] = {};
+        char buffer[256] = {};
         const size_t matchCount = CountDocumentMatches(g_state.document);
         std::snprintf(
             buffer,
             sizeof(buffer),
-            "Loaded %zu set(s), %zu game(s) from %s.",
+            Tr("Loaded %zu set(s), %zu game(s) from %s."),
             g_state.document.sessions.size(),
             matchCount,
             Basename(g_state.document.sourcePath).c_str());
@@ -4743,7 +4764,7 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
     std::vector<std::string> parts;
     if (!filter.playerName.empty())
     {
-        parts.push_back("Player " + filter.playerName);
+        parts.push_back(Tr("Player ") + filter.playerName);
     }
     if (!filter.opponentName.empty())
     {
@@ -4751,30 +4772,30 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
     }
     if (!IsAllCharacterValue(filter.playerCharacter))
     {
-        parts.push_back("Player character " + filter.playerCharacter);
+        parts.push_back(Tr("Player character ") + Tr(filter.playerCharacter));
     }
     if (!IsAllCharacterValue(filter.opponentCharacter))
     {
-        parts.push_back("Opponent character " + filter.opponentCharacter);
+        parts.push_back(Tr("Opponent character ") + Tr(filter.opponentCharacter));
     }
     if (ParseSetStatusMode(filter.setStatus) == SetStatusMode::Played)
     {
-        parts.push_back("played only");
+        parts.push_back(Tr("played only"));
     }
     else if (ParseSetStatusMode(filter.setStatus) == SetStatusMode::Empty)
     {
-        parts.push_back("empty only");
+        parts.push_back(Tr("empty only"));
     }
     switch (ParseGameCountFilterMode(filter.gameCount))
     {
     case GameCountFilterMode::One:
-        parts.push_back("1 game");
+        parts.push_back(Tr("1 game"));
         break;
     case GameCountFilterMode::TwoToThree:
-        parts.push_back("2-3 games");
+        parts.push_back(Tr("2-3 games"));
         break;
     case GameCountFilterMode::FourPlus:
-        parts.push_back("4+ games");
+        parts.push_back(Tr("4+ games"));
         break;
     case GameCountFilterMode::Any:
     default:
@@ -4782,16 +4803,16 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
     }
     if (ParseSwitchFilterMode(filter.characterSwitches) == SwitchFilterMode::Stable)
     {
-        parts.push_back("No character changes");
+        parts.push_back(Tr("No character changes"));
     }
     else if (ParseSwitchFilterMode(filter.characterSwitches) == SwitchFilterMode::Swapped)
     {
-        parts.push_back("Has character changes");
+        parts.push_back(Tr("Has character changes"));
     }
 
     if (parts.empty())
     {
-        return "All sets";
+        return Tr("All sets");
     }
 
     std::string joined;
@@ -4808,11 +4829,11 @@ std::string BuildFilterSummary(const BattleLogFilter& filter)
 
 std::string BuildBrowserPageText()
 {
-    char buffer[80] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "Page %d/%d  Results %d",
+        Tr("Page %d/%d  Results %d"),
         g_state.browserPage + 1,
         GetBrowserPageCount(),
         GetBrowserResultCount());
@@ -4860,11 +4881,11 @@ std::string FormatRecordWithRate(const char* label, int wins, int losses)
 
 std::string FormatRateText(const char* label, int wins, int losses)
 {
-    char buffer[64] = {};
+    char buffer[128] = {};
     const double rate = ComputeWinRatePercent(wins, losses);
     if (rate < 0.0)
     {
-        std::snprintf(buffer, sizeof(buffer), "%s N/A", label);
+        std::snprintf(buffer, sizeof(buffer), Tr("%s N/A"), label);
     }
     else
     {
@@ -4882,24 +4903,24 @@ std::string BuildSummaryTitleText()
 {
     if (g_state.summaryMode == SummaryMode::FullLog)
     {
-        return "BATTLE LOG SUMMARY";
+        return Tr("BATTLE LOG SUMMARY");
     }
     if (g_state.summaryMode == SummaryMode::Search && g_state.summary.isHeadToHead)
     {
-        return "MATCHUP SUMMARY";
+        return Tr("MATCHUP SUMMARY");
     }
     if (g_state.summaryMode == SummaryMode::Search && !g_state.summary.hasPerspective)
     {
-        return "SEARCH SUMMARY";
+        return Tr("SEARCH SUMMARY");
     }
-    return "PLAYER SUMMARY";
+    return Tr("PLAYER SUMMARY");
 }
 
 std::string BuildSummaryIdentityText()
 {
     if (g_state.summaryMode == SummaryMode::FullLog)
     {
-        return "All logged sets";
+        return Tr("All logged sets");
     }
     if (g_state.summaryMode == SummaryMode::Search)
     {
@@ -4909,7 +4930,9 @@ std::string BuildSummaryIdentityText()
         }
         if (!g_state.summary.nickname.empty())
         {
-            return g_state.summary.nickname;
+            return g_state.summary.nickname == "Filtered results"
+                ? std::string(Tr("Filtered results"))
+                : g_state.summary.nickname;
         }
     }
     return g_state.currentNickname;
@@ -4918,12 +4941,13 @@ std::string BuildSummaryIdentityText()
 std::string BuildSummaryLoadText()
 {
     const BattleLogSummary& summary = GetDisplayedSummary();
-    char buffer[128] = {};
+    char buffer[192] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%s %d set(s), %d game(s)",
-        g_state.summaryMode == SummaryMode::Search ? "Found" : "Loaded",
+        g_state.summaryMode == SummaryMode::Search
+            ? Tr("Found %d set(s), %d game(s)")
+            : Tr("Loaded %d set(s), %d game(s)"),
         summary.totalSessions,
         summary.totalGames);
     return buffer;
@@ -4934,9 +4958,9 @@ std::string BuildSummarySetRateText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (!summary.hasPerspective)
     {
-        return "Completed " + std::to_string(summary.completedSessions);
+        return Tr("Completed ") + std::to_string(summary.completedSessions);
     }
-    return FormatRateText("Set WR", summary.setWins, summary.setLosses);
+    return FormatRateText(Tr("Set WR"), summary.setWins, summary.setLosses);
 }
 
 std::string BuildSummaryGameRateText()
@@ -4946,7 +4970,7 @@ std::string BuildSummaryGameRateText()
     {
         return BuildSummaryAverageSetDurationText();
     }
-    return FormatRateText("Game WR", summary.gameWins, summary.gameLosses);
+    return FormatRateText(Tr("Game WR"), summary.gameWins, summary.gameLosses);
 }
 
 std::string BuildSummaryAverageGamesText()
@@ -4954,14 +4978,14 @@ std::string BuildSummaryAverageGamesText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (summary.completedSessions <= 0)
     {
-        return "Avg Games/Set N/A";
+        return Tr("Avg Games/Set N/A");
     }
 
-    char buffer[64] = {};
+    char buffer[128] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "Avg Games/Set %.1f",
+        Tr("Avg Games/Set %.1f"),
         summary.averageGamesPerCompletedSet);
     return buffer;
 }
@@ -4971,10 +4995,10 @@ std::string BuildSummaryAverageSetDurationText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (summary.completedSessions <= 0)
     {
-        return "Avg Set Time N/A";
+        return Tr("Avg Set Time N/A");
     }
 
-    return "Avg Set Time " + FormatDurationShort(summary.averageSetDurationSeconds);
+    return Tr("Avg Set Time ") + FormatDurationShort(summary.averageSetDurationSeconds);
 }
 
 std::string BuildSummaryLongestSetText()
@@ -4982,14 +5006,14 @@ std::string BuildSummaryLongestSetText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (summary.completedSessions <= 0)
     {
-        return "Longest Set N/A";
+        return Tr("Longest Set N/A");
     }
 
-    char buffer[96] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "Longest: %s / %d games",
+        Tr("Longest: %s / %d games"),
         FormatDurationShort(summary.longestSetByDurationSeconds).c_str(),
         summary.longestSetByGamesCount);
     return buffer;
@@ -5000,9 +5024,9 @@ std::string BuildSummaryCompletionRatioText()
     const BattleLogSummary& summary = GetDisplayedSummary();
     if (summary.hasPerspective)
     {
-        return FormatRecordWithRate("Win-Lose", summary.setWins, summary.setLosses);
+        return FormatRecordWithRate(Tr("Win-Lose"), summary.setWins, summary.setLosses);
     }
-    return FormatRecordWithRate("Played", summary.completedSessions, summary.emptySessions);
+    return FormatRecordWithRate(Tr("Played"), summary.completedSessions, summary.emptySessions);
 }
 
 std::string BuildSummaryUsageText()
@@ -5027,25 +5051,29 @@ std::string BuildSummaryRecentText()
     if (!summary.hasSessions)
     {
         return g_state.summaryMode == SummaryMode::FullLog
-            ? "No logged sessions found."
-            : "No sessions found.";
+            ? Tr("No logged sessions found.")
+            : Tr("No sessions found.");
     }
 
     const std::string recentDate =
         summary.recentTimestamp.empty()
-            ? std::string("unknown date")
+            ? std::string(Tr("unknown date"))
             : summary.recentTimestamp.substr(0, summary.recentTimestamp.find(' '));
 
     if (summary.isHeadToHead)
     {
-        return "Most recent: " + recentDate;
+        return Tr("Most recent: ") + recentDate;
     }
 
-    const std::string prefix = summary.hasPerspective ? "Last vs " : "Most recent: ";
-    return prefix
-        + (summary.recentOpponent.empty() ? "?" : summary.recentOpponent)
-        + " on "
-        + recentDate;
+    const std::string opponent = summary.recentOpponent.empty() ? std::string("?") : summary.recentOpponent;
+    char buffer[256] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        summary.hasPerspective ? Tr("Last vs %s on %s") : Tr("Most recent: %s on %s"),
+        opponent.c_str(),
+        recentDate.c_str());
+    return buffer;
 }
 
 std::string BuildLoadStatusText()
@@ -5073,40 +5101,46 @@ std::string BuildBrowserRecordLeftText()
 {
     if (g_state.browserSummary.hasPerspective)
     {
-        return FormatRecordWithRate("Sets", g_state.browserSummary.setWins, g_state.browserSummary.setLosses);
+        return FormatRecordWithRate(Tr("Sets"), g_state.browserSummary.setWins, g_state.browserSummary.setLosses);
     }
 
-    return "Played " + std::to_string(g_state.browserSummary.completedSessions)
-        + "  Empty " + std::to_string(g_state.browserSummary.emptySessions);
+    char buffer[128] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        Tr("Played %d  Empty %d"),
+        g_state.browserSummary.completedSessions,
+        g_state.browserSummary.emptySessions);
+    return buffer;
 }
 
 std::string BuildBrowserRecordRightText()
 {
     if (g_state.browserSummary.hasPerspective)
     {
-        return FormatRecordWithRate("Games", g_state.browserSummary.gameWins, g_state.browserSummary.gameLosses);
+        return FormatRecordWithRate(Tr("Games"), g_state.browserSummary.gameWins, g_state.browserSummary.gameLosses);
     }
 
-    return "Games " + std::to_string(g_state.browserSummary.totalGames);
+    return Tr("Games ") + std::to_string(g_state.browserSummary.totalGames);
 }
 
 std::string BuildBrowserUsageLeftText()
 {
-    return "Playtime: " + FormatDurationShort(g_state.browserSummary.totalDurationSeconds);
+    return Tr("Playtime: ") + FormatDurationShort(g_state.browserSummary.totalDurationSeconds);
 }
 
 std::string BuildBrowserUsageRightText()
 {
     if (g_state.browserSummary.completedSessions <= 0)
     {
-        return "Avg Games/Set N/A";
+        return Tr("Avg Games/Set N/A");
     }
 
-    char buffer[64] = {};
+    char buffer[128] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "Avg Games/Set %.1f",
+        Tr("Avg Games/Set %.1f"),
         g_state.browserSummary.averageGamesPerCompletedSet);
     return buffer;
 }
@@ -5115,14 +5149,14 @@ std::string BuildBrowserLongestSetText()
 {
     if (g_state.browserSummary.completedSessions <= 0)
     {
-        return "Longest N/A";
+        return Tr("Longest N/A");
     }
 
-    char buffer[96] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "Longest %s / %dg",
+        Tr("Longest %s / %dg"),
         FormatDurationShort(g_state.browserSummary.longestSetByDurationSeconds).c_str(),
         g_state.browserSummary.longestSetByGamesCount);
     return buffer;
@@ -5700,7 +5734,7 @@ void DrawSummaryPanel(
     MenuTitleCentered(surface, BuildSummaryTitleText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 4, titleColor);
     MenuTextCentered(
         surface,
-        "ACTIONS",
+        Tr("ACTIONS"),
         kSummaryActionPanelX + 2,
         kSummaryActionPanelX + kSummaryActionPanelW - 2,
         kSummaryActionPanelY + 3,
@@ -5713,11 +5747,11 @@ void DrawSummaryPanel(
     const int halfSplitRight = kSummaryCardX + (kSummaryCardW / 2) + 4;
     const int wideRightLeft = kSummaryCardX + 122;
     const std::string setsText = summary.hasPerspective
-        ? ("Sets " + std::to_string(summary.setWins) + "-" + std::to_string(summary.setLosses))
-        : ("Sessions " + std::to_string(summary.totalSessions));
+        ? (Tr("Sets ") + std::to_string(summary.setWins) + "-" + std::to_string(summary.setLosses))
+        : (Tr("Sessions ") + std::to_string(summary.totalSessions));
     const std::string gamesText = summary.hasPerspective
-        ? ("Games " + std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses))
-        : ("Games " + std::to_string(summary.totalGames));
+        ? (Tr("Games ") + std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses))
+        : (Tr("Games ") + std::to_string(summary.totalGames));
     MenuTextLeft(surface, setsText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 42, textColor);
     MenuTextRight(surface, gamesText, halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 42, textColor);
 
@@ -5736,16 +5770,16 @@ void DrawSummaryPanel(
         kSummaryCardY + 53,
         dimColor);
 
-    const std::string playTimeText = "Playtime: " + FormatDurationShort(summary.totalDurationSeconds);
+    const std::string playTimeText = Tr("Playtime: ") + FormatDurationShort(summary.totalDurationSeconds);
     const std::string mostPlayedText =
         summary.isHeadToHead
-            ? ("Most played matchup: "
+            ? (Tr("Most played matchup: ")
                 + AbbreviateForDisplay(
-                    summary.mostUsedMatchup.empty() ? std::string("N/A") : summary.mostUsedMatchup,
+                    summary.mostUsedMatchup.empty() ? std::string(Tr("N/A")) : TranslateMatchupLabel(summary.mostUsedMatchup),
                     18))
-            : ("Most played character: "
+            : (Tr("Most played character: ")
                 + AbbreviateForDisplay(
-                    summary.mostUsedCharacter.empty() ? std::string("N/A") : summary.mostUsedCharacter,
+                    summary.mostUsedCharacter.empty() ? std::string(Tr("N/A")) : Tr(summary.mostUsedCharacter),
                     18));
     MenuTextLeft(surface, BuildSummaryAverageGamesText(), kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 64, dimColor);
     if (summary.hasPerspective)
@@ -5782,7 +5816,7 @@ void DrawBrowserPanel(
     DrawPanelBox(surface, kBrowserHeaderPanelX, kBrowserHeaderPanelY, kBrowserHeaderPanelW, kBrowserHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kBrowserContentPanelY, kContentColumnW + 4, 84, panelFill, panelFrame);
     DrawPanelBox(surface, kBrowserActionPanelX, kBrowserActionPanelY, kBrowserActionPanelW, kBrowserActionPanelH, panelFill, panelFrame);
-    MenuTitleCentered(surface, "SET BROWSER", kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, titleColor);
+    MenuTitleCentered(surface, Tr("SET BROWSER"), kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, titleColor);
     MenuTextLeft(surface, BuildFilterSummary(g_state.activeFilter), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 18, textColor);
     MenuTextLeft(surface, BuildBrowserPageText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
     MenuTextRight(surface, BuildBrowserLongestSetText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
@@ -5792,7 +5826,7 @@ void DrawBrowserPanel(
     MenuTextRight(surface, BuildBrowserUsageRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 57, dimColor);
     MenuTextCentered(
         surface,
-        "ACTIONS",
+        Tr("ACTIONS"),
         kBrowserActionPanelX + 2,
         kBrowserActionPanelX + kBrowserActionPanelW - 2,
         kBrowserActionPanelY + 3,
@@ -5810,10 +5844,10 @@ void DrawFiltersPanel(
     DrawPanelBox(surface, kPanelX, kPanelY, kPanelW, 46, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, 72, kContentColumnW + 4, 96, panelFill, panelFrame);
     DrawPanelBox(surface, kActionStackX, 164, kActionStackW, 44, panelFill, panelFrame);
-    MenuTitleCentered(surface, "SEARCH", kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, titleColor);
+    MenuTitleCentered(surface, Tr("SEARCH"), kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, titleColor);
     MenuTextLeft(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 18, textColor);
-    MenuTextLeft(surface, "Exact names. Character, set type, and game count filters.", kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, dimColor);
-    MenuTextCentered(surface, "ACTIONS", kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, titleColor);
+    MenuTextLeft(surface, Tr("Exact names. Character, set type, and game count filters."), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, dimColor);
+    MenuTextCentered(surface, Tr("ACTIONS"), kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, titleColor);
 }
 
 void DrawDetailPanel(
@@ -5828,13 +5862,13 @@ void DrawDetailPanel(
     DrawPanelBox(surface, kDetailHeaderPanelX, kDetailHeaderPanelY, kDetailHeaderPanelW, kDetailHeaderPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kContentColumnX - 2, kDetailContentPanelY, kContentColumnW + 4, kDetailContentPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kDetailActionPanelX, kDetailActionPanelY, kDetailActionPanelW, kDetailActionPanelH, panelFill, panelFrame);
-    MenuTitleCentered(surface, "SET DETAILS", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 4, titleColor);
-    MenuTextCentered(surface, "ACTIONS", kDetailActionPanelX + 2, kDetailActionPanelX + kDetailActionPanelW - 2, kDetailActionPanelY + 3, titleColor);
+    MenuTitleCentered(surface, Tr("SET DETAILS"), kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 4, titleColor);
+    MenuTextCentered(surface, Tr("ACTIONS"), kDetailActionPanelX + 2, kDetailActionPanelX + kDetailActionPanelW - 2, kDetailActionPanelY + 3, titleColor);
 
     const BattleLogSession* session = GetDetailSession();
     if (session == nullptr)
     {
-        MenuTextCentered(surface, "No set selected.", kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, alertColor);
+        MenuTextCentered(surface, Tr("No set selected."), kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 24, alertColor);
         return;
     }
 
@@ -5847,11 +5881,13 @@ void DrawDetailPanel(
         + " "
         + rightName;
     const std::string dateTimeText = FormatDateTime(session->date, session->time);
-    const std::string durationText =
-        "Games: "
-        + std::to_string(static_cast<int>(session->matches.size()))
-        + "  Playtime: "
-        + FormatDurationShort(session->totalDurationSeconds);
+    char durationText[160] = {};
+    std::snprintf(
+        durationText,
+        sizeof(durationText),
+        Tr("Games: %d  Playtime: %s"),
+        static_cast<int>(session->matches.size()),
+        FormatDurationShort(session->totalDurationSeconds).c_str());
 
     MenuTextCentered(
         surface,
@@ -5873,7 +5909,7 @@ void DrawScreenTitleBar(
 {
     constexpr int kLogicalWidth = 320;
     DrawPanelBox(surface, 0, 0, kLogicalWidth, 14, fillColor, frameColor);
-    MenuTitleCentered(surface, "BATTLE LOG", 2, kLogicalWidth - 2, 3, titleColor);
+    MenuTitleCentered(surface, Tr("BATTLE LOG"), 2, kLogicalWidth - 2, 3, titleColor);
 }
 
 void DrawSummaryRows(
@@ -5886,11 +5922,11 @@ void DrawSummaryRows(
     uint8_t selectedText)
 {
     const std::array<std::string, 5> labels = {{
-        g_state.summaryMode == SummaryMode::Search ? std::string("VIEW SETS") : std::string("MY SETS"),
-        "SEARCH",
-        "ALL SETS",
-        "REFRESH",
-        "BACK",
+        g_state.summaryMode == SummaryMode::Search ? std::string(Tr("VIEW SETS")) : std::string(Tr("MY SETS")),
+        Tr("SEARCH"),
+        Tr("ALL SETS"),
+        Tr("REFRESH"),
+        Tr("BACK"),
     }};
 
     constexpr int kButtonCount = 5;
@@ -5979,7 +6015,7 @@ void DrawBrowserRows(
             if (slot == 0 && GetBrowserResultCount() == 0)
             {
                 textC(
-                    "<no matching sets>",
+                    Tr("<no matching sets>"),
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
                     rowY + 2,
@@ -6001,10 +6037,10 @@ void DrawBrowserRows(
     }
 
     static const std::array<const char*, 4> kControls = {
-        "PREV",
-        "NEXT",
-        "FILTERS",
-        "BACK",
+        I18N_KEY("PREV"),
+        I18N_KEY("NEXT"),
+        I18N_KEY("FILTERS"),
+        I18N_KEY("BACK"),
     };
 
     constexpr int kButtonCount = 4;
@@ -6021,7 +6057,7 @@ void DrawBrowserRows(
         DrawRowBoxAt(surface, rowX, rowY, kBrowserActionButtonW, kBrowserActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
         MenuTextCentered(
             surface,
-            kControls[static_cast<size_t>(control)],
+            Tr(kControls[static_cast<size_t>(control)]),
             rowX + 2,
             rowX + kBrowserActionButtonW - 2,
             rowY + 2,
@@ -6046,16 +6082,16 @@ void DrawFilterRows(
     };
 
     const std::array<FilterRow, 10> rows = {{
-        {"PLAYER", GetFilterFieldValue(FilterEditField::PlayerName, true)},
-        {"OPPONENT", GetFilterFieldValue(FilterEditField::OpponentName, true)},
-        {"PLAYER CHARACTER", g_state.draftFilter.playerCharacter},
-        {"OPPONENT CHARACTER", g_state.draftFilter.opponentCharacter},
-        {"SET TYPE", g_state.draftFilter.setStatus},
-        {"GAMES IN SET", g_state.draftFilter.gameCount},
-        {"CHAR CHANGES", g_state.draftFilter.characterSwitches},
-        {"APPLY", ""},
-        {"RESET", ""},
-        {"BACK", ""},
+        {Tr("PLAYER"), GetFilterFieldValue(FilterEditField::PlayerName, true)},
+        {Tr("OPPONENT"), GetFilterFieldValue(FilterEditField::OpponentName, true)},
+        {Tr("PLAYER CHARACTER"), Tr(g_state.draftFilter.playerCharacter)},
+        {Tr("OPPONENT CHARACTER"), Tr(g_state.draftFilter.opponentCharacter)},
+        {Tr("SET TYPE"), Tr(g_state.draftFilter.setStatus)},
+        {Tr("GAMES IN SET"), Tr(g_state.draftFilter.gameCount)},
+        {Tr("CHAR CHANGES"), Tr(g_state.draftFilter.characterSwitches)},
+        {Tr("APPLY"), ""},
+        {Tr("RESET"), ""},
+        {Tr("BACK"), ""},
     }};
 
     for (size_t index = 0; index < rows.size(); ++index)
@@ -6174,7 +6210,7 @@ void DrawDetailRows(
             if (slot == 0)
             {
                 textC(
-                    "<no games>",
+                    Tr("<no games>"),
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
                     rowY + 2,
@@ -6200,9 +6236,9 @@ void DrawDetailRows(
     }
 
     static const std::array<const char*, 3> kControls = {
-        "PREV",
-        "NEXT",
-        "BACK",
+        I18N_KEY("PREV"),
+        I18N_KEY("NEXT"),
+        I18N_KEY("BACK"),
     };
     constexpr int kButtonCount = 3;
     constexpr int kButtonsTotalWidth =
@@ -6218,7 +6254,7 @@ void DrawDetailRows(
         DrawRowBoxAt(surface, rowX, rowY, kDetailActionButtonW, kDetailActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
         MenuTextCentered(
             surface,
-            kControls[static_cast<size_t>(control)],
+            Tr(kControls[static_cast<size_t>(control)]),
             rowX + 2,
             rowX + kDetailActionButtonW - 2,
             rowY + 3,
@@ -6294,41 +6330,41 @@ std::string BuildRowLabel(NetplayMenuAction action)
     switch (action)
     {
     case NetplayMenuAction::BattleLogBrowseMine:
-        return g_state.summaryMode == SummaryMode::Search ? "VIEW SETS" : "BROWSE MY SETS";
+        return g_state.summaryMode == SummaryMode::Search ? Tr("VIEW SETS") : Tr("BROWSE MY SETS");
     case NetplayMenuAction::BattleLogSearchFilters:
-        return "SEARCH";
+        return Tr("SEARCH");
     case NetplayMenuAction::BattleLogBrowseAll:
-        return "BROWSE ALL SETS";
+        return Tr("BROWSE ALL SETS");
     case NetplayMenuAction::BattleLogRefresh:
-        return "REFRESH LOG";
+        return Tr("REFRESH LOG");
     case NetplayMenuAction::BattleLogEditPlayerName:
-        return "PLAYER";
+        return Tr("PLAYER");
     case NetplayMenuAction::BattleLogEditOpponentName:
-        return "OPPONENT";
+        return Tr("OPPONENT");
     case NetplayMenuAction::BattleLogPlayerCharacter:
-        return "PLAYER CHARACTER";
+        return Tr("PLAYER CHARACTER");
     case NetplayMenuAction::BattleLogOpponentCharacter:
-        return "OPPONENT CHARACTER";
+        return Tr("OPPONENT CHARACTER");
     case NetplayMenuAction::BattleLogSetStatus:
-        return "SET TYPE";
+        return Tr("SET TYPE");
     case NetplayMenuAction::BattleLogGameCount:
-        return "GAMES IN SET";
+        return Tr("GAMES IN SET");
     case NetplayMenuAction::BattleLogCharacterSwitches:
-        return "CHAR CHANGES";
+        return Tr("CHAR CHANGES");
     case NetplayMenuAction::BattleLogApplyFilters:
-        return "APPLY FILTERS";
+        return Tr("APPLY FILTERS");
     case NetplayMenuAction::BattleLogResetFilters:
-        return "RESET FILTERS";
+        return Tr("RESET FILTERS");
     case NetplayMenuAction::BattleLogBrowserPrevPage:
     case NetplayMenuAction::BattleLogDetailPrevPage:
-        return "PREV PAGE";
+        return Tr("PREV PAGE");
     case NetplayMenuAction::BattleLogBrowserNextPage:
     case NetplayMenuAction::BattleLogDetailNextPage:
-        return "NEXT PAGE";
+        return Tr("NEXT PAGE");
     case NetplayMenuAction::BattleLogBrowserFilters:
-        return "FILTERS";
+        return Tr("FILTERS");
     case NetplayMenuAction::BattleLogBack:
-        return "BACK";
+        return Tr("BACK");
     default:
         break;
     }
@@ -6356,11 +6392,16 @@ std::string BuildRowLabel(NetplayMenuAction action)
         {
             return "--";
         }
-        return "GAME " + std::to_string(
+        char label[64] = {};
+        std::snprintf(
+            label,
+            sizeof(label),
+            Tr("GAME %d"),
             g_state.detailPage * netplay::menu::kBattleLogVisibleGameRows + slot + 1);
+        return label;
     }
 
-    return "BATTLE LOG";
+    return Tr("BATTLE LOG");
 }
 
 std::string BuildRowPrimaryText(NetplayMenuAction action)
@@ -6377,15 +6418,15 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
     case NetplayMenuAction::BattleLogEditOpponentName:
         return GetFilterFieldValue(FilterEditField::OpponentName, true);
     case NetplayMenuAction::BattleLogPlayerCharacter:
-        return g_state.draftFilter.playerCharacter;
+        return Tr(g_state.draftFilter.playerCharacter);
     case NetplayMenuAction::BattleLogOpponentCharacter:
-        return g_state.draftFilter.opponentCharacter;
+        return Tr(g_state.draftFilter.opponentCharacter);
     case NetplayMenuAction::BattleLogSetStatus:
-        return g_state.draftFilter.setStatus;
+        return Tr(g_state.draftFilter.setStatus);
     case NetplayMenuAction::BattleLogGameCount:
-        return g_state.draftFilter.gameCount;
+        return Tr(g_state.draftFilter.gameCount);
     case NetplayMenuAction::BattleLogCharacterSwitches:
-        return g_state.draftFilter.characterSwitches;
+        return Tr(g_state.draftFilter.characterSwitches);
     default:
         return {};
     }
@@ -6397,76 +6438,76 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     std::string hint;
     if (g_state.edit.active)
     {
-        footer = "Typing filter name. Enter/A=Apply  B/Esc=Cancel  Backspace=Delete";
+        footer = Tr("Typing filter name. Enter/A=Apply  B/Esc=Cancel  Backspace=Delete");
     }
     else
     {
         switch (selectedAction)
         {
         case NetplayMenuAction::BattleLogBrowseMine:
-            footer = "Show only sets involving your configured nickname.";
+            footer = Tr("Show only sets involving your configured nickname.");
             break;
         case NetplayMenuAction::BattleLogSearchFilters:
         case NetplayMenuAction::BattleLogBrowserFilters:
             footer =
                 selectedAction == NetplayMenuAction::BattleLogSearchFilters
-                    ? "Search by player, matchup, characters, set type, games, and character changes."
-                    : "Refine this set list by player, matchup, characters, set type, games, and character changes.";
+                    ? Tr("Search by player, matchup, characters, set type, games, and character changes.")
+                    : Tr("Refine this set list by player, matchup, characters, set type, games, and character changes.");
             break;
         case NetplayMenuAction::BattleLogBrowseAll:
-            footer = "Clear filters and browse the full battle log.";
+            footer = Tr("Clear filters and browse the full battle log.");
             break;
         case NetplayMenuAction::BattleLogRefresh:
-            footer = "Re-read BattleLog.txt from disk.";
+            footer = Tr("Re-read BattleLog.txt from disk.");
             break;
         case NetplayMenuAction::BattleLogEditPlayerName:
         case NetplayMenuAction::BattleLogEditOpponentName:
-            footer = "Press A or Enter to edit this field.";
+            footer = Tr("Press A or Enter to edit this field.");
             break;
         case NetplayMenuAction::BattleLogPlayerCharacter:
         case NetplayMenuAction::BattleLogOpponentCharacter:
-            footer = "Use left/right or A to cycle through parsed characters.";
+            footer = Tr("Use left/right or A to cycle through parsed characters.");
             break;
         case NetplayMenuAction::BattleLogSetStatus:
-            footer = "Choose any set, only played sets, or only empty 0-0 headers.";
+            footer = Tr("Choose any set, only played sets, or only empty 0-0 headers.");
             break;
         case NetplayMenuAction::BattleLogGameCount:
-            footer = "Filter by how many games were logged inside the set.";
+            footer = Tr("Filter by how many games were logged inside the set.");
             break;
         case NetplayMenuAction::BattleLogCharacterSwitches:
-            footer = "Filter sets where nobody switched, or where someone changed character.";
+            footer = Tr("Filter sets where nobody switched, or where someone changed character.");
             break;
         case NetplayMenuAction::BattleLogApplyFilters:
             footer =
                 g_state.filterReturnView == View::Summary
-                    ? "Run this search and open a summary before browsing sets."
-                    : "Run this query in the set browser.";
+                    ? Tr("Run this search and open a summary before browsing sets.")
+                    : Tr("Run this query in the set browser.");
             break;
         case NetplayMenuAction::BattleLogResetFilters:
-            footer = "Clear the draft filter and keep browsing.";
+            footer = Tr("Clear the draft filter and keep browsing.");
             break;
         case NetplayMenuAction::BattleLogBrowserPrevPage:
         case NetplayMenuAction::BattleLogDetailPrevPage:
-            footer = "Show the previous page.";
+            footer = Tr("Show the previous page.");
             break;
         case NetplayMenuAction::BattleLogBrowserNextPage:
         case NetplayMenuAction::BattleLogDetailNextPage:
-            footer = "Show the next page.";
+            footer = Tr("Show the next page.");
             break;
         case NetplayMenuAction::BattleLogBack:
             switch (g_state.view)
             {
             case View::Summary:
-                footer = "Return to the netplay main menu.";
+                footer = Tr("Return to the netplay main menu.");
                 break;
             case View::Browser:
-                footer = "Return to the summary screen.";
+                footer = Tr("Return to the summary screen.");
                 break;
             case View::Filters:
-                footer = "Return without applying draft changes.";
+                footer = Tr("Return without applying draft changes.");
                 break;
             case View::SetDetail:
-                footer = "Return to the set browser.";
+                footer = Tr("Return to the set browser.");
                 break;
             }
             break;
@@ -6474,12 +6515,12 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
             if (selectedAction >= NetplayMenuAction::BattleLogSession0
                 && selectedAction <= NetplayMenuAction::BattleLogSession5)
             {
-                footer = "Open the highlighted set.";
+                footer = Tr("Open the highlighted set.");
             }
             else if (selectedAction >= NetplayMenuAction::BattleLogGame0
                 && selectedAction <= NetplayMenuAction::BattleLogGame6)
             {
-                footer = "Per-game log entry inside this set.";
+                footer = Tr("Per-game log entry inside this set.");
             }
             break;
         }
@@ -6491,10 +6532,10 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         {
             hint =
                 g_state.summaryMode == SummaryMode::Search
-                    ? "Press C to Switch to Profile"
+                    ? Tr("Press C to Switch to Profile")
                     : (g_state.summaryMode == SummaryMode::FullLog
-                        ? "Press C to Switch to Profile"
-                        : "Press C to Switch to Full Summary");
+                        ? Tr("Press C to Switch to Profile")
+                        : Tr("Press C to Switch to Full Summary"));
         }
         else if (g_state.view == View::Filters)
         {
@@ -6502,24 +6543,24 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
                 selectedAction == NetplayMenuAction::BattleLogApplyFilters
                     || selectedAction == NetplayMenuAction::BattleLogResetFilters
                     || selectedAction == NetplayMenuAction::BattleLogBack
-                ? "Press C to Switch to Fields"
-                : "Press C to Switch to Actions";
+                ? Tr("Press C to Switch to Fields")
+                : Tr("Press C to Switch to Actions");
         }
         else if (g_state.view == View::Browser)
         {
             hint =
                 selectedAction >= NetplayMenuAction::BattleLogBrowserPrevPage
                     && selectedAction <= NetplayMenuAction::BattleLogBack
-                ? "Press C to Switch to Set List"
-                : "Press C to Switch to Actions";
+                ? Tr("Press C to Switch to Set List")
+                : Tr("Press C to Switch to Actions");
         }
         else if (g_state.view == View::SetDetail)
         {
             hint =
                 selectedAction >= NetplayMenuAction::BattleLogDetailPrevPage
                     && selectedAction <= NetplayMenuAction::BattleLogBack
-                ? "Press C to Switch to Games"
-                : "Press C to Switch to Actions";
+                ? Tr("Press C to Switch to Games")
+                : Tr("Press C to Switch to Actions");
         }
     }
 
@@ -6527,9 +6568,9 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     {
         if (hint.empty())
         {
-            return g_state.statusMessage;
+            return Tr(g_state.statusMessage);
         }
-        return g_state.statusMessage + "\n" + hint;
+        return Tr(g_state.statusMessage) + "\n" + hint;
     }
 
     if (footer.empty())
@@ -6746,14 +6787,14 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
                 --g_state.browserPage;
                 pageChanged = true;
                 StartPageSlide(-1, View::Browser);
-                SetStatusMessage("Previous page.");
+                SetStatusMessage(I18N_KEY("Previous page."));
             }
             else if (horizontalDir > 0 && g_state.browserPage + 1 < GetBrowserPageCount())
             {
                 ++g_state.browserPage;
                 pageChanged = true;
                 StartPageSlide(1, View::Browser);
-                SetStatusMessage("Next page.");
+                SetStatusMessage(I18N_KEY("Next page."));
             }
 
             if (pageChanged)
@@ -6787,14 +6828,14 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
                 --g_state.detailPage;
                 pageChanged = true;
                 StartPageSlide(-1, View::SetDetail);
-                SetStatusMessage("Previous page.");
+                SetStatusMessage(I18N_KEY("Previous page."));
             }
             else if (horizontalDir > 0 && g_state.detailPage + 1 < GetDetailPageCount())
             {
                 ++g_state.detailPage;
                 pageChanged = true;
                 StartPageSlide(1, View::SetDetail);
-                SetStatusMessage("Next page.");
+                SetStatusMessage(I18N_KEY("Next page."));
             }
 
             if (pageChanged)
@@ -6901,7 +6942,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
             RebuildFilteredSessionIndices();
             if (GetBrowserResultCount() == 0)
             {
-                SetStatusMessage("No sets matched the current search.");
+                SetStatusMessage(I18N_KEY("No sets matched the current search."));
             }
             (void)EnsureRenderAssetsLoaded(screenContext);
             SwitchView(screenContext, View::Browser, 0);
@@ -6921,7 +6962,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         RebuildFilteredSessionIndices();
         if (GetBrowserResultCount() == 0)
         {
-            SetStatusMessage("No sets matched your nickname.");
+            SetStatusMessage(I18N_KEY("No sets matched your nickname."));
         }
         (void)EnsureRenderAssetsLoaded(screenContext);
         SwitchView(screenContext, View::Browser, 0);
@@ -6995,7 +7036,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         RefreshDisplayedSummary();
         if (GetBrowserResultCount() == 0)
         {
-            SetStatusMessage("No sets matched the current filter.");
+            SetStatusMessage(I18N_KEY("No sets matched the current filter."));
         }
         if (g_state.filterReturnView == View::Summary)
         {
@@ -7015,7 +7056,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         g_state.draftFilter.setStatus = GetDefaultBattleLogSetStatus();
         g_state.draftFilter.gameCount = "Any";
         g_state.draftFilter.characterSwitches = "Any";
-        SetStatusMessage("Draft filters cleared.");
+        SetStatusMessage(I18N_KEY("Draft filters cleared."));
         RebuildMenuEntries();
         return true;
 
@@ -7024,7 +7065,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             --g_state.browserPage;
             StartPageSlide(-1, View::Browser);
-            SetStatusMessage("Previous page.");
+            SetStatusMessage(I18N_KEY("Previous page."));
         }
         RebuildMenuEntries();
         SetSelection(screenContext, *GetSelectionStorage(View::Browser));
@@ -7035,7 +7076,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             ++g_state.browserPage;
             StartPageSlide(1, View::Browser);
-            SetStatusMessage("Next page.");
+            SetStatusMessage(I18N_KEY("Next page."));
         }
         RebuildMenuEntries();
         SetSelection(screenContext, *GetSelectionStorage(View::Browser));
@@ -7053,7 +7094,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             --g_state.detailPage;
             StartPageSlide(-1, View::SetDetail);
-            SetStatusMessage("Previous page.");
+            SetStatusMessage(I18N_KEY("Previous page."));
         }
         RebuildMenuEntries();
         SetSelection(screenContext, *GetSelectionStorage(View::SetDetail));
@@ -7064,7 +7105,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         {
             ++g_state.detailPage;
             StartPageSlide(1, View::SetDetail);
-            SetStatusMessage("Next page.");
+            SetStatusMessage(I18N_KEY("Next page."));
         }
         RebuildMenuEntries();
         SetSelection(screenContext, *GetSelectionStorage(View::SetDetail));

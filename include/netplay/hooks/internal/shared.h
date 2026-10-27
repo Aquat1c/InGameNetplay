@@ -100,7 +100,7 @@ struct DelaySetupOverlayState
     int currentDelay = 0;
     char p1Name[64] = {};
     char p2Name[64] = {};
-    char errorMessage[96] = {};
+    char errorMessage[128] = {};
 };
 
 struct SpectateConfirmOverlayState
@@ -109,7 +109,7 @@ struct SpectateConfirmOverlayState
     int selectedOption = 0;
     int optionCount = 2;
     int promptKind = 0;
-    char errorMessage[96] = {};
+    char errorMessage[128] = {};
 };
 
 struct HostingOverlayState

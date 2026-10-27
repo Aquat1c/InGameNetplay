@@ -206,6 +206,11 @@ void Reload()
     {
         loaded.menuTtfFontFace = "Yu Gothic";
     }
+    loaded.language = ReadStringValue(L"Others", L"Language", L"English", iniPath);
+    if (loaded.language.empty())
+    {
+        loaded.language = "English";
+    }
     loaded.hostingTipFontFace =
         ReadStringValue(L"Others", L"HostingTipFont", L"Yu Gothic", iniPath);
     if (loaded.hostingTipFontFace.empty())
@@ -348,6 +353,11 @@ bool IsMenuTtfTextEnabled()
 const std::string& MenuTtfFontFace()
 {
     return g_settings.menuTtfFontFace;
+}
+
+const std::string& Language()
+{
+    return g_settings.language;
 }
 
 const std::string& HostingTipFontFace()

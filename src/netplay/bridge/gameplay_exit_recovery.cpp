@@ -4,6 +4,7 @@
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/i18n.h"
 
 #include "crash_handler.h"
 #include "logger.h"
@@ -362,7 +363,7 @@ bool RunGameplayExitContinuation(const char* origin)
             takeover::CopyString(
                 takeover::g_hostBlock->consoleErrorText,
                 sizeof(takeover::g_hostBlock->consoleErrorText),
-                "Frontend recovery was not scheduled");
+                I18N_KEY("Frontend recovery was not scheduled"));
             InterlockedIncrement(
                 &takeover::g_hostBlock->consoleErrorSerial);
         }

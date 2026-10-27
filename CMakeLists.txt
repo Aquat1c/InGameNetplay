@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EFZInGameNetplayMod VERSION 0.5.6 LANGUAGES C CXX)
+project(EFZInGameNetplayMod VERSION 0.6.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -41,6 +41,12 @@ if(EFZ_EMBEDDED_TLS)
     add_subdirectory(third_party/mbedtls EXCLUDE_FROM_ALL)
 endif()
 
+if(MSVC)
+    # Translation tables hold UTF-8 literals.
+    set_source_files_properties(src/netplay/core/i18n_ja.cpp
+        PROPERTIES COMPILE_OPTIONS "/utf-8")
+endif()
+
 add_library(efz_netplay_mod SHARED
     src/crash_handler.cpp
     src/dllmain.cpp
@@ -74,6 +80,8 @@ add_library(efz_netplay_mod SHARED
     src/netplay/interop/overlay_channel.cpp
     src/netplay/interop/overlay_ipc.cpp
     src/netplay/interop/overlay_helper_hooks.cpp
+    src/netplay/core/i18n.cpp
+    src/netplay/core/i18n_ja.cpp
     src/netplay/core/input_utils.cpp
     src/netplay/core/lobby_client.cpp
     src/netplay/core/menu_model.cpp
@@ -313,6 +321,26 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME interop_tests COMMAND interop_tests)
+
+    add_executable(i18n_tests tests/i18n_tests.cpp
+        src/netplay/core/i18n.cpp
+        src/netplay/core/i18n_ja.cpp)
+    target_include_directories(i18n_tests PRIVATE include)
+    target_compile_features(i18n_tests PRIVATE cxx_std_17)
+    target_compile_definitions(i18n_tests PRIVATE NOMINMAX)
+    if(MSVC)
+        target_compile_options(i18n_tests PRIVATE /W4 /EHsc /utf-8)
+        if(EFZ_XP_COMPAT)
+            target_compile_definitions(i18n_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(i18n_tests PRIVATE /Zc:threadSafeInit-)
+        endif()
+        if(EFZ_STATIC_RUNTIME)
+            set_property(TARGET i18n_tests PROPERTY
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endif()
+    add_test(NAME i18n_tests COMMAND i18n_tests)
 
     if(WIN32)
         add_executable(revival_session_validation_tests

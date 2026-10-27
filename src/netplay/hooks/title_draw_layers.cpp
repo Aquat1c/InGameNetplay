@@ -1,5 +1,6 @@
 #include "netplay/hooks/internal/shared.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/hooks/debug_overlay.h"
@@ -238,7 +239,9 @@ void DrawSpriteText(
 
 void DrawRuntimeSpriteOverlay(uint32_t screenContext)
 {
-    if (!g_useRuntimeTextOverlay || !g_netplayMenuState.active || !g_spriteFont.loaded)
+    // The game's sprite font is ASCII-only; translated text takes the GDI path.
+    if (!g_useRuntimeTextOverlay || !g_netplayMenuState.active || !g_spriteFont.loaded
+        || netplay::i18n::IsTranslationActive())
     {
         return;
     }
@@ -421,7 +424,6 @@ bool DrawDynamicFieldValuesGdi(uint32_t screenContext, bool allowWindowDc)
         g_netplayMenuState.active,
         g_useRuntimeTextOverlay,
         IsMenuSlideTransitionActive(),
-        netplay::options::IsSaveOverlayActive(),
         g_netplayMenuState.menuId,
         g_netplayMenuState.renderLayout.highlightHeight,
         g_netplayMenuState.paletteStart,
@@ -548,7 +550,7 @@ BOOL RenderNetplayMenuRuntimeText(uint32_t screenContext)
     DrawNetplayBaseLayer(screenContext);
     DrawRuntimeSpriteOverlay(screenContext);
     const bool forceGdi = (g_netplayMenuState.menuId == NetplayMenuId::Lobby);
-    if (!g_spriteFont.loaded || forceGdi)
+    if (!g_spriteFont.loaded || forceGdi || netplay::i18n::IsTranslationActive())
     {
         (void)DrawRuntimeTextOverlayGdi(screenContext, false);
     }

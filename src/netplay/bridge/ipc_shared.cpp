@@ -4,6 +4,7 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/revival_launcher_probe.h"
 #include "netplay/bridge/session_lifecycle.h"
+#include "netplay/core/i18n.h"
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -2381,7 +2382,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                         sizeof(g_hostBlock->consoleErrorText),
                         reason != nullptr
                             ? reason
-                            : "External launcher attachment failed");
+                            : I18N_KEY("External launcher attachment failed"));
                     InterlockedIncrement(&g_hostBlock->consoleErrorSerial);
                 }
                 InterlockedExchange(&g_revivalExitIntercepted, 1);
@@ -2469,7 +2470,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                         exitCallsitesReady ? 1 : 0,
                         exitIatReady ? 1 : 0);
                     requestManagedAttachRecovery(
-                        "External Tournament recovery-guard installation failed");
+                        I18N_KEY("External Tournament recovery-guard installation failed"));
                     MarkRevivalSyncDiagnosticsSessionStart(
                         "ExternalTournamentAdoption_guard_quarantined");
                     ReleaseRevivalLauncherProbe(&probe);
@@ -2481,7 +2482,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                     mod::Log(
                         "LauncherBootstrap: Tournament session changed after early guard publication; quarantining parked generation");
                     requestManagedAttachRecovery(
-                        "External Tournament session changed during guard publication");
+                        I18N_KEY("External Tournament session changed during guard publication"));
                     MarkRevivalSyncDiagnosticsSessionStart(
                         "ExternalTournamentAdoption_guard_revalidate_failed");
                     ReleaseRevivalLauncherProbe(&probe);
@@ -2581,7 +2582,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                     mod::Log(
                         "LauncherBootstrap: host IPC unavailable after Tournament guard publication; quarantining parked generation");
                     requestManagedAttachRecovery(
-                        "External Tournament host IPC setup failed");
+                        I18N_KEY("External Tournament host IPC setup failed"));
                     MarkRevivalSyncDiagnosticsSessionStart(
                         "ExternalTournamentAdoption_ipc_quarantined");
                     ReleaseRevivalLauncherProbe(&probe);
@@ -2691,7 +2692,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                     if (tickHookReady)
                     {
                         requestManagedAttachRecovery(
-                            "External launcher recovery-hook installation failed");
+                            I18N_KEY("External launcher recovery-hook installation failed"));
                     }
                     MarkRevivalSyncDiagnosticsSessionStart(
                         "ExternalLauncherAdoption_quarantined");
@@ -2705,7 +2706,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 mod::Log(
                     "LauncherBootstrap: session changed after hook publication; scheduling managed title recovery");
                 requestManagedAttachRecovery(
-                    "External Revival session changed during attachment");
+                    I18N_KEY("External Revival session changed during attachment"));
                 MarkRevivalSyncDiagnosticsSessionStart(
                     "ExternalLauncherAdoption_revalidate_failed");
                 ReleaseRevivalLauncherProbe(&probe);
@@ -2911,10 +2912,10 @@ bool CompleteExternalLauncherUiAttachment(
             g_hostBlock->consoleErrorText,
             sizeof(g_hostBlock->consoleErrorText),
             !hooksInstalled
-                ? "Launcher title/UI hook installation failed"
+                ? I18N_KEY("Launcher title/UI hook installation failed")
                 : (externalSimulation && !simulationHandoffReady
-                    ? "Launcher online simulation handoff failed"
-                    : "Launcher session changed during UI attachment"));
+                    ? I18N_KEY("Launcher online simulation handoff failed")
+                    : I18N_KEY("Launcher session changed during UI attachment")));
         InterlockedIncrement(&g_hostBlock->consoleErrorSerial);
     }
     InterlockedExchange(

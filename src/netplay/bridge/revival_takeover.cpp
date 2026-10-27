@@ -7,6 +7,7 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/options_menu.h"
 
 #include "crash_handler.h"
@@ -3879,7 +3880,7 @@ bool StartSession(
             SetPhase(
                 ioStatus,
                 NetbridgePhase::Failed,
-                "Previous external Revival launcher is still exiting; try again shortly.");
+                I18N_KEY("Previous external Revival launcher is still exiting; try again shortly."));
             return false;
         }
     }
@@ -3905,7 +3906,7 @@ bool StartSession(
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
-            "Revival netplay session Protocol setup failed.");
+            I18N_KEY("Revival netplay session Protocol setup failed."));
         return false;
     }
     TemporaryHostProtocolFailureGuard protocolFailureGuard(
@@ -3930,7 +3931,7 @@ bool StartSession(
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
-            "Tournament cleanup is still in progress; try again after returning to title.");
+            I18N_KEY("Tournament cleanup is still in progress; try again after returning to title."));
         return false;
     }
 
@@ -3964,7 +3965,7 @@ bool StartSession(
 
     if (!EnsureHostIpc())
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "IPC setup failed");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("IPC setup failed"));
         return false;
     }
 
@@ -3978,7 +3979,7 @@ bool StartSession(
 
     if (!EnsureLocalRevivalLoaded(true))
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.dll unavailable");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("EfzRevival.dll unavailable"));
         return false;
     }
     if (!ActiveRevivalProfileSupportsSessionStart())
@@ -4006,7 +4007,7 @@ bool StartSession(
             static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->startInitPlayerRva : 0),
             static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->frameHookRva : 0),
             static_cast<unsigned long>((g_activeRevival != nullptr) ? g_activeRevival->perFrameTickRva : 0));
-        SetPhase(ioStatus, NetbridgePhase::Failed, "Unsupported EfzRevival.dll profile");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("Unsupported EfzRevival.dll profile"));
         return false;
     }
 
@@ -4016,7 +4017,7 @@ bool StartSession(
 
     if (ProcessAlive(ioStatus))
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "Session already active");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("Session already active"));
         return false;
     }
 
@@ -4056,7 +4057,7 @@ bool StartSession(
             sessionFamily,
             writeHostProtocol))
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival.ini write failed");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("EfzRevival.ini write failed"));
         return false;
     }
     STARTUPINFOA si = {};
@@ -4083,7 +4084,7 @@ bool StartSession(
         const std::string selfPath = ModulePath(SelfModule());
         if (selfPath.empty())
         {
-            SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] failed to get self module path");
+            SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("[Wine] failed to get self module path"));
             return false;
         }
 
@@ -4153,7 +4154,7 @@ bool StartSession(
         {
             mod::Log("Takeover [Wine]: CreateProcess failed err=%lu",
                      static_cast<unsigned long>(GetLastError()));
-            SetPhase(ioStatus, NetbridgePhase::Failed, "[Wine] CreateProcess(EfzRevival.exe) failed");
+            SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("[Wine] CreateProcess(EfzRevival.exe) failed"));
             return false;
         }
 
@@ -4179,7 +4180,7 @@ bool StartSession(
 
         if (!created)
         {
-            SetPhase(ioStatus, NetbridgePhase::Failed, "CreateProcess(EfzRevival.exe) failed");
+            SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("CreateProcess(EfzRevival.exe) failed"));
             return false;
         }
 
@@ -4208,8 +4209,8 @@ bool StartSession(
     if (!InjectSelf(pi.hProcess, &remoteBase))
     {
         const char* reason = useWinePath
-            ? "[Wine] DLL injection failed"
-            : "Self injection failed";
+            ? I18N_KEY("[Wine] DLL injection failed")
+            : I18N_KEY("Self injection failed");
         SetPhase(ioStatus, NetbridgePhase::Failed, reason);
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
@@ -4222,7 +4223,7 @@ bool StartSession(
 
     if (!PatchIat(pi.hProcess, pi.dwProcessId, patches, true))
     {
-        SetPhase(ioStatus, NetbridgePhase::Failed, "IAT patch failed");
+        SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("IAT patch failed"));
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -4469,7 +4470,7 @@ bool StartSession(
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
-            "Helper console capture worker unavailable");
+            I18N_KEY("Helper console capture worker unavailable"));
         (void)TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -4485,7 +4486,7 @@ bool StartSession(
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
-            "Failed to resume EfzRevival helper main thread");
+            I18N_KEY("Failed to resume EfzRevival helper main thread"));
         (void)TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -4501,7 +4502,7 @@ bool StartSession(
         SetPhase(
             ioStatus,
             NetbridgePhase::Failed,
-            "Helper process-exit watcher unavailable");
+            I18N_KEY("Helper process-exit watcher unavailable"));
         const BOOL terminateOk =
             TerminatePeerProcessIfOwned(0, "start_watcher_failure");
         CloseHandle(pi.hThread);
@@ -4532,7 +4533,7 @@ bool StartSession(
         static_cast<unsigned>(std::strlen(g_hostBlock->consoleInput)),
         static_cast<unsigned>(std::strlen(g_hostBlock->consoleInputAux)),
         static_cast<long>(auxSerialForSession));
-    SetPhase(ioStatus, NetbridgePhase::Connecting, "awaiting handshake");
+    SetPhase(ioStatus, NetbridgePhase::Connecting, I18N_KEY("awaiting handshake"));
     RefreshRuntimeStatus(ioStatus);
     LogRevival102jDeepSnapshot("StartSession.99.armed", ioStatus);
     mod::Log("Takeover: start session armed (asynchronous handshake via Tick)");
@@ -4917,7 +4918,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 static_cast<long>(controlWakeRequest),
                 static_cast<long>(controlWakeServed),
                 static_cast<long>(requiredControlWakeSerial));
-            PublishConsoleError("Opponent timed out.");
+            PublishConsoleError(I18N_KEY("Opponent timed out."));
             InterlockedExchange(
                 &g_hostBlock->nativeDelayTimeoutHandledSerial,
                 nativeTimeoutSerial);
@@ -4945,7 +4946,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                     SetPhase(
                         ioStatus,
                         NetbridgePhase::Failed,
-                        "EfzRevival spectator process ended during initialization");
+                        I18N_KEY("EfzRevival spectator process ended during initialization"));
                     g_localInitAppliedForSession = false;
                     const bool localInitOk = ForceLocalPlayInit();
                     mod::Log(
@@ -4975,20 +4976,20 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
                 }
                 else
                 {
-                    SetPhase(ioStatus, NetbridgePhase::Connecting, "awaiting runtime sync");
+                    SetPhase(ioStatus, NetbridgePhase::Connecting, I18N_KEY("awaiting runtime sync"));
                     mod::Log("Takeover: helper process exited after init; still waiting for runtime sync");
                 }
             }
             else
             {
-                SetPhase(ioStatus, NetbridgePhase::Failed, "EfzRevival process ended during connect");
+                SetPhase(ioStatus, NetbridgePhase::Failed, I18N_KEY("EfzRevival process ended during connect"));
                 ReinitLocalPlay();
             }
         }
         else
         {
             SetPhase(ioStatus, NetbridgePhase::SessionEnded,
-                     runtimeReady ? "peer disconnected" : nullptr);
+                     runtimeReady ? I18N_KEY("peer disconnected") : nullptr);
             ReinitLocalPlay();
             if (runtimeReady)
             {
@@ -5443,7 +5444,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
             SetPhase(
                 ioStatus,
                 NetbridgePhase::Failed,
-                "EfzRevival spectator initialization failed");
+                I18N_KEY("EfzRevival spectator initialization failed"));
             g_localInitAppliedForSession = false;
             const bool localInitOk = ForceLocalPlayInit();
             mod::Log(

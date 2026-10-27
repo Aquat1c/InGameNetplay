@@ -4,6 +4,7 @@
 #include "netplay/bridge/console_handoff_policy.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "crash_handler.h"
+#include "netplay/core/i18n.h"
 
 #include <array>
 #include <cctype>
@@ -1127,32 +1128,32 @@ static bool TryMapBlockedChildConsoleErrorText(const std::string& text, std::str
 
     if (ContainsCaseInsensitive(trimmed, "Connection timed out"))
     {
-        *outText = "Connection timed out";
+        *outText = I18N_KEY("Connection timed out.");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Source quit or timed out"))
     {
-        *outText = "Source quit or timed out";
+        *outText = I18N_KEY("Source quit or timed out");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Host timed out"))
     {
-        *outText = "Host timed out";
+        *outText = I18N_KEY("Host timed out");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Remote timed out"))
     {
-        *outText = "Remote timed out";
+        *outText = I18N_KEY("Remote timed out");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Only one net instance allowed"))
     {
-        *outText = "Only one net instance allowed";
+        *outText = I18N_KEY("Only one net instance allowed");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Spectators have been disabled"))
     {
-        *outText = "Spectators have been disabled by the host";
+        *outText = I18N_KEY("Spectators have been disabled by the host.");
         return true;
     }
     if (ContainsCaseInsensitive(trimmed, "Socket error"))
@@ -1641,8 +1642,8 @@ BOOL StubCreateProcessA(
             {
                 PublishConsoleError(
                     looksLikePause
-                        ? "Revival entered a lasolasse prompt"
-                        : "Revival attempted an unexpected child process");
+                        ? I18N_KEY("Revival entered a lasolasse prompt")
+                        : I18N_KEY("Revival attempted an unexpected child process"));
             }
             errorSerialAfter = PeekPublishedConsoleErrorSerial();
         }

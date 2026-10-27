@@ -4,6 +4,7 @@
 
 #include "crash_handler.h"
 #include "logger.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/session_bridge.h"
@@ -30,6 +31,7 @@ DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
             netplay::mod_settings::IsFileLoggingEnabled());
         mod::InstallCrashHandlers(moduleHandle, false);
         mod::Log("Module attached at %p", moduleHandle);
+        netplay::i18n::Reload();
 
         if (!netplay::bridge::Initialize())
         {

@@ -70,8 +70,13 @@ struct RtTextItem
     uint32_t rgba = 0xFFFFFFFFu;       // IM_COL32-style ABGR-packed color
     int16_t clipX0 = 0;
     int16_t clipX1 = 0;
-    char text[112] = {};
+    int16_t y1 = 0;                    // occluder bottom (logical)
+    bool occluder = false;             // hides items submitted before it inside [x0,x1)x[y,y1)
+    char text[192] = {};               // UTF-8; set through SetRtText
 };
+
+// Copies `text` into item.text, cut on a UTF-8 character boundary.
+void SetRtText(RtTextItem& item, const char* text, size_t length);
 
 bool IsRtTextAvailable();
 
@@ -83,6 +88,14 @@ int MeasureRtTextWidth(RtTextProfile profile, const char* text);
 
 void BeginRtTextFrame();
 void SubmitRtText(const RtTextItem& item);
+// Logical rect of an indexed modal panel; RT text submitted earlier in the
+// frame is not drawn inside it.
+void SubmitRtOccluder(int x, int y, int w, int h);
 void CommitRtTextFrame();
 void ClearRtText();
+
+// Brackets the game's blocking 21-step palette fade so committed RT frames
+// dim with the palette.
+void BeginRtTextFade(bool fadeIn);
+void EndRtTextFade();
 }

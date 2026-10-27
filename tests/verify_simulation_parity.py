@@ -355,9 +355,18 @@ for signature in (
     )
     if suspend_at < 0 or suspend_at > first_mutation:
         fail(f"{signature} does not verify UI teardown before state mutation")
+    if "RunTransitionFadeOut(" in handoff:
+        fail(f"{signature} fades outside the UI/export barrier")
 
 suspend_ui = function_slice(
     title_flow, "static bool SuspendUiHooksForOnlineSimulation(")
+fade_at = suspend_ui.find("RunTransitionFadeOut(")
+export_suspend_at = suspend_ui.find("state_export::SuspendForOnlineSimulation()")
+frontend_suspend_at = suspend_ui.find("SuspendUpdateHooksForOnlineSimulation()")
+imgui_suspend_at = suspend_ui.find("debug_overlay::SuspendForOnlineSimulation()")
+if not (0 <= export_suspend_at < fade_at
+        and 0 <= frontend_suspend_at < fade_at < imgui_suspend_at):
+    fail("handoff fade must run after export/frontend suspension and before UI teardown")
 for required in (
     "TickExportOnly(true)",
     "state_export::SuspendForOnlineSimulation()",

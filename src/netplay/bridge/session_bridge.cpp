@@ -4,6 +4,7 @@
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/revival_takeover.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/i18n.h"
 #include "netplay/hooks/menu_hooks.h"
 #include "logger.h"
 
@@ -461,7 +462,7 @@ static bool StartSessionInternal(
             *outHostFailure =
                 HostStartFailure::StartAlreadyInProgress;
         }
-        SetPhase(NetbridgePhase::Failed, "session start already in progress");
+        SetPhase(NetbridgePhase::Failed, I18N_KEY("session start already in progress"));
         mod::Log("SessionBridge: StartSession rejected (worker already running)");
         return false;
     }
@@ -496,7 +497,7 @@ static bool StartSessionInternal(
             g_status.port = port;
             SetPhase(
                 NetbridgePhase::Failed,
-                "Invalid Revival netplay session address or port.");
+                I18N_KEY("Invalid Revival netplay session address or port."));
             MarkSynchronousStartRejectedUnlocked(
                 role,
                 "invalid_remote_endpoint");
@@ -524,11 +525,11 @@ static bool StartSessionInternal(
             const char* errorText =
                 resolution.failure
                         == network::RemoteEndpointResolveFailure::NameLookup
-                    ? "Could not find that host. Check the address and try again."
+                    ? I18N_KEY("Could not find that host. Check the address and try again.")
                     : resolution.failure
                             == network::RemoteEndpointResolveFailure::NoUsableFamily
-                        ? "This PC cannot use any address available for that host."
-                        : "Network connections are not available on this PC.";
+                        ? I18N_KEY("This PC cannot use any address available for that host.")
+                        : I18N_KEY("Network connections are not available on this PC.");
             SetPhase(NetbridgePhase::Failed, errorText);
             MarkSynchronousStartRejectedUnlocked(
                 role,
@@ -556,12 +557,10 @@ static bool StartSessionInternal(
             resolution.selectedProbe;
         if (probe.unavailable)
         {
-            char errorText[128] = {};
-            std::snprintf(
-                errorText,
-                sizeof(errorText),
-                "%s connections are not available on this PC or network.",
-                network::FamilyName(remoteEndpoint.family));
+            const char* errorText =
+                remoteEndpoint.family == network::NetworkFamily::IPv6
+                    ? I18N_KEY("IPv6 connections are not available on this PC or network.")
+                    : I18N_KEY("IPv4 connections are not available on this PC or network.");
             g_status.role = static_cast<int>(role);
             g_status.port = port;
             SetPhase(NetbridgePhase::Failed, errorText);
@@ -623,7 +622,7 @@ static bool StartSessionInternal(
             g_status.port = port;
             SetPhase(
                 NetbridgePhase::Failed,
-                "The hosting settings are invalid.");
+                I18N_KEY("The hosting settings are invalid."));
             MarkSynchronousStartRejectedUnlocked(
                 role,
                 "invalid_host_family");
@@ -653,7 +652,7 @@ static bool StartSessionInternal(
                 g_status.port = port;
                 SetPhase(
                     NetbridgePhase::Failed,
-                    "The detected address is not a global public address.");
+                    I18N_KEY("The detected address is not a global public address."));
                 MarkSynchronousStartRejectedUnlocked(
                     role,
                     "public_address_not_global_or_family_mismatch");
@@ -1187,7 +1186,7 @@ void CancelSession(const char* reason)
         }
         else
         {
-            SetPhase(NetbridgePhase::Failed, "start canceled");
+            SetPhase(NetbridgePhase::Failed, I18N_KEY("start canceled"));
         }
         return;
     }

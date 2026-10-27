@@ -1,5 +1,6 @@
 #include "netplay/core/menu_model.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
 
@@ -35,7 +36,7 @@ constexpr std::array<NetplayMenuEntry, 4> kJoinMenuEntries = {{
 
 static NetplayMenuEntry s_lobbyDynEntries[kLobbyMaxDisplayPlayers + 2] = {};
 static NetplayMenuSpec  s_lobbyDynSpec = {
-    NetplayMenuId::Lobby, "LOBBY BROWSER", s_lobbyDynEntries, 0, 0
+    NetplayMenuId::Lobby, I18N_KEY("LOBBY BROWSER"), s_lobbyDynEntries, 0, 0
 };
 
 void RebuildLobbyMenuEntries(int idleCount, int playingCount)
@@ -124,10 +125,10 @@ const NetplayMenuSpec* GetMenuSpec(NetplayMenuId menuId)
     }
 
     static const std::array<NetplayMenuSpec, 4> specs = {{
-        {NetplayMenuId::Main,     "NETPLAY SETTINGS", kMainMenuEntries.data(),     static_cast<int>(kMainMenuEntries.size()),     0},
-        {NetplayMenuId::Host,     "HOST SETTINGS",    kHostMenuEntries.data(),     static_cast<int>(kHostMenuEntries.size()),     0},
-        {NetplayMenuId::Join,     "JOIN SETTINGS",    kJoinMenuEntries.data(),     static_cast<int>(kJoinMenuEntries.size()),     0},
-        {NetplayMenuId::Options,  "OPTIONS",          nullptr,                      0,                                              0},
+        {NetplayMenuId::Main,     I18N_KEY("NETPLAY SETTINGS"), kMainMenuEntries.data(),     static_cast<int>(kMainMenuEntries.size()),     0},
+        {NetplayMenuId::Host,     I18N_KEY("HOST SETTINGS"),    kHostMenuEntries.data(),     static_cast<int>(kHostMenuEntries.size()),     0},
+        {NetplayMenuId::Join,     I18N_KEY("JOIN SETTINGS"),    kJoinMenuEntries.data(),     static_cast<int>(kJoinMenuEntries.size()),     0},
+        {NetplayMenuId::Options,  I18N_KEY("OPTIONS"),          nullptr,                      0,                                              0},
     }};
 
     for (const NetplayMenuSpec& spec : specs)

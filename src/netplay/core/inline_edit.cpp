@@ -2,6 +2,7 @@
 
 #include "logger.h"
 #include "netplay/core/constants.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/menu_model.h"
 #include "netplay/core/network_endpoint.h"
@@ -432,7 +433,7 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
         uint16_t parsedPort = 0;
         if (!netplay::validation::ParsePort(value, &parsedPort))
         {
-            SetError(state, "INVALID PORT");
+            SetError(state, I18N_KEY("INVALID PORT"));
             mod::Log("InlineEdit: invalid port '%s'", value.c_str());
             return false;
         }
@@ -454,7 +455,7 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
                 value,
                 &parsedInput))
         {
-            SetError(state, "INVALID ADDRESS");
+            SetError(state, I18N_KEY("INVALID ADDRESS"));
             mod::Log("InlineEdit: invalid join address '%s'", value.c_str());
             return false;
         }
@@ -465,7 +466,7 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
     case NetplayMenuAction::NicknameEdit:
         if (!netplay::validation::IsValidNickname(value))
         {
-            SetError(state, "INVALID NAME");
+            SetError(state, I18N_KEY("INVALID NAME"));
             mod::Log("InlineEdit: invalid nickname '%s'", value.c_str());
             return false;
         }
@@ -474,7 +475,7 @@ bool Commit(netplay::inline_edit::State* state, netplay::inline_edit::Values* va
     case NetplayMenuAction::PlayerRoomsEditCode:
         if (!netplay::validation::IsValidLobbyRoomCode(value))
         {
-            SetError(state, "INVALID ROOM CODE");
+            SetError(state, I18N_KEY("INVALID ROOM CODE"));
             mod::Log("InlineEdit: invalid room code '%s'", value.c_str());
             return false;
         }

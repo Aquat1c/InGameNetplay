@@ -4,6 +4,7 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/options_menu.h"
 #include "netplay/core/player_rooms_menu.h"
@@ -23,6 +24,7 @@ using NetplayMenuSpec = netplay::menu::NetplayMenuSpec;
 using NetplayMenuAction = netplay::menu::NetplayMenuAction;
 using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
 using netplay::menu::GetMenuSpec;
+using netplay::i18n::Tr;
 constexpr char kLobbyPlayingEyeGlyph = '\x7F';
 
 std::string BuildMenuHeaderText()
@@ -35,17 +37,17 @@ std::string BuildMenuHeaderText()
             {
                 return g_lobbySession->GetRoomAlias();
             }
-            return "PLAYER ROOM";
+            return Tr("PLAYER ROOM");
         }
-        return "LOBBY";
+        return Tr("LOBBY");
     }
 
     const NetplayMenuSpec* spec = GetMenuSpec(g_netplayMenuState.menuId);
     if (spec == nullptr || spec->headerLabel == nullptr)
     {
-        return "NETPLAY";
+        return Tr("NETPLAY");
     }
-    return spec->headerLabel;
+    return Tr(spec->headerLabel);
 }
 
 std::string BuildRowLabel(const NetplayMenuEntry& entry)
@@ -59,19 +61,25 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     switch (entry.action)
     {
     case NetplayMenuAction::OpenHost:
-        return "HOST";
+        return Tr("HOST");
     case NetplayMenuAction::OpenJoin:
-        return "JOIN";
+        return Tr("JOIN");
     case NetplayMenuAction::OpenPlayerRooms:
-        return "PLAYER ROOMS";
+        return Tr("PLAYER ROOMS");
     case NetplayMenuAction::OpenLobby:
-        return "LOBBY";
+        return Tr("LOBBY");
     case NetplayMenuAction::OpenBattleLog:
-        return "BATTLE LOG";
+        return Tr("BATTLE LOG");
     case NetplayMenuAction::OpenOptions:
     {
         const char* badge = netplay::update_check::BadgeText();
-        return (badge[0] != 0) ? std::string("OPTIONS ") + badge : std::string("OPTIONS");
+        if (badge[0] == 0)
+        {
+            return Tr("OPTIONS");
+        }
+        char text[128] = {};
+        std::snprintf(text, sizeof(text), Tr("OPTIONS %s"), badge);
+        return text;
     }
     case NetplayMenuAction::PlayerRoomsRefresh:
     case NetplayMenuAction::PlayerRoomsJoin:
@@ -83,37 +91,37 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
     case NetplayMenuAction::PlayerRoomsSlot2:
         return netplay::player_rooms::BuildRowLabel(entry.action);
     case NetplayMenuAction::LeaveNetplay:
-        return "RETURN TO TITLE";
+        return Tr("RETURN TO TITLE");
     case NetplayMenuAction::HostStart:
-        return "START HOST";
+        return Tr("START HOST");
     case NetplayMenuAction::HostEditPort:
         if (GetInlineEditDisplayValue(entry.action, &value, true))
         {
-            return "PORT: " + value;
+            return Tr("PORT: ") + value;
         }
-        return "PORT";
+        return Tr("PORT");
     case NetplayMenuAction::BackToMain:
-        return "BACK";
+        return Tr("BACK");
     case NetplayMenuAction::JoinConnect:
-        return "CONNECT";
+        return Tr("CONNECT");
     case NetplayMenuAction::JoinEditAddress:
         if (GetInlineEditDisplayValue(entry.action, &value, true))
         {
-            return "ADDRESS: " + value;
+            return Tr("ADDRESS: ") + value;
         }
-        return "ADDRESS";
+        return Tr("ADDRESS");
     case NetplayMenuAction::JoinEditPort:
         if (GetInlineEditDisplayValue(entry.action, &value, true))
         {
-            return "PORT: " + value;
+            return Tr("PORT: ") + value;
         }
-        return "PORT";
+        return Tr("PORT");
     case NetplayMenuAction::NicknameEdit:
         if (GetInlineEditDisplayValue(entry.action, &value, true))
         {
-            return "NAME: " + value;
+            return Tr("NAME: ") + value;
         }
-        return "NAME";
+        return Tr("NAME");
     case NetplayMenuAction::OptionRow0:
     case NetplayMenuAction::OptionRow1:
     case NetplayMenuAction::OptionRow2:
@@ -130,7 +138,7 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
             const auto status = g_lobbySession->GetStatus();
             if (!status.playing.empty())
             {
-                return status.playing[0].p1Name + " vs " + status.playing[0].p2Name;
+                return status.playing[0].p1Name + Tr(" vs ") + status.playing[0].p2Name;
             }
         }
         return "";
@@ -160,7 +168,7 @@ std::string BuildRowLabel(const NetplayMenuEntry& entry)
                 std::string name;
                 if (de.isSelf)
                 {
-                    name = "[YOU] " + de.name;
+                    name = Tr("[YOU] ") + de.name;
                 }
                 else if (de.isChallenge)
                 {
@@ -255,7 +263,7 @@ std::string AppendPlayerRoomCodeFooter(std::string footer)
         return footer;
     }
 
-    const std::string codeLine = "Room Code: " + g_lobbySession->GetRoomCode();
+    const std::string codeLine = Tr("Room Code: ") + g_lobbySession->GetRoomCode();
     if (footer.empty())
     {
         return codeLine;
@@ -268,61 +276,66 @@ std::string BuildActionTooltip(NetplayMenuAction action)
     switch (action)
     {
     case NetplayMenuAction::OpenHost:
-        return "Host a direct match.";
+        return Tr("Host a direct match.");
     case NetplayMenuAction::OpenJoin:
-        return "Configure a direct host connection.\nPress C to paste IP:PORT. Press D to Spectate IP.";
+        return Tr("Configure a direct host connection.\nPress C to paste IP:PORT. Press D to Spectate IP.");
     case NetplayMenuAction::OpenPlayerRooms:
-        return "Browse public and private player rooms.";
+        return Tr("Browse public and private player rooms.");
     case NetplayMenuAction::OpenLobby:
-        return "Enter the global lobby player list.";
+        return Tr("Enter the global lobby player list.");
     case NetplayMenuAction::OpenBattleLog:
-        return "Browse and search BattleLog.txt.";
+        return Tr("Browse and search BattleLog.txt.");
     case NetplayMenuAction::OpenOptions:
         if (netplay::update_check::IsUpdateAvailable())
         {
-            return "Adjust netplay settings.\nNew release "
-                + netplay::update_check::LatestVersion() + " is on GitHub - see About.";
+            char text[192] = {};
+            std::snprintf(
+                text,
+                sizeof(text),
+                Tr("Adjust netplay settings.\nNew release %s is on GitHub - see About."),
+                netplay::update_check::LatestVersion().c_str());
+            return text;
         }
-        return "Adjust netplay settings.\nSaved in EfzRevival.ini.";
+        return Tr("Adjust netplay settings.\nSaved in EfzRevival.ini.");
     case NetplayMenuAction::PlayerRoomsRefresh:
-        return "Refresh the public room list.";
+        return Tr("Refresh the public room list.");
     case NetplayMenuAction::PlayerRoomsJoin:
-        return "Join the room code shown below.";
+        return Tr("Join the room code shown below.");
     case NetplayMenuAction::PlayerRoomsEditCode:
-        return "Set the room code or alias to join.";
+        return Tr("Set the room code or alias to join.");
     case NetplayMenuAction::PlayerRoomsCreate:
-        return "Create a room using the selected visibility.";
+        return Tr("Create a room using the selected visibility.");
     case NetplayMenuAction::PlayerRoomsRoomType:
-        return "Choose whether new rooms are Private or Public.";
+        return Tr("Choose whether new rooms are Private or Public.");
     case NetplayMenuAction::PlayerRoomsSlot0:
     case NetplayMenuAction::PlayerRoomsSlot1:
     case NetplayMenuAction::PlayerRoomsSlot2:
-        return "Join the highlighted public room.";
+        return Tr("Join the highlighted public room.");
     case NetplayMenuAction::LeaveNetplay:
-        return "Return to the title screen.";
+        return Tr("Return to the title screen.");
     case NetplayMenuAction::HostStart:
-        return "Begin hosting on the selected port.";
+        return Tr("Begin hosting on the selected port.");
     case NetplayMenuAction::HostEditPort:
-        return "Set the port other players will use.";
+        return Tr("Set the port other players will use.");
     case NetplayMenuAction::JoinConnect:
-        return "Connect to the host using the settings below.\nPress C to paste IP:PORT. Press D to Spectate IP.";
+        return Tr("Connect to the host using the settings below.\nPress C to paste IP:PORT. Press D to Spectate IP.");
     case NetplayMenuAction::JoinEditAddress:
-        return "Set the host address.\nPress C to paste IP:PORT. Press D to Spectate IP.";
+        return Tr("Set the host address.\nPress C to paste IP:PORT. Press D to Spectate IP.");
     case NetplayMenuAction::JoinEditPort:
-        return "Set the host port.\nPress C to paste IP:PORT. Press D to Spectate IP.";
+        return Tr("Set the host port.\nPress C to paste IP:PORT. Press D to Spectate IP.");
     case NetplayMenuAction::NicknameEdit:
-        return "Update the nickname shown in lobbies and online matches.";
+        return Tr("Update the nickname shown in lobbies and online matches.");
     case NetplayMenuAction::BackToMain:
-        return "Return to the netplay main menu.";
+        return Tr("Return to the netplay main menu.");
     case NetplayMenuAction::LobbyPlaying0:
-        return "Spectate the highlighted live match.";
+        return Tr("Spectate the highlighted live match.");
     case NetplayMenuAction::LobbySlot0:
     case NetplayMenuAction::LobbySlot1:
     case NetplayMenuAction::LobbySlot2:
     case NetplayMenuAction::LobbySlot3:
     case NetplayMenuAction::LobbySlot4:
     case NetplayMenuAction::LobbySlot5:
-        return "Inspect this lobby entry.";
+        return Tr("Inspect this lobby entry.");
     default:
         return {};
     }
@@ -338,7 +351,7 @@ std::string BuildLobbyRowTooltip(const NetplayMenuEntry& entry)
 {
     if (entry.action == NetplayMenuAction::LobbyPlaying0)
     {
-        return "Spectate the highlighted live match.";
+        return Tr("Spectate the highlighted live match.");
     }
 
     if (!IsLobbySlotAction(entry.action))
@@ -348,7 +361,7 @@ std::string BuildLobbyRowTooltip(const NetplayMenuEntry& entry)
 
     if (!g_lobbySession)
     {
-        return "Refreshing lobby status.";
+        return Tr("Refreshing lobby status.");
     }
 
     const auto status = g_lobbySession->GetStatus();
@@ -357,23 +370,23 @@ std::string BuildLobbyRowTooltip(const NetplayMenuEntry& entry)
     const int realSlot = visSlot + g_netplayMenuState.lobbyScrollOffset;
     if (realSlot < 0 || realSlot >= static_cast<int>(status.displayEntries.size()))
     {
-        return "Refreshing lobby status.";
+        return Tr("Refreshing lobby status.");
     }
 
     const auto& displayEntry = status.displayEntries[realSlot];
     if (displayEntry.isSelf)
     {
-        return "This is your current lobby entry.";
+        return Tr("This is your current lobby entry.");
     }
     if (displayEntry.isChallenge)
     {
-        return "Accept this player's challenge.";
+        return Tr("Accept this player's challenge.");
     }
     if (displayEntry.isPlaying)
     {
-        return "Spectate this player's live match.";
+        return Tr("Spectate this player's live match.");
     }
-    return "Challenge this idle player to a match.";
+    return Tr("Challenge this idle player to a match.");
 }
 
 std::string BuildEntryTooltip(const NetplayMenuEntry& entry)
@@ -425,20 +438,28 @@ bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
     const int textWidth = ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, line.c_str());
     if (textWidth > availableWidth && !line.empty())
     {
-        if (!hasNonAscii)
+        // Marquee stepping by whole UTF-8 characters.
+        constexpr DWORD kScrollStepMs = 180;
+        constexpr size_t kPadChars = 6;
+        const std::string spacer(kPadChars, ' ');
+        const std::string marquee = line + spacer + line + spacer;
+        std::vector<size_t> charStart;
+        for (size_t i = 0; i < marquee.size(); ++i)
         {
-            constexpr DWORD kScrollStepMs = 180;
-            constexpr size_t kPadChars = 6;
-            const size_t visibleChars = (std::max)(
-                static_cast<size_t>(1),
-                line.size() * static_cast<size_t>(availableWidth)
-                    / static_cast<size_t>(textWidth));
-            const std::string spacer(kPadChars, ' ');
-            const std::string marquee = line + spacer + line + spacer;
-            const size_t cycle = line.size() + spacer.size();
-            const size_t start = (GetTickCount() / kScrollStepMs) % cycle;
-            window = marquee.substr(start, (std::min)(visibleChars + 2, marquee.size() - start));
+            if ((static_cast<unsigned char>(marquee[i]) & 0xC0u) != 0x80u)
+            {
+                charStart.push_back(i);
+            }
         }
+        const size_t cycleChars = charStart.size() / 2;
+        const size_t visibleChars = (std::max)(
+            static_cast<size_t>(1),
+            cycleChars * static_cast<size_t>(availableWidth)
+                / static_cast<size_t>(textWidth));
+        const size_t first = (GetTickCount() / kScrollStepMs) % cycleChars;
+        const size_t last = (std::min)(first + visibleChars + 2, charStart.size());
+        const size_t endByte = last < charStart.size() ? charStart[last] : marquee.size();
+        window = marquee.substr(charStart[first], endByte - charStart[first]);
         while (!window.empty()
             && ov::MeasureRtTextWidth(ov::RtTextProfile::Footer, window.c_str()) > availableWidth)
         {
@@ -453,9 +474,7 @@ bool SubmitFooterRtLine(const std::string& line, int left, int right, int y)
     item.align = ov::RtTextAlign::Left;
     item.profile = ov::RtTextProfile::Footer;
     item.rgba = 0xFFD0D0D0u; // footer grey (208,208,208), same as the 5x7 color
-    const size_t bytes = (std::min)(window.size(), sizeof(item.text) - 1);
-    std::memcpy(item.text, window.data(), bytes);
-    item.text[bytes] = '\0';
+    ov::SetRtText(item, window.data(), window.size());
     ov::SubmitRtText(item);
     return ov::IsRtTextAvailable();
 }
@@ -534,21 +553,21 @@ std::string BuildFooterText()
     {
         if (!g_inlineEditState.errorMessage.empty() && GetTickCount() < g_inlineEditState.errorExpireTick)
         {
-            return g_inlineEditState.errorMessage + "  Enter=Save Esc=Cancel";
+            return Tr(g_inlineEditState.errorMessage) + "  " + Tr("Enter=Save Esc=Cancel");
         }
 
         switch (g_inlineEditState.action)
         {
         case NetplayMenuAction::HostEditPort:
-            return "Edit host port\nEnter=Save Esc=Cancel";
+            return Tr("Edit host port\nEnter=Save Esc=Cancel");
         case NetplayMenuAction::JoinEditAddress:
-            return "Edit host address\nEnter=Save Esc=Cancel Ctrl+V=Paste";
+            return Tr("Edit host address\nEnter=Save Esc=Cancel Ctrl+V=Paste");
         case NetplayMenuAction::JoinEditPort:
-            return "Edit host port\nEnter=Save Esc=Cancel Ctrl+V=Paste";
+            return Tr("Edit host port\nEnter=Save Esc=Cancel Ctrl+V=Paste");
         case NetplayMenuAction::NicknameEdit:
-            return "Edit nickname\nEnter=Save Esc=Cancel Ctrl+V=Paste";
+            return Tr("Edit nickname\nEnter=Save Esc=Cancel Ctrl+V=Paste");
         default:
-            return "Enter=Save Esc=Cancel";
+            return Tr("Enter=Save Esc=Cancel");
         }
     }
 
@@ -777,7 +796,6 @@ bool DrawRuntimeTextOverlayGdi(uint32_t screenContext, bool allowWindowDc)
         g_useRuntimeTextOverlay || lobbyForced,
         g_netplayMenuState.active,
         g_enableGdiFallbackOverlay || lobbyForced,
-        netplay::options::IsSaveOverlayActive(),
         g_netplayMenuState.menuId,
         optionsSlideOffsetX,
     };
@@ -819,9 +837,7 @@ void DrawTransientTextCentered(
         item.align = netplay::debug_overlay::RtTextAlign::Center;
         item.profile = profile;
         item.rgba = rgba;
-        const size_t bytes = (std::min)(std::strlen(text), sizeof(item.text) - 1);
-        std::memcpy(item.text, text, bytes);
-        item.text[bytes] = '\0';
+        netplay::debug_overlay::SetRtText(item, text, std::strlen(text));
         netplay::debug_overlay::SubmitRtText(item);
         if (netplay::debug_overlay::IsRtTextAvailable())
         {
@@ -840,13 +856,6 @@ void DrawTransientTextCentered(
         fallbackColor);
 }
 
-void BeginTopModalTextLayer()
-{
-    if (netplay::mod_settings::IsMenuTtfTextEnabled())
-    {
-        netplay::debug_overlay::BeginRtTextFrame();
-    }
-}
 } // namespace
 
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
@@ -895,37 +904,38 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     constexpr int delayPanelY = (240 - delayPanelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, delayPanelX, delayPanelY, delayPanelW, delayPanelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, delayPanelX, delayPanelY, delayPanelW, delayPanelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(delayPanelX, delayPanelY, delayPanelW, delayPanelH);
 
     const int cL = delayPanelX + 6;
     const int cR = delayPanelX + delayPanelW - 6;
 
     DrawTransientTextCentered(
-        sv, "MATCH DELAY", cL, cR, delayPanelY + 8,
+        sv, Tr("MATCH DELAY"), cL, cR, delayPanelY + 8,
         netplay::debug_overlay::RtTextProfile::OverlayTitle,
         titleColor, kRtOverlayTitle);
 
     char line[192] = {};
     if (g_delaySetupOverlay.pingMs >= 0)
     {
-        std::snprintf(line, sizeof(line), "Ping: %d ms", g_delaySetupOverlay.pingMs);
+        std::snprintf(line, sizeof(line), Tr("Ping: %d ms"), g_delaySetupOverlay.pingMs);
     }
     else
     {
-        std::snprintf(line, sizeof(line), "Ping: measuring...");
+        std::snprintf(line, sizeof(line), Tr("Ping: measuring..."));
     }
     DrawTransientTextCentered(
         sv, line, cL, cR, delayPanelY + 26,
         netplay::debug_overlay::RtTextProfile::OverlayBody,
         textColor, kRtOverlayText);
 
-    std::snprintf(line, sizeof(line), "Delay: %d   (recommended %d)",
+    std::snprintf(line, sizeof(line), Tr("Delay: %d   (recommended %d)"),
         g_delaySetupOverlay.selectedDelay, g_delaySetupOverlay.recommendedDelay);
     DrawTransientTextCentered(
         sv, line, cL, cR, delayPanelY + 42,
         netplay::debug_overlay::RtTextProfile::OverlayBody,
         brightColor, kRtOverlayBright);
 
-    std::snprintf(line, sizeof(line), "Range: %d to %d",
+    std::snprintf(line, sizeof(line), Tr("Range: %d to %d"),
         g_delaySetupOverlay.minDelay, g_delaySetupOverlay.maxDelay);
     DrawTransientTextCentered(
         sv, line, cL, cR, delayPanelY + 56,
@@ -935,7 +945,7 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     if (g_delaySetupOverlay.waitingForRuntimeReady)
     {
         DrawTransientTextCentered(
-            sv, "Delay submitted. Waiting for sync...", cL, cR, delayPanelY + 72,
+            sv, Tr("Delay submitted. Waiting for sync..."), cL, cR, delayPanelY + 72,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
     }
@@ -943,21 +953,31 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     {
         if (g_delaySetupOverlay.errorMessage[0] != '\0')
         {
+            if (std::strcmp(g_delaySetupOverlay.errorMessage, "Delay apply failed") == 0)
+            {
+                std::snprintf(line, sizeof(line), "%s", Tr(g_delaySetupOverlay.errorMessage));
+            }
+            else
+            {
+                std::snprintf(
+                    line, sizeof(line), Tr("Delay apply failed: %s"),
+                    Tr(g_delaySetupOverlay.errorMessage));
+            }
             DrawTransientTextCentered(
-                sv, g_delaySetupOverlay.errorMessage, cL, cR, delayPanelY + 70,
+                sv, line, cL, cR, delayPanelY + 70,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 errorColor, kRtOverlayError);
         }
         else if (g_delaySetupOverlay.p1Name[0] != '\0' && g_delaySetupOverlay.p2Name[0] != '\0')
         {
-            std::snprintf(line, sizeof(line), "%s vs %s", g_delaySetupOverlay.p1Name, g_delaySetupOverlay.p2Name);
+            std::snprintf(line, sizeof(line), Tr("%s vs %s"), g_delaySetupOverlay.p1Name, g_delaySetupOverlay.p2Name);
             DrawTransientTextCentered(
                 sv, line, cL, cR, delayPanelY + 70,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 textColor, kRtOverlayText);
         }
         DrawTransientTextCentered(
-            sv, "Left/Right: Adjust    A: Confirm    B: Cancel",
+            sv, Tr("Left/Right: Adjust    A: Confirm    B: Cancel"),
             cL, cR, delayPanelY + 84,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
@@ -1001,22 +1021,22 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         && !g_hostingOverlay.challengeMode
         && netplay::bridge::async_host::IsMinimized())
     {
-        const char* badge = "HOSTING";
+        const char* badge = Tr("HOSTING");
         uint8_t badgeColor = frameColor;
         if (netplay::bridge::async_host::
                 HasHostListenerStartupFailed())
         {
-            badge = "HOST FAILED";
+            badge = Tr("HOST FAILED");
             badgeColor = redColor;
         }
         else if (netplay::bridge::async_host::IsTimedOut())
         {
-            badge = "TIMED OUT";
+            badge = Tr("TIMED OUT");
             badgeColor = yellowColor;
         }
         else if (netplay::bridge::async_host::IsPeerFoundHeld())
         {
-            badge = "OPPONENT FOUND!";
+            badge = Tr("OPPONENT FOUND!");
             badgeColor = greenColor;
         }
         int badgeTextW = netplay::font::MeasureText5x7Width(badge, 1);
@@ -1036,6 +1056,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         const int badgeY = 4;
         netplay::font::FillIndexedSurfaceRect(sv, badgeX, badgeY, badgeW, 13, bgColor);
         netplay::font::DrawIndexedSurfaceFrame(sv, badgeX, badgeY, badgeW, 13, badgeColor);
+        netplay::debug_overlay::SubmitRtOccluder(badgeX, badgeY, badgeW, 13);
         DrawTransientTextCentered(
             sv, badge, badgeX + 2, badgeX + badgeW - 2, badgeY + 3,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
@@ -1058,13 +1079,14 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     constexpr int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(panelX, panelY, panelW, panelH);
 
     const int cL = panelX + 6;
     const int cR = panelX + panelW - 6;
 
     DrawTransientTextCentered(
         sv,
-        g_hostingOverlay.challengeMode ? "CHALLENGING" : "HOSTING",
+        g_hostingOverlay.challengeMode ? Tr("CHALLENGING") : Tr("HOSTING"),
         cL, cR, panelY + 8,
         netplay::debug_overlay::RtTextProfile::OverlayTitle,
         titleColor, kRtOverlayTitle);
@@ -1072,19 +1094,19 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     if (g_hostingOverlay.failed)
     {
         DrawTransientTextCentered(
-            sv, "Hosting failed", cL, cR, panelY + 28,
+            sv, Tr("Hosting failed"), cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             redColor, kRtOverlayRed);
         if (g_hostingOverlay.errorText[0] != '\0')
         {
             DrawTransientTextCentered(
-                sv, g_hostingOverlay.errorText,
+                sv, Tr(g_hostingOverlay.errorText),
                 cL, cR, panelY + 42,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 textColor, kRtOverlayText);
         }
         DrawTransientTextCentered(
-            sv, "Press any button to dismiss",
+            sv, Tr("Press any button to dismiss"),
             cL, cR, panelY + 58,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
@@ -1099,7 +1121,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         if (g_hostingOverlay.challengeMode)
         {
             DrawTransientTextCentered(
-                sv, "B/ESC: Cancel challenge",
+                sv, Tr("B/ESC: Cancel challenge"),
                 cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 textColor, kRtOverlayText);
@@ -1112,7 +1134,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             std::snprintf(
                 line,
                 sizeof(line),
-                "Starting %s Revival netplay session...",
+                Tr("Starting %s Revival netplay session..."),
                 netplay::network::FamilyName(
                     g_hostingOverlay.effectiveFamily));
         }
@@ -1121,7 +1143,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             std::snprintf(
                 line,
                 sizeof(line),
-                "vs %s",
+                Tr("vs %s"),
                 g_hostingOverlay.targetName);
         }
         DrawTransientTextCentered(
@@ -1129,14 +1151,14 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             brightColor, kRtOverlayBright);
         DrawTransientTextCentered(
-            sv, "B/ESC: Cancel challenge", cL, cR, panelY + 58,
+            sv, Tr("B/ESC: Cancel challenge"), cL, cR, panelY + 58,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             textColor, kRtOverlayText);
     }
     else if (g_hostingOverlay.listenerMismatch)
     {
         DrawTransientTextCentered(
-            sv, "Retrying hosting setup...", cL, cR, panelY + 28,
+            sv, Tr("Retrying hosting setup..."), cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             yellowColor, kRtOverlayYellow);
     }
@@ -1145,7 +1167,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         std::snprintf(
             line,
             sizeof(line),
-            "Starting %s Revival netplay session...",
+            Tr("Starting %s Revival netplay session..."),
             netplay::network::FamilyName(
                 g_hostingOverlay.effectiveFamily));
         DrawTransientTextCentered(
@@ -1158,7 +1180,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         std::snprintf(
             line,
             sizeof(line),
-            "%s ready on port %u; public IP unavailable",
+            Tr("%s ready on port %u; public IP unavailable"),
             netplay::network::FamilyName(
                 g_hostingOverlay.effectiveFamily),
             static_cast<unsigned>(g_hostingOverlay.port));
@@ -1178,7 +1200,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 endpoint,
                 &formattedEndpoint))
         {
-            formattedEndpoint = "Invalid detected endpoint";
+            formattedEndpoint = Tr("Invalid detected endpoint");
         }
         DrawTransientTextCentered(
             sv, formattedEndpoint.c_str(), cL, cR, panelY + 28,
@@ -1201,7 +1223,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         if (showCopiedFlash)
         {
             DrawTransientTextCentered(
-                sv, "Copied to clipboard!", cL, cR, panelY + 42,
+                sv, Tr("Copied to clipboard!"), cL, cR, panelY + 42,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 greenColor, kRtOverlayGreen);
         }
@@ -1213,7 +1235,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 std::snprintf(
                     line,
                     sizeof(line),
-                    "Automatic retry succeeded with %s",
+                    Tr("Automatic retry succeeded with %s"),
                     netplay::network::FamilyName(
                         g_hostingOverlay.effectiveFamily));
             }
@@ -1222,7 +1244,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                 std::snprintf(
                     line,
                     sizeof(line),
-                    "%s address not detected, using %s",
+                    Tr("%s address not detected, using %s"),
                     netplay::network::FamilyName(
                         g_hostingOverlay.preferredFamily),
                     netplay::network::FamilyName(
@@ -1238,7 +1260,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             && !g_hostingOverlay.ipFetchFailed)
         {
             DrawTransientTextCentered(
-                sv, "Press C to copy IP address", cL, cR, panelY + 42,
+                sv, Tr("Press C to copy IP address"), cL, cR, panelY + 42,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 dimColor, kRtOverlayDim);
         }
@@ -1246,7 +1268,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         if (!g_hostingOverlay.listenerReady)
         {
             DrawTransientTextCentered(
-                sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+                sv, Tr("B/ESC: Cancel"), cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 textColor, kRtOverlayText);
         }
@@ -1254,7 +1276,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                      HasHostListenerStartupFailed())
         {
             DrawTransientTextCentered(
-                sv, "HOSTING FAILED   B/ESC: Cancel",
+                sv, Tr("HOSTING FAILED   B/ESC: Cancel"),
                 cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 textColor, kRtOverlayText);
@@ -1262,21 +1284,21 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         else if (netplay::bridge::async_host::IsTimedOut())
         {
             DrawTransientTextCentered(
-                sv, "OPPONENT TIMED OUT   B/ESC: Cancel", cL, cR, panelY + 58,
+                sv, Tr("OPPONENT TIMED OUT   B/ESC: Cancel"), cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 textColor, kRtOverlayText);
         }
         else if (netplay::bridge::async_host::IsPeerFoundHeld())
         {
             DrawTransientTextCentered(
-                sv, "OPPONENT FOUND!", cL, cR, panelY + 58,
+                sv, Tr("OPPONENT FOUND!"), cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 greenColor, kRtOverlayGreen);
         }
         else
         {
             DrawTransientTextCentered(
-                sv, "D: Minimize    B/ESC: Cancel", cL, cR, panelY + 58,
+                sv, Tr("D: Minimize    B/ESC: Cancel"), cL, cR, panelY + 58,
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 textColor, kRtOverlayText);
         }
@@ -1301,8 +1323,6 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
         return false;
     }
 
-    BeginTopModalTextLayer();
-
     const netplay::font::IndexedSurfaceView sv = {
         lockedSurface.pixels, lockedSurface.width, lockedSurface.height, lockedSurface.pitch,
     };
@@ -1321,19 +1341,20 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
     constexpr int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(panelX, panelY, panelW, panelH);
 
     const int cL = panelX + 6;
     const int cR = panelX + panelW - 6;
     DrawTransientTextCentered(
-        sv, "STOP HOSTING?", cL, cR, panelY + 8,
+        sv, Tr("STOP HOSTING?"), cL, cR, panelY + 8,
         netplay::debug_overlay::RtTextProfile::OverlayTitle,
         titleColor, kRtOverlayYellow);
     DrawTransientTextCentered(
-        sv, "End the host session to continue?", cL, cR, panelY + 24,
+        sv, Tr("End the host session to continue?"), cL, cR, panelY + 24,
         netplay::debug_overlay::RtTextProfile::OverlayBody,
         textColor, kRtOverlayText);
 
-    const char* labels[2] = {"Stop hosting", "Keep hosting"};
+    const char* labels[2] = {Tr("Stop hosting"), Tr("Keep hosting")};
     for (int i = 0; i < 2; ++i)
     {
         const bool selected = (g_stopHostingConfirm.selection == i);
@@ -1342,7 +1363,7 @@ bool DrawStopHostingConfirmGdi(uint32_t screenContext)
         {
             netplay::font::FillIndexedSurfaceRect(sv, panelX + 30, rowY - 1, panelW - 60, 13, hlColor);
         }
-        char optionText[48] = {};
+        char optionText[96] = {};
         std::snprintf(
             optionText,
             sizeof(optionText),
@@ -1397,7 +1418,7 @@ void DrawAsyncHostGameplayOverlay(uint32_t screenContext)
         std::snprintf(
             msg,
             sizeof(msg),
-            "Hosting failed - %s to return",
+            Tr("Hosting failed - %s to return"),
             ah::ReturnKeyDisplay());
         col = redColor;
     }
@@ -1406,17 +1427,17 @@ void DrawAsyncHostGameplayOverlay(uint32_t screenContext)
         std::snprintf(
             msg,
             sizeof(msg),
-            "Opponent timed out - %s to return",
+            Tr("Opponent timed out - %s to return"),
             ah::ReturnKeyDisplay());
     }
     else if (ah::IsPeerFoundHeld())
     {
-        std::snprintf(msg, sizeof(msg), "OPPONENT FOUND!  Press %s to join", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), Tr("OPPONENT FOUND!  Press %s to join"), ah::ReturnKeyDisplay());
         col = greenColor;
     }
     else
     {
-        std::snprintf(msg, sizeof(msg), "Hosting...  (%s to return)", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), Tr("Hosting...  (%s to return)"), ah::ReturnKeyDisplay());
     }
 
     const int surfaceW = static_cast<int>(lockedSurface.width);
@@ -1465,14 +1486,15 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     constexpr int panelY = (240 - panelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, panelX, panelY, panelW, panelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, panelX, panelY, panelW, panelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(panelX, panelY, panelW, panelH);
 
     const int cL = panelX + 6;
     const int cR = panelX + panelW - 6;
 
-    const char* panelTitle = "JOINING";
+    const char* panelTitle = Tr("JOINING");
     if (g_joiningOverlay.spectateMode)
     {
-        panelTitle = g_joiningOverlay.waitingForGameBegin ? "WAIT TO SPECTATE" : "SPECTATING";
+        panelTitle = g_joiningOverlay.waitingForGameBegin ? Tr("WAIT TO SPECTATE") : Tr("SPECTATING");
     }
     DrawTransientTextCentered(
         sv, panelTitle, cL, cR, panelY + 8,
@@ -1483,18 +1505,18 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     if (g_joiningOverlay.failed)
     {
         DrawTransientTextCentered(
-            sv, "Connection failed", cL, cR, panelY + 28,
+            sv, Tr("Connection failed"), cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             redColor, kRtOverlayRed);
         if (g_joiningOverlay.errorText[0] != '\0')
         {
             DrawTransientTextCentered(
-                sv, g_joiningOverlay.errorText, cL, cR, panelY + 42,
+                sv, Tr(g_joiningOverlay.errorText), cL, cR, panelY + 42,
                 netplay::debug_overlay::RtTextProfile::OverlayBody,
                 textColor, kRtOverlayText);
         }
         DrawTransientTextCentered(
-            sv, "Press any button to dismiss", cL, cR, panelY + 58,
+            sv, Tr("Press any button to dismiss"), cL, cR, panelY + 58,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
     }
@@ -1502,22 +1524,22 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     {
         if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
         {
-            std::snprintf(line, sizeof(line), "%s is not in a match yet", g_joiningOverlay.targetName);
+            std::snprintf(line, sizeof(line), Tr("%s is not in a match yet"), g_joiningOverlay.targetName);
         }
         else
         {
-            std::snprintf(line, sizeof(line), "Host is not in a match yet");
+            std::snprintf(line, sizeof(line), Tr("Host is not in a match yet."));
         }
         DrawTransientTextCentered(
             sv, line, cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
         DrawTransientTextCentered(
-            sv, "Waiting for game to begin...", cL, cR, panelY + 42,
+            sv, Tr("Waiting for game to begin..."), cL, cR, panelY + 42,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             dimColor, kRtOverlayDim);
         DrawTransientTextCentered(
-            sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+            sv, Tr("B/ESC: Cancel"), cL, cR, panelY + 58,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
     }
@@ -1525,7 +1547,7 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
     {
         if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
         {
-            std::snprintf(line, sizeof(line), "Connecting to %s ...", g_joiningOverlay.targetName);
+            std::snprintf(line, sizeof(line), Tr("Connecting to %s ..."), g_joiningOverlay.targetName);
         }
         else
         {
@@ -1538,12 +1560,12 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
                     endpoint,
                     &formattedEndpoint))
             {
-                formattedEndpoint = "invalid endpoint";
+                formattedEndpoint = Tr("invalid endpoint");
             }
             std::snprintf(
                 line,
                 sizeof(line),
-                "Connecting to %s ...",
+                Tr("Connecting to %s ..."),
                 formattedEndpoint.c_str());
         }
         DrawTransientTextCentered(
@@ -1551,7 +1573,7 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
         DrawTransientTextCentered(
-            sv, "B/ESC: Cancel", cL, cR, panelY + 58,
+            sv, Tr("B/ESC: Cancel"), cL, cR, panelY + 58,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
     }
@@ -1574,8 +1596,6 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     {
         return false;
     }
-
-    BeginTopModalTextLayer();
 
     if (!s_loggedForCurrentOverlay)
     {
@@ -1613,6 +1633,7 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     const int specPanelY = (240 - specPanelH) / 2;
     netplay::font::FillIndexedSurfaceRect(sv, specPanelX, specPanelY, specPanelW, specPanelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, specPanelX, specPanelY, specPanelW, specPanelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(specPanelX, specPanelY, specPanelW, specPanelH);
 
     const int sTextL = specPanelX + 6;
     const int sTextR = specPanelX + specPanelW - 6;
@@ -1624,7 +1645,7 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
         {
             netplay::font::FillIndexedSurfaceRect(sv, specPanelX + 40, y - 2, specPanelW - 80, 12, hlColor);
         }
-        char optionText[40] = {};
+        char optionText[96] = {};
         std::snprintf(optionText, sizeof(optionText), "%s %s", selected ? ">" : " ", label);
         DrawTransientTextCentered(
             sv,
@@ -1640,44 +1661,44 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     if (hostNotYetPlayingPrompt)
     {
         DrawTransientTextCentered(
-            sv, "HOST NOT PLAYING", sTextL, sTextR, specPanelY + 6,
+            sv, Tr("HOST NOT PLAYING"), sTextL, sTextR, specPanelY + 6,
             netplay::debug_overlay::RtTextProfile::OverlayTitle,
             titleColor, kRtOverlayTitle);
         DrawTransientTextCentered(
-            sv, "Host is not in a match yet.", sTextL, sTextR, specPanelY + 24,
+            sv, Tr("Host is not in a match yet."), sTextL, sTextR, specPanelY + 24,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
         DrawTransientTextCentered(
-            sv, "Choose what to do:", sTextL, sTextR, specPanelY + 38,
+            sv, Tr("Choose what to do:"), sTextL, sTextR, specPanelY + 38,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
-        drawOption(0, "Join", specPanelY + 56);
-        drawOption(1, "Wait", specPanelY + 70);
-        drawOption(2, "Cancel", specPanelY + 84);
+        drawOption(0, Tr("Join"), specPanelY + 56);
+        drawOption(1, Tr("Wait"), specPanelY + 70);
+        drawOption(2, Tr("Cancel"), specPanelY + 84);
     }
     else
     {
         DrawTransientTextCentered(
-            sv, "SPECTATE?", sTextL, sTextR, specPanelY + 6,
+            sv, Tr("SPECTATE?"), sTextL, sTextR, specPanelY + 6,
             netplay::debug_overlay::RtTextProfile::OverlayTitle,
             titleColor, kRtOverlayTitle);
         DrawTransientTextCentered(
-            sv, "Host is already in a match.", sTextL, sTextR, specPanelY + 24,
+            sv, Tr("Host is already in a match."), sTextL, sTextR, specPanelY + 24,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
         DrawTransientTextCentered(
-            sv, "Join as a spectator?", sTextL, sTextR, specPanelY + 40,
+            sv, Tr("Join as a spectator?"), sTextL, sTextR, specPanelY + 40,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             textColor, kRtOverlayText);
-        drawOption(0, "Yes", specPanelY + 60);
-        drawOption(1, "No", specPanelY + 76);
+        drawOption(0, Tr("Yes"), specPanelY + 60);
+        drawOption(1, Tr("No"), specPanelY + 76);
     }
 
     if (g_spectateConfirmOverlay.errorMessage[0] != '\0')
     {
         DrawTransientTextCentered(
             sv,
-            g_spectateConfirmOverlay.errorMessage,
+            Tr(g_spectateConfirmOverlay.errorMessage),
             sTextL,
             sTextR,
             specPanelY + specPanelH - 26,
@@ -1687,7 +1708,7 @@ bool DrawSpectateConfirmOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*
     }
 
     DrawTransientTextCentered(
-        sv, "Up/Down: Select    A: Confirm    B: Cancel",
+        sv, Tr("Up/Down: Select    A: Confirm    B: Cancel"),
         sTextL, sTextR, specPanelY + specPanelH - 13,
         netplay::debug_overlay::RtTextProfile::OverlayHint,
         dimColor, kRtOverlayDim);
@@ -1752,6 +1773,7 @@ bool DrawDebugOverlay(uint32_t screenContext)
 
     netplay::font::FillIndexedSurfaceRect(sv, panelLeft, panelTop, panelW, panelH, bgColor);
     netplay::font::DrawIndexedSurfaceFrame(sv, panelLeft, panelTop, panelW, panelH, frameColor);
+    netplay::debug_overlay::SubmitRtOccluder(panelLeft, panelTop, panelW, panelH);
 
     netplay::font::DrawTextCentered5x7(sv, "DEBUG MENU", panelLeft + 2, panelRight - 2, panelTop + 4, 1, 1, titleColor);
 

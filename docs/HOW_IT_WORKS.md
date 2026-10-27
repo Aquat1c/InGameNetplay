@@ -192,11 +192,41 @@ ROOMS, LOBBY, BATTLE LOG, OPTIONS.
   Windows fonts and a bundled-Noto fallback, and a GDI path for scripts the
   main renderer cannot shape. Font files are located through
   `src/netplay/render/sprite_font_map.cpp`.
+- TrueType menu text is drawn above the paletted surface, so it does not
+  follow the palette by itself. The game's screen fades are bracketed so the
+  text dims step by step with the palette, and every menu panel registers its
+  rectangle so text underneath it is cut out rather than showing through.
+  Before an online match the fade into character select runs first, and the
+  text layer is shut down only after it.
 - A Dear ImGui layer (`src/netplay/hooks/debug_overlay.cpp`) draws the
   in-match hosting badge and a developer panel. It cooperates with
   display-changing mods through the reset contract - see
   [displaymanager-reset-contract.md](displaymanager-reset-contract.md) and
   `include/compat/overlay_reset_api.h`.
+
+### Translations
+
+The menus can be shown in Japanese: `Language` under `[Others]` in
+`EfzRevival.ini`, or OPTIONS > INTERFACE in game. Translations are compiled
+into the DLL (`src/netplay/core/i18n.cpp`, table in `i18n_ja.cpp`).
+
+- The English text is the key. Text the mod draws goes through
+  `netplay::i18n::Tr("...")` at the point where it is displayed; the
+  English original stays in logs, `EfzRevival.ini`, the shared state export
+  and anything the code compares or parses.
+- Literals in static tables that are built before a language is chosen
+  (menu labels, bridge error strings) are marked `I18N_KEY("...")` and
+  passed through `Tr()` where they are drawn.
+- A translated `printf` format must use the same conversions in the same
+  order as the English one; `tests/i18n_tests.cpp` checks every entry,
+  along with valid UTF-8 and unique keys.
+- Translated text is drawn by the TrueType layer, or by the GDI path when
+  the bitmap font is in use. The ImGui font atlas bakes exactly the
+  characters the active table uses, and the game's ASCII-only sprite font is
+  skipped while a translation is active.
+- Adding a language: add a table file next to `i18n_ja.cpp`, list it in
+  `kTables` in `i18n.cpp`, and add the name to the `Language` choices in
+  `options_menu.cpp`.
 
 ## Async hosting
 

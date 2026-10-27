@@ -2,6 +2,7 @@
 
 #include "efz_netplay_state.h"
 #include "logger.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/text_utils.h"
 #include "netplay/core/validation.h"
 #include "netplay/hooks/internal/shared.h"
@@ -167,7 +168,7 @@ DWORD WINAPI RoomWorkerThreadMain(void* rawContext)
                 }
                 catch (...)
                 {
-                    error = "Public room list request failed";
+                    error = I18N_KEY("Public room list request failed.");
                     mod::Log("PlayerRooms::RefreshWorker: unhandled exception");
                 }
                 PublishRefreshWorkerResult(
@@ -195,7 +196,7 @@ DWORD WINAPI RoomWorkerThreadMain(void* rawContext)
                 }
                 catch (...)
                 {
-                    error = "Join request failed";
+                    error = I18N_KEY("Join request failed.");
                     mod::Log("PlayerRooms::JoinWorker: unhandled exception");
                 }
                 PublishRoomActionWorkerResult(
@@ -223,7 +224,7 @@ DWORD WINAPI RoomWorkerThreadMain(void* rawContext)
                 }
                 catch (...)
                 {
-                    error = "Create room request failed";
+                    error = I18N_KEY("Create room request failed.");
                     mod::Log("PlayerRooms::CreateWorker: unhandled exception");
                 }
                 PublishRoomActionWorkerResult(
@@ -323,13 +324,13 @@ const char* GetHeaderLabel()
     switch (g_state.view)
     {
     case BrowserView::Root:
-        return "PLAYER ROOMS";
+        return I18N_KEY("PLAYER ROOMS");
     case BrowserView::Join:
-        return "JOIN ROOM";
+        return I18N_KEY("JOIN ROOM");
     case BrowserView::Create:
-        return "CREATE ROOM";
+        return I18N_KEY("CREATE ROOM");
     default:
-        return "PLAYER ROOMS";
+        return I18N_KEY("PLAYER ROOMS");
     }
 }
 
@@ -396,7 +397,7 @@ void ResetHorizontalInputState()
 
 const char* GetRoomTypeLabel()
 {
-    return g_state.createPublic ? "Public" : "Private";
+    return g_state.createPublic ? I18N_KEY("Public") : I18N_KEY("Private");
 }
 
 int GetTotalPublicRoomCount()
@@ -448,13 +449,12 @@ int GetRoomIndexForAction(NetplayMenuAction action)
 
 std::string BuildPlayerCountText(int playerCount)
 {
-    char buffer[32] = {};
+    char buffer[64] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%d %s",
-        playerCount,
-        playerCount == 1 ? "player" : "players");
+        playerCount == 1 ? i18n::Tr("%d player") : i18n::Tr("%d players"),
+        playerCount);
     return buffer;
 }
 
@@ -464,7 +464,7 @@ std::string BuildRoomCodeDisplay(bool includePlaceholder)
     {
         return g_state.roomCode;
     }
-    return includePlaceholder ? "<enter code>" : std::string();
+    return includePlaceholder ? std::string(i18n::Tr("<enter code>")) : std::string();
 }
 
 int ClampSelectionForCurrentSpec(int selection)
@@ -640,11 +640,11 @@ void PumpRefreshResult()
         {
             if (g_state.publicRooms.empty())
             {
-                SetStatusMessage("No public rooms found.");
+                SetStatusMessage(I18N_KEY("No public rooms found."));
             }
             else
             {
-                SetStatusMessage("Public room list refreshed.");
+                SetStatusMessage(I18N_KEY("Public room list refreshed."));
             }
         }
     }
@@ -656,7 +656,7 @@ void PumpRefreshResult()
         }
         if (showStatusMessage)
         {
-            SetStatusMessage(error.empty() ? "Public room list request failed." : error.c_str());
+            SetStatusMessage(error.empty() ? I18N_KEY("Public room list request failed.") : error.c_str());
         }
     }
 
@@ -676,7 +676,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
     {
         if (showStatusMessage)
         {
-            SetStatusMessage("Public room list is already refreshing.");
+            SetStatusMessage(I18N_KEY("Public room list is already refreshing."));
         }
         return false;
     }
@@ -695,7 +695,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
 
     if (showStatusMessage)
     {
-        SetStatusMessage("Refreshing public room list...");
+        SetStatusMessage(I18N_KEY("Refreshing public room list..."));
     }
 
     auto context = std::unique_ptr<RoomWorkerContext>(
@@ -711,7 +711,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
         g_refreshInFlight.store(false, std::memory_order_release);
         if (showStatusMessage)
         {
-            SetStatusMessage("Public room list request failed.");
+            SetStatusMessage(I18N_KEY("Public room list request failed."));
         }
         return false;
     }
@@ -763,7 +763,7 @@ bool PumpRoomActionResult(uint32_t screenContext)
     if (!ok)
     {
         SetStatusMessage(error.empty()
-            ? (kind == AsyncRoomActionKind::Create ? "Create room failed." : "Join room failed.")
+            ? (kind == AsyncRoomActionKind::Create ? I18N_KEY("Create room failed.") : I18N_KEY("Join room failed."))
             : error.c_str());
         return true;
     }
@@ -783,7 +783,7 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
     PumpRefreshResult();
     if (IsRoomActionInFlight())
     {
-        SetStatusMessage("Room request is already in progress.");
+        SetStatusMessage(I18N_KEY("Room request is already in progress."));
         return false;
     }
 
@@ -798,7 +798,7 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
         g_roomActionResultError.clear();
     }
     g_roomActionInFlight.store(true, std::memory_order_release);
-    SetStatusMessage("Joining room...");
+    SetStatusMessage(I18N_KEY("Joining room..."));
 
     const std::string nickname = hooks::g_netplayMenuState.nickname;
     const uint16_t hostPort = hooks::g_netplayMenuState.hostPort;
@@ -815,7 +815,7 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
     if (!LaunchRoomWorker(std::move(context), "Join"))
     {
         g_roomActionInFlight.store(false, std::memory_order_release);
-        SetStatusMessage("Join request failed.");
+        SetStatusMessage(I18N_KEY("Join request failed."));
         return false;
     }
 
@@ -827,7 +827,7 @@ bool StartAsyncCreateRoom()
     PumpRefreshResult();
     if (IsRoomActionInFlight())
     {
-        SetStatusMessage("Room request is already in progress.");
+        SetStatusMessage(I18N_KEY("Room request is already in progress."));
         return false;
     }
 
@@ -842,7 +842,7 @@ bool StartAsyncCreateRoom()
         g_roomActionResultError.clear();
     }
     g_roomActionInFlight.store(true, std::memory_order_release);
-    SetStatusMessage("Creating room...");
+    SetStatusMessage(I18N_KEY("Creating room..."));
 
     const std::string nickname = hooks::g_netplayMenuState.nickname;
     const std::string roomType = GetRoomTypeLabel();
@@ -860,7 +860,7 @@ bool StartAsyncCreateRoom()
     if (!LaunchRoomWorker(std::move(context), "Create"))
     {
         g_roomActionInFlight.store(false, std::memory_order_release);
-        SetStatusMessage("Create room request failed.");
+        SetStatusMessage(I18N_KEY("Create room request failed."));
         return false;
     }
 
@@ -914,7 +914,7 @@ bool EnterMenu()
     }
     if (g_lobbySessionShutdownInFlight)
     {
-        SetStatusMessage("Leaving room...");
+        SetStatusMessage(I18N_KEY("Leaving room..."));
         g_refreshAfterLobbySessionShutdown = true;
     }
     else
@@ -946,7 +946,7 @@ void NotifyLobbySessionShutdownStarted()
     InvalidateRefreshResults();
     if (!HasStatusMessage())
     {
-        SetStatusMessage("Leaving room...");
+        SetStatusMessage(I18N_KEY("Leaving room..."));
     }
 }
 
@@ -974,21 +974,21 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
     switch (action)
     {
     case NetplayMenuAction::PlayerRoomsOpenJoin:
-        return "Join Room";
+        return i18n::Tr("Join Room");
     case NetplayMenuAction::PlayerRoomsOpenCreate:
-        return "Create Room";
+        return i18n::Tr("Create Room");
     case NetplayMenuAction::PlayerRoomsRefresh:
-        return "Refresh Rooms";
+        return i18n::Tr("Refresh Rooms");
     case NetplayMenuAction::PlayerRoomsJoin:
-        return "Join Room";
+        return i18n::Tr("Join Room");
     case NetplayMenuAction::PlayerRoomsEditCode:
-        return "Room Code";
+        return i18n::Tr("Room Code");
     case NetplayMenuAction::PlayerRoomsCreate:
-        return "Create Room";
+        return i18n::Tr("Create Room");
     case NetplayMenuAction::PlayerRoomsRoomType:
-        return "Room Type";
+        return i18n::Tr("Room Type");
     case NetplayMenuAction::BackToMain:
-        return "Back";
+        return i18n::Tr("Back");
     case NetplayMenuAction::PlayerRoomsSlot0:
     case NetplayMenuAction::PlayerRoomsSlot1:
     case NetplayMenuAction::PlayerRoomsSlot2:
@@ -996,9 +996,9 @@ std::string BuildRowPrimaryText(NetplayMenuAction action)
         const int roomIndex = GetRoomIndexForAction(action);
         if (roomIndex < 0 || roomIndex >= static_cast<int>(g_state.publicRooms.size()))
         {
-            return "No Public Rooms";
+            return i18n::Tr("No Public Rooms");
         }
-        return "ID " + g_state.publicRooms[static_cast<size_t>(roomIndex)].roomCode;
+        return i18n::Tr("ID ") + g_state.publicRooms[static_cast<size_t>(roomIndex)].roomCode;
     }
     default:
         return {};
@@ -1013,11 +1013,17 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
     case NetplayMenuAction::PlayerRoomsOpenJoin:
         if (!g_state.publicRooms.empty())
         {
-            return std::to_string(static_cast<int>(g_state.publicRooms.size())) + " listed";
+            char buffer[64] = {};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                i18n::Tr("%d listed"),
+                static_cast<int>(g_state.publicRooms.size()));
+            return buffer;
         }
         return {};
     case NetplayMenuAction::PlayerRoomsOpenCreate:
-        return GetRoomTypeLabel();
+        return i18n::Tr(GetRoomTypeLabel());
     case NetplayMenuAction::PlayerRoomsEditCode:
         if (hooks::g_inlineEditState.active
             && hooks::g_inlineEditState.action == NetplayMenuAction::PlayerRoomsEditCode)
@@ -1029,13 +1035,13 @@ std::string BuildRowSecondaryText(NetplayMenuAction action)
             }
             if (value.empty())
             {
-                return "<enter code>";
+                return i18n::Tr("<enter code>");
             }
             return value;
         }
         return BuildRoomCodeDisplay(true);
     case NetplayMenuAction::PlayerRoomsRoomType:
-        return GetRoomTypeLabel();
+        return i18n::Tr(GetRoomTypeLabel());
     case NetplayMenuAction::PlayerRoomsSlot0:
     case NetplayMenuAction::PlayerRoomsSlot1:
     case NetplayMenuAction::PlayerRoomsSlot2:
@@ -1068,38 +1074,42 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
     PumpRefreshResult();
     if (IsRoomActionInFlight())
     {
-        return g_state.statusMessage.empty() ? "Processing room request..." : g_state.statusMessage;
+        if (g_state.statusMessage.empty())
+        {
+            return i18n::Tr("Processing room request...");
+        }
+        return i18n::Tr(g_state.statusMessage);
     }
     if (HasStatusMessage())
     {
-        return g_state.statusMessage;
+        return i18n::Tr(g_state.statusMessage);
     }
 
     if (IsRefreshInFlight())
     {
         if (g_state.publicRooms.empty())
         {
-            return "Loading public room list...";
+            return i18n::Tr("Loading public room list...");
         }
-        return "Refreshing public room list...";
+        return i18n::Tr("Refreshing public room list...");
     }
 
     switch (selectedAction)
     {
     case NetplayMenuAction::PlayerRoomsOpenJoin:
-        return "Browse public rooms or join by room code.";
+        return i18n::Tr("Browse public rooms or join by room code.");
     case NetplayMenuAction::PlayerRoomsOpenCreate:
-        return "Open room creation settings.";
+        return i18n::Tr("Open room creation settings.");
     case NetplayMenuAction::PlayerRoomsRefresh:
-        return "Refresh the public room list.";
+        return i18n::Tr("Refresh the public room list.");
     case NetplayMenuAction::PlayerRoomsJoin:
-        return "Join the room code shown below.";
+        return i18n::Tr("Join the room code shown below.");
     case NetplayMenuAction::PlayerRoomsEditCode:
-        return "Set the room code or alias to join.\nEnter=Edit";
+        return i18n::Tr("Set the room code or alias to join.\nEnter=Edit");
     case NetplayMenuAction::PlayerRoomsCreate:
-        return "Create a new room with the selected visibility.";
+        return i18n::Tr("Create a new room with the selected visibility.");
     case NetplayMenuAction::PlayerRoomsRoomType:
-        return "Choose whether new rooms are Private or Public.\nLeft/Right=Toggle";
+        return i18n::Tr("Choose whether new rooms are Private or Public.\nLeft/Right=Toggle");
     case NetplayMenuAction::PlayerRoomsSlot0:
     case NetplayMenuAction::PlayerRoomsSlot1:
     case NetplayMenuAction::PlayerRoomsSlot2:
@@ -1107,23 +1117,23 @@ std::string BuildFooterText(NetplayMenuAction selectedAction)
         const int roomIndex = GetRoomIndexForAction(selectedAction);
         if (roomIndex < 0 || roomIndex >= static_cast<int>(g_state.publicRooms.size()))
         {
-            return "No public rooms are currently listed.";
+            return i18n::Tr("No public rooms are currently listed.");
         }
 
         const bool canScrollLeft = g_state.listScrollOffset > 0;
         const bool canScrollRight = g_state.listScrollOffset < GetMaxListScroll();
         if (canScrollLeft || canScrollRight)
         {
-            return "Join the highlighted public room.\nLeft/Right=Scroll room list";
+            return i18n::Tr("Join the highlighted public room.\nLeft/Right=Scroll room list");
         }
-        return "Join the highlighted public room.";
+        return i18n::Tr("Join the highlighted public room.");
     }
     case NetplayMenuAction::BackToMain:
         if (g_state.view == BrowserView::Root)
         {
-            return "Return to the netplay main menu.";
+            return i18n::Tr("Return to the netplay main menu.");
         }
-        return "Return to the Player Rooms menu.";
+        return i18n::Tr("Return to the Player Rooms menu.");
     default:
         return {};
     }
@@ -1227,7 +1237,7 @@ bool HandleCancel(uint32_t screenContext)
     }
     if (IsRoomActionInFlight())
     {
-        SetStatusMessage("Wait for the room request to finish.");
+        SetStatusMessage(I18N_KEY("Wait for the room request to finish."));
         return true;
     }
     if (g_state.view == BrowserView::Root)
@@ -1249,7 +1259,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
     if (IsRoomActionInFlight())
     {
-        SetStatusMessage("Room request is already in progress.");
+        SetStatusMessage(I18N_KEY("Room request is already in progress."));
         return true;
     }
 
@@ -1266,7 +1276,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         || action == NetplayMenuAction::PlayerRoomsSlot2;
     if (g_lobbySessionShutdownInFlight && requiresStableRoomState)
     {
-        SetStatusMessage("Leaving room...");
+        SetStatusMessage(I18N_KEY("Leaving room..."));
         return true;
     }
 
@@ -1284,7 +1294,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
     case NetplayMenuAction::PlayerRoomsJoin:
         if (!netplay::validation::IsValidLobbyRoomCode(g_state.roomCode))
         {
-            SetStatusMessage("Enter a valid room code first.");
+            SetStatusMessage(I18N_KEY("Enter a valid room code first."));
             return true;
         }
         return StartAsyncJoinRoom(g_state.roomCode);
@@ -1303,7 +1313,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         const int roomIndex = GetRoomIndexForAction(action);
         if (roomIndex < 0 || roomIndex >= static_cast<int>(g_state.publicRooms.size()))
         {
-            SetStatusMessage("No public room is available in this slot.");
+            SetStatusMessage(I18N_KEY("No public room is available in this slot."));
             return true;
         }
         return StartAsyncJoinRoom(g_state.publicRooms[static_cast<size_t>(roomIndex)].roomCode);

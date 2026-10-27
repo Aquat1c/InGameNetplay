@@ -4,6 +4,7 @@
 
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/hooks/menu_query.h"
 #include "netplay_resource_ids.h"
@@ -17,6 +18,7 @@
 #include <windows.h>
 #include <d3d9.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
@@ -202,6 +204,10 @@ bool g_rtTextLockInited = false;
 std::vector<RtTextItem> g_rtTextStaging;
 std::vector<RtTextItem> g_rtTextActive;
 volatile LONG g_rtTextPublished = 0;
+// Game thread only. 0 = no fade, 1 = fade-out, 2 = fade-in.
+int g_rtFadeMode = 0;
+int g_rtFadeFrame = 0;
+float g_rtTextActiveBrightness = 1.0f;   // under g_rtTextLock
 
 void EnsureRtTextLock()
 {
@@ -532,6 +538,20 @@ void LoadRtFonts()
     const ImWchar* baseRanges = io.Fonts->GetGlyphRangesCyrillic();
     bool jpMergedAnywhere = false;
 
+    // Exactly the characters the active translation uses, merged into every
+    // size (headers and badges included). Must outlive the atlas build.
+    static ImVector<ImWchar> s_translationRanges;
+    s_translationRanges.clear();
+    {
+        ImFontGlyphRangesBuilder builder;
+        for (const char* text : netplay::i18n::ActiveValues())
+        {
+            builder.AddText(text);
+        }
+        builder.BuildRanges(&s_translationRanges);
+    }
+    const bool haveTranslationRanges = s_translationRanges.Size > 1;
+
     auto mergeRanges = [&](float px, const ImWchar* ranges, const char* filePath, bool fromMemory) -> bool {
         ImFontConfig mergeConfig;
         mergeConfig.MergeMode = true;
@@ -571,6 +591,12 @@ void LoadRtFonts()
         if (!jpCapablePrimary && (jpPath != nullptr || jpFromMemory))
         {
             (void)mergeRanges(px, baseRanges, jpPath, jpFromMemory);
+        }
+        if (haveTranslationRanges)
+        {
+            jpMergedAnywhere |= jpCapablePrimary
+                ? mergeRanges(px, s_translationRanges.Data, path, primaryFromMemory)
+                : mergeRanges(px, s_translationRanges.Data, jpPath, jpFromMemory);
         }
         if (wantJapanese)
         {
@@ -888,6 +914,10 @@ bool EnsureInited(IDirect3DDevice9* device)
     ImGui::StyleColorsDark();
 
     LoadRtFonts();
+    // Text sites wait for ImFont::IsLoaded(), which only turns true once the
+    // atlas is built; the DX9 backend would build it lazily on the first
+    // NewFrame, which runs only after some text was submitted.
+    ImGui::GetIO().Fonts->Build();
 
     if (!ImGui_ImplWin32_Init(hwnd))
     {
@@ -926,21 +956,21 @@ void DrawAsyncIndicator()
         return;
     }
 
-    char msg[160] = {};
+    char msg[256] = {};
     ImU32 textColor = IM_COL32(255, 255, 255, 255);
     if (ah::IsTimedOut())
     {
-        std::snprintf(msg, sizeof(msg), "Opponent timed out - %s to return", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), netplay::i18n::Tr("Opponent timed out - %s to return"), ah::ReturnKeyDisplay());
         textColor = IM_COL32(255, 210, 210, 255);
     }
     else if (ah::IsPeerFoundHeld())
     {
-        std::snprintf(msg, sizeof(msg), "OPPONENT FOUND!  Press %s to start", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), netplay::i18n::Tr("OPPONENT FOUND!  Press %s to start"), ah::ReturnKeyDisplay());
         textColor = IM_COL32(120, 255, 140, 255);
     }
     else
     {
-        std::snprintf(msg, sizeof(msg), "Hosting...  Press %s to return to HOST menu", ah::ReturnKeyDisplay());
+        std::snprintf(msg, sizeof(msg), netplay::i18n::Tr("Hosting...  Press %s to return to HOST menu"), ah::ReturnKeyDisplay());
     }
 
     const ImGuiIO& io = ImGui::GetIO();
@@ -969,8 +999,19 @@ void DrawRtTextItems()
     EnsureRtTextLock();
     EnterCriticalSection(&g_rtTextLock);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    for (const RtTextItem& item : g_rtTextActive)
+    const float brightness = g_rtTextActiveBrightness;
+    if (brightness <= 0.0f)
     {
+        LeaveCriticalSection(&g_rtTextLock);
+        return;
+    }
+    for (size_t index = 0; index < g_rtTextActive.size(); ++index)
+    {
+        const RtTextItem& item = g_rtTextActive[index];
+        if (item.occluder)
+        {
+            continue;
+        }
         ImFont* font = RtFontFor(item.profile);
         if (font == nullptr || !font->IsLoaded())
         {
@@ -1004,17 +1045,72 @@ void DrawRtTextItems()
             + (style.cellRtPx - textSize.y) * 0.5f
             + style.yBiasRtPx
             + offsetY;
-        const bool clip = item.clipX1 > item.clipX0;
-        if (clip)
+        // Visible pieces of the text box: the item clip minus every occluder
+        // submitted after it. Each cut leaves at most 4 pieces.
+        ImVec4 pieces[16];
+        size_t pieceCount = 1;
+        pieces[0] = ImVec4(x - 4.0f, y - 4.0f, x + textSize.x + 4.0f, y + textSize.y + 4.0f);
+        if (item.clipX1 > item.clipX0)
         {
-            dl->PushClipRect(
-                ImVec2(static_cast<float>(item.clipX0) * 2.0f, 0.0f),
-                ImVec2(static_cast<float>(item.clipX1) * 2.0f, static_cast<float>(kGameRtH)),
-                true);
+            pieces[0].x = (std::max)(pieces[0].x, static_cast<float>(item.clipX0) * 2.0f);
+            pieces[0].z = (std::min)(pieces[0].z, static_cast<float>(item.clipX1) * 2.0f);
         }
-        dl->AddText(font, fontPx, ImVec2(x, y), item.rgba, item.text);
-        if (clip)
+        for (size_t j = index + 1; j < g_rtTextActive.size() && pieceCount > 0; ++j)
         {
+            const RtTextItem& cut = g_rtTextActive[j];
+            if (!cut.occluder)
+            {
+                continue;
+            }
+            const ImVec4 c(
+                static_cast<float>(cut.x0) * 2.0f, static_cast<float>(cut.y) * 2.0f,
+                static_cast<float>(cut.x1) * 2.0f, static_cast<float>(cut.y1) * 2.0f);
+            ImVec4 next[16];
+            size_t nextCount = 0;
+            for (size_t p = 0; p < pieceCount; ++p)
+            {
+                const ImVec4 r = pieces[p];
+                if (r.x >= c.z || r.z <= c.x || r.y >= c.w || r.w <= c.y)
+                {
+                    if (nextCount < 16) next[nextCount++] = r;
+                    continue;
+                }
+                const float midTop = (std::max)(r.y, c.y);
+                const float midBottom = (std::min)(r.w, c.w);
+                const ImVec4 parts[4] = {
+                    ImVec4(r.x, r.y, r.z, c.y),
+                    ImVec4(r.x, c.w, r.z, r.w),
+                    ImVec4(r.x, midTop, c.x, midBottom),
+                    ImVec4(c.z, midTop, r.z, midBottom),
+                };
+                for (const ImVec4& part : parts)
+                {
+                    if (part.z > part.x && part.w > part.y && nextCount < 16)
+                    {
+                        next[nextCount++] = part;
+                    }
+                }
+            }
+            std::memcpy(pieces, next, sizeof(ImVec4) * nextCount);
+            pieceCount = nextCount;
+        }
+
+        ImU32 color = item.rgba;
+        if (brightness < 1.0f)
+        {
+            const auto scale = [brightness](ImU32 channel) {
+                return static_cast<ImU32>(static_cast<float>(channel & 0xFFu) * brightness + 0.5f);
+            };
+            color = (item.rgba & 0xFF000000u)
+                | (scale(item.rgba >> 16) << 16)
+                | (scale(item.rgba >> 8) << 8)
+                | scale(item.rgba);
+        }
+        for (size_t p = 0; p < pieceCount; ++p)
+        {
+            const ImVec4& r = pieces[p];
+            dl->PushClipRect(ImVec2(r.x, r.y), ImVec2(r.z, r.w), true);
+            dl->AddText(font, fontPx, ImVec2(x, y), color, item.text);
             dl->PopClipRect();
         }
     }
@@ -1249,7 +1345,13 @@ void Render(IDirect3DDevice9* device)
     const bool wantRtText =
         InterlockedCompareExchange(&g_rtTextPublished, 0, 0) != 0;
 
-    const bool needsInitialization = debugAvailable && !g_inited;
+    // Menu TTF text needs ImGui before anything is submitted: text sites check
+    // IsRtTextAvailable() (non-ASCII footer lines wait for extended glyphs), so
+    // waiting for a first submission left the first menu visit on the bitmap font.
+    const bool menuWantsRtText = netplay::mod_settings::IsMenuTtfTextEnabled()
+        && netplay::hooks::IsNetplayMenuActive()
+        && !netplay::hooks::IsOnlineSimulationUiSuspended();
+    const bool needsInitialization = (debugAvailable || menuWantsRtText) && !g_inited;
     if (!needsInitialization && !wantPanel && !wantIndicator && !wantRtText)
     {
         return;
@@ -1300,7 +1402,7 @@ void Render(IDirect3DDevice9* device)
     }
 #endif
 
-    if (!debugAvailable && !wantIndicator && !wantRtText && !g_inited)
+    if (!needsInitialization && !wantIndicator && !wantRtText && !g_inited)
     {
         return;
     }
@@ -1318,6 +1420,7 @@ void Render(IDirect3DDevice9* device)
     {
         ImGui_ImplDX9_InvalidateDeviceObjects();
         LoadRtFonts();
+        ImGui::GetIO().Fonts->Build();
     }
 
     ImGui_ImplDX9_NewFrame();
@@ -1423,6 +1526,21 @@ void BeginRtTextFrame()
     LeaveCriticalSection(&g_rtTextLock);
 }
 
+void SetRtText(RtTextItem& item, const char* text, size_t length)
+{
+    size_t bytes = (std::min)(length, sizeof(item.text) - 1);
+    if (bytes < length)
+    {
+        while (bytes > 0
+            && (static_cast<unsigned char>(text[bytes]) & 0xC0u) == 0x80u)
+        {
+            --bytes;   // text[bytes] continues a character: cut before it
+        }
+    }
+    std::memcpy(item.text, text, bytes);
+    item.text[bytes] = '\0';
+}
+
 void SubmitRtText(const RtTextItem& item)
 {
     if (item.text[0] == '\0')
@@ -1438,12 +1556,59 @@ void SubmitRtText(const RtTextItem& item)
     LeaveCriticalSection(&g_rtTextLock);
 }
 
+void SubmitRtOccluder(int x, int y, int w, int h)
+{
+    if (!netplay::mod_settings::IsMenuTtfTextEnabled())
+    {
+        return;   // no RT frame is open to receive it
+    }
+    RtTextItem occluder;
+    occluder.occluder = true;
+    occluder.x0 = static_cast<int16_t>(x);
+    occluder.x1 = static_cast<int16_t>(x + w);
+    occluder.y = static_cast<int16_t>(y);
+    occluder.y1 = static_cast<int16_t>(y + h);
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    if (g_rtTextStaging.size() < 256)
+    {
+        g_rtTextStaging.push_back(occluder);
+    }
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
+void BeginRtTextFade(bool fadeIn)
+{
+    g_rtFadeMode = fadeIn ? 2 : 1;
+    g_rtFadeFrame = 0;
+}
+
+void EndRtTextFade()
+{
+    const bool fadedOut = g_rtFadeMode == 1;
+    g_rtFadeMode = 0;
+    EnsureRtTextLock();
+    EnterCriticalSection(&g_rtTextLock);
+    g_rtTextActiveBrightness = fadedOut ? 0.0f : 1.0f;
+    LeaveCriticalSection(&g_rtTextLock);
+}
+
 void CommitRtTextFrame()
 {
+    // Render step n of a fade is presented under the palette set by step n-1
+    // (efz fade loop: render, then set the palette at 5% per step).
+    float brightness = 1.0f;
+    if (g_rtFadeMode != 0)
+    {
+        const int n = g_rtFadeFrame++;
+        const float level = n == 0 ? 0.0f : (std::min)(static_cast<float>(n - 1) / 20.0f, 1.0f);
+        brightness = g_rtFadeMode == 1 ? (n == 0 ? 1.0f : 1.0f - level) : level;
+    }
     EnsureRtTextLock();
     EnterCriticalSection(&g_rtTextLock);
     g_rtTextActive.swap(g_rtTextStaging);
     g_rtTextStaging.clear();
+    g_rtTextActiveBrightness = brightness;
     const LONG published = g_rtTextActive.empty() ? 0 : 1;
     LeaveCriticalSection(&g_rtTextLock);
     InterlockedExchange(&g_rtTextPublished, published);

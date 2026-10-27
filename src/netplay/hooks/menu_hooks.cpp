@@ -5,6 +5,7 @@
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 
 #include "crash_handler.h"
@@ -776,6 +777,11 @@ bool IsNetplayMenuActive()
 {
     return internal::g_netplayMenuState.active;
 }
+
+bool IsOnlineSimulationUiSuspended()
+{
+    return internal::g_onlineSimulationUiSuspended.load(std::memory_order_acquire);
+}
 } // namespace netplay::hooks
 
 namespace netplay
@@ -798,7 +804,7 @@ void ShowInProgressMessage(HWND owner)
     (void)owner;
     if (hooks::internal::g_netplayMenuState.active)
     {
-        hooks::internal::SetNetplayStatusMessage("In progress.");
+        hooks::internal::SetNetplayStatusMessage(netplay::i18n::Tr("In progress."));
         return;
     }
 

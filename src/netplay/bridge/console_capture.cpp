@@ -1,4 +1,5 @@
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
 
 #include <algorithm>
@@ -676,7 +677,7 @@ void NoteConsolePromptLine(
             text.c_str());
         if (classified && isActivePeer)
         {
-            PublishConsoleError("Source quit or timed out");
+            PublishConsoleError(I18N_KEY("Source quit or timed out"));
         }
         return;
     }
@@ -715,19 +716,19 @@ void NoteConsolePromptLine(
         const char* friendly;
     };
     static const ConsoleErrorMapping kConsoleErrorMap[] = {
-        {"header crc mismatch", "Desync detected by Revival (header CRC mismatch)."},
-        {"state not recoverable", "Desync detected by Revival (state not recoverable)."},
-        {"Connection timed out", "Connection timed out."},
-        {"Source quit or timed out", "Opponent quit or timed out."},
-        {"Host timed out", "Host timed out - no one connected."},
-        {"Remote timed out", "Opponent timed out."},
-        {"Invalid address", "Invalid address - check the IP and port."},
-        {"Only one net instance allowed", "A netplay session is already running."},
-        {"Remote is using a deprecated version", "Opponent is on an outdated Revival version."},
-        {"New version available", "A new Revival version is available - please update."},
-        {"Invalid delay", "Invalid delay value."},
-        {"Already playing, spectators have been disabled", "Host is already playing; spectators are disabled."},
-        {"Spectators have been disabled", "Spectators have been disabled by the host."},
+        {"header crc mismatch", I18N_KEY("Desync detected by Revival (header CRC mismatch).")},
+        {"state not recoverable", I18N_KEY("Desync detected by Revival (state not recoverable).")},
+        {"Connection timed out", I18N_KEY("Connection timed out.")},
+        {"Source quit or timed out", I18N_KEY("Opponent quit or timed out.")},
+        {"Host timed out", I18N_KEY("Host timed out - no one connected.")},
+        {"Remote timed out", I18N_KEY("Opponent timed out.")},
+        {"Invalid address", I18N_KEY("Invalid address - check the IP and port.")},
+        {"Only one net instance allowed", I18N_KEY("A netplay session is already running.")},
+        {"Remote is using a deprecated version", I18N_KEY("Opponent is on an outdated Revival version.")},
+        {"New version available", I18N_KEY("A new Revival version is available - please update.")},
+        {"Invalid delay", I18N_KEY("Invalid delay value.")},
+        {"Already playing, spectators have been disabled", I18N_KEY("Host is already playing; spectators are disabled.")},
+        {"Spectators have been disabled", I18N_KEY("Spectators have been disabled by the host.")},
     };
     for (const ConsoleErrorMapping& mapping : kConsoleErrorMap)
     {

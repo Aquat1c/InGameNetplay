@@ -7,6 +7,7 @@
 #include "netplay/bridge/session_bridge.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
+#include "netplay/core/i18n.h"
 #include "netplay/core/input_utils.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/core/network_capability.h"
@@ -39,6 +40,7 @@
 namespace netplay::hooks::internal
 {
 using namespace netplay::constants;
+using netplay::i18n::Tr;
 using NetplayMenuId = netplay::menu::NetplayMenuId;
 using NetplayMenuAction = netplay::menu::NetplayMenuAction;
 using NetplayMenuEntry = netplay::menu::NetplayMenuEntry;
@@ -68,6 +70,7 @@ constexpr int kVsHumanHandoffRetryStride = 8;
 constexpr int kVsHumanHandoffMaxBlockedFrames = 60;
 constexpr uint32_t kVsHumanHandoffBlockedCooldownMs = 750;
 constexpr uint32_t kOnlineSimSuspendFailFastMs = 250;
+constexpr uint32_t kOnlineSimHandoffRefadeMs = 10000;
 inline uint32_t TimerArmTickNonZero()
 {
     const uint32_t now = static_cast<uint32_t>(GetTickCount());
@@ -130,6 +133,7 @@ uint32_t g_spectateHandoffWarmupStartTick = 0;
 int g_spectateHandoffBlockedFrames = 0;
 uint32_t g_spectateHandoffBlockedCooldownStartTick = 0;
 uint32_t g_onlineSimSuspendFailFastStartTick = 0;
+uint32_t g_onlineSimHandoffFadeTick = 0;
 bool g_vsHumanHandoffWarmupActive = false;
 int g_vsHumanHandoffWarmupFrames = 0;
 uint32_t g_vsHumanHandoffWarmupStartTick = 0;
@@ -2721,7 +2725,7 @@ static void ShowHostStartupFailure(
     const std::string error =
         errorText != nullptr && errorText[0] != '\0'
             ? errorText
-            : "Unknown Host startup error.";
+            : I18N_KEY("Unknown Host startup error.");
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     g_hostingOverlay.active = true;
@@ -2898,7 +2902,7 @@ static void PumpDirectHostDiscovery()
                 task->targetName.c_str(),
                 task->targetPlayerId);
             ShowHostStartupFailure(
-                "That player is no longer available.",
+                I18N_KEY("That player is no longer available."),
                 HostFailureNeedsBridgeCancel());
             return;
         }
@@ -2911,7 +2915,7 @@ static void PumpDirectHostDiscovery()
                 task->targetName.c_str(),
                 task->targetPlayerId);
             ShowHostStartupFailure(
-                "A public address could not be detected for the available connection type.",
+                I18N_KEY("A public address could not be detected for the available connection type."),
                 HostFailureNeedsBridgeCancel());
             return;
         }
@@ -2970,7 +2974,7 @@ static void PumpDirectHostDiscovery()
         ShowHostStartupFailure(
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
-                : "Could not start the Revival netplay session.",
+                : I18N_KEY("Could not start the Revival netplay session."),
             true);
         return;
     }
@@ -3077,7 +3081,7 @@ static bool BeginAutomaticHostFamilyRetry(
         netplay::bridge::CancelSession(
             "host_family_retry_target_gone");
         ShowHostStartupFailure(
-            "That player is no longer available.",
+            I18N_KEY("That player is no longer available."),
             true);
         return true;
     }
@@ -3259,7 +3263,7 @@ static void PumpHostListenerObservation()
         netplay::bridge::CancelSession(
             "lobby_host_listener_ack_timeout");
         ShowHostStartupFailure(
-            "Hosting did not start in time. Please try again.",
+            I18N_KEY("Hosting did not start in time. Please try again."),
             false);
         return;
     }
@@ -3339,7 +3343,7 @@ static void PumpHostListenerObservation()
         netplay::bridge::CancelSession(
             "host_listener_family_or_port_mismatch");
         ShowHostStartupFailure(
-            "Hosting started on an unexpected port. Please try again.",
+            I18N_KEY("Hosting started on an unexpected port. Please try again."),
             true);
         return;
     }
@@ -3378,7 +3382,7 @@ static void PumpHostListenerObservation()
         netplay::bridge::CancelSession(
             "host_listener_family_mismatch_after_retry");
         ShowHostStartupFailure(
-            "Hosting could not start with either connection type.",
+            I18N_KEY("Hosting could not start with either connection type."),
             true);
         return;
     }
@@ -3401,7 +3405,7 @@ static void PumpHostListenerObservation()
             netplay::bridge::CancelSession(
                 "lobby_target_gone_before_endpoint_publish");
             ShowHostStartupFailure(
-                "That player is no longer available.",
+                I18N_KEY("That player is no longer available."),
                 true);
             return;
         }
@@ -3427,7 +3431,7 @@ static void PumpHostListenerObservation()
             netplay::bridge::CancelSession(
                 "invalid_lobby_endpoint_after_listener_ack");
             ShowHostStartupFailure(
-                "The public address could not be prepared for this connection.",
+                I18N_KEY("The public address could not be prepared for this connection."),
                 true);
             return;
         }
@@ -3703,7 +3707,7 @@ bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string*
     {
         if (outErrorMessage != nullptr)
         {
-            *outErrorMessage = "Set the join address and port first.";
+            *outErrorMessage = I18N_KEY("Set the join address and port first.");
         }
         mod::Log("WaitToSpectate: missing join address/port");
         return false;
@@ -3735,7 +3739,7 @@ bool TryStartWaitToSpectateFromJoinSettings(uint32_t screenContext, std::string*
         *outErrorMessage =
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
-                : "Unknown error";
+                : I18N_KEY("Unknown error");
     }
     mod::Log(
         "WaitToSpectate: StartSession failed -> %s",
@@ -3759,7 +3763,7 @@ bool TryStartWaitToSpectateAtAddress(
     {
         if (outErrorMessage != nullptr)
         {
-            *outErrorMessage = "No active match host information is available for spectating yet.";
+            *outErrorMessage = I18N_KEY("No active match host information is available for spectating yet.");
         }
         mod::Log("WaitToSpectate: missing address/port");
         return false;
@@ -3791,7 +3795,7 @@ bool TryStartWaitToSpectateAtAddress(
         *outErrorMessage =
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
-                : "Unknown error";
+                : I18N_KEY("Unknown error");
     }
     mod::Log(
         "WaitToSpectate: StartSession failed -> %s",
@@ -3897,12 +3901,12 @@ bool RestartPendingSpectateSessionAsJoin(uint32_t screenContext)
     }
 
     const auto status = netplay::bridge::GetStatus();
-    char text[256] = {};
+    char text[512] = {};
     std::snprintf(
         text,
         sizeof(text),
-        "Join start failed.\n\n%s",
-        status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+        Tr("Join start failed.\n\n%s"),
+        Tr(status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error"));
     SetNetplayStatusMessage(text);
     mod::Log(
         "SpectateConfirmOverlay: restarting pending spectate as Join failed endpoint=%s family=%s error='%s'",
@@ -4026,7 +4030,7 @@ bool HandleSpectateConfirmOverlayInput(
                     std::snprintf(
                         g_spectateConfirmOverlay.errorMessage,
                         sizeof(g_spectateConfirmOverlay.errorMessage),
-                        "Failed to send answer");
+                        I18N_KEY("Failed to send answer"));
                 }
                 mod::Log("SpectateConfirmOverlay: answer failed choice=%d promptKind=%d", choice, g_spectateConfirmOverlay.promptKind);
                 return true;
@@ -4064,7 +4068,7 @@ bool HandleSpectateConfirmOverlayInput(
                 std::snprintf(
                     g_spectateConfirmOverlay.errorMessage,
                     sizeof(g_spectateConfirmOverlay.errorMessage),
-                    "Failed to send answer");
+                    I18N_KEY("Failed to send answer"));
             }
             mod::Log("SpectateConfirmOverlay: answer failed choice=%d", choice);
             return true;
@@ -4394,7 +4398,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
                 std::snprintf(
                     g_delaySetupOverlay.errorMessage,
                     sizeof(g_delaySetupOverlay.errorMessage),
-                    "Delay apply failed: %s",
+                    "%s",
                     status.errorMsg);
             }
             else
@@ -4402,7 +4406,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
                 std::snprintf(
                     g_delaySetupOverlay.errorMessage,
                     sizeof(g_delaySetupOverlay.errorMessage),
-                    "Delay apply failed");
+                    I18N_KEY("Delay apply failed"));
             }
             mod::Log("DelayOverlay: confirm failed selected=%d", selectedDelay);
             return true;
@@ -4603,7 +4607,8 @@ bool ShutdownLobbySessionForProcessExit(bool emergency, const char* reason)
 
 static bool SuspendUiHooksForOnlineSimulation(
     uint32_t screenContext,
-    const char* reason)
+    const char* reason,
+    bool fadeOut)
 {
     if (g_onlineSimSuspendFailFastStartTick != 0
         && (reason == nullptr
@@ -4629,12 +4634,29 @@ static bool SuspendUiHooksForOnlineSimulation(
         return false;
     }
 
+    const bool frontendOk =
+        netplay::bridge::frontend_return::SuspendUpdateHooksForOnlineSimulation();
+
+    // The fade-out runs before the ImGui/EndScene teardown so menu RT text
+    // dims with the palette. Safe: the fade loop pumps no messages and the
+    // simulation has not started. A teardown failure after it restores the
+    // palette, and retries inside kOnlineSimHandoffRefadeMs skip the fade so
+    // a failing handoff cannot block the game thread on every attempt.
+    bool fadedNow = false;
+    if (fadeOut && frontendOk
+        && (g_onlineSimHandoffFadeTick == 0
+            || GetTickCount() - g_onlineSimHandoffFadeTick
+                >= kOnlineSimHandoffRefadeMs))
+    {
+        RunTransitionFadeOut(screenContext, 0, 0);
+        g_onlineSimHandoffFadeTick = TimerArmTickNonZero();
+        fadedNow = true;
+    }
+
     const bool windowRemoved = RemoveNetplayWindowHook();
     const bool imguiOk =
         netplay::debug_overlay::SuspendForOnlineSimulation();
     const bool renderOk = netplay::battle_log::ShutdownRenderOverlay();
-    const bool frontendOk =
-        netplay::bridge::frontend_return::SuspendUpdateHooksForOnlineSimulation();
     bool windowOk = windowRemoved;
 #if !defined(EFZ_NATIVE_TICK_PASSTHROUGH)
     if (windowRemoved && imguiOk && renderOk && frontendOk)
@@ -4645,6 +4667,7 @@ static bool SuspendUiHooksForOnlineSimulation(
     if (windowOk && imguiOk && renderOk && frontendOk)
     {
         g_onlineSimSuspendFailFastStartTick = 0;
+        g_onlineSimHandoffFadeTick = 0;
         g_onlineSimulationUiSuspended.store(
             true,
             std::memory_order_release);
@@ -4652,12 +4675,19 @@ static bool SuspendUiHooksForOnlineSimulation(
     }
 
     mod::Log(
-        "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=%s window=%d imgui=%d endScene=%d screenUpdates=%d",
+        "ONLINE_SIMULATION_HANDOFF_BLOCKED reason=%s window=%d imgui=%d endScene=%d screenUpdates=%d faded=%d",
         reason != nullptr ? reason : "unknown",
         windowOk ? 1 : 0,
         imguiOk ? 1 : 0,
         renderOk ? 1 : 0,
-        frontendOk ? 1 : 0);
+        frontendOk ? 1 : 0,
+        fadedNow ? 1 : 0);
+
+    if (fadedNow)
+    {
+        auto const setPalette = reinterpret_cast<SetPaletteFn>(RuntimeAddress(kVaSetPalette));
+        setPalette(GetGraphicsContext(screenContext), static_cast<int>(screenContext + kOffsetPalette));
+    }
 
     g_onlineSimSuspendFailFastStartTick = TimerArmTickNonZero();
     g_onlineSimulationUiSuspended.store(
@@ -4701,7 +4731,8 @@ bool PrepareExternalLauncherSimulationHandoffImpl()
 
     const bool suspended = SuspendUiHooksForOnlineSimulation(
         titleScreenContext,
-        "external_launcher_adoption");
+        "external_launcher_adoption",
+        false);
     mod::Log(
         "EXTERNAL_LAUNCHER_SIMULATION_HANDOFF screen=%d titleContext=0x%08lX suspended=%d",
         currentScreen,
@@ -4738,12 +4769,11 @@ void HandoffSpectateSession(uint32_t screenContext)
         return;
     }
     if (!SuspendUiHooksForOnlineSimulation(
-            screenContext, "spectator_handoff"))
+            screenContext, "spectator_handoff", true))
     {
         return;
     }
 
-    RunTransitionFadeOut(screenContext, 0, 0);
     PrepareSpectateReplayState(screenContext);
 
     // The spectator relies on the host EXE having VS-human state (mode 4, CPU flags 0, clean init/exit flags); without this call it silently desyncs.
@@ -5175,12 +5205,11 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
         return;
     }
     if (!SuspendUiHooksForOnlineSimulation(
-            screenContext, "connected_player_handoff"))
+            screenContext, "connected_player_handoff", true))
     {
         return;
     }
 
-    RunTransitionFadeOut(screenContext, 0, 0);
     PrepareVsHumanGameState(screenContext);
 
     if (g_netplayMenuState.bgmActive)
@@ -5396,8 +5425,8 @@ bool StartJoinSpectateIpAction(uint32_t screenContext, bool playSuccessSound)
         *reinterpret_cast<uint32_t*>(screenContext + kOffsetWindowHandle));
     ShowStubActionMessage(
         owner,
-        "Spectate IP failed.\n\n"
-        + (errorMessage.empty() ? std::string("Unknown error") : errorMessage));
+        Tr("Spectate IP failed.\n\n")
+        + (errorMessage.empty() ? std::string(Tr("Unknown error")) : Tr(errorMessage)));
     return false;
 }
 
@@ -5569,7 +5598,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         }
         if (g_lobbySessionShutdownInFlight.load())
         {
-            ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
+            ShowStubActionMessage(owner, Tr("Still leaving room.\nPlease wait."));
             break;
         }
         g_netplayMenuState.mainSelection = logicalSelection;
@@ -5582,7 +5611,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         }
         if (g_lobbySessionShutdownInFlight.load())
         {
-            ShowStubActionMessage(owner, "Still leaving room.\nPlease wait.");
+            ShowStubActionMessage(owner, Tr("Still leaving room.\nPlease wait."));
             break;
         }
         g_netplayMenuState.mainSelection = logicalSelection;
@@ -5657,12 +5686,12 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         else
         {
             const netplay::bridge::NetbridgeStatus status = netplay::bridge::GetStatus();
-            char text[320] = {};
+            char text[512] = {};
             snprintf(
                 text,
                 sizeof(text),
-                "Join start failed.\n\n%s",
-                status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error");
+                Tr("Join start failed.\n\n%s"),
+                Tr(status.errorMsg[0] != '\0' ? status.errorMsg : "Unknown error"));
             ShowStubActionMessage(owner, text);
         }
         break;
@@ -5674,14 +5703,14 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
     {
         if (!g_lobbySession)
         {
-            ShowStubActionMessage(owner, "Lobby status unavailable.");
+            ShowStubActionMessage(owner, Tr("Lobby status unavailable."));
             break;
         }
 
         const auto status = g_lobbySession->GetStatus();
         if (status.playing.empty() || status.playing[0].hostIp.empty())
         {
-            ShowStubActionMessage(owner, "No active match host information is available for spectating yet.");
+            ShowStubActionMessage(owner, Tr("No active match host information is available for spectating yet."));
             break;
         }
         const auto selectedPair = status.playing[0];
@@ -5693,7 +5722,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         if (g_lobbySession->IsInBattle())
         {
             mod::Log("LobbyPlaying0: BLOCKED spectate - lobby session still busy");
-            ShowStubActionMessage(owner, "Cannot spectate right now.");
+            ShowStubActionMessage(owner, Tr("Cannot spectate right now."));
             break;
         }
 
@@ -5707,7 +5736,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 selectedPair.hostIp.c_str());
             ShowStubActionMessage(
                 owner,
-                "The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port.");
+                Tr("The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port."));
             break;
         }
 
@@ -5730,12 +5759,12 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         }
         else
         {
-            char text[320] = {};
+            char text[512] = {};
             snprintf(
                 text,
                 sizeof(text),
-                "Wait to spectate failed.\n\n%s",
-                errorMessage.empty() ? "Unknown error" : errorMessage.c_str());
+                Tr("Wait to spectate failed.\n\n%s"),
+                Tr(errorMessage.empty() ? "Unknown error" : errorMessage.c_str()));
             mod::Log("LobbyPlaying0: wait-to-spectate FAILED: %s", errorMessage.c_str());
             ShowStubActionMessage(owner, text);
         }
@@ -5753,14 +5782,14 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
 
         if (!g_lobbySession)
         {
-            ShowStubActionMessage(owner, "Lobby session unavailable.");
+            ShowStubActionMessage(owner, Tr("Lobby session unavailable."));
             break;
         }
 
         const auto lobStatus = g_lobbySession->GetStatus();
         if (realSlot >= static_cast<int>(lobStatus.displayEntries.size()))
         {
-            ShowStubActionMessage(owner, "Invalid lobby slot.");
+            ShowStubActionMessage(owner, Tr("Invalid lobby slot."));
             break;
         }
 
@@ -5768,7 +5797,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
 
         if (entry.isSelf)
         {
-            ShowStubActionMessage(owner, "That's you!");
+            ShowStubActionMessage(owner, Tr("That's you!"));
             break;
         }
         if (entry.isPlaying && !entry.isChallenge)
@@ -5777,13 +5806,13 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             {
                 mod::Log("LobbySpectate: BLOCKED spectate for '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
-                ShowStubActionMessage(owner, "Cannot spectate right now.");
+                ShowStubActionMessage(owner, Tr("Cannot spectate right now."));
                 break;
             }
 
             if (entry.spectateIp.empty())
             {
-                ShowStubActionMessage(owner, "No host information available\nfor spectating.");
+                ShowStubActionMessage(owner, Tr("No host information available\nfor spectating."));
                 break;
             }
 
@@ -5797,7 +5826,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                     entry.spectateIp.c_str());
                 ShowStubActionMessage(
                     owner,
-                    "The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port.");
+                    Tr("The lobby published an invalid host endpoint.\nExpected IPv4:port or [IPv6]:port."));
                 break;
             }
 
@@ -5828,11 +5857,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             }
             else
             {
-                char text[320] = {};
+                char text[512] = {};
                 snprintf(text, sizeof(text),
-                    "Wait to spectate failed for '%s'.\n\n%s",
+                    Tr("Wait to spectate failed for '%s'.\n\n%s"),
                     entry.name.c_str(),
-                    errorMessage.empty() ? "Unknown error" : errorMessage.c_str());
+                    Tr(errorMessage.empty() ? "Unknown error" : errorMessage.c_str()));
                 ShowStubActionMessage(owner, text);
             }
             break;
@@ -5844,7 +5873,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             {
                 mod::Log("LobbySlot: BLOCKED challenge accept from '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
-                ShowStubActionMessage(owner, "Cannot accept challenges\nright now.");
+                ShowStubActionMessage(owner, Tr("Cannot accept challenges\nright now."));
                 break;
             }
 
@@ -5860,7 +5889,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                     entry.ipPort.c_str());
                 ShowStubActionMessage(
                     owner,
-                    "The challenger published an invalid endpoint.\nExpected IPv4:port or [IPv6]:port.");
+                    Tr("The challenger published an invalid endpoint.\nExpected IPv4:port or [IPv6]:port."));
                 break;
             }
 
@@ -5891,11 +5920,11 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             else
             {
                 const netplay::bridge::NetbridgeStatus bridgeStatus = netplay::bridge::GetStatus();
-                char text[320] = {};
+                char text[512] = {};
                 snprintf(text, sizeof(text),
-                    "Accept failed for '%s'.\n\n%s",
+                    Tr("Accept failed for '%s'.\n\n%s"),
                     entry.name.c_str(),
-                    bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error");
+                    Tr(bridgeStatus.errorMsg[0] != '\0' ? bridgeStatus.errorMsg : "Unknown error"));
                 ShowStubActionMessage(owner, text);
             }
         }
@@ -5905,7 +5934,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
             {
                 mod::Log("LobbySlot: BLOCKED challenge send to '%s' id=%d - lobby session still busy",
                     entry.name.c_str(), entry.playerId);
-                ShowStubActionMessage(owner, "Cannot send challenges\nright now.");
+                ShowStubActionMessage(owner, Tr("Cannot send challenges\nright now."));
                 break;
             }
 
@@ -5916,12 +5945,12 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 {
                     ShowStubActionMessage(
                         owner,
-                        "Detecting your public address.\nPlease wait a moment and try again.");
+                        Tr("Detecting your public address.\nPlease wait a moment and try again."));
                 }
                 else
                 {
                     ShowHostStartupFailure(
-                        "A public address could not be detected. Check your connection and try again.",
+                        I18N_KEY("A public address could not be detected. Check your connection and try again."),
                         false);
                 }
                 break;
@@ -5941,7 +5970,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                     publicIp.c_str(),
                     static_cast<unsigned>(g_netplayMenuState.hostPort));
                 ShowHostStartupFailure(
-                    "The detected public address cannot be used for hosting.",
+                    I18N_KEY("The detected public address cannot be used for hosting."),
                     false);
                 break;
             }
@@ -6042,7 +6071,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
                 ShowHostStartupFailure(
                     bridgeStatus.errorMsg[0] != '\0'
                         ? bridgeStatus.errorMsg
-                        : "Could not start the Revival netplay session.",
+                        : I18N_KEY("Could not start the Revival netplay session."),
                     true);
             }
         }
@@ -6344,7 +6373,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                     else
                     {
                         SetNetplayStatusMessage(
-                            "Invalid endpoint. Use IPv4:port or [IPv6]:port.");
+                            Tr("Invalid endpoint. Use IPv4:port or [IPv6]:port."));
                         mod::Log(
                             "JoinPaste: rejected endpoint='%s' expected=IPv4:port_or_[IPv6]:port",
                             clipText.c_str());
@@ -6431,7 +6460,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         const char* failureText =
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
-                : (phase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error");
+                : (phase == NetbridgePhase::SessionEnded ? I18N_KEY("Session ended") : I18N_KEY("Unknown error"));
 
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
@@ -6497,7 +6526,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         mod::Log(
             "LobbyChallenge: target left lobby before connect, canceling local session phase=%s",
             netplay::bridge::PhaseToString(bridgePhase));
-        SetNetplayStatusMessage("Challenge canceled: player left lobby.");
+        SetNetplayStatusMessage(Tr("Challenge canceled: player left lobby."));
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
         ResetHostingOverlayState();
@@ -6517,7 +6546,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         mod::Log(
             "LobbyChallenge: challenger left lobby before connect, canceling local accept phase=%s",
             netplay::bridge::PhaseToString(bridgePhase));
-        SetNetplayStatusMessage("Challenger left the lobby.");
+        SetNetplayStatusMessage(Tr("Challenger left the lobby."));
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
         ResetHostingOverlayState();
@@ -6552,7 +6581,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         const char* failureText =
             bridgeStatus.errorMsg[0] != '\0'
                 ? bridgeStatus.errorMsg
-                : "Hosting could not start. Please try again.";
+                : I18N_KEY("Hosting could not start. Please try again.");
         ShowHostStartupFailure(
             failureText,
             HostFailureNeedsBridgeCancel());
@@ -6638,7 +6667,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             g_pendingLobbySpectateWait.hostIp.c_str(),
             g_pendingLobbySpectateWait.p1Name.c_str(),
             g_pendingLobbySpectateWait.p2Name.c_str());
-        SetNetplayStatusMessage("Wait to spectate canceled: players stopped playing.");
+        SetNetplayStatusMessage(Tr("Wait to spectate canceled: players stopped playing."));
         ClearPendingLobbySpectateWait("pair_left_playing");
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
@@ -7053,7 +7082,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             else
             {
                 strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText),
-                    bridgePhase == NetbridgePhase::SessionEnded ? "Session ended" : "Unknown error",
+                    bridgePhase == NetbridgePhase::SessionEnded ? I18N_KEY("Session ended") : I18N_KEY("Unknown error"),
                     _TRUNCATE);
             }
             mod::Log("JoiningOverlay: connection failed - %s", g_joiningOverlay.errorText);
@@ -7112,7 +7141,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ClearPendingLobbySpectateWait("session_ended");
             if (bridgeStatus.errorMsg[0] != '\0')
             {
-                SetNetplayStatusMessage(bridgeStatus.errorMsg, 3200);
+                SetNetplayStatusMessage(Tr(bridgeStatus.errorMsg), 3200);
             }
             netplay::bridge::CancelSession("no_overlay_session_ended");
             notifyLobbySessionEndedForCurrentBridgeRole(false);

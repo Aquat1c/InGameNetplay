@@ -646,6 +646,22 @@ int MeasureText5x7(const std::string& text, int scaleX)
 
 int MeasureText5x7Width(const std::string& text, int scaleX)
 {
+#if defined(_WIN32)
+    // Non-ASCII text is drawn by DrawTextUtf8Gdi, so measure it the same way
+    // (the 5x7 measure counts bytes).
+    if (ContainsNonAscii(text))
+    {
+        const std::wstring wideText = Utf8ToWideBestEffort(text);
+        int profile = 0;
+        int pixelHeight = 0;
+        ClassifyUtf8Text(wideText, scaleX, &profile, &pixelHeight);
+        const int width = MeasureTextWideGdi(wideText, pixelHeight, profile);
+        if (width > 0)
+        {
+            return width;
+        }
+    }
+#endif
     return MeasureText5x7(text, scaleX);
 }
 

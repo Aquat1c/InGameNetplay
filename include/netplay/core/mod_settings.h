@@ -19,6 +19,7 @@ struct Settings
     bool hideEmptySetsInBattleLog = true;
     bool menuTtfText = true;
     std::string menuTtfFontFace = "Yu Gothic";
+    std::string language = "English";
     std::string hostingTipFontFace = "Yu Gothic";
     // DIK_* binding form (e.g. "DIK_F1").
     std::string asyncHostReturnKey = "DIK_F1";
@@ -51,6 +52,7 @@ bool AreAllVerboseLogsEnabled();
 bool HideEmptySetsInBattleLogByDefault();
 bool IsMenuTtfTextEnabled();
 const std::string& MenuTtfFontFace();
+const std::string& Language();
 const std::string& HostingTipFontFace();
 const std::string& AsyncHostReturnKeyBinding();
 bool AreOnlineCustomColorsEnabled();
