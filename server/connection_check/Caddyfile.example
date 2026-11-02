@@ -1,0 +1,13 @@
+check.example.com {
+ @connection_check path /api/connection-check/v1/*
+ route {
+  reverse_proxy @connection_check 127.0.0.1:3211 {
+   header_up X-EFZ-Client-IP {http.request.remote.host}
+   header_up -CF-*
+   header_up -X-Forwarded-*
+   header_up -Forwarded
+   header_up -X-Real-IP
+  }
+  respond 404
+ }
+}

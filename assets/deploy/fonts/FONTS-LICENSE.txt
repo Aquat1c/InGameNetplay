@@ -1,0 +1,31 @@
+Bundled fonts in this folder
+============================
+
+These font files are NOT part of the mod's MIT license. They keep their own
+licenses, summarized below. This note is shipped alongside the fonts so the
+attribution travels with them.
+
+NotoSansCJKjp-Regular.ttf
+NotoSansMonoCJKjp-Regular.ttf
+    Noto Sans CJK JP / Noto Sans Mono CJK JP.
+    Copyright (c) The Noto Project Authors (https://github.com/notofonts).
+    SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+    Freely redistributable. If you redistribute these fonts, the FULL OFL 1.1
+    license text must be included with them (add the upstream OFL.txt to this
+    folder for a public release). Converted from the upstream CFF/OTF to
+    TrueType outlines with fontTools/cu2qu for stb_truetype compatibility.
+
+Meiryo.ttf
+yugothib.ttf  (Yu Gothic Bold)
+    Copyright (c) Microsoft Corporation. Proprietary. NOT under an open license
+    and NOT granted by this project. Included as legally-obtained copies for
+    convenience. Redistributing them is your responsibility, subject to
+    Microsoft's font licensing. If you may not redistribute Microsoft fonts,
+    delete these two files - the mod falls back to the OFL Noto fonts (and its
+    embedded copy) automatically.
+
+ITC Bolt/ITC Bolt.ttf
+    A TrueType build of ITC Bolt from OnlineWebFonts.Com, licensed under
+    Creative Commons Attribution 4.0 (CC BY 4.0). Attribution required: credit
+    OnlineWebFonts.Com ("Web Fonts"). See ITC Bolt/License.txt (kept with the
+    font). Opt-in Latin display face.

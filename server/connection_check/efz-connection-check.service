@@ -1,0 +1,17 @@
+[Unit]
+Description=EFZ in-game netplay connection check
+After=network-online.target
+
+[Service]
+User=efz
+ExecStart=/usr/bin/python3 -E -s -B /opt/efz-connection-check/connection_check_service.py --listen-port 3211 --udp-port 10831 --relay 128.199.38.97:10800
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

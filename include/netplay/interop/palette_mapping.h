@@ -1,0 +1,711 @@
+// Do not hand-edit the tables.
+
+#pragma once
+
+#include <cstdint>
+#include <cstring>
+
+struct SpriteArea {
+    const char* name;
+    const int8_t* indices;
+    int count;
+};
+
+struct PortraitArea {
+    const char* name;
+    int start;
+    int end;
+};
+
+struct FfFix {
+    int8_t target;
+    int8_t source;
+    float  factor;
+};
+
+struct CharacterMapping {
+    const char* charName;
+    const SpriteArea* spriteAreas;
+    int spriteAreaCount;
+    const PortraitArea* portraitAreas;
+    int portraitAreaCount;
+    const FfFix* ffFixes;
+    int ffFixCount;
+};
+
+static const int8_t akane_spr_skin[] = {2,3,4,5};
+static const int8_t akane_spr_hair[] = {6,7,8,9,10};
+static const int8_t akane_spr_top[] = {11,12,13};
+static const int8_t akane_spr_bottom[] = {14,15,16};
+static const int8_t akane_spr_acc[] = {23,24,25};
+
+static const SpriteArea akane_sprite[] = {
+    {"skin", akane_spr_skin, 4},
+    {"hair", akane_spr_hair, 5},
+    {"top", akane_spr_top, 3},
+    {"bottom", akane_spr_bottom, 3},
+    {"acc", akane_spr_acc, 3},
+};
+
+static const PortraitArea akane_portrait[] = {
+    {"skin", 2, 8},
+    {"hair", 32, 40},
+    {"top", 14, 20},
+    {"bottom", 25, 30},
+    {"acc", 13, 9},
+};
+
+static const int8_t akiko_spr_skin[] = {2,3,4,5};
+static const int8_t akiko_spr_bottom[] = {9,10,11,12};
+static const int8_t akiko_spr_eyes2[] = {13,14,15};
+static const int8_t akiko_spr_eyes[] = {17,18};
+static const int8_t akiko_spr_hair[] = {19,20,21,22};
+static const int8_t akiko_spr_top[] = {23,24,25,26};
+static const int8_t akiko_spr_top2[] = {29,30,31,32};
+static const int8_t akiko_spr_acc[] = {27,28};
+static const int8_t akiko_spr_unko[] = {37,38,39,40};
+
+static const SpriteArea akiko_sprite[] = {
+    {"skin", akiko_spr_skin, 4},
+    {"bottom", akiko_spr_bottom, 4},
+    {"eyes2", akiko_spr_eyes2, 3},
+    {"eyes", akiko_spr_eyes, 2},
+    {"hair", akiko_spr_hair, 4},
+    {"top", akiko_spr_top, 4},
+    {"top2", akiko_spr_top2, 4},
+    {"acc", akiko_spr_acc, 2},
+    {"unko", akiko_spr_unko, 4},
+};
+
+static const PortraitArea akiko_portrait[] = {
+    {"skin", 2, 4},
+    {"bottom", 9, 12},
+    {"eyes2", 13, 15},
+    {"eyes", 17, 18},
+    {"hair", 19, 22},
+    {"top", 23, 26},
+    {"top2", 29, 32},
+    {"acc", 27, 28},
+    {"unko", 33, 35},
+};
+
+static const int8_t ayu_spr_skin[] = {1,2,3};
+static const int8_t ayu_spr_hair[] = {37,11,10,9};
+static const int8_t ayu_spr_top[] = {8,7,6};
+static const int8_t ayu_spr_eyes2[] = {15,13,12};
+static const int8_t ayu_spr_wings[] = {19,17,18};
+static const int8_t ayu_spr_eyes[] = {5,4};
+
+static const SpriteArea ayu_sprite[] = {
+    {"skin", ayu_spr_skin, 3},
+    {"hair", ayu_spr_hair, 4},
+    {"top", ayu_spr_top, 3},
+    {"eyes2", ayu_spr_eyes2, 3},
+    {"wings", ayu_spr_wings, 3},
+    {"eyes", ayu_spr_eyes, 2},
+};
+
+static const PortraitArea ayu_portrait[] = {
+    {"skin", 1, 7},
+    {"hair", 16, 8},
+    {"top", 23, 18},
+    {"eyes2", 34, 39},
+    {"wings", 34, 32},
+    {"eyes", 25, 29},
+};
+
+static const int8_t doppel_spr_skin[] = {1,2,3,4};
+static const int8_t doppel_spr_hair[] = {5,6,7,25};
+static const int8_t doppel_spr_top[] = {18,19,11};
+static const int8_t doppel_spr_bottom[] = {8,9,10};
+static const int8_t doppel_spr_acc[] = {17,21,12,13,24};
+
+static const SpriteArea doppel_sprite[] = {
+    {"skin", doppel_spr_skin, 4},
+    {"hair", doppel_spr_hair, 4},
+    {"top", doppel_spr_top, 3},
+    {"bottom", doppel_spr_bottom, 3},
+    {"acc", doppel_spr_acc, 5},
+};
+
+static const PortraitArea doppel_portrait[] = {
+    {"skin", 1, 5},
+    {"hair", 25, 30},
+    {"top", 17, 21},
+    {"bottom", 6, 10},
+    {"acc", 33, 36},
+};
+
+static const int8_t ikumi_spr_skin[] = {2,3,4,5,6};
+static const int8_t ikumi_spr_hair[] = {10,11,12,13};
+static const int8_t ikumi_spr_acc[] = {17,18,19,20};
+static const int8_t ikumi_spr_top[] = {21,22,23};
+static const int8_t ikumi_spr_eyes2[] = {38,39,40};
+
+static const SpriteArea ikumi_sprite[] = {
+    {"skin", ikumi_spr_skin, 5},
+    {"hair", ikumi_spr_hair, 4},
+    {"acc", ikumi_spr_acc, 4},
+    {"top", ikumi_spr_top, 3},
+    {"eyes2", ikumi_spr_eyes2, 3},
+};
+
+static const PortraitArea ikumi_portrait[] = {
+    {"skin", 2, 6},
+    {"hair", 7, 12},
+    {"acc", 17, 21},
+    {"top", 22, 26},
+    {"eyes2", 37, 40},
+};
+
+static const int8_t kanna_spr_skin[] = {2,3,4,5};
+static const int8_t kanna_spr_hair[] = {12,11,9,10};
+static const int8_t kanna_spr_top[] = {22,23,24,25};
+static const int8_t kanna_spr_bottom[] = {19,20,21};
+static const int8_t kanna_spr_wings[] = {31,30,29};
+
+static const SpriteArea kanna_sprite[] = {
+    {"skin", kanna_spr_skin, 4},
+    {"hair", kanna_spr_hair, 4},
+    {"top", kanna_spr_top, 4},
+    {"bottom", kanna_spr_bottom, 3},
+    {"wings", kanna_spr_wings, 3},
+};
+
+static const PortraitArea kanna_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 8, 13},
+    {"top", 25, 30},
+    {"bottom", 19, 24},
+    {"wings", 36, 30},
+};
+
+static const int8_t kano_spr_skin[] = {2,3,4,5};
+static const int8_t kano_spr_top[] = {10,11,12,13};
+static const int8_t kano_spr_bottom[] = {17,18,19,20};
+static const int8_t kano_spr_eyes[] = {23,24};
+static const int8_t kano_spr_acc[] = {26,27,28};   // armband
+static const int8_t kano_spr_hair[] = {6,7,8,9};
+
+static const SpriteArea kano_sprite[] = {
+    {"skin", kano_spr_skin, 4},
+    {"top", kano_spr_top, 4},
+    {"bottom", kano_spr_bottom, 4},
+    {"eyes", kano_spr_eyes, 2},
+    {"acc", kano_spr_acc, 3},
+    {"hair", kano_spr_hair, 4},
+};
+
+static const PortraitArea kano_portrait[] = {
+    {"skin", 2, 7},
+    {"top", 8, 13},
+    {"bottom", 14, 19},
+    {"eyes", 20, 24},
+    {"acc", 25, 29},
+    {"hair", 34, 40},
+};
+
+static const int8_t kaori_spr_skin[] = {1,2,3,4};
+static const int8_t kaori_spr_hair[] = {19,20,21,22};
+static const int8_t kaori_spr_acc[] = {24,25,26};
+static const int8_t kaori_spr_bottom[] = {9,10,11};
+static const int8_t kaori_spr_eyes[] = {17,18};
+static const int8_t kaori_spr_top[] = {13,8,15};
+
+static const SpriteArea kaori_sprite[] = {
+    {"skin", kaori_spr_skin, 4},
+    {"hair", kaori_spr_hair, 4},
+    {"acc", kaori_spr_acc, 3},
+    {"bottom", kaori_spr_bottom, 3},
+    {"eyes", kaori_spr_eyes, 2},
+    {"top", kaori_spr_top, 3},
+};
+
+static const PortraitArea kaori_portrait[] = {
+    {"skin", 1, 5},
+    {"hair", 24, 29},
+    {"acc", 33, 36},
+    {"bottom", 17, 20},
+    {"eyes", 37, 40},
+    {"top", 6, 10},
+};
+
+static const int8_t makoto_spr_skin[] = {2,3,4,5};
+static const int8_t makoto_spr_top[] = {8,7,6};
+static const int8_t makoto_spr_hair[] = {12,11,10,9};
+static const int8_t makoto_spr_top2[] = {16,15,14,13};
+static const int8_t makoto_spr_acc[] = {23,22,21};
+static const int8_t makoto_spr_bottom[] = {28,27,26,25,24};
+
+static const SpriteArea makoto_sprite[] = {
+    {"skin", makoto_spr_skin, 4},
+    {"top", makoto_spr_top, 3},
+    {"hair", makoto_spr_hair, 4},
+    {"top2", makoto_spr_top2, 4},
+    {"acc", makoto_spr_acc, 3},
+    {"bottom", makoto_spr_bottom, 5},
+};
+
+static const PortraitArea makoto_portrait[] = {
+    {"skin", 2, 7},
+    {"top", 12, 8},
+    {"hair", 22, 17},
+    {"top2", 28, 23},
+    {"acc", 31, 29},
+    {"bottom", 36, 32},
+};
+
+static const int8_t mai_spr_skin[] = {1,2,3,4};
+static const int8_t mai_spr_hair[] = {5,6,7,14};
+static const int8_t mai_spr_bottom[] = {11,12,13};
+static const int8_t mai_spr_mai[] = {23,24,25};
+static const int8_t mai_spr_acc[] = {9,10};
+static const int8_t mai_spr_eyes[] = {21,22};
+static const int8_t mai_spr_ears[] = {18,17};   // mini-Mai bunny ears
+
+static const SpriteArea mai_sprite[] = {
+    {"skin", mai_spr_skin, 4},
+    {"hair", mai_spr_hair, 4},
+    {"bottom", mai_spr_bottom, 3},
+    {"mai", mai_spr_mai, 3},
+    {"acc", mai_spr_acc, 2},
+    {"eyes", mai_spr_eyes, 2},
+    {"ears", mai_spr_ears, 2},
+};
+
+static const PortraitArea mai_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 24, 17},
+    {"bottom", 12, 8},
+    {"mai", 13, 16},
+    {"acc", 40, 36},
+    {"eyes", 35, 32},
+    {"ears", 29, 31},
+};
+
+static const int8_t mayu_spr_skin[] = {5,4,3,2};
+static const int8_t mayu_spr_hair[] = {9,8,7};
+static const int8_t mayu_spr_top[] = {19,18,17};
+static const int8_t mayu_spr_top2[] = {28,27,26};
+static const int8_t mayu_spr_eyes2[] = {13,12,11,10};
+static const int8_t mayu_spr_bottom[] = {15,14,25};
+
+static const SpriteArea mayu_sprite[] = {
+    {"skin", mayu_spr_skin, 4},
+    {"hair", mayu_spr_hair, 3},
+    {"top", mayu_spr_top, 3},
+    {"top2", mayu_spr_top2, 3},
+    {"eyes2", mayu_spr_eyes2, 4},
+    {"bottom", mayu_spr_bottom, 3},
+};
+
+static const PortraitArea mayu_portrait[] = {
+    {"skin", 7, 2},
+    {"hair", 14, 8},
+    {"top", 21, 17},
+    {"top2", 26, 31},
+    {"eyes2", 25, 23},
+    {"bottom", 38, 33},
+};
+
+static const int8_t minagi_spr_skin[] = {2,3,4,5};
+static const int8_t minagi_spr_hair[] = {14,15,16};
+static const int8_t minagi_spr_top[] = {10,11,12};
+static const int8_t minagi_spr_bottom[] = {17,18,19,20};
+static const int8_t minagi_spr_hair2[] = {25,26,27,32};
+static const int8_t minagi_spr_acc[] = {22,23,24};
+static const int8_t minagi_spr_eyes2[] = {9,7,8};
+
+static const SpriteArea minagi_sprite[] = {
+    {"skin", minagi_spr_skin, 4},
+    {"hair", minagi_spr_hair, 3},
+    {"top", minagi_spr_top, 3},
+    {"bottom", minagi_spr_bottom, 4},
+    {"hair2", minagi_spr_hair2, 4},
+    {"acc", minagi_spr_acc, 3},
+    {"eyes2", minagi_spr_eyes2, 3},
+};
+
+static const PortraitArea minagi_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 17, 22},
+    {"top", 12, 16},
+    {"bottom", 23, 28},
+    {"hair2", 34, 38},
+    {"acc", 29, 33},
+    {"eyes2", 11, 9},
+};
+
+static const int8_t mio_spr_skin[] = {1,2,3,4};
+static const int8_t mio_spr_hair[] = {5,6,7};
+static const int8_t mio_spr_top[] = {21,20,19,18};
+static const int8_t mio_spr_eyes[] = {22,23};
+static const int8_t mio_spr_book[] = {14,15};
+static const int8_t mio_spr_acc2[] = {31,24,25};
+static const int8_t mio_spr_bow[] = {25,11};   // ribbon
+
+static const SpriteArea mio_sprite[] = {
+    {"skin", mio_spr_skin, 4},
+    {"hair", mio_spr_hair, 3},
+    {"top", mio_spr_top, 4},
+    {"eyes", mio_spr_eyes, 2},
+    {"book", mio_spr_book, 2},
+    {"acc2", mio_spr_acc2, 3},
+    {"bow", mio_spr_bow, 2},
+};
+
+static const PortraitArea mio_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 8, 13},
+    {"top", 21, 16},
+    {"eyes", 22, 25},
+    {"book", 34, 36},
+    {"acc2", 26, 29},
+    {"bow", 37, 40},
+};
+
+static const int8_t misaki_spr_skin[] = {2,3,4,5};
+static const int8_t misaki_spr_eyes2[] = {12,15};
+static const int8_t misaki_spr_top[] = {16,18,19,17};
+static const int8_t misaki_spr_hair[] = {6,7,8,11};
+static const int8_t misaki_spr_bottom[] = {9,10,14};
+
+static const SpriteArea misaki_sprite[] = {
+    {"skin", misaki_spr_skin, 4},
+    {"eyes2", misaki_spr_eyes2, 2},
+    {"top", misaki_spr_top, 4},
+    {"hair", misaki_spr_hair, 4},
+    {"bottom", misaki_spr_bottom, 3},
+};
+
+static const PortraitArea misaki_portrait[] = {
+    {"skin", 2, 8},
+    {"eyes2", 10, 14},
+    {"top", 15, 20},
+    {"hair", 22, 30},
+    {"bottom", 33, 39},
+};
+
+static const int8_t mishio_spr_skin[] = {2,3,4,5};
+static const int8_t mishio_spr_hair[] = {17,18,19,20};
+static const int8_t mishio_spr_eyes2[] = {40,39,38};
+static const int8_t mishio_spr_boots[] = {8,9,10};   // spear
+static const int8_t mishio_spr_bottom[] = {24,25,26};
+static const int8_t mishio_spr_top[] = {6,7,8,11};
+static const int8_t mishio_spr_acc[] = {21,22,23};
+static const int8_t mishio_spr_eyes[] = {31,32};
+
+static const SpriteArea mishio_sprite[] = {
+    {"skin", mishio_spr_skin, 4},
+    {"hair", mishio_spr_hair, 4},
+    {"eyes2", mishio_spr_eyes2, 3},
+    {"boots", mishio_spr_boots, 3},
+    {"bottom", mishio_spr_bottom, 3},
+    {"top", mishio_spr_top, 4},
+    {"acc", mishio_spr_acc, 3},
+    {"eyes", mishio_spr_eyes, 2},
+};
+
+static const PortraitArea mishio_portrait[] = {
+    {"skin", 2, 6},
+    {"hair", 17, 22},
+    {"eyes2", 9, 12},
+    {"boots", 14, 16},
+    {"bottom", 23, 27},
+    {"top", 32, 29},
+    {"acc", 33, 36},
+    {"eyes", 37, 40},
+};
+
+static const int8_t misuzu_spr_skin[] = {2,3,4,5};
+static const int8_t misuzu_spr_hair[] = {6,7,8,9};
+static const int8_t misuzu_spr_bottom[] = {10,11,12,13};
+static const int8_t misuzu_spr_eyes[] = {14,15,16};
+static const int8_t misuzu_spr_acc[] = {17,18,19,20};
+static const int8_t misuzu_spr_acc2[] = {21,22,23,24};
+static const int8_t misuzu_spr_top[] = {25,26,27,28};
+static const int8_t misuzu_spr_eyes2[] = {38,39,40};
+
+static const SpriteArea misuzu_sprite[] = {
+    {"skin", misuzu_spr_skin, 4},
+    {"hair", misuzu_spr_hair, 4},
+    {"bottom", misuzu_spr_bottom, 4},
+    {"eyes", misuzu_spr_eyes, 3},
+    {"acc", misuzu_spr_acc, 4},
+    {"acc2", misuzu_spr_acc2, 4},
+    {"top", misuzu_spr_top, 4},
+    {"eyes2", misuzu_spr_eyes2, 3},
+};
+
+static const PortraitArea misuzu_portrait[] = {
+    {"skin", 2, 6},
+    {"hair", 7, 12},
+    {"bottom", 13, 17},
+    {"eyes", 18, 21},
+    {"acc", 22, 25},
+    {"acc2", 26, 29},
+    {"top", 30, 34},
+    {"eyes2", 36, 38},
+};
+
+static const int8_t mizuka_spr_skin[] = {2,3,4,5};
+static const int8_t mizuka_spr_hair[] = {20,21,22};
+static const int8_t mizuka_spr_top[] = {6,7,8};
+static const int8_t mizuka_spr_bottom[] = {9,10,11};
+static const int8_t mizuka_spr_acc[] = {17,18,19};
+static const int8_t mizuka_spr_acc2[] = {26,27};
+
+static const SpriteArea mizuka_sprite[] = {
+    {"skin", mizuka_spr_skin, 4},
+    {"hair", mizuka_spr_hair, 3},
+    {"top", mizuka_spr_top, 3},
+    {"bottom", mizuka_spr_bottom, 3},
+    {"acc", mizuka_spr_acc, 3},
+    {"acc2", mizuka_spr_acc2, 2},
+};
+
+static const PortraitArea mizuka_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 27, 31},
+    {"top", 8, 12},
+    {"bottom", 13, 16},
+    {"acc", 22, 26},
+    {"acc2", 33, 36},
+};
+
+static const int8_t nayuki_spr_skin[] = {2,3,4,5};
+static const int8_t nayuki_spr_eyes[] = {17,18};
+static const int8_t nayuki_spr_eyes2[] = {13,14,15};
+static const int8_t nayuki_spr_socks[] = {9,8,7,6};
+static const int8_t nayuki_spr_hair[] = {19,20,21,22};
+static const int8_t nayuki_spr_top[] = {29,30,31,32};
+static const int8_t nayuki_spr_bottom[] = {10,11,12};
+static const int8_t nayuki_spr_acc[] = {23,24,25};
+static const int8_t nayuki_spr_bag[] = {33,34,35,36};
+static const int8_t nayuki_spr_unko[] = {26,27,28};
+
+static const SpriteArea nayuki_sprite[] = {
+    {"skin", nayuki_spr_skin, 4},
+    {"eyes", nayuki_spr_eyes, 2},
+    {"eyes2", nayuki_spr_eyes2, 3},
+    {"socks", nayuki_spr_socks, 4},
+    {"hair", nayuki_spr_hair, 4},
+    {"top", nayuki_spr_top, 4},
+    {"bottom", nayuki_spr_bottom, 3},
+    {"acc", nayuki_spr_acc, 3},
+    {"bag", nayuki_spr_bag, 4},
+    {"unko", nayuki_spr_unko, 3},
+};
+
+static const PortraitArea nayuki_portrait[] = {
+    {"skin", 2, 5},
+    {"eyes", 17, 18},
+    {"eyes2", 13, 15},
+    {"socks", 9, 6},
+    {"hair", 19, 22},
+    {"top", 29, 32},
+    {"bottom", 10, 12},
+    {"acc", 23, 25},
+    {"bag", 33, 36},
+    {"unko", 26, 28},
+};
+
+static const int8_t neyuki_spr_skin[] = {3,4,5,6,7,8};
+static const int8_t neyuki_spr_hair[] = {9,10,11,12};
+static const int8_t neyuki_spr_top[] = {25,26,27,28};
+static const int8_t neyuki_spr_kero[] = {22,23,24};
+
+static const SpriteArea neyuki_sprite[] = {
+    {"skin", neyuki_spr_skin, 6},
+    {"hair", neyuki_spr_hair, 4},
+    {"top", neyuki_spr_top, 4},
+    {"kero", neyuki_spr_kero, 3},
+};
+
+static const PortraitArea neyuki_portrait[] = {
+    {"skin", 2, 8},
+    {"hair", 8, 14},
+    {"top", 17, 22},
+    {"kero", 33, 37},
+};
+
+static const int8_t rumi_spr_skin[] = {1,2,3,4};
+static const int8_t rumi_spr_hair[] = {5,6,7};
+static const int8_t rumi_spr_top[] = {18,19,11};
+static const int8_t rumi_spr_bottom[] = {8,9};
+static const int8_t rumi_spr_acc[] = {17,21,12,13,24};
+
+static const SpriteArea rumi_sprite[] = {
+    {"skin", rumi_spr_skin, 4},
+    {"hair", rumi_spr_hair, 3},
+    {"top", rumi_spr_top, 3},
+    {"bottom", rumi_spr_bottom, 2},
+    {"acc", rumi_spr_acc, 5},
+};
+
+static const PortraitArea rumi_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 8, 13},
+    {"top", 30, 34},
+    {"bottom", 14, 19},
+    {"acc", 25, 29},
+};
+
+static const int8_t sayuri_spr_skin[] = {1,2,3,4};
+static const int8_t sayuri_spr_hair[] = {17,18,19,20};
+static const int8_t sayuri_spr_bottom[] = {9,10,11};
+static const int8_t sayuri_spr_acc[] = {5,6,7,8};
+static const int8_t sayuri_spr_acc2[] = {21,22,23};
+static const int8_t sayuri_spr_eyes2[] = {30,31,32};
+static const int8_t sayuri_spr_eyes[] = {15,14,13};
+static const int8_t sayuri_spr_gun[] = {33,34,35};
+
+static const SpriteArea sayuri_sprite[] = {
+    {"skin", sayuri_spr_skin, 4},
+    {"hair", sayuri_spr_hair, 4},
+    {"bottom", sayuri_spr_bottom, 3},
+    {"acc", sayuri_spr_acc, 4},
+    {"acc2", sayuri_spr_acc2, 3},
+    {"eyes2", sayuri_spr_eyes2, 3},
+    {"eyes", sayuri_spr_eyes, 3},
+    {"gun", sayuri_spr_gun, 3},
+};
+
+static const PortraitArea sayuri_portrait[] = {
+    {"skin", 2, 6},
+    {"hair", 33, 37},
+    {"bottom", 7, 11},
+    {"acc", 17, 20},
+    {"acc2", 12, 14},
+    {"eyes2", 21, 25},
+    {"eyes", 40, 38},
+    {"gun", 15, 16},
+};
+
+static const int8_t shiori_spr_skin[] = {8,7,6,5};
+static const int8_t shiori_spr_hair[] = {4,3,2,1};
+static const int8_t shiori_spr_top[] = {12,11,10,9};
+static const int8_t shiori_spr_bottom[] = {16,15,14,13};
+static const int8_t shiori_spr_acc[] = {20,19,18,17};
+static const int8_t shiori_spr_eyes[] = {30,29};
+static const int8_t shiori_spr_scarf1[] = {24,22,25};
+static const int8_t shiori_spr_scarf2[] = {28,27,26};
+
+static const SpriteArea shiori_sprite[] = {
+    {"skin", shiori_spr_skin, 4},
+    {"hair", shiori_spr_hair, 4},
+    {"top", shiori_spr_top, 4},
+    {"bottom", shiori_spr_bottom, 4},
+    {"acc", shiori_spr_acc, 4},
+    {"eyes", shiori_spr_eyes, 2},
+    {"scarf1", shiori_spr_scarf1, 3},
+    {"scarf2", shiori_spr_scarf2, 3},
+};
+
+static const PortraitArea shiori_portrait[] = {
+    {"skin", 7, 2},
+    {"hair", 12, 8},
+    {"top", 16, 13},
+    {"bottom", 32, 29},
+    {"acc", 20, 17},
+    {"eyes", 35, 33},
+    {"scarf1", 24, 21},
+    {"scarf2", 28, 25},
+};
+
+static const int8_t unknown_spr_skin[] = {2,3,4,5};
+static const int8_t unknown_spr_hair[] = {6,7,17,19};
+static const int8_t unknown_spr_top[] = {9,20,10,18,15};
+static const int8_t unknown_spr_acc2[] = {12,13};
+static const int8_t unknown_spr_eyes[] = {11,14};
+static const int8_t unknown_spr_eyes2[] = {22,23};
+
+static const SpriteArea unknown_sprite[] = {
+    {"skin", unknown_spr_skin, 4},
+    {"hair", unknown_spr_hair, 4},
+    {"top", unknown_spr_top, 5},
+    {"acc2", unknown_spr_acc2, 2},
+    {"eyes", unknown_spr_eyes, 2},
+    {"eyes2", unknown_spr_eyes2, 2},
+};
+
+static const PortraitArea unknown_portrait[] = {
+    {"skin", 2, 7},
+    {"hair", 8, 14},
+    {"top", 23, 18},
+    {"acc2", 40, 37},
+    {"eyes", 29, 32},
+    {"eyes2", 27, 24},
+};
+
+#define CHAR_MAPPING(name, spr, port) \
+    {name, spr, sizeof(spr)/sizeof(spr[0]), port, sizeof(port)/sizeof(port[0]), nullptr, 0}
+#define CHAR_MAPPING_FF(name, spr, port, ff) \
+    {name, spr, sizeof(spr)/sizeof(spr[0]), port, sizeof(port)/sizeof(port[0]), ff, sizeof(ff)/sizeof(ff[0])}
+
+static const FfFix akiko_ff[]   = { {14, 29, 0.75f} };                       // undershirt dark = eyeball dark
+static const FfFix minagi_ff[]  = { {9, 11, 0.80f}, {10, 9, 0.60f} };        // eyeballs
+static const FfFix mio_ff[]     = { {14, 13, 0.20f} };                       // darkest hair = eyebrows
+static const FfFix shiori_ff[]  = { {36, 8, 0.30f}, {37, 35, 1.10f} };       // hair->eyebrows, lightest eyes
+static const FfFix unknown_ff[] = { {26, 27, 0.70f}, {25, 26, 0.60f}, {24, 25, 0.50f} }; // eye fixes (cascade)
+
+static const CharacterMapping g_CharacterMappings[] = {
+    CHAR_MAPPING("akane", akane_sprite, akane_portrait),
+    CHAR_MAPPING_FF("akiko", akiko_sprite, akiko_portrait, akiko_ff),
+    CHAR_MAPPING("ayu", ayu_sprite, ayu_portrait),
+    CHAR_MAPPING("doppel", doppel_sprite, doppel_portrait),
+    CHAR_MAPPING("exnanase", doppel_sprite, doppel_portrait),
+    CHAR_MAPPING("ikumi", ikumi_sprite, ikumi_portrait),
+    CHAR_MAPPING("kanna", kanna_sprite, kanna_portrait),
+    CHAR_MAPPING("kano", kano_sprite, kano_portrait),
+    CHAR_MAPPING("kaori", kaori_sprite, kaori_portrait),
+    CHAR_MAPPING("makoto", makoto_sprite, makoto_portrait),
+    CHAR_MAPPING("mai", mai_sprite, mai_portrait),
+    CHAR_MAPPING("mayu", mayu_sprite, mayu_portrait),
+    CHAR_MAPPING_FF("minagi", minagi_sprite, minagi_portrait, minagi_ff),
+    CHAR_MAPPING_FF("mio", mio_sprite, mio_portrait, mio_ff),
+    CHAR_MAPPING("misaki", misaki_sprite, misaki_portrait),
+    CHAR_MAPPING("mishio", mishio_sprite, mishio_portrait),
+    CHAR_MAPPING("misuzu", misuzu_sprite, misuzu_portrait),
+    CHAR_MAPPING("mizuka", mizuka_sprite, mizuka_portrait),
+    CHAR_MAPPING("nagamori", mizuka_sprite, mizuka_portrait),
+    CHAR_MAPPING("nayuki", neyuki_sprite, neyuki_portrait),    // Sleepy Nayuki
+    CHAR_MAPPING("nayukib", nayuki_sprite, nayuki_portrait),   // Awake Nayuki
+    CHAR_MAPPING("neyuki", neyuki_sprite, neyuki_portrait),
+    CHAR_MAPPING("rumi", rumi_sprite, rumi_portrait),
+    CHAR_MAPPING("nanase", rumi_sprite, rumi_portrait),
+    CHAR_MAPPING("sayuri", sayuri_sprite, sayuri_portrait),
+    CHAR_MAPPING_FF("shiori", shiori_sprite, shiori_portrait, shiori_ff),
+    CHAR_MAPPING_FF("unknown", unknown_sprite, unknown_portrait, unknown_ff),
+    CHAR_MAPPING_FF("mizukab", unknown_sprite, unknown_portrait, unknown_ff),
+};
+
+static const int g_NumMappings = sizeof(g_CharacterMappings) / sizeof(g_CharacterMappings[0]);
+
+inline const CharacterMapping* FindCharacterMapping(const char* charName)
+{
+    char nameLower[64];
+    int i = 0;
+    for (; charName[i] && i < 63; i++) {
+        char c = charName[i];
+        nameLower[i] = (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+    }
+    nameLower[i] = '\0';
+    
+    for (int j = 0; j < g_NumMappings; j++) {
+        if (strcmp(nameLower, g_CharacterMappings[j].charName) == 0) {
+            return &g_CharacterMappings[j];
+        }
+    }
+    return nullptr;
+}
+
+inline const SpriteArea* FindSpriteArea(const CharacterMapping* mapping, const char* areaName)
+{
+    for (int i = 0; i < mapping->spriteAreaCount; i++) {
+        if (strcmp(mapping->spriteAreas[i].name, areaName) == 0) {
+            return &mapping->spriteAreas[i];
+        }
+    }
+    return nullptr;
+}
