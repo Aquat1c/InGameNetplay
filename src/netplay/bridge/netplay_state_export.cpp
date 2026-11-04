@@ -1,4 +1,5 @@
 #include "netplay/bridge/netplay_state_export.h"
+#include "netplay/bridge/netplay_state_snapshot.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -86,7 +87,7 @@ namespace
 {
 HANDLE g_shmHandle = nullptr;
 EFZNetplayState* g_shmView = nullptr;
-EFZNetplayState g_localCopy = {};
+StateSnapshot g_snapshot;
 std::thread g_updateWorker;
 HANDLE g_updateEvent = nullptr;
 CRITICAL_SECTION g_updateRequestLock = {};
@@ -170,7 +171,8 @@ void PublishSuspendedHeartbeat()
         screenIdx == 1 || screenIdx == 2 || screenIdx == 3;
 
     EnterCriticalSection(&g_updateRequestLock);
-    EFZNetplayState s = g_localCopy;
+    EFZNetplayState s = {};
+    (void)g_snapshot.Copy(&s, sizeof(s), EFZ_NETPLAY_STATE_VERSION);
     if (inOnlineFlow)
     {
         ApplyOnlineFlowScreen(s, screenIdx);
@@ -181,7 +183,7 @@ void PublishSuspendedHeartbeat()
     {
         std::memcpy(g_shmView, &s, sizeof(EFZNetplayState));
     }
-    g_localCopy = s;
+    g_snapshot.Publish(s);
     g_lastExportTickMs = s.lastUpdateTick;
     LeaveCriticalSection(&g_updateRequestLock);
 
@@ -630,7 +632,7 @@ void Initialize()
     {
         std::memcpy(g_shmView, &init, sizeof(EFZNetplayState));
     }
-    g_localCopy = init;
+    g_snapshot.Publish(init);
 
     InitializeCriticalSection(&g_updateRequestLock);
     g_updateRequestLockInitialized = true;
@@ -702,7 +704,7 @@ void Shutdown()
         g_shmHandle = nullptr;
     }
 
-    g_localCopy = {};
+    g_snapshot.Publish({});
     mod::Log("StateExport: shutdown");
 }
 
@@ -1277,7 +1279,7 @@ void UpdateNow(const NetbridgeStatus& status)
     {
         std::memcpy(g_shmView, &s, sizeof(EFZNetplayState));
     }
-    g_localCopy = s;
+    g_snapshot.Publish(s);
     g_lastExportTickMs = s.lastUpdateTick;
     if (g_updateRequestLockInitialized)
     {
@@ -1396,9 +1398,30 @@ void PublishOnlineBoundary(const NetbridgeStatus& status)
     UpdateNow(status);
 }
 
+void PublishTrainingHandoffBoundary(const NetbridgeStatus& status)
+{
+    if (g_updateRequestLockInitialized) EnterCriticalSection(&g_updateRequestLock);
+    const uint32_t tick = GetTickCount();
+    g_snapshot.PublishHandoff(status, tick,
+        static_cast<uint32_t>(InterlockedIncrement(&g_stateSeq)));
+    g_lastExportTickMs = tick;
+    if (g_shmView != nullptr)
+    {
+        EFZNetplayState snapshot = {};
+        if (g_snapshot.Copy(&snapshot, sizeof(snapshot), EFZ_NETPLAY_STATE_VERSION))
+            std::memcpy(g_shmView, &snapshot, sizeof(snapshot));
+    }
+    if (g_updateRequestLockInitialized) LeaveCriticalSection(&g_updateRequestLock);
+}
+
 const EFZNetplayState* GetExportedState()
 {
-    return &g_localCopy;
+    return g_snapshot.LegacyPointer();
+}
+
+bool CopyExportedState(EFZNetplayState* output, uint32_t outputSize, uint32_t minimumVersion)
+{
+    return g_snapshot.Copy(output, outputSize, minimumVersion);
 }
 
 }

@@ -418,7 +418,12 @@ shown on both screens - character select, spectating, and the win screen:
 A versioned snapshot of what is happening - session mode and phase, scores,
 nicknames, ping, menu page, character picks, end reasons, async-host status
 - is published to a named shared-memory block (`EFZNetplay_State`) and
-through the `EFZNetplay_GetState()` export. The contract, including the
+through the `EFZNetplay_CopyState(output, outputSize, minimumVersion)` export.
+The copy export returns nonzero after a compatible publication is copied
+into caller-owned storage under the publication mutex. Failed calls leave
+the destination unchanged. `EFZNetplay_GetState()` remains available for
+older consumers, but its raw pointer and the named mapping do not synchronize
+with producer writes. The contract, including the
 magic/version/capability checks consumers must perform, is
 `include/efz_netplay_state.h`; the writer is
 `src/netplay/bridge/netplay_state_export.cpp` (`ExportWorkerMain()`,
@@ -426,6 +431,17 @@ magic/version/capability checks consumers must perform, is
 `ResumeControlPlaneUpdates()` around the online handoff). Adding a field
 means bumping the ABI version there and populating it in the writer - the
 header is the single source of truth.
+
+When Extended Practice is loaded, native session initialization and online
+simulation handoff first call its `EFZ_TM_PrepareNetplayV1` export.
+Starting a background host listener leaves Practice running; a pending
+native initialization retires it before destroying or replacing the session. This drains Practice
+writers before Revival can own the online world. After publishing the
+resulting state synchronously, `EFZ_TM_FinishNetplayPrepareV1` releases the
+pending handoff. The export worker drains before session startup; a failed
+drain rejects startup and restores its previous suspension state.
+An older training DLL without these exports blocks session start; update
+both companion DLLs together.
 
 Instrumenting a running rollback simulation can itself cause desyncs, so
 ordinary updates stop at the online handoff. Two narrow paths keep the state

@@ -4811,8 +4811,10 @@ bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus)
     return ready;
 }
 
-void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
+void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
+          bool* trainingRetirementRequired, bool trainingRetired)
 {
+    if (trainingRetirementRequired) *trainingRetirementRequired = false;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (ioStatus == nullptr)
     {
@@ -5163,6 +5165,13 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick)
         const DWORD initReady = WaitForSingleObject(g_hostInitEvent, 0);
         if (initReady == WAIT_OBJECT_0)
         {
+            if (!trainingRetired)
+            {
+                if (!SetEvent(g_hostInitEvent))
+                    mod::Log("Takeover: failed to rearm training retirement init event");
+                if (trainingRetirementRequired) *trainingRetirementRequired = true;
+                return;
+            }
             LogRevival102jDeepSnapshot("Tick.31.init_event_post_tick_consumed", ioStatus);
             LogSessionDiagnosticState("Tick_init_handshake_pre");
 

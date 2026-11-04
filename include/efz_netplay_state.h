@@ -1,4 +1,7 @@
-// EFZ Netplay State Export - public interface shared with consumer mods
+// Prefer EFZNetplay_CopyState(output, outputSize, minimumVersion), returning int (__cdecl).
+// Returns 1 for a coherent bounded copy; 0 leaves output untouched. outputSize must be >= 12.
+// Legacy EFZNetplay_GetState and the "EFZNetplay_State" mapping expose mutable storage.
+// Validate magic, version and structSize before using any copied fields.
 #pragma once
 
 #include <cstdint>

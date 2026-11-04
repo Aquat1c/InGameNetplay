@@ -164,6 +164,7 @@ bool BeginOptionsIniAccess(
 void EndOptionsIniAccess();
 bool ApplyInputDelay(int delayFrames);
 bool AnswerSpectatePromptChoice(int choice);
+bool PrepareTrainingForOnlineSimulation();
 bool PrepareVsHumanHandoff();
 bool RequiresNativeVsHumanSyncForHandoff();
 // Safe from game/window callbacks; never under loader lock.

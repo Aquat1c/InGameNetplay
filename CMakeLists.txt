@@ -390,6 +390,26 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND WIN32)
+    add_executable(training_handoff_tests tests/training_handoff_tests.cpp)
+    target_include_directories(training_handoff_tests PRIVATE include)
+    target_compile_features(training_handoff_tests PRIVATE cxx_std_17)
+    if(MSVC AND EFZ_XP_COMPAT)
+        target_compile_definitions(training_handoff_tests PRIVATE
+            WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+        target_compile_options(training_handoff_tests PRIVATE /Zc:threadSafeInit-)
+    endif()
+    add_test(NAME training_handoff_tests COMMAND training_handoff_tests)
+
+    add_executable(netplay_state_snapshot_tests tests/netplay_state_snapshot_tests.cpp)
+    target_include_directories(netplay_state_snapshot_tests PRIVATE include)
+    target_compile_features(netplay_state_snapshot_tests PRIVATE cxx_std_17)
+    if(MSVC AND EFZ_XP_COMPAT)
+        target_compile_definitions(netplay_state_snapshot_tests PRIVATE
+            WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+        target_compile_options(netplay_state_snapshot_tests PRIVATE /Zc:threadSafeInit-)
+    endif()
+    add_test(NAME netplay_state_snapshot_tests COMMAND netplay_state_snapshot_tests)
+
     add_executable(network_endpoint_tests EXCLUDE_FROM_ALL
         tests/network_endpoint_tests.cpp
         src/netplay/core/network_capability.cpp

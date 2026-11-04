@@ -26,5 +26,9 @@ bool OnlineCharSelectChanged();
 // Game thread only, on a non-battle screen edge.
 void PublishOnlineBoundary(const NetbridgeStatus& status);
 
+// Requires a drained export worker; reads only the supplied status.
+void PublishTrainingHandoffBoundary(const NetbridgeStatus& status);
+
 const EFZNetplayState* GetExportedState();
+bool CopyExportedState(EFZNetplayState* output, uint32_t outputSize, uint32_t minimumVersion);
 }

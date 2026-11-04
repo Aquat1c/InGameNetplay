@@ -21,6 +21,8 @@ namespace netplay::bridge
 {
 namespace
 {
+#include "netplay/bridge/training_handoff.inl"
+
 std::mutex g_mutex;
 NetbridgeStatus g_status = {};
 uint32_t g_connectStartTick = 0;
@@ -314,20 +316,25 @@ void Tick()
     QueryPerformanceCounter(&tickQpcPre);
 
     NetbridgeStatus statusSnapshot = {};
+    bool trainingRetirementRequired = false;
+    uint32_t requestSerial = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_initialized)
-        {
-            return;
-        }
-
-        if (g_startWorkerRunning)
-        {
-            return;
-        }
-
+        if (!g_initialized || g_startWorkerRunning) return;
         JoinFinishedWorkerUnlocked();
-        takeover::Tick(&g_status, &g_connectStartTick);
+        takeover::Tick(&g_status, &g_connectStartTick, &trainingRetirementRequired);
+        requestSerial = g_startRequestSerial;
+        statusSnapshot = g_status;
+    }
+    if (trainingRetirementRequired)
+    {
+        TrainingHandoff trainingHandoff;
+        if (!trainingHandoff.Ready()) return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
+        if (!g_initialized || g_startWorkerRunning || requestSerial != g_startRequestSerial
+            || (phase != NetbridgePhase::Connecting && phase != NetbridgePhase::DelaySetup)) return;
+        takeover::Tick(&g_status, &g_connectStartTick, nullptr, true);
         statusSnapshot = g_status;
     }
 
@@ -481,6 +488,8 @@ static bool StartSessionInternal(
         *outHostFailure = HostStartFailure::None;
     }
 
+    TrainingHandoff trainingHandoff(role != NetbridgeRole::Host);
+    if (!trainingHandoff.Ready()) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
     {
@@ -1073,8 +1082,16 @@ bool AnswerSpectatePromptChoice(int choice)
     return answered;
 }
 
+bool PrepareTrainingForOnlineSimulation()
+{
+    TrainingHandoff trainingHandoff;
+    return trainingHandoff.Ready();
+}
+
 bool PrepareVsHumanHandoff()
 {
+    TrainingHandoff trainingHandoff;
+    if (!trainingHandoff.Ready()) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
     {

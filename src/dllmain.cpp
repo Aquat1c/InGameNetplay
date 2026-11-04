@@ -226,3 +226,9 @@ EFZNetplay_GetState(void)
     return netplay::bridge::state_export::GetExportedState();
 }
 
+extern "C" __declspec(dllexport) int __cdecl
+EFZNetplay_CopyState(EFZNetplayState* output, uint32_t outputSize, uint32_t minimumVersion)
+{
+    return netplay::bridge::state_export::CopyExportedState(output, outputSize, minimumVersion) ? 1 : 0;
+}
+

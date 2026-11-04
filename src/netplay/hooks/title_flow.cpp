@@ -4654,6 +4654,7 @@ static bool SuspendUiHooksForOnlineSimulation(
         g_onlineSimSuspendFailFastStartTick = 0;
     }
 
+    if (!netplay::bridge::PrepareTrainingForOnlineSimulation()) return false;
     // Drain the export barrier before simulation begins.
     netplay::bridge::TickExportOnly(true);
     if (!netplay::bridge::state_export::SuspendForOnlineSimulation())

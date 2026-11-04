@@ -30,7 +30,8 @@ bool StartSession(
     bool writeHostProtocol,
     NetbridgeStatus* ioStatus,
     uint32_t* outConnectStartTick);
-void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick);
+void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
+          bool* trainingRetirementRequired = nullptr, bool trainingRetired = false);
 void CancelSession(const char* reason, NetbridgeStatus* ioStatus);
 bool ConsumeRevivalExitInterception(int* outMode, NetbridgeStatus* ioStatus);
 bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus);
