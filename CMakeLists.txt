@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EFZInGameNetplayMod VERSION 0.6.2 LANGUAGES C CXX)
+project(EFZInGameNetplayMod VERSION 0.6.3.1 LANGUAGES C CXX)
 
 include(CTest)
 
