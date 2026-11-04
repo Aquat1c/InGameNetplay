@@ -203,13 +203,13 @@ void TestQueuedReadBoundary()
     }
     {
         std::lock_guard<std::mutex> queueLock(g_ownedLogEfzQueueMutex);
-        g_ownedLogEfzAccepting = false;
+        g_consoleWorker.BeginDrain();
     }
     Expect(!FlushPendingConsoleOutput("reader_enqueue_rejected", true),
         "active-worker enqueue failure cannot report a completed input-read boundary");
     {
         std::lock_guard<std::mutex> queueLock(g_ownedLogEfzQueueMutex);
-        g_ownedLogEfzAccepting = true;
+        g_consoleWorker.Started();
     }
     std::unique_lock<std::mutex> parserLock(g_consoleLogMutex);
     Expect(EnqueueConsoleParseChunk("WriteConsoleOutputCharacterW", "x", 1, false, 6),

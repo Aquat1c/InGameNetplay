@@ -27,7 +27,7 @@ public:
     // localSide: 0=P1, 1=P2, -1=spectator.
     void Begin(int localSide);
     void End();
-    bool IsActive() const { return m_active; }
+    bool IsActive() const { return m_state != HandshakeState::Idle; }
     HandshakeState State() const { return m_state; }
 
     void SetSendSink(SendSink sink, void* user);
@@ -49,7 +49,6 @@ private:
     void SendAck(std::uint32_t nonce);
     void LogRejectedFrame(const char* reason, std::size_t len);
 
-    bool           m_active = false;
     int            m_localSide = -1;
     HandshakeState m_state = HandshakeState::Idle;
     std::uint32_t  m_nonce = 0;

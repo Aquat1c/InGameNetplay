@@ -2623,7 +2623,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 const int roleMode = block->initParams[0];
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
-                const bool delayPromptPending = promptSerial > 0 && promptSerial != promptServed;
+                const bool delayPromptPending = console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending;
                 const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
                 const bool auxNotServedYet = servedAuxSerial != auxSerial;
                 bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
@@ -2684,11 +2684,11 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             {
                 const LONG scPromptSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
                 const LONG scPromptServed = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
-                if (scPromptSerial > 0 && scPromptSerial != scPromptServed)
+                if (console_handoff::ReadPromptGeneration(scPromptSerial, scPromptServed) == console_handoff::PromptState::Pending)
                 {
                     const LONG scInputSerial = InterlockedCompareExchange(&block->spectateConfirmInputSerial, 0, 0);
                     const LONG scInputServedSerial = InterlockedCompareExchange(&block->spectateConfirmInputServedSerial, 0, 0);
-                    if (scInputSerial > scInputServedSerial)
+                    if (console_handoff::ReadInputDelivery(scInputSerial, scInputServedSerial) == console_handoff::InputDeliveryState::Queued)
                     {
                         const int scValue = block->spectateConfirmInputValue;
                         char scLine[16] = {};
@@ -2746,7 +2746,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
-                if (promptSerial > 0 && promptSerial != promptServed)
+                if (console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending)
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
@@ -3123,7 +3123,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 const int roleMode = block->initParams[0];
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
-                const bool delayPromptPending = promptSerial > 0 && promptSerial != promptServed;
+                const bool delayPromptPending = console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending;
                 const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
                 const bool auxNotServedYet = servedAuxSerial != auxSerial;
                 bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
@@ -3172,11 +3172,11 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             {
                 const LONG scPromptSerialW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
                 const LONG scPromptServedW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
-                if (scPromptSerialW > 0 && scPromptSerialW != scPromptServedW)
+                if (console_handoff::ReadPromptGeneration(scPromptSerialW, scPromptServedW) == console_handoff::PromptState::Pending)
                 {
                     const LONG scInputSerialW = InterlockedCompareExchange(&block->spectateConfirmInputSerial, 0, 0);
                     const LONG scInputServedSerialW = InterlockedCompareExchange(&block->spectateConfirmInputServedSerial, 0, 0);
-                    if (scInputSerialW > scInputServedSerialW)
+                    if (console_handoff::ReadInputDelivery(scInputSerialW, scInputServedSerialW) == console_handoff::InputDeliveryState::Queued)
                     {
                         const int scValueW = block->spectateConfirmInputValue;
                         char scLineW[16] = {};
@@ -3234,7 +3234,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
 
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
-                if (promptSerial > 0 && promptSerial != promptServed)
+                if (console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending)
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);

@@ -3,6 +3,10 @@
 #include "netplay/bridge/session_start_state.h"
 #include "netplay/bridge/gameplay_exit_state.h"
 #include "netplay/bridge/frontend_return_state.h"
+#include "netplay/bridge/console_capture_state.h"
+#include "netplay/bridge/export_worker_state.h"
+#include "netplay/bridge/native_resource_state.h"
+#include "netplay/bridge/console_handoff_policy.h"
 #include <cstdio>
 int main() {
     using namespace netplay::bridge;
@@ -61,5 +65,43 @@ int main() {
     expect(frontend_return::ReturnConsumed(ReturnOwnership::ContinuationClaimedConsumed), "claimed continuation publishes teardown suppression before completion");
     expect(frontend_return::FinishReturn(ReturnOwnership::ContinuationClaimedConsumed) == ReturnOwnership::ContinuationConsumed, "completion releases ownership and preserves suppression");
     expect(frontend_return::ResetReturnConsumed(ReturnOwnership::ContinuationClaimedConsumed) == ReturnOwnership::ContinuationClaimed, "clearing suppression must not release an unfinished continuation");
+    takeover::console_capture::WorkerLifecycle consoleWorker;
+    consoleWorker.Started();
+    expect(consoleWorker.Accepting() && consoleWorker.StartedOrDraining(), "running console accepts and owns queued work");
+    consoleWorker.BeginDrain();
+    expect(!consoleWorker.Accepting() && consoleWorker.StartedOrDraining(), "draining console rejects new work but permits close boundaries");
+    consoleWorker.DrainFinished();
+    expect(consoleWorker.Stopping() && consoleWorker.HasWorker() && !consoleWorker.StartedOrDraining(), "stopping console remains owned until join");
+    consoleWorker.BeginDrain();
+    expect(consoleWorker.Stopping() && !consoleWorker.StartedOrDraining(), "duplicate shutdown must not reopen a worker after drain completion");
+    consoleWorker.Joined();
+    expect(!consoleWorker.HasWorker(), "joined console permits restart");
+    expect(state_export::AcceptsAsyncUpdates(state_export::WorkerState::Running), "running exporter accepts asynchronous updates");
+    expect(!state_export::AcceptsAsyncUpdates(state_export::WorkerState::Stopping), "stopping exporter rejects new asynchronous work");
+    takeover::RenderContextLifecycle render;
+    render.Consume();
+    expect(!render.HasContext(), "consuming an empty render context does not create a retained pointer");
+    render.Save(123);
+    render.Consume();
+    expect(render.HasContext() && !render.IsSaved() && render.pointer == 123, "consumed render context remains available for later cleanup");
+    render.Clear();
+    expect(!render.HasContext(), "procedural rendering clears retained context");
+    takeover::StallLifecycle stall;
+    stall.ObserveSync();
+    stall.Begin();
+    stall.Reset(false);
+    expect(!stall.Active() && stall.TracksSync(), "stall reset may preserve synchronization observation");
+    stall.Reset(true);
+    stall.Begin();
+    expect(stall.Active() && !stall.TracksSync(), "stall may start before a valid sync sample");
+    stall.ObserveSync();
+    expect(stall.Active() && stall.TracksSync(), "first sync sample preserves an already active stall");
+    using console_handoff::PromptState;
+    expect(console_handoff::ReadPromptGeneration(3, 4) == PromptState::Pending, "native prompt acknowledgement requires the exact generation");
+    expect(console_handoff::ReadOrderedPromptProgress(3, 4) == PromptState::Served, "ordered prompt progress accepts later served generations");
+    expect(console_handoff::ReadDelayHandoff(3, 2, 4, 3) == console_handoff::DelayHandoffState::InputQueued, "queued input still belongs to the held native prompt");
+    expect(console_handoff::ReadDelayHandoff(3, 2, 4, 4) == console_handoff::DelayHandoffState::InputServed, "served explicit input releases the held delay reader");
+    expect(console_handoff::ReadTimeoutCleanup(true, 4, 5) == console_handoff::TimeoutCleanupState::WaitingForWake, "timeout cleanup cannot consume an earlier wake");
+    expect(console_handoff::ReadTimeoutCleanup(false, 0, 0) == console_handoff::TimeoutCleanupState::Ready, "dead helper does not require a future wake");
     return failures ? 1 : 0;
 }

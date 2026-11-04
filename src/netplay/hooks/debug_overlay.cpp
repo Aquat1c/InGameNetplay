@@ -204,7 +204,8 @@ std::vector<RtTextItem> g_rtTextStaging;
 std::vector<RtTextItem> g_rtTextActive;
 volatile LONG g_rtTextPublished = 0;
 // Game thread only. 0 = no fade, 1 = fade-out, 2 = fade-in.
-int g_rtFadeMode = 0;
+enum class RtFadeMode { None, Out, In };
+RtFadeMode g_rtFadeMode = RtFadeMode::None;
 int g_rtFadeFrame = 0;
 float g_rtTextActiveBrightness = 1.0f;   // under g_rtTextLock
 
@@ -1587,14 +1588,14 @@ void SubmitRtOccluder(int x, int y, int w, int h)
 
 void BeginRtTextFade(bool fadeIn)
 {
-    g_rtFadeMode = fadeIn ? 2 : 1;
+    g_rtFadeMode = fadeIn ? RtFadeMode::In : RtFadeMode::Out;
     g_rtFadeFrame = 0;
 }
 
 void EndRtTextFade()
 {
-    const bool fadedOut = g_rtFadeMode == 1;
-    g_rtFadeMode = 0;
+    const bool fadedOut = g_rtFadeMode == RtFadeMode::Out;
+    g_rtFadeMode = RtFadeMode::None;
     EnsureRtTextLock();
     EnterCriticalSection(&g_rtTextLock);
     g_rtTextActiveBrightness = fadedOut ? 0.0f : 1.0f;
@@ -1605,11 +1606,11 @@ void CommitRtTextFrame()
 {
     // Step n is presented under the palette set by step n-1.
     float brightness = 1.0f;
-    if (g_rtFadeMode != 0)
+    if (g_rtFadeMode != RtFadeMode::None)
     {
         const int n = g_rtFadeFrame++;
         const float level = n == 0 ? 0.0f : (std::min)(static_cast<float>(n - 1) / 20.0f, 1.0f);
-        brightness = g_rtFadeMode == 1 ? (n == 0 ? 1.0f : 1.0f - level) : level;
+        brightness = g_rtFadeMode == RtFadeMode::Out ? (n == 0 ? 1.0f : 1.0f - level) : level;
     }
     EnsureRtTextLock();
     EnterCriticalSection(&g_rtTextLock);

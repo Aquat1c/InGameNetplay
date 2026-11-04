@@ -20,7 +20,6 @@ void OverlayChannel::Begin(int localSide)
         End();
         return;
     }
-    m_active = true;
     m_localSide = (localSide == 0 || localSide == 1) ? localSide : -1;
     m_state = HandshakeState::Probing;
     m_nonce = static_cast<std::uint32_t>(GetTickCount()) ^ 0x9E3779B9u;
@@ -38,14 +37,13 @@ void OverlayChannel::Begin(int localSide)
 
 void OverlayChannel::End()
 {
-    if (!m_active)
+    if (!IsActive())
     {
         return;
     }
     mod::Log("OverlayChannel: end state=%d helloCount=%lu",
              static_cast<int>(m_state),
              static_cast<unsigned long>(m_helloCount));
-    m_active = false;
     m_state = HandshakeState::Idle;
     m_palettes.Clear();
 }
@@ -93,7 +91,7 @@ void OverlayChannel::SendAck(std::uint32_t nonce)
 
 void OverlayChannel::Tick(std::uint32_t nowMs)
 {
-    if (!m_active)
+    if (!IsActive())
     {
         return;
     }
@@ -140,7 +138,7 @@ void OverlayChannel::LogRejectedFrame(const char* reason, std::size_t len)
 bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
                                        std::size_t len)
 {
-    if (!m_active)
+    if (!IsActive())
     {
         return false;
     }
@@ -210,7 +208,7 @@ bool OverlayChannel::OnInboundDatagram(const std::uint8_t* datagram,
 
 void OverlayChannel::SubmitLocalPaletteRow(const protocol::PaletteBlobBody& row)
 {
-    if (!m_active || m_localSide < 0)
+    if (!IsActive() || m_localSide < 0)
     {
         return;
     }
@@ -247,7 +245,7 @@ void OverlayChannel::SubmitLocalPaletteRow(const protocol::PaletteBlobBody& row)
 bool OverlayChannel::GetPeerPaletteRow(int side,
                                        protocol::PaletteBlobBody* out) const
 {
-    if (!m_active)
+    if (!IsActive())
     {
         return false;
     }
@@ -256,7 +254,7 @@ bool OverlayChannel::GetPeerPaletteRow(int side,
 
 void OverlayChannel::ResetPaletteExchangeForRematch()
 {
-    if (!m_active)
+    if (!IsActive())
     {
         return;
     }

@@ -1,5 +1,6 @@
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/netplay_state_snapshot.h"
+#include "netplay/bridge/export_worker_state.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -94,11 +95,20 @@ CRITICAL_SECTION g_updateRequestLock = {};
 bool g_updateRequestLockInitialized = false;
 NetbridgeStatus g_pendingStatus = {};
 volatile LONG g_updateRequestPending = 0;
-volatile LONG g_updateWorkerStop = 0;
-volatile LONG g_updateWorkerReady = 0;
+volatile LONG g_updateWorkerState = static_cast<LONG>(WorkerState::Dormant);
 volatile LONG g_updatePublishDropped = 0;
 volatile LONG g_updateInFlight = 0;
-volatile LONG g_updatesSuspended = 0;
+volatile LONG g_updateMode = static_cast<LONG>(UpdateMode::Full);
+
+WorkerState CurrentWorkerState()
+{
+    return static_cast<WorkerState>(InterlockedCompareExchange(&g_updateWorkerState, 0, 0));
+}
+
+bool UpdatesSuspended()
+{
+    return static_cast<UpdateMode>(InterlockedCompareExchange(&g_updateMode, 0, 0)) == UpdateMode::SuspendedHeartbeat;
+}
 
 uint8_t g_prevInNetplayMenu = 0;
 uint8_t g_prevInNetplayCharacterSelect = 0;
@@ -217,25 +227,25 @@ void ExportWorkerMain()
     while (g_updateEvent != nullptr)
     {
         const bool suspended =
-            InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0;
+            UpdatesSuspended();
         const DWORD waitResult = WaitForSingleObject(
             g_updateEvent,
             suspended ? kSuspendedHeartbeatMs : INFINITE);
         if (waitResult != WAIT_OBJECT_0)
         {
-            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            if (CurrentWorkerState() == WorkerState::Stopping)
             {
                 break;
             }
             if (waitResult == WAIT_TIMEOUT
-                && InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+                && UpdatesSuspended())
             {
                 PublishSuspendedHeartbeat();
             }
             continue;
         }
 
-        if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+        if (CurrentWorkerState() == WorkerState::Stopping)
         {
             break;
         }
@@ -263,7 +273,7 @@ void ExportWorkerMain()
             UpdateNow(snapshot);
             InterlockedDecrement(&g_updateInFlight);
 
-            if (InterlockedCompareExchange(&g_updateWorkerStop, 0, 0) != 0)
+            if (CurrentWorkerState() == WorkerState::Stopping)
             {
                 break;
             }
@@ -275,18 +285,18 @@ void ExportWorkerMain()
 
 void QueueUpdate(const NetbridgeStatus& status)
 {
-    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    if (UpdatesSuspended())
     {
         return;
     }
     InterlockedIncrement(&g_updateInFlight);
     // Second check closes the race with suspension: a loser publishes nothing.
-    if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    if (UpdatesSuspended())
     {
         InterlockedDecrement(&g_updateInFlight);
         return;
     }
-    if (InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) == 0
+    if (!AcceptsAsyncUpdates(CurrentWorkerState())
         || g_updateEvent == nullptr
         || !g_updateRequestLockInitialized)
     {
@@ -638,11 +648,10 @@ void Initialize()
     g_updateRequestLockInitialized = true;
     g_pendingStatus = {};
     InterlockedExchange(&g_updateRequestPending, 0);
-    InterlockedExchange(&g_updateWorkerStop, 0);
-    InterlockedExchange(&g_updateWorkerReady, 0);
+    InterlockedExchange(&g_updateWorkerState, static_cast<LONG>(WorkerState::Dormant));
     InterlockedExchange(&g_updatePublishDropped, 0);
     InterlockedExchange(&g_updateInFlight, 0);
-    InterlockedExchange(&g_updatesSuspended, 0);
+    InterlockedExchange(&g_updateMode, static_cast<LONG>(UpdateMode::Full));
 
     g_updateEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (g_updateEvent != nullptr)
@@ -650,7 +659,7 @@ void Initialize()
         try
         {
             g_updateWorker = std::thread(ExportWorkerMain);
-            InterlockedExchange(&g_updateWorkerReady, 1);
+            InterlockedExchange(&g_updateWorkerState, static_cast<LONG>(WorkerState::Running));
         }
         catch (...)
         {
@@ -662,13 +671,12 @@ void Initialize()
     mod::Log("StateExport: initialized (shm=%s, view=%p, async=%d)",
              g_shmHandle != nullptr ? "ok" : "FAIL",
              static_cast<void*>(g_shmView),
-             InterlockedCompareExchange(&g_updateWorkerReady, 0, 0) != 0 ? 1 : 0);
+             AcceptsAsyncUpdates(CurrentWorkerState()) ? 1 : 0);
 }
 
 void Shutdown()
 {
-    InterlockedExchange(&g_updateWorkerReady, 0);
-    InterlockedExchange(&g_updateWorkerStop, 1);
+    InterlockedExchange(&g_updateWorkerState, static_cast<LONG>(WorkerState::Stopping));
     if (g_updateEvent != nullptr)
     {
         (void)SetEvent(g_updateEvent);
@@ -684,7 +692,7 @@ void Shutdown()
     }
     InterlockedExchange(&g_updateRequestPending, 0);
     InterlockedExchange(&g_updatePublishDropped, 0);
-    InterlockedExchange(&g_updatesSuspended, 1);
+    InterlockedExchange(&g_updateMode, static_cast<LONG>(UpdateMode::SuspendedHeartbeat));
     g_pendingStatus = {};
     if (g_updateRequestLockInitialized)
     {
@@ -710,8 +718,7 @@ void Shutdown()
 
 void EmergencyShutdown()
 {
-    InterlockedExchange(&g_updateWorkerReady, 0);
-    InterlockedExchange(&g_updateWorkerStop, 1);
+    InterlockedExchange(&g_updateWorkerState, static_cast<LONG>(WorkerState::Stopping));
     if (g_updateEvent != nullptr)
     {
         (void)SetEvent(g_updateEvent);
@@ -743,7 +750,7 @@ void UpdateNow(const NetbridgeStatus& status)
             static_cast<NetbridgePhase>(status.phase) != NetbridgePhase::SessionEnded;
         if (sessionActive
             && g_lastExportTickMs != 0
-            && InterlockedCompareExchange(&g_updatesSuspended, 0, 0) == 0)
+            && !UpdatesSuspended())
         {
             const uint32_t elapsed = now - g_lastExportTickMs;
             if (elapsed > kExportStallWarningMs)
@@ -865,7 +872,7 @@ void UpdateNow(const NetbridgeStatus& status)
         std::memcpy(g_latchedP1Name, s.p1Name, sizeof(g_latchedP1Name));
         std::memcpy(g_latchedP2Name, s.p2Name, sizeof(g_latchedP2Name));
     }
-    else if (InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0)
+    else if (UpdatesSuspended())
     {
         std::memcpy(s.p1Name, g_latchedP1Name, sizeof(s.p1Name));
         std::memcpy(s.p2Name, g_latchedP2Name, sizeof(s.p2Name));
@@ -993,7 +1000,7 @@ void UpdateNow(const NetbridgeStatus& status)
         // Launcher-adopted sessions suspend without setting the return flag.
         const bool inOnlineFlow =
             netplay::hooks::internal::g_returnToNetplayAfterMatch
-            || InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0;
+            || UpdatesSuspended();
 
         s.inNetplayCharacterSelect = 0;
         s.inNetplayMatch = 0;
@@ -1315,7 +1322,7 @@ void Update(const NetbridgeStatus& status)
 
 bool SuspendForOnlineSimulation()
 {
-    InterlockedExchange(&g_updatesSuspended, 1);
+    InterlockedExchange(&g_updateMode, static_cast<LONG>(UpdateMode::SuspendedHeartbeat));
     if (g_updateRequestLockInitialized)
     {
         EnterCriticalSection(&g_updateRequestLock);
@@ -1360,13 +1367,13 @@ bool SuspendForOnlineSimulation()
 
 void ResumeControlPlaneUpdates()
 {
-    InterlockedExchange(&g_updatesSuspended, 0);
+    InterlockedExchange(&g_updateMode, static_cast<LONG>(UpdateMode::Full));
 }
 
 bool IsSuspendedForOnlineSimulation()
 {
     return g_updateRequestLockInitialized
-        && InterlockedCompareExchange(&g_updatesSuspended, 0, 0) != 0;
+        && UpdatesSuspended();
 }
 
 bool OnlineCharSelectChanged()

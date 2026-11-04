@@ -1,6 +1,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/i18n.h"
 #include "netplay/core/mod_settings.h"
+#include "netplay/bridge/console_capture_state.h"
 
 #include <algorithm>
 #include <array>
@@ -1342,9 +1343,7 @@ static std::condition_variable g_ownedLogEfzQueueCv;
 static std::condition_variable g_ownedLogEfzDrainCv;
 static std::deque<OwnedLogEfzEntry> g_ownedLogEfzQueue;
 static std::thread g_ownedLogEfzWorker;
-static bool g_ownedLogEfzWorkerStarted = false;
-static bool g_ownedLogEfzWorkerStopping = false;
-static bool g_ownedLogEfzAccepting = false;
+static console_capture::WorkerLifecycle g_consoleWorker;
 static volatile LONG g_ownedLogEfzEmergencyStop = 0;
 static unsigned long long g_ownedLogEfzEnqueuedSequence = 0;
 static unsigned long long g_ownedLogEfzProcessedSequence = 0;
@@ -1899,7 +1898,7 @@ static void ManagedLogEfzWorkerMain()
         {
             std::unique_lock<std::mutex> lock(g_ownedLogEfzQueueMutex);
             const auto wakePredicate = [] {
-                    return g_ownedLogEfzWorkerStopping
+                    return g_consoleWorker.Stopping()
                         || InterlockedCompareExchange(
                                &g_ownedLogEfzEmergencyStop, 0, 0) != 0
                         || (!g_ownedLogEfzQueue.empty()
@@ -1940,7 +1939,7 @@ static void ManagedLogEfzWorkerMain()
                     TryAcquireConsoleIngressRecord(&ingressPosition);
                 if (ingressSlot == nullptr)
                 {
-                    if (g_ownedLogEfzWorkerStopping
+                    if (g_consoleWorker.Stopping()
                         && g_ownedLogEfzQueue.empty()
                         && g_consoleIngressDequeuePosition
                             >= CaptureConsoleIngressBoundary())
@@ -2004,7 +2003,7 @@ static void ManagedLogEfzWorkerMain()
 bool StartConsoleCaptureWorker(bool enableRawIngress)
 {
     std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-    if (g_ownedLogEfzWorkerStarted)
+    if (g_consoleWorker.HasWorker())
     {
         return !enableRawIngress
             || g_consoleIngressAccepting.load(std::memory_order_acquire);
@@ -2013,22 +2012,19 @@ bool StartConsoleCaptureWorker(bool enableRawIngress)
     g_consoleIngressPollingEnabled.store(
         enableRawIngress, std::memory_order_release);
     ResetConsoleIngress();
-    g_ownedLogEfzWorkerStopping = false;
-    g_ownedLogEfzAccepting = false;
+    g_consoleWorker.Joined();
     InterlockedExchange(&g_ownedLogEfzEmergencyStop, 0);
     try
     {
         g_ownedLogEfzWorker = std::thread(ManagedLogEfzWorkerMain);
-        g_ownedLogEfzWorkerStarted = true;
-        g_ownedLogEfzAccepting = true;
+        g_consoleWorker.Started();
         g_consoleIngressAccepting.store(
             enableRawIngress, std::memory_order_release);
         return true;
     }
     catch (...)
     {
-        g_ownedLogEfzWorkerStarted = false;
-        g_ownedLogEfzAccepting = false;
+        g_consoleWorker.Joined();
         g_consoleIngressAccepting.store(false, std::memory_order_release);
         g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         mod::Log(
@@ -2061,8 +2057,7 @@ static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line
 
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (!g_ownedLogEfzWorkerStarted || g_ownedLogEfzWorkerStopping
-            || !g_ownedLogEfzAccepting
+        if (!g_consoleWorker.Accepting()
             || InterlockedCompareExchange(
                    &g_ownedLogEfzEmergencyStop, 0, 0) != 0)
         {
@@ -2175,8 +2170,7 @@ static bool EnqueueConsoleParseFlush(bool waitForDrain)
 
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (!g_ownedLogEfzWorkerStarted || g_ownedLogEfzWorkerStopping
-            || !g_ownedLogEfzAccepting
+        if (!g_consoleWorker.Accepting()
             || InterlockedCompareExchange(
                    &g_ownedLogEfzEmergencyStop, 0, 0) != 0)
         {
@@ -2212,7 +2206,7 @@ static bool EnqueueConsoleParseFlush(bool waitForDrain)
         std::unique_lock<std::mutex> lock(g_ownedLogEfzQueueMutex);
         g_ownedLogEfzDrainCv.wait(lock, [flushSequence] {
             return g_ownedLogEfzProcessedSequence >= flushSequence
-                || !g_ownedLogEfzWorkerStarted
+                || !g_consoleWorker.HasWorker()
                 || InterlockedCompareExchange(
                        &g_ownedLogEfzEmergencyStop, 0, 0) != 0;
         });
@@ -2234,7 +2228,7 @@ bool FlushPendingConsoleOutput(const char*, bool waitForDrain)
     if (waitForDrain)
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (g_ownedLogEfzWorkerStarted
+        if (g_consoleWorker.HasWorker()
             || InterlockedCompareExchange(&g_ownedLogEfzEmergencyStop, 0, 0) != 0)
         {
             return false;
@@ -2266,12 +2260,12 @@ void StopManagedLogEfzWorker(bool waitForDrain)
     unsigned long long closeSequence = 0;
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (!g_ownedLogEfzWorkerStarted)
+        if (!g_consoleWorker.HasWorker())
         {
             g_consoleIngressAccepting.store(false, std::memory_order_release);
             return;
         }
-        g_ownedLogEfzAccepting = false;
+        g_consoleWorker.BeginDrain();
         (void)PauseConsoleIngress();
         OwnedLogEfzEntry closeEntry;
         closeEntry.kind = OwnedLogEfzEntry::Kind::CloseBoundary;
@@ -2290,7 +2284,7 @@ void StopManagedLogEfzWorker(bool waitForDrain)
                 || InterlockedCompareExchange(
                        &g_ownedLogEfzEmergencyStop, 0, 0) != 0;
         });
-        g_ownedLogEfzWorkerStopping = true;
+        g_consoleWorker.DrainFinished();
         joinWorker = g_ownedLogEfzWorker.joinable();
     }
     g_ownedLogEfzQueueCv.notify_all();
@@ -2301,9 +2295,7 @@ void StopManagedLogEfzWorker(bool waitForDrain)
     }
     {
         std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        g_ownedLogEfzWorkerStarted = false;
-        g_ownedLogEfzWorkerStopping = false;
-        g_ownedLogEfzAccepting = false;
+        g_consoleWorker.Joined();
         g_consoleIngressAccepting.store(false, std::memory_order_release);
         g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         g_ownedLogEfzQueue.clear();
@@ -2334,8 +2326,7 @@ void CloseMirrorLogFiles()
     {
         std::lock_guard<std::mutex> parserLock(g_consoleLogMutex);
         std::lock_guard<std::mutex> queueLock(g_ownedLogEfzQueueMutex);
-        if (g_ownedLogEfzWorkerStarted
-            && !g_ownedLogEfzWorkerStopping
+        if (g_consoleWorker.StartedOrDraining()
             && InterlockedCompareExchange(
                    &g_ownedLogEfzEmergencyStop, 0, 0) == 0)
         {

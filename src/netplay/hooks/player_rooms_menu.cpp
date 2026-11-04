@@ -77,8 +77,7 @@ uint32_t g_roomActionResultGeneration = 0;
 AsyncRoomActionKind g_roomActionResultKind = AsyncRoomActionKind::None;
 netplay::lobby::LobbyJoinedRoom g_roomActionResultJoinedRoom = {};
 std::string g_roomActionResultError;
-bool g_lobbySessionShutdownInFlight = false;
-bool g_refreshAfterLobbySessionShutdown = false;
+hooks::RoomReturnRefreshState g_roomReturnRefresh;
 std::array<int8_t, 2> g_lastHorizontalInput = {};
 
 enum class RoomWorkerKind : uint8_t
@@ -610,9 +609,9 @@ void PumpRefreshResult()
             "PlayerRooms::PumpRefreshResult: discarded stale refresh result generation=%u current=%u",
             static_cast<unsigned>(resultGeneration),
             static_cast<unsigned>(g_refreshGeneration.load(std::memory_order_relaxed)));
-        if (g_refreshAfterLobbySessionShutdown && !g_lobbySessionShutdownInFlight && !IsRefreshInFlight())
+        if (g_roomReturnRefresh.IsRefreshPending() && !IsRefreshInFlight())
         {
-            g_refreshAfterLobbySessionShutdown = false;
+            g_roomReturnRefresh.Reset();
             (void)StartAsyncRefresh(false);
         }
         return;
@@ -651,9 +650,9 @@ void PumpRefreshResult()
 
     RebuildMenuEntries();
 
-    if (g_refreshAfterLobbySessionShutdown && !g_lobbySessionShutdownInFlight && !IsRefreshInFlight())
+    if (g_roomReturnRefresh.IsRefreshPending() && !IsRefreshInFlight())
     {
-        g_refreshAfterLobbySessionShutdown = false;
+        g_roomReturnRefresh.Reset();
         (void)StartAsyncRefresh(false);
     }
 }
@@ -868,8 +867,7 @@ const NetplayMenuSpec* GetMenuSpec()
 void ResetState()
 {
     g_state = {};
-    g_lobbySessionShutdownInFlight = false;
-    g_refreshAfterLobbySessionShutdown = false;
+    g_roomReturnRefresh.Reset();
     g_refreshRequest.Reset();
     g_refreshGeneration.store(1, std::memory_order_release);
     g_refreshRequest.DiscardResult();
@@ -895,10 +893,9 @@ bool EnterMenu()
     {
         g_state.roomCode.clear();
     }
-    if (g_lobbySessionShutdownInFlight)
+    if (g_roomReturnRefresh.IsWaitingForShutdown())
     {
         SetStatusMessage(I18N_KEY("Leaving room..."));
-        g_refreshAfterLobbySessionShutdown = true;
     }
     else
     {
@@ -924,8 +921,7 @@ void LeaveMenu()
 
 void NotifyLobbySessionShutdownStarted()
 {
-    g_lobbySessionShutdownInFlight = true;
-    g_refreshAfterLobbySessionShutdown = true;
+    g_roomReturnRefresh.BeginShutdown();
     InvalidateRefreshResults();
     if (!HasStatusMessage())
     {
@@ -935,8 +931,8 @@ void NotifyLobbySessionShutdownStarted()
 
 void NotifyLobbySessionShutdownCompleted()
 {
-    g_lobbySessionShutdownInFlight = false;
-    if (!g_refreshAfterLobbySessionShutdown)
+    g_roomReturnRefresh.CompleteShutdown();
+    if (!g_roomReturnRefresh.IsRefreshPending())
     {
         return;
     }
@@ -947,7 +943,7 @@ void NotifyLobbySessionShutdownCompleted()
         return;
     }
 
-    g_refreshAfterLobbySessionShutdown = false;
+    g_roomReturnRefresh.Reset();
     (void)StartAsyncRefresh(false);
 }
 
@@ -1257,7 +1253,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
         || action == NetplayMenuAction::PlayerRoomsSlot0
         || action == NetplayMenuAction::PlayerRoomsSlot1
         || action == NetplayMenuAction::PlayerRoomsSlot2;
-    if (g_lobbySessionShutdownInFlight && requiresStableRoomState)
+    if (g_roomReturnRefresh.IsWaitingForShutdown() && requiresStableRoomState)
     {
         SetStatusMessage(I18N_KEY("Leaving room..."));
         return true;

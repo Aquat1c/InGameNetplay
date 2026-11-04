@@ -6,6 +6,40 @@
 
 namespace netplay::bridge::console_handoff
 {
+enum class PromptState { Unseen, Pending, Served };
+inline PromptState ReadPromptGeneration(LONG request, LONG served)
+{
+    return request <= 0 ? PromptState::Unseen
+        : request == served ? PromptState::Served : PromptState::Pending;
+}
+inline PromptState ReadOrderedPromptProgress(LONG request, LONG served)
+{
+    return request <= 0 ? PromptState::Unseen
+        : served >= request ? PromptState::Served : PromptState::Pending;
+}
+enum class InputDeliveryState { Absent, Queued, Served };
+inline InputDeliveryState ReadInputDelivery(LONG request, LONG served)
+{
+    return request > served ? InputDeliveryState::Queued
+        : request > 0 ? InputDeliveryState::Served : InputDeliveryState::Absent;
+}
+enum class DelayHandoffState { NoPrompt, PromptServed, WaitingInput, InputQueued, InputServed };
+inline DelayHandoffState ReadDelayHandoff(LONG prompt, LONG promptServed, LONG input, LONG inputServed)
+{
+    const auto progress = ReadOrderedPromptProgress(prompt, promptServed);
+    if (progress == PromptState::Unseen) return DelayHandoffState::NoPrompt;
+    if (progress == PromptState::Served) return DelayHandoffState::PromptServed;
+    const auto delivery = ReadInputDelivery(input, inputServed);
+    return delivery == InputDeliveryState::Queued ? DelayHandoffState::InputQueued
+        : delivery == InputDeliveryState::Served ? DelayHandoffState::InputServed : DelayHandoffState::WaitingInput;
+}
+enum class TimeoutCleanupState { WaitingForWake, Ready };
+inline TimeoutCleanupState ReadTimeoutCleanup(bool helperAlive, LONG served, LONG required)
+{
+    return !helperAlive || (required > 0 && served >= required)
+        ? TimeoutCleanupState::Ready : TimeoutCleanupState::WaitingForWake;
+}
+
 struct InitialConsoleInputPlan
 {
     int menuChoice = 0;
@@ -83,16 +117,15 @@ inline bool HasPendingExplicitDelayInput(
     LONG inputSerial,
     LONG inputServedSerial)
 {
-    return promptSerial > 0
-        && promptServedSerial < promptSerial
-        && inputSerial > inputServedSerial;
+    return ReadDelayHandoff(promptSerial, promptServedSerial, inputSerial, inputServedSerial)
+        == DelayHandoffState::InputQueued;
 }
 
 inline bool IsExplicitDelayInputServed(
     LONG inputSerial,
     LONG inputServedSerial)
 {
-    return inputSerial > 0 && inputServedSerial >= inputSerial;
+    return ReadInputDelivery(inputSerial, inputServedSerial) == InputDeliveryState::Served;
 }
 
 inline bool IsHeldHostDelayReader(
@@ -102,10 +135,8 @@ inline bool IsHeldHostDelayReader(
     LONG inputSerial,
     LONG inputServedSerial)
 {
-    return isHostSession
-        && promptSerial > 0
-        && promptServedSerial < promptSerial
-        && !IsExplicitDelayInputServed(inputSerial, inputServedSerial);
+    const auto state = ReadDelayHandoff(promptSerial, promptServedSerial, inputSerial, inputServedSerial);
+    return isHostSession && (state == DelayHandoffState::WaitingInput || state == DelayHandoffState::InputQueued);
 }
 
 inline LONG SelectPromptTransitionWakeSerial(
@@ -152,8 +183,7 @@ inline bool IsNativeTimeoutCleanupReady(
     LONG controlWakeServedSerial,
     LONG requiredControlWakeSerial)
 {
-    return !helperAlive
-        || (requiredControlWakeSerial > 0
-            && controlWakeServedSerial >= requiredControlWakeSerial);
+    return ReadTimeoutCleanup(helperAlive, controlWakeServedSerial, requiredControlWakeSerial)
+        == TimeoutCleanupState::Ready;
 }
 }

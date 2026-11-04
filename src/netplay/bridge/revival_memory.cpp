@@ -1,4 +1,5 @@
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/native_resource_state.h"
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/frontend_return.h"
@@ -1084,8 +1085,7 @@ bool ReadConfiguredInputDelay(int* outDelay)
 }
 
 static HANDLE        g_spectatorEscWatcherThread  = nullptr;
-static volatile LONG g_spectatorEscWatcherStarted = 0;
-static volatile LONG g_spectatorEscWatcherStop    = 0;
+static volatile LONG g_spectatorEscWatcherState = static_cast<LONG>(SpectatorWatcherState::Dormant);
 static volatile LONG g_spectatorEscRequested      = 0;
 
 static bool IsCurrentProcessForeground()
@@ -1100,7 +1100,7 @@ static bool IsCurrentProcessForeground()
 static DWORD WINAPI SpectatorEscWatcherThreadProc(LPVOID)
 {
     bool escWasDown = false;
-    while (InterlockedCompareExchange(&g_spectatorEscWatcherStop, 0, 0) == 0)
+    while (InterlockedCompareExchange(&g_spectatorEscWatcherState, 0, 0) != static_cast<LONG>(SpectatorWatcherState::StopRequested))
     {
         if (g_localRoleFlag == kLocalRoleSpectate && g_dllExitProcessPatchesSaved)
         {
@@ -1130,7 +1130,9 @@ static DWORD WINAPI SpectatorEscWatcherThreadProc(LPVOID)
 
 void StartSpectatorEscWatcher()
 {
-    if (InterlockedCompareExchange(&g_spectatorEscWatcherStarted, 1, 0) != 0)
+    if (InterlockedCompareExchange(&g_spectatorEscWatcherState,
+            static_cast<LONG>(SpectatorWatcherState::Started),
+            static_cast<LONG>(SpectatorWatcherState::Dormant)) != static_cast<LONG>(SpectatorWatcherState::Dormant))
     {
         return;
     }
@@ -1140,7 +1142,7 @@ void StartSpectatorEscWatcher()
     {
         mod::Log("SPECTATOR_ESC_WATCHER: CreateThread failed err=%lu",
                  static_cast<unsigned long>(GetLastError()));
-        InterlockedExchange(&g_spectatorEscWatcherStarted, 0);
+        InterlockedExchange(&g_spectatorEscWatcherState, static_cast<LONG>(SpectatorWatcherState::Dormant));
     }
     else
     {
@@ -1154,7 +1156,7 @@ void StopSpectatorEscWatcher()
     {
         return;
     }
-    InterlockedExchange(&g_spectatorEscWatcherStop, 1);
+    InterlockedExchange(&g_spectatorEscWatcherState, static_cast<LONG>(SpectatorWatcherState::StopRequested));
     WaitForSingleObject(g_spectatorEscWatcherThread, 250);
     CloseHandle(g_spectatorEscWatcherThread);
     g_spectatorEscWatcherThread = nullptr;
@@ -1476,7 +1478,7 @@ static DWORD g_tournamentRestorePageProtect[kMaxTournamentExePatches] = {};
 static bool g_tournamentRestorePageProtectPending[kMaxTournamentExePatches] = {};
 static uint8_t
     g_processAttachTournamentPreimage[kMaxTournamentExePatches][kMaxTournamentExePatchBytes] = {};
-static volatile LONG g_processAttachTournamentPreimageState = 0;
+static volatile LONG g_processAttachTournamentPreimageState = static_cast<LONG>(PreimageCaptureState::Unattempted);
 
 void CaptureTournamentExePreimageAtProcessAttach()
 {
@@ -1485,7 +1487,10 @@ void CaptureTournamentExePreimageAtProcessAttach()
     };
     static constexpr size_t kSizes[] = {7u, 7u, 1u, 20u};
     if (InterlockedCompareExchange(
-            &g_processAttachTournamentPreimageState, -1, 0) != 0)
+            &g_processAttachTournamentPreimageState,
+            static_cast<LONG>(PreimageCaptureState::Capturing),
+            static_cast<LONG>(PreimageCaptureState::Unattempted))
+        != static_cast<LONG>(PreimageCaptureState::Unattempted))
     {
         return;
     }
@@ -1510,7 +1515,7 @@ void CaptureTournamentExePreimageAtProcessAttach()
     }
     InterlockedExchange(
         &g_processAttachTournamentPreimageState,
-        captured ? 1 : -1);
+        static_cast<LONG>(captured ? PreimageCaptureState::Captured : PreimageCaptureState::Failed));
 }
 
 bool SaveTournamentExePatches()
@@ -3515,8 +3520,7 @@ bool ReverseInputSwapIfClient()
     return true;
 }
 
-static uintptr_t g_savedRenderContext = 0;
-static bool      g_renderContextSaved = false;
+static RenderContextLifecycle g_renderContext;
 
 bool SaveRenderContext()
 {
@@ -3527,8 +3531,7 @@ bool SaveRenderContext()
     }
     if (g_activeRevival->usesProceduralDdrawTextApi)
     {
-        g_savedRenderContext = 0;
-        g_renderContextSaved = false;
+        g_renderContext.Clear();
         return true;
     }
     if (g_activeRevival->renderContextGlobalOffset == 0)
@@ -3556,8 +3559,7 @@ bool SaveRenderContext()
         return false;
     }
 
-    g_savedRenderContext = value;
-    g_renderContextSaved = true;
+    g_renderContext.Save(value);
 
     int initOnceGuard = -1;
     if (g_activeRevival->initOnceGuardOffset != 0)
@@ -3585,7 +3587,7 @@ static bool RestoreRenderContextInternal(bool consumeSaved)
         (void)consumeSaved;
         return true;
     }
-    if (g_savedRenderContext == 0)
+    if (!g_renderContext.HasContext())
     {
         return false;
     }
@@ -3603,12 +3605,12 @@ static bool RestoreRenderContextInternal(bool consumeSaved)
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(revival);
-    if (!g_renderContextSaved)
+    if (!g_renderContext.IsSaved())
     {
         mod::Log(
             "RestoreRenderContext: using retained EfzRender* 0x%08lX "
             "after saved flag was consumed",
-            static_cast<unsigned long>(g_savedRenderContext));
+            static_cast<unsigned long>(g_renderContext.pointer));
     }
 
     uintptr_t currentRenderCtx = 0;
@@ -3618,17 +3620,17 @@ static bool RestoreRenderContextInternal(bool consumeSaved)
 
     auto* ptr = reinterpret_cast<uintptr_t*>(
         base + g_activeRevival->renderContextGlobalOffset);
-    *ptr = g_savedRenderContext;
+    *ptr = g_renderContext.pointer;
     mod::Log("RestoreRenderContext: restored EfzRender* 0x%08lX (was 0x%08lX, %s)",
-             static_cast<unsigned long>(g_savedRenderContext),
+             static_cast<unsigned long>(g_renderContext.pointer),
              static_cast<unsigned long>(currentRenderCtx),
              currentRenderCtx == 0 ? "was NULL - H2 confirmed stale!"
-                                   : (currentRenderCtx == g_savedRenderContext
+                                   : (currentRenderCtx == g_renderContext.pointer
                                           ? "unchanged"
                                           : "was different"));
     if (consumeSaved)
     {
-        g_renderContextSaved = false;
+        g_renderContext.Consume();
     }
     return true;
 }
@@ -3640,7 +3642,7 @@ bool RestoreRenderContext()
 
 bool RestoreRenderContextForGameplayExitCleanup()
 {
-    if (g_savedRenderContext == 0 && !SaveRenderContext())
+    if (!g_renderContext.HasContext() && !SaveRenderContext())
     {
         return false;
     }
@@ -3649,7 +3651,7 @@ bool RestoreRenderContextForGameplayExitCleanup()
 
 void MarkRenderContextConsumedForGameplayExitCleanup()
 {
-    g_renderContextSaved = false;
+    g_renderContext.Consume();
 }
 
 struct Revival102jTextState
@@ -3811,7 +3813,7 @@ bool ClearRevivalText()
     }
 
     if (!g_activeRevival->usesProceduralDdrawTextApi
-        && g_savedRenderContext == 0)
+        && !g_renderContext.HasContext())
     {
         (void)SaveRenderContext();
     }
@@ -3937,7 +3939,7 @@ bool SetRevivalTextRenderingEnabled(bool enable, const char* reason)
         return false;
     }
 
-    if (g_savedRenderContext == 0)
+    if (!g_renderContext.HasContext())
     {
         (void)SaveRenderContext();
     }
@@ -5319,7 +5321,7 @@ bool AdoptExistingTournamentExePatchState()
     }
 
     if (InterlockedCompareExchange(
-            &g_processAttachTournamentPreimageState, 0, 0) != 1
+            &g_processAttachTournamentPreimageState, 0, 0) != static_cast<LONG>(PreimageCaptureState::Captured)
         || std::memcmp(
                g_processAttachTournamentPreimage[0],
                displaced[0],
@@ -6049,8 +6051,7 @@ struct GameplayStallSample
 
 struct GameplayStallTrackerState
 {
-    bool active = false;
-    bool syncFrameTracked = false;
+    StallLifecycle lifecycle;
     DWORD stallStartMs = 0;
     DWORD lastProgressLogMs = 0;
     DWORD lastSyncFrameChangeMs = 0;
@@ -6296,14 +6297,14 @@ static const char* GameplayStallOriginToString(
 
 static DWORD GameplayStallElapsedMs(const GameplayStallSample& sample)
 {
-    return g_gameplayStall.active
+    return g_gameplayStall.lifecycle.Active()
         ? sample.nowMs - g_gameplayStall.stallStartMs
         : 0u;
 }
 
 static DWORD GameplayStallSyncFrameStallMs(const GameplayStallSample& sample)
 {
-    if (!g_gameplayStall.syncFrameTracked)
+    if (!g_gameplayStall.lifecycle.TracksSync())
     {
         return GameplayStallElapsedMs(sample);
     }
@@ -6315,7 +6316,7 @@ static void ResetGameplayStallTracker(
     const GameplayStallSample& sample,
     bool clearSyncTracking)
 {
-    if (g_gameplayStall.active)
+    if (g_gameplayStall.lifecycle.Active())
     {
         mod::Log(
             "STALL_TRACK_RESET reason=%s previousStallMs=%lu previousBypassCount=%u previousCommitFrame=%d currentCommitFrame=%d screen=%u mode=%d",
@@ -6328,7 +6329,7 @@ static void ResetGameplayStallTracker(
             sample.mode);
     }
 
-    g_gameplayStall.active = false;
+    g_gameplayStall.lifecycle.Reset(clearSyncTracking);
     g_gameplayStall.stallStartMs = 0;
     g_gameplayStall.lastProgressLogMs = 0;
     g_gameplayStall.stallStartFrameTick = 0;
@@ -6338,7 +6339,6 @@ static void ResetGameplayStallTracker(
 
     if (clearSyncTracking)
     {
-        g_gameplayStall.syncFrameTracked = false;
         g_gameplayStall.lastSyncFrame = -1;
         g_gameplayStall.lastSyncFrameChangeMs = 0;
         g_gameplayStall.lastSyncFrameChangeTick = 0;
@@ -6387,9 +6387,9 @@ static void BeginGameplayStallTracker(
         && !sample.originalTickSkipped
         && sample.screen == 3
         && sample.syncFrameValid
-        && g_gameplayStall.syncFrameTracked;
+        && g_gameplayStall.lifecycle.TracksSync();
 
-    g_gameplayStall.active = true;
+    g_gameplayStall.lifecycle.Begin();
     g_gameplayStall.stallStartMs = startsFromSyncFreeze
         ? g_gameplayStall.lastSyncFrameChangeMs
         : sample.nowMs;
@@ -6402,9 +6402,9 @@ static void BeginGameplayStallTracker(
     g_gameplayStall.screen = sample.screen;
     g_gameplayStall.mode = sample.mode;
 
-    if (sample.syncFrameValid && !g_gameplayStall.syncFrameTracked)
+    if (sample.syncFrameValid && !g_gameplayStall.lifecycle.TracksSync())
     {
-        g_gameplayStall.syncFrameTracked = true;
+        g_gameplayStall.lifecycle.ObserveSync();
         g_gameplayStall.lastSyncFrame = sample.syncFrame;
         g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
         g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
@@ -6544,7 +6544,7 @@ static bool UpdateGameplayStallTracker(
         || sample.pendingMenuEntry
         || sample.recoveryCompleted)
     {
-        if (g_gameplayStall.active
+        if (g_gameplayStall.lifecycle.Active()
             || sample.originalTickBypassed
             || sample.originalTickSkipped)
         {
@@ -6586,9 +6586,9 @@ static bool UpdateGameplayStallTracker(
 
     if (sample.role == kLocalRoleOnline && sample.syncFrameValid)
     {
-        if (!g_gameplayStall.syncFrameTracked)
+        if (!g_gameplayStall.lifecycle.TracksSync())
         {
-            g_gameplayStall.syncFrameTracked = true;
+            g_gameplayStall.lifecycle.ObserveSync();
             g_gameplayStall.lastSyncFrame = sample.syncFrame;
             g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
             g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
@@ -6596,7 +6596,7 @@ static bool UpdateGameplayStallTracker(
         else if (sample.syncFrame != g_gameplayStall.lastSyncFrame)
         {
             ResetGameplayStallTracker("syncFrame_advanced", sample, false);
-            g_gameplayStall.syncFrameTracked = true;
+            g_gameplayStall.lifecycle.ObserveSync();
             g_gameplayStall.lastSyncFrame = sample.syncFrame;
             g_gameplayStall.lastSyncFrameChangeMs = sample.nowMs;
             g_gameplayStall.lastSyncFrameChangeTick = sample.frameTick;
@@ -6616,7 +6616,7 @@ static bool UpdateGameplayStallTracker(
         sample.role == kLocalRoleOnline
         && sample.screen == 3
         && sample.syncFrameValid
-        && g_gameplayStall.syncFrameTracked
+        && g_gameplayStall.lifecycle.TracksSync()
         && syncFrameStallMs >= kGameplayStallConsoleErrorMs;
     const bool startCandidate =
         sample.originalTickBypassed
@@ -6624,7 +6624,7 @@ static bool UpdateGameplayStallTracker(
         || (sample.screen == 3 && syncFrameFrozen)
         || sample.consoleErrorSerial > 0;
 
-    if (!g_gameplayStall.active)
+    if (!g_gameplayStall.lifecycle.Active())
     {
         if (!startCandidate)
         {
@@ -9687,7 +9687,7 @@ void ResetGameModeValidation()
     ResetOnlineMatchEscGracefulQuit();
     ResetScheduledGracefulQuitTeardown();
     ReleaseQuitRingHeader();
-    if (g_gameplayStall.active)
+    if (g_gameplayStall.lifecycle.Active())
     {
         GameplayStallSample sample = {};
         sample.screen = ReadCurrentScreenIndexForRecovery();
@@ -10736,8 +10736,8 @@ static void LogSessionDiagnosticStateImpl(const char* context, bool force)
         g_sessionNumber,
         g_dllExitProcessPatchesSaved ? 1 : 0,
         g_tournamentPatchesSaved ? 1 : 0,
-        g_renderContextSaved ? 1 : 0,
-        static_cast<unsigned long>(g_savedRenderContext));
+        g_renderContext.IsSaved() ? 1 : 0,
+        static_cast<unsigned long>(g_renderContext.pointer));
 
     HMODULE revival = GetModuleHandleA("EfzRevival.dll");
     if (revival != nullptr && g_activeRevival != nullptr)
@@ -11278,8 +11278,8 @@ void LogInitWriteSnapshot(const char* context)
         g_localInitAppliedForSession ? 1 : 0,
         g_dllExitProcessPatchesSaved ? 1 : 0,
         g_tournamentPatchesSaved ? 1 : 0,
-        g_renderContextSaved ? 1 : 0,
-        static_cast<unsigned long>(g_savedRenderContext),
+        g_renderContext.IsSaved() ? 1 : 0,
+        static_cast<unsigned long>(g_renderContext.pointer),
         g_frameHookInstalled ? 1 : 0,
         g_forceLocalPlayInitCount);
 }

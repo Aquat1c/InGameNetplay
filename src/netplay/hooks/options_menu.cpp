@@ -136,7 +136,7 @@ enum class ModalKind : uint8_t
 
 struct ModalOverlayState
 {
-    bool active = false;
+    bool IsActive() const { return kind != ModalKind::None; }
     ModalKind kind = ModalKind::None;
     int selectedOption = 0;
     int itemIndex = -1;
@@ -1243,7 +1243,6 @@ void ReturnToCategoryRoot(uint32_t screenContext, int focusCategoryIndex)
 void OpenModal(ModalKind kind)
 {
     g_state.modal = {};
-    g_state.modal.active = true;
     g_state.modal.kind = kind;
     g_state.modal.selectedOption = 0;
 }
@@ -1256,7 +1255,6 @@ void OpenRebindModal(int itemIndex)
     }
 
     g_state.modal = {};
-    g_state.modal.active = true;
     g_state.modal.kind = ModalKind::Rebind;
     g_state.modal.itemIndex = itemIndex;
     netplay::input::PrimeKeyState(&g_state.modal.keyDown);
@@ -2907,7 +2905,7 @@ bool HandleEditInput(uint32_t screenContext, const uint8_t* inputBytes, bool* es
 
 bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter, bool* escapeDown)
 {
-    if (!g_state.modal.active || g_state.modal.kind != ModalKind::Rebind || inactivityCounter == nullptr)
+    if (!g_state.modal.IsActive() || g_state.modal.kind != ModalKind::Rebind || inactivityCounter == nullptr)
     {
         return false;
     }
@@ -3001,7 +2999,7 @@ bool HandleRebindOverlayInput(uint32_t screenContext, const uint8_t* inputBytes,
 
 bool HandleModalOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter, bool* escapeDown)
 {
-    if (!g_state.modal.active || inputBytes == nullptr || inactivityCounter == nullptr)
+    if (!g_state.modal.IsActive() || inputBytes == nullptr || inactivityCounter == nullptr)
     {
         return false;
     }
@@ -3575,7 +3573,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
 bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 {
-    if (!g_state.modal.active)
+    if (!g_state.modal.IsActive())
     {
         return false;
     }
@@ -3793,7 +3791,7 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
 bool IsSaveOverlayActive()
 {
-    return g_state.modal.active;
+    return g_state.modal.IsActive();
 }
 
 int GetOptionsSlideOffsetX()
@@ -3815,12 +3813,12 @@ int GetOptionsSlideOffsetX()
 
 bool IsBusy()
 {
-    return g_state.edit.active || g_state.modal.active;
+    return g_state.edit.active || g_state.modal.IsActive();
 }
 
 uint8_t GetMenuDetailForStateExport()
 {
-    if (g_state.modal.active)
+    if (g_state.modal.IsActive())
     {
         return static_cast<uint8_t>(EFZ_MENU_DETAIL_OPTIONS_MODAL);
     }

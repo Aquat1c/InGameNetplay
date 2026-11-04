@@ -92,7 +92,8 @@ constexpr DWORD kPollIntervalMs = 500;
 #endif
 constexpr int kPollFailureLimit = 3;
 constexpr DWORD kStatusResponseLogIntervalMs = 30000;
-std::atomic<int> g_lobbyHttpBackend{ -1 }; // -1 unknown, 0 none, 1 WinHTTP, 2 WinINet, 3 EmbeddedTLS
+enum class LobbyHttpBackend { Unknown, None, WinHttp, WinInet, EmbeddedTls };
+std::atomic<LobbyHttpBackend> g_lobbyHttpBackend{LobbyHttpBackend::Unknown};
 
 bool OutgoingChallengeTargetStillPresent(
     int targetPlayerId,
@@ -985,19 +986,19 @@ void ClosePersistentWinHttpConnection()
 
     if (state.session == nullptr && state.connection == nullptr)
     {
-        g_lobbyHttpBackend.store(-1);
+        g_lobbyHttpBackend.store(LobbyHttpBackend::Unknown);
         return;
     }
 
     WinHttpApi& api = GetWinHttpApi();
     if (!api.available)
     {
-        g_lobbyHttpBackend.store(-1);
+        g_lobbyHttpBackend.store(LobbyHttpBackend::Unknown);
         return;
     }
 
     ResetPersistentWinHttpConnection(api, state);
-    g_lobbyHttpBackend.store(-1);
+    g_lobbyHttpBackend.store(LobbyHttpBackend::Unknown);
 }
 
 std::string DoHttpGetViaWinHttp(
@@ -1213,12 +1214,12 @@ std::string TryHttpGetForEndpoint(
     bool allowWinHttpForThisUrl,
     DWORD connectTimeoutMs,
     DWORD receiveTimeoutMs,
-    int* outBackend,
+    LobbyHttpBackend* outBackend,
     netplay::tls::KeepAliveClient* keepAlive = nullptr)
 {
     if (outBackend != nullptr)
     {
-        *outBackend = 0;
+        *outBackend = LobbyHttpBackend::None;
     }
 
     const bool isHttps = HasHttpsScheme(requestUrl);
@@ -1233,7 +1234,7 @@ std::string TryHttpGetForEndpoint(
             DoHttpGetViaWinInet(requestUrl, connectTimeoutMs, receiveTimeoutMs);
         if (!result.empty() && outBackend != nullptr)
         {
-            *outBackend = 2;
+            *outBackend = LobbyHttpBackend::WinInet;
         }
         return result;
     };
@@ -1243,7 +1244,7 @@ std::string TryHttpGetForEndpoint(
             DoHttpGetViaWinHttp(defaultPathForWinHttp, connectTimeoutMs, receiveTimeoutMs);
         if (!result.empty() && outBackend != nullptr)
         {
-            *outBackend = 1;
+            *outBackend = LobbyHttpBackend::WinHttp;
         }
         return result;
     };
@@ -1270,7 +1271,7 @@ std::string TryHttpGetForEndpoint(
         {
             if (outBackend != nullptr)
             {
-                *outBackend = 3;
+                *outBackend = LobbyHttpBackend::EmbeddedTls;
             }
             return body;
         }
@@ -1284,8 +1285,8 @@ std::string TryHttpGetForEndpoint(
         return std::string();
     };
 
-    const int rememberedBackend = g_lobbyHttpBackend.load();
-    if (rememberedBackend == 2 && !endpointConfig.forceEmbeddedTls)
+    const auto rememberedBackend = g_lobbyHttpBackend.load();
+    if (rememberedBackend == LobbyHttpBackend::WinInet && !endpointConfig.forceEmbeddedTls)
     {
         const std::string rememberedResult = tryWinInet();
         if (!rememberedResult.empty())
@@ -1296,7 +1297,7 @@ std::string TryHttpGetForEndpoint(
             "LobbySession::DoHttpGet: %s endpoint remembered WinINet failed; falling back",
             endpointTag.c_str());
     }
-    else if (rememberedBackend == 3 && tryEmbeddedTls)
+    else if (rememberedBackend == LobbyHttpBackend::EmbeddedTls && tryEmbeddedTls)
     {
         const std::string rememberedResult = tryEmbedded();
         if (!rememberedResult.empty())
@@ -1308,7 +1309,7 @@ std::string TryHttpGetForEndpoint(
             return std::string();
         }
     }
-    else if (rememberedBackend == 1
+    else if (rememberedBackend == LobbyHttpBackend::WinHttp
         && allowWinHttpForThisUrl
         && !endpointConfig.forceWinInet
         && !endpointConfig.forceEmbeddedTls)
@@ -1380,9 +1381,9 @@ std::string TryHttpGetForEndpoint(
     return std::string();
 }
 
-void LogBackendTransition(const LobbyEndpointConfig& endpointConfig, int backend, const char* endpointTag)
+void LogBackendTransition(const LobbyEndpointConfig& endpointConfig, LobbyHttpBackend backend, const char* endpointTag)
 {
-    const int previous = g_lobbyHttpBackend.exchange(backend);
+    const auto previous = g_lobbyHttpBackend.exchange(backend);
     if (previous == backend)
     {
         return;
@@ -1390,13 +1391,13 @@ void LogBackendTransition(const LobbyEndpointConfig& endpointConfig, int backend
 
     switch (backend)
     {
-    case 1:
+    case LobbyHttpBackend::WinHttp:
         mod::Log("LobbySession::DoHttpGet: backend=WinHTTP endpoint=%s", endpointTag);
         break;
-    case 2:
+    case LobbyHttpBackend::WinInet:
         mod::Log("LobbySession::DoHttpGet: backend=WinINet endpoint=%s", endpointTag);
         break;
-    case 3:
+    case LobbyHttpBackend::EmbeddedTls:
         mod::Log(
             "LobbySession::DoHttpGet: backend=EmbeddedTLS endpoint=%s verify=%d",
             endpointTag,
@@ -1445,7 +1446,7 @@ std::string DoLobbyHttpGetPath(
         proxyUrl.clear();
     }
 
-    int backend = 0;
+    LobbyHttpBackend backend = LobbyHttpBackend::None;
     const bool allowPrimaryWinHttp = !endpointConfig.hasBaseUrlOverride;
     std::string body = TryHttpGetForEndpoint(
         endpointConfig,
@@ -1485,7 +1486,7 @@ std::string DoLobbyHttpGetPath(
         }
     }
 
-    if (backend == 0)
+    if (backend == LobbyHttpBackend::None)
     {
         mod::Log("LobbySession::DoHttpGet: no available HTTP backend");
     }

@@ -225,8 +225,7 @@ procedural_at = save_render.find(
 module_at = save_render.find('GetModuleHandleA("EfzRevival.dll")')
 global_at = save_render.find("renderContextGlobalOffset")
 for required in (
-    "g_savedRenderContext = 0;",
-    "g_renderContextSaved = false;",
+    "g_renderContext.Clear();",
     "return true;",
 ):
     if required not in save_render[procedural_at:module_at]:
@@ -238,7 +237,7 @@ restore_render = function_slice(
     revival, "static bool RestoreRenderContextInternal(")
 procedural_at = restore_render.find(
     "g_activeRevival->usesProceduralDdrawTextApi")
-saved_at = restore_render.find("g_savedRenderContext == 0")
+saved_at = restore_render.find("!g_renderContext.HasContext()")
 if not (0 <= procedural_at < saved_at) \
         or "return true;" not in restore_render[procedural_at:saved_at]:
     fail("procedural RestoreRenderContext is not an early no-write success")

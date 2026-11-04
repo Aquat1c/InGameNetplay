@@ -1,9 +1,97 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 
 namespace netplay::hooks::internal
 {
+enum class RecoveryInputPhase { Idle, FixedWindow, AwaitingRelease };
+
+class RecoveryInputQuarantine
+{
+public:
+    bool IsActive() const { return phase_ != RecoveryInputPhase::Idle; }
+    bool IsAwaitingRelease() const { return phase_ == RecoveryInputPhase::AwaitingRelease; }
+    int FramesRemaining() const { return framesRemaining_; }
+    void Begin(int frames)
+    {
+        framesRemaining_ = frames > 0 ? frames : 0;
+        phase_ = framesRemaining_ > 0 ? RecoveryInputPhase::FixedWindow : RecoveryInputPhase::AwaitingRelease;
+    }
+    bool Suppress(bool actionHeld)
+    {
+        if (!IsActive()) return false;
+        if (phase_ == RecoveryInputPhase::FixedWindow)
+        {
+            if (--framesRemaining_ == 0) phase_ = RecoveryInputPhase::AwaitingRelease;
+            return true;
+        }
+        if (actionHeld) return true;
+        phase_ = RecoveryInputPhase::Idle;
+        return false;
+    }
+private:
+    RecoveryInputPhase phase_ = RecoveryInputPhase::Idle;
+    int framesRemaining_ = 0;
+};
+
+enum class HandoffWarmupPhase { Idle, Warming, Retrying, CoolingDown };
+
+class HandoffWarmupState
+{
+public:
+    bool IsActive() const { return phase_ == HandoffWarmupPhase::Warming || IsRetrying(); }
+    bool IsRetrying() const { return phase_ == HandoffWarmupPhase::Retrying; }
+    bool IsCoolingDown() const { return phase_ == HandoffWarmupPhase::CoolingDown; }
+    int Frames() const { return frames_; }
+    int BlockedFrames() const { return blockedFrames_; }
+    uint32_t StartTick() const { return startTick_; }
+    uint32_t CooldownStartTick() const { return cooldownStartTick_; }
+    void Reset() { *this = {}; }
+    void Begin(uint32_t tick)
+    {
+        Reset();
+        phase_ = HandoffWarmupPhase::Warming;
+        startTick_ = tick;
+    }
+    bool AdvanceFrame(int target)
+    {
+        if (!IsActive()) return false;
+        if (++frames_ >= target) phase_ = HandoffWarmupPhase::Retrying;
+        return IsRetrying();
+    }
+    int RecordBlockedFrame() { return ++blockedFrames_; }
+    void BeginCooldown(uint32_t tick)
+    {
+        Reset();
+        phase_ = HandoffWarmupPhase::CoolingDown;
+        cooldownStartTick_ = tick;
+    }
+private:
+    HandoffWarmupPhase phase_ = HandoffWarmupPhase::Idle;
+    int frames_ = 0;
+    int blockedFrames_ = 0;
+    uint32_t startTick_ = 0;
+    uint32_t cooldownStartTick_ = 0;
+};
+
+enum class RoomReturnRefreshPhase { Idle, WaitingForShutdown, RefreshPending };
+
+class RoomReturnRefreshState
+{
+public:
+    bool IsWaitingForShutdown() const { return phase_ == RoomReturnRefreshPhase::WaitingForShutdown; }
+    bool IsRefreshPending() const { return phase_ == RoomReturnRefreshPhase::RefreshPending; }
+    void BeginShutdown() { phase_ = RoomReturnRefreshPhase::WaitingForShutdown; }
+    void CompleteShutdown()
+    {
+        if (IsWaitingForShutdown()) phase_ = RoomReturnRefreshPhase::RefreshPending;
+    }
+    void Reset() { phase_ = RoomReturnRefreshPhase::Idle; }
+private:
+    RoomReturnRefreshPhase phase_ = RoomReturnRefreshPhase::Idle;
+};
+
 enum class RoomRequestPhase { Idle, Running, Succeeded, Failed };
 
 class RoomRequestState

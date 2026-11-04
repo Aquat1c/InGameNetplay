@@ -51,6 +51,42 @@ int main()
     spectate.End(false);
     assert(!spectate.IsBusy());
 
+    RecoveryInputQuarantine quarantine;
+    assert(!quarantine.Suppress(false));
+    quarantine.Begin(2);
+    assert(quarantine.Suppress(false) && quarantine.FramesRemaining() == 1);
+    assert(quarantine.Suppress(false) && quarantine.FramesRemaining() == 0);
+    assert(quarantine.IsAwaitingRelease());
+    assert(quarantine.Suppress(true));
+    assert(!quarantine.Suppress(false) && !quarantine.IsActive());
+    quarantine.Begin(0);
+    assert(quarantine.Suppress(true) && !quarantine.Suppress(false));
+
+    HandoffWarmupState warmup;
+    assert(!warmup.IsActive() && !warmup.IsCoolingDown());
+    warmup.Begin(0);
+    assert(warmup.IsActive() && !warmup.AdvanceFrame(2));
+    assert(warmup.AdvanceFrame(2) && warmup.IsRetrying());
+    assert(warmup.AdvanceFrame(2) && warmup.Frames() == 3);
+    assert(warmup.RecordBlockedFrame() == 1);
+    warmup.BeginCooldown(0);
+    assert(!warmup.IsActive() && warmup.IsCoolingDown());
+    assert(warmup.Frames() == 0 && warmup.BlockedFrames() == 0);
+    warmup.Reset();
+    assert(!warmup.IsCoolingDown());
+    warmup.Begin(12);
+    assert(warmup.StartTick() == 12 && !warmup.IsRetrying());
+
+    RoomReturnRefreshState roomReturn;
+    roomReturn.CompleteShutdown();
+    assert(!roomReturn.IsRefreshPending());
+    roomReturn.BeginShutdown();
+    assert(roomReturn.IsWaitingForShutdown() && !roomReturn.IsRefreshPending());
+    roomReturn.CompleteShutdown();
+    assert(!roomReturn.IsWaitingForShutdown() && roomReturn.IsRefreshPending());
+    roomReturn.Reset();
+    assert(!roomReturn.IsRefreshPending());
+
     RoomRequestState roomRequest;
     assert(!roomRequest.IsInFlight());
     roomRequest.Begin();

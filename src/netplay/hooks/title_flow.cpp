@@ -130,24 +130,15 @@ struct PendingRoomLeaveAction
 PendingRoomLeaveAction g_pendingRoomLeaveAction;
 uint32_t g_lastRecoveryNoOverlaySuppressedTick = 0;
 constexpr int kRecoveryMenuInputQuarantineFrames = 45;
-bool g_recoveryMenuInputQuarantineActive = false;
+RecoveryInputQuarantine g_recoveryMenuInputQuarantine;
 bool g_recoveryMenuInputQuarantineLoggedSuppress = false;
 bool g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
 bool g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
-int g_recoveryMenuInputQuarantineFramesRemaining = 0;
 constexpr uint32_t kDeferredLobbyRefreshTimeoutMs = 3000;
-bool g_spectateHandoffWarmupActive = false;
-int g_spectateHandoffWarmupFrames = 0;
-uint32_t g_spectateHandoffWarmupStartTick = 0;
-int g_spectateHandoffBlockedFrames = 0;
-uint32_t g_spectateHandoffBlockedCooldownStartTick = 0;
+HandoffWarmupState g_spectateHandoffWarmup;
 uint32_t g_onlineSimSuspendFailFastStartTick = 0;
 uint32_t g_onlineSimHandoffFadeTick = 0;
-bool g_vsHumanHandoffWarmupActive = false;
-int g_vsHumanHandoffWarmupFrames = 0;
-uint32_t g_vsHumanHandoffWarmupStartTick = 0;
-int g_vsHumanHandoffBlockedFrames = 0;
-uint32_t g_vsHumanHandoffBlockedCooldownStartTick = 0;
+HandoffWarmupState g_vsHumanHandoffWarmup;
 struct PendingLobbySpectateWait
 {
     bool active = false;
@@ -531,11 +522,10 @@ struct MenuControlProfile
 };
 
 MenuControlProfile g_menuControlProfile = {};
-bool g_menuControlProfileLoaded = false;
-bool g_menuControlRuntimeCompatActive = false;
+enum class MenuControlSyncPhase { Untried, Native, RuntimeCompatibility };
+MenuControlSyncPhase g_menuControlSyncPhase = MenuControlSyncPhase::Untried;
 InputSnapshot g_lastCompatInputSnapshot = {};
 bool g_hasLoggedCompatInputSnapshot = false;
-bool g_menuControlSyncAttempted = false;
 uint8_t g_lastMenuControlSyncProfileIndex = 0xFFu;
 std::array<uintptr_t, 2> g_menuLiveAxisRangeNormalizedDevicePtrs = {};
 FILETIME g_lastIgcrOverrideWriteTime = {};
@@ -1282,7 +1272,7 @@ void WriteMenuActionsToBytes(uint8_t* inputBytes, int player, const std::array<b
 
 void ApplyIgcrMenuControlCompatibility(int gameSystem, uint8_t* inputBytes)
 {
-    if (!g_menuControlRuntimeCompatActive || inputBytes == nullptr)
+    if ((g_menuControlSyncPhase != MenuControlSyncPhase::RuntimeCompatibility) || inputBytes == nullptr)
     {
         return;
     }
@@ -1471,10 +1461,8 @@ bool ReloadNativeMenuControlBindings(uint32_t screenContext)
 bool SyncMenuControlBindings(uint32_t screenContext)
 {
     g_menuControlProfile = {};
-    g_menuControlProfileLoaded = false;
-    g_menuControlRuntimeCompatActive = false;
     g_hasLoggedCompatInputSnapshot = false;
-    g_menuControlSyncAttempted = true;
+    g_menuControlSyncPhase = MenuControlSyncPhase::Native;
     UpdateIgcrOverrideWriteTimeCache();
 
     const int gameSystem = GetGameSystem(screenContext);
@@ -1533,16 +1521,16 @@ bool SyncMenuControlBindings(uint32_t screenContext)
             static_cast<unsigned long>(inputManager));
         const bool nativeOk = ReloadNativeMenuControlBindings(screenContext);
         g_menuControlProfile = effectiveProfile;
-        g_menuControlProfileLoaded = true;
-        g_menuControlRuntimeCompatActive =
-            effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides;
+        g_menuControlSyncPhase =
+            (effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides)
+            ? MenuControlSyncPhase::RuntimeCompatibility : MenuControlSyncPhase::Native;
         return nativeOk;
     }
 
     g_menuControlProfile = effectiveProfile;
-    g_menuControlProfileLoaded = true;
-    g_menuControlRuntimeCompatActive =
-        effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides;
+    g_menuControlSyncPhase =
+        (effectiveProfile.hasRuntimeOnlyPadBindings || effectiveProfile.hasPovDirectionalOverrides)
+        ? MenuControlSyncPhase::RuntimeCompatibility : MenuControlSyncPhase::Native;
     mod::Log(
         "MenuControls: IGCR profile sync applied profile=%u inputManager=0x%08lX runtimeOnly=%d povMaskP1=0x%02X povMaskP2=0x%02X extAxis=%d compat=%d",
         static_cast<unsigned>(effectiveProfile.profileIndex),
@@ -1551,7 +1539,7 @@ bool SyncMenuControlBindings(uint32_t screenContext)
         static_cast<unsigned>(effectiveProfile.povMasks[0]),
         static_cast<unsigned>(effectiveProfile.povMasks[1]),
         ProfileUsesExtendedPadAxisBindings(effectiveProfile) ? 1 : 0,
-        g_menuControlRuntimeCompatActive ? 1 : 0);
+        (g_menuControlSyncPhase == MenuControlSyncPhase::RuntimeCompatibility) ? 1 : 0);
     return true;
 }
 
@@ -1564,12 +1552,12 @@ void MaybeRefreshMenuControlBindings(uint32_t screenContext)
     }
     g_nextMenuControlRefreshTick = now + 500u;
 
-    bool needsSync = !g_menuControlSyncAttempted;
+    bool needsSync = (g_menuControlSyncPhase == MenuControlSyncPhase::Untried);
 
     uint8_t profileIndex = 0;
     if (ReadMenuControlProfileIndex(&profileIndex))
     {
-        if (!g_menuControlSyncAttempted || profileIndex != g_lastMenuControlSyncProfileIndex)
+        if ((g_menuControlSyncPhase == MenuControlSyncPhase::Untried) || profileIndex != g_lastMenuControlSyncProfileIndex)
         {
             needsSync = true;
         }
@@ -1594,10 +1582,8 @@ void MaybeRefreshMenuControlBindings(uint32_t screenContext)
 void ResetMenuControlCompatibilityState()
 {
     g_menuControlProfile = {};
-    g_menuControlProfileLoaded = false;
-    g_menuControlRuntimeCompatActive = false;
     g_hasLoggedCompatInputSnapshot = false;
-    g_menuControlSyncAttempted = false;
+    g_menuControlSyncPhase = MenuControlSyncPhase::Untried;
     g_lastMenuControlSyncProfileIndex = 0xFFu;
     g_menuLiveAxisRangeNormalizedDevicePtrs = {};
     g_lastIgcrOverrideWriteTime = {};
@@ -1915,36 +1901,28 @@ void ClearLocalMenuControlState(uint32_t screenContext)
 
 void ResetSpectateHandoffWarmup(const char* reason)
 {
-    if (g_spectateHandoffWarmupActive && reason != nullptr)
+    if (g_spectateHandoffWarmup.IsActive() && reason != nullptr)
     {
         mod::Log(
             "SpectateHandoffWarmup: reset reason=%s frames=%d target=%d",
             reason,
-            g_spectateHandoffWarmupFrames,
+            g_spectateHandoffWarmup.Frames(),
             kSpectateTitleWarmupFrames);
     }
-    g_spectateHandoffWarmupActive = false;
-    g_spectateHandoffWarmupFrames = 0;
-    g_spectateHandoffWarmupStartTick = 0;
-    g_spectateHandoffBlockedFrames = 0;
-    g_spectateHandoffBlockedCooldownStartTick = 0;
+    g_spectateHandoffWarmup.Reset();
 }
 
 void ResetVsHumanHandoffWarmup(const char* reason)
 {
-    if (g_vsHumanHandoffWarmupActive && reason != nullptr)
+    if (g_vsHumanHandoffWarmup.IsActive() && reason != nullptr)
     {
         mod::Log(
             "VsHumanHandoffWarmup: reset reason=%s frames=%d target=%d",
             reason,
-            g_vsHumanHandoffWarmupFrames,
+            g_vsHumanHandoffWarmup.Frames(),
             kVsHumanTitleWarmupFrames);
     }
-    g_vsHumanHandoffWarmupActive = false;
-    g_vsHumanHandoffWarmupFrames = 0;
-    g_vsHumanHandoffWarmupStartTick = 0;
-    g_vsHumanHandoffBlockedFrames = 0;
-    g_vsHumanHandoffBlockedCooldownStartTick = 0;
+    g_vsHumanHandoffWarmup.Reset();
 }
 
 bool AdvanceVsHumanHandoffWarmup(
@@ -1954,9 +1932,9 @@ bool AdvanceVsHumanHandoffWarmup(
     const char* source,
     uint32_t* inactivityCounter)
 {
-    if (g_vsHumanHandoffBlockedCooldownStartTick != 0)
+    if (g_vsHumanHandoffWarmup.IsCoolingDown())
     {
-        if (GetTickCount() - g_vsHumanHandoffBlockedCooldownStartTick
+        if (GetTickCount() - g_vsHumanHandoffWarmup.CooldownStartTick()
             < kVsHumanHandoffBlockedCooldownMs)
         {
             ClearLocalMenuControlState(screenContext);
@@ -1966,15 +1944,12 @@ bool AdvanceVsHumanHandoffWarmup(
             }
             return false;
         }
-        g_vsHumanHandoffBlockedCooldownStartTick = 0;
+        g_vsHumanHandoffWarmup.Reset();
     }
 
-    if (!g_vsHumanHandoffWarmupActive)
+    if (!g_vsHumanHandoffWarmup.IsActive())
     {
-        g_vsHumanHandoffWarmupActive = true;
-        g_vsHumanHandoffWarmupFrames = 0;
-        g_vsHumanHandoffWarmupStartTick = GetTickCount();
-        g_vsHumanHandoffBlockedFrames = 0;
+        g_vsHumanHandoffWarmup.Begin(GetTickCount());
         mod::Log(
             "VsHumanHandoffWarmup: armed targetFrames=%d source=%s role=%d roleFlag=%d init=%d phase=%s "
             "sync(mode=%d flag1084=%d session=%d flags=%d/%d) screen=%d menuSel=%d peerAlive=%d",
@@ -1994,8 +1969,7 @@ bool AdvanceVsHumanHandoffWarmup(
             netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
     }
 
-    ++g_vsHumanHandoffWarmupFrames;
-    if (g_vsHumanHandoffWarmupFrames < kVsHumanTitleWarmupFrames)
+    if (!g_vsHumanHandoffWarmup.AdvanceFrame(kVsHumanTitleWarmupFrames))
     {
         ClearLocalMenuControlState(screenContext);
         if (inactivityCounter != nullptr)
@@ -2006,7 +1980,7 @@ bool AdvanceVsHumanHandoffWarmup(
     }
 
     const int framesPastTarget =
-        g_vsHumanHandoffWarmupFrames - kVsHumanTitleWarmupFrames;
+        g_vsHumanHandoffWarmup.Frames() - kVsHumanTitleWarmupFrames;
     const bool attemptThisFrame =
         framesPastTarget == 0
         || (framesPastTarget % kVsHumanHandoffRetryStride) == 0;
@@ -2014,13 +1988,13 @@ bool AdvanceVsHumanHandoffWarmup(
     if (attemptThisFrame)
     {
         const uint32_t elapsedMs =
-            g_vsHumanHandoffWarmupStartTick != 0
-                ? GetTickCount() - g_vsHumanHandoffWarmupStartTick
+            g_vsHumanHandoffWarmup.StartTick() != 0
+                ? GetTickCount() - g_vsHumanHandoffWarmup.StartTick()
                 : 0;
         mod::Log(
             "VsHumanHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
             "pastTarget=%d screen=%d menuSel=%d",
-            g_vsHumanHandoffWarmupFrames,
+            g_vsHumanHandoffWarmup.Frames(),
             kVsHumanTitleWarmupFrames,
             static_cast<unsigned long>(elapsedMs),
             framesPastTarget,
@@ -2041,17 +2015,17 @@ bool AdvanceVsHumanHandoffWarmup(
         }
     }
 
-    if (++g_vsHumanHandoffBlockedFrames >= kVsHumanHandoffMaxBlockedFrames)
+    if (g_vsHumanHandoffWarmup.RecordBlockedFrame() >= kVsHumanHandoffMaxBlockedFrames)
     {
         mod::Log(
             "VsHumanHandoffWarmup: ABORT handoff blocked for %d frames "
             "(warmupFrames=%d) - releasing the game loop and backing off %ums; "
             "SuspendUiHooksForOnlineSimulation never succeeded",
-            g_vsHumanHandoffBlockedFrames,
-            g_vsHumanHandoffWarmupFrames,
+            g_vsHumanHandoffWarmup.BlockedFrames(),
+            g_vsHumanHandoffWarmup.Frames(),
             static_cast<unsigned>(kVsHumanHandoffBlockedCooldownMs));
         ResetVsHumanHandoffWarmup("handoff_blocked_timeout");
-        g_vsHumanHandoffBlockedCooldownStartTick = TimerArmTickNonZero();
+        g_vsHumanHandoffWarmup.BeginCooldown(TimerArmTickNonZero());
     }
     return false;
 }
@@ -2086,18 +2060,17 @@ bool HasRecoveryMenuAxisInput(const uint8_t* inputBytes)
 
 void BeginRecoveryMenuInputQuarantine(uint32_t screenContext, const char* origin)
 {
-    g_recoveryMenuInputQuarantineActive = true;
+    g_recoveryMenuInputQuarantine.Begin(kRecoveryMenuInputQuarantineFrames);
     g_recoveryMenuInputQuarantineLoggedSuppress = false;
     g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
     g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
-    g_recoveryMenuInputQuarantineFramesRemaining = kRecoveryMenuInputQuarantineFrames;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     g_joinWaitToSpectateButtonDown = {};
     ClearTitleInputLatches(screenContext);
     mod::Log(
         "RECOVERY_MENU_INPUT_QUARANTINE_BEGIN screenContext=0x%08X frames=%d origin=%s",
         screenContext,
-        g_recoveryMenuInputQuarantineFramesRemaining,
+        g_recoveryMenuInputQuarantine.FramesRemaining(),
         origin != nullptr ? origin : "unknown");
 }
 
@@ -2106,7 +2079,7 @@ bool SuppressRecoveryMenuInputIfNeeded(
     const uint8_t* inputBytes,
     uint32_t* inactivityCounter)
 {
-    if (!g_recoveryMenuInputQuarantineActive)
+    if (!g_recoveryMenuInputQuarantine.IsActive())
     {
         return false;
     }
@@ -2116,24 +2089,15 @@ bool SuppressRecoveryMenuInputIfNeeded(
     const bool axisHeld = HasRecoveryMenuAxisInput(inputBytes);
     const bool cancelHeld = inputBytes != nullptr
         && (inputBytes[18] != 0 || inputBytes[19] != 0);
-    const bool suppress =
-        g_recoveryMenuInputQuarantineFramesRemaining > 0
-        || actionHeld
-        || escapeHeld;
+    const bool suppress = g_recoveryMenuInputQuarantine.Suppress(actionHeld || escapeHeld);
 
     if (!suppress)
     {
-        g_recoveryMenuInputQuarantineActive = false;
         g_recoveryMenuInputQuarantineLoggedSuppress = false;
         g_recoveryMenuInputQuarantineLoggedHeldAfterWindow = false;
         g_recoveryMenuInputQuarantineLoggedLeaveSuppress = false;
         mod::Log("RECOVERY_MENU_INPUT_QUARANTINE_END reason=released");
         return false;
-    }
-
-    if (g_recoveryMenuInputQuarantineFramesRemaining > 0)
-    {
-        --g_recoveryMenuInputQuarantineFramesRemaining;
     }
 
     ClearTitleInputLatches(screenContext);
@@ -2149,14 +2113,14 @@ bool SuppressRecoveryMenuInputIfNeeded(
 
     const bool heldAfterWindow =
         (actionHeld || escapeHeld)
-        && g_recoveryMenuInputQuarantineFramesRemaining == 0;
+        && g_recoveryMenuInputQuarantine.FramesRemaining() == 0;
     if (!g_recoveryMenuInputQuarantineLoggedSuppress
         || (heldAfterWindow && !g_recoveryMenuInputQuarantineLoggedHeldAfterWindow))
     {
         mod::Log(
             "RECOVERY_MENU_INPUT_QUARANTINE_SUPPRESS framesRemaining=%d actionHeld=%d axisHeld=%d escapeHeld=%d "
             "p1(h=%d v=%d c=%u b=%u d=%u) p2(h=%d v=%d c=%u b=%u d=%u) menu=%s selection=%d",
-            g_recoveryMenuInputQuarantineFramesRemaining,
+            g_recoveryMenuInputQuarantine.FramesRemaining(),
             actionHeld ? 1 : 0,
             axisHeld ? 1 : 0,
             escapeHeld ? 1 : 0,
@@ -2185,7 +2149,7 @@ bool SuppressRecoveryMenuInputIfNeeded(
             "RECOVERY_MENU_LEAVE_SUPPRESSED reason=input_quarantine cancelHeld=%d escapeHeld=%d framesRemaining=%d",
             cancelHeld ? 1 : 0,
             escapeHeld ? 1 : 0,
-            g_recoveryMenuInputQuarantineFramesRemaining);
+            g_recoveryMenuInputQuarantine.FramesRemaining());
         g_recoveryMenuInputQuarantineLoggedLeaveSuppress = true;
     }
 
@@ -6906,24 +6870,21 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
     if (spectateHandoffReady)
     {
-        if (g_spectateHandoffBlockedCooldownStartTick != 0)
+        if (g_spectateHandoffWarmup.IsCoolingDown())
         {
-            if (GetTickCount() - g_spectateHandoffBlockedCooldownStartTick
+            if (GetTickCount() - g_spectateHandoffWarmup.CooldownStartTick()
                 < kVsHumanHandoffBlockedCooldownMs)
             {
                 ClearLocalMenuControlState(screenContext);
                 ++(*inactivityCounter);
                 return 0;
             }
-            g_spectateHandoffBlockedCooldownStartTick = 0;
+            g_spectateHandoffWarmup.Reset();
         }
 
-        if (!g_spectateHandoffWarmupActive)
+        if (!g_spectateHandoffWarmup.IsActive())
         {
-            g_spectateHandoffWarmupActive = true;
-            g_spectateHandoffWarmupFrames = 0;
-            g_spectateHandoffWarmupStartTick = GetTickCount();
-            g_spectateHandoffBlockedFrames = 0;
+            g_spectateHandoffWarmup.Begin(GetTickCount());
             ClearPendingLobbySpectateWait("spectate_handoff_warmup");
             ResetDelaySetupOverlayState();
             ResetSpectateConfirmOverlayState();
@@ -6947,8 +6908,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 netplay::bridge::IsPeerProcessAlive() ? 1 : 0);
         }
 
-        ++g_spectateHandoffWarmupFrames;
-        if (g_spectateHandoffWarmupFrames < kSpectateTitleWarmupFrames)
+        if (!g_spectateHandoffWarmup.AdvanceFrame(kSpectateTitleWarmupFrames))
         {
             ClearLocalMenuControlState(screenContext);
             ++(*inactivityCounter);
@@ -6956,7 +6916,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         const int framesPastTarget =
-            g_spectateHandoffWarmupFrames - kSpectateTitleWarmupFrames;
+            g_spectateHandoffWarmup.Frames() - kSpectateTitleWarmupFrames;
         const bool attemptThisFrame =
             framesPastTarget == 0
             || (framesPastTarget % kVsHumanHandoffRetryStride) == 0;
@@ -6964,13 +6924,13 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (attemptThisFrame)
         {
             const uint32_t elapsedMs =
-                g_spectateHandoffWarmupStartTick != 0
-                    ? GetTickCount() - g_spectateHandoffWarmupStartTick
+                g_spectateHandoffWarmup.StartTick() != 0
+                    ? GetTickCount() - g_spectateHandoffWarmup.StartTick()
                     : 0;
             mod::Log(
                 "SpectateHandoffWarmup: complete frames=%d target=%d elapsedMs=%lu "
                 "pastTarget=%d screen=%d menuSel=%d",
-                g_spectateHandoffWarmupFrames,
+                g_spectateHandoffWarmup.Frames(),
                 kSpectateTitleWarmupFrames,
                 static_cast<unsigned long>(elapsedMs),
                 framesPastTarget,
@@ -7000,17 +6960,17 @@ char UpdateNetplayMenu(uint32_t screenContext)
             ++(*inactivityCounter);
         }
 
-        if (++g_spectateHandoffBlockedFrames >= kVsHumanHandoffMaxBlockedFrames)
+        if (g_spectateHandoffWarmup.RecordBlockedFrame() >= kVsHumanHandoffMaxBlockedFrames)
         {
             mod::Log(
                 "SpectateHandoffWarmup: ABORT handoff blocked for %d frames "
                 "(warmupFrames=%d) - releasing the game loop and backing off %ums; "
                 "SuspendUiHooksForOnlineSimulation never succeeded",
-                g_spectateHandoffBlockedFrames,
-                g_spectateHandoffWarmupFrames,
+                g_spectateHandoffWarmup.BlockedFrames(),
+                g_spectateHandoffWarmup.Frames(),
                 static_cast<unsigned>(kVsHumanHandoffBlockedCooldownMs));
             ResetSpectateHandoffWarmup("handoff_blocked_timeout");
-            g_spectateHandoffBlockedCooldownStartTick = TimerArmTickNonZero();
+            g_spectateHandoffWarmup.BeginCooldown(TimerArmTickNonZero());
         }
         return 0;
     }
@@ -7060,7 +7020,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 || (bridgePhase == NetbridgePhase::Connected
                     && !netplay::bridge::RequiresNativeVsHumanSyncForHandoff())))
         {
-            if (!g_vsHumanHandoffWarmupActive)
+            if (!g_vsHumanHandoffWarmup.IsActive())
             {
                 mod::Log(
                     "DelayOverlay: runtime ready for VS-human title warmup phase=%s sync(mode=%d flag1084=%d session=%d)",
