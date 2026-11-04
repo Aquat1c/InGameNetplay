@@ -42,7 +42,8 @@ bool ValidateHelperImage(unsigned char* base, const HelperProfile& profile)
             || nt->FileHeader.SizeOfOptionalHeader != sizeof(IMAGE_OPTIONAL_HEADER32)
             || nt->FileHeader.TimeDateStamp != profile.timestamp
             || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC
-            || nt->OptionalHeader.ImageBase != 0x400000
+            || (nt->OptionalHeader.ImageBase != 0x400000
+                && nt->OptionalHeader.ImageBase != reinterpret_cast<uintptr_t>(base))
             || nt->OptionalHeader.SizeOfImage != profile.imageSize)
             return false;
         const auto original = reinterpret_cast<uintptr_t>(base + profile.nullHandlerRva);

@@ -102,6 +102,9 @@ void TestSyntheticImages()
         nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
         Expect(!InstallHelperDelayDisconnectHandler(image.Module(), f.tag), "non-x86 helper is rejected");
         nt->FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+        nt->OptionalHeader.ImageBase = 0x12340000;
+        Expect(!InstallHelperDelayDisconnectHandler(image.Module(), f.tag), "unrelated declared image base is rejected");
+        nt->OptionalHeader.ImageBase = 0x400000;
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image.bytes);
         dos->e_lfanew = -1;
         Expect(!InstallHelperDelayDisconnectHandler(image.Module(), f.tag), "invalid PE header offset is rejected");
@@ -134,6 +137,17 @@ void TestSyntheticImages()
         MEMORY_BASIC_INFORMATION memory = {};
         VirtualQuery(image.bytes + f.quitSlot, &memory, sizeof(memory));
         Expect(memory.Protect == PAGE_READONLY, "original vtable page protection is restored");
+
+        Image relocated(f.imageSize);
+        Expect(relocated.bytes != nullptr, "rebased image allocation succeeds");
+        if (relocated.bytes == nullptr) continue;
+        InitializeSynthetic(relocated, f);
+        auto* relocatedNt = reinterpret_cast<IMAGE_NT_HEADERS32*>(relocated.bytes + 0x80);
+        relocatedNt->OptionalHeader.ImageBase = static_cast<DWORD>(relocated.Address(0));
+        Expect(InstallHelperDelayDisconnectHandler(relocated.Module(), f.tag),
+            "loader-rebased image header accepts validated relocated callbacks");
+        Expect(relocated.Slot(f.quitSlot) == relocated.Address(f.replacement),
+            "rebased helper installs its native disconnect callback");
     }
 }
 
