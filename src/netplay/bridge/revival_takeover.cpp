@@ -2,6 +2,7 @@
 #include <ws2tcpip.h>
 
 #include "netplay/bridge/revival_takeover.h"
+#include "netplay/bridge/native_log_history.h"
 #include "netplay/bridge/console_handoff_policy.h"
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
@@ -308,10 +309,19 @@ void LogPendingSpectateConsoleSnapshot()
 
 void EnsureHostLogEfzIatPatched(bool verboseLogs)
 {
-    (void)verboseLogs;
-    mod::Log(
-        "Takeover: host logEfz IAT capture disabled (simulation parity); "
-        "helper-process console capture remains active");
+    static bool patched = false;
+    if (patched || g_localRevivalModule == nullptr || g_activeRevival == &kRevival_Unsupported)
+        return;
+
+    ConfigureNativeLogHistory(GameDirectoryWide(),
+        g_launchDisposition != revival_launch::LaunchDisposition::DirectGameHost);
+    const std::unordered_map<std::string, uint32_t> opens = {
+        {"CreateFileA", static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&OpenHostLogFileA))},
+        {"CreateFileW", static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&OpenHostLogFileW))},
+    };
+    patched = PatchIat(GetCurrentProcess(), GetCurrentProcessId(), opens, verboseLogs);
+    mod::Log("Takeover: native log open policy installed=%d; native writes remain unchanged",
+        patched ? 1 : 0);
 }
 
 static const RevivalAddressProfile* FindRevivalProfileByTimestamp(uint32_t timestamp)

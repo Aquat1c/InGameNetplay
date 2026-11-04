@@ -288,9 +288,6 @@ DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool
 void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial);
 void PrimeManagedLogEfzHistory();
 bool StartConsoleCaptureWorker(bool enableRawIngress);
-void BeginManagedLogEfzWrite();
-void EndManagedLogEfzWrite();
-bool IsManagedLogEfzWriteActive();
 void ResetNativeWorkflowFlags();
 void NoteConsolePromptLine(
     const std::string& text,

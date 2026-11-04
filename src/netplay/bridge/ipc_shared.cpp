@@ -2329,6 +2329,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 g_localRoleFlag = probe.role;
                 g_lastValidatedSessionPtr = probe.sessionPtr;
                 PublishHostRevivalBase();
+                EnsureHostLogEfzIatPatched(true);
                 mod::Log(
                     "LauncherBootstrap: attached exact Practice session version=%s role=%d session=0x%08lX initCalls=0 policy=passive",
                     probe.profile->versionTag,

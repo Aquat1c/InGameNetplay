@@ -62,6 +62,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/revival_takeover.cpp
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
+    src/netplay/bridge/native_log_history.cpp
     src/netplay/bridge/helper_delay_disconnect.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/revival_session_validation.cpp
@@ -392,6 +393,15 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND WIN32)
+    add_library(native_log_fixture SHARED tests/native_log_fixture.cpp)
+    add_executable(native_log_history_tests tests/native_log_history_tests.cpp)
+    target_include_directories(native_log_history_tests PRIVATE include)
+    target_compile_features(native_log_history_tests PRIVATE cxx_std_17)
+    target_compile_definitions(native_log_history_tests PRIVATE NOMINMAX)
+    add_dependencies(native_log_history_tests native_log_fixture)
+    add_test(NAME native_log_history_tests COMMAND native_log_history_tests $<TARGET_FILE:native_log_fixture>)
+    set_tests_properties(native_log_history_tests PROPERTIES TIMEOUT 20)
+
     add_executable(process_injection_tests
         tests/process_injection_tests.cpp)
     target_include_directories(process_injection_tests PRIVATE include)

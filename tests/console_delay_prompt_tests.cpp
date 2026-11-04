@@ -1,7 +1,27 @@
+#include <windows.h>
+#include <cstring>
+#include <string>
+
+namespace
+{
+std::string g_testModulePath;
+DWORD WINAPI TestGetModuleFileNameA(HMODULE module, LPSTR path, DWORD size)
+{
+    if (g_testModulePath.empty()) return GetModuleFileNameA(module, path, size);
+    if (g_testModulePath.size() >= size) return size;
+    std::memcpy(path, g_testModulePath.c_str(), g_testModulePath.size() + 1);
+    return static_cast<DWORD>(g_testModulePath.size());
+}
+}
+
+#define GetModuleFileNameA TestGetModuleFileNameA
 #include "../src/netplay/bridge/console_capture.cpp"
+#undef GetModuleFileNameA
 
 #include <iostream>
 #include <future>
+#include <fstream>
+#include <iterator>
 
 namespace
 {
@@ -14,6 +34,7 @@ bool g_workerRejectedReadBoundary = false;
 std::string g_consoleError;
 std::string g_quitEndpoint;
 bool g_quitIsActivePeer = true;
+bool g_testRevivalProcess = true;
 
 void Expect(bool condition, const char* message)
 {
@@ -66,7 +87,7 @@ bool g_nativeWorkflowHolePunchDiedSeen = false;
 bool g_holePunchServerConfigLoaded = false;
 std::string g_configuredHolePunchServer;
 
-bool IsCurrentProcessRevival() { return true; }
+bool IsCurrentProcessRevival() { return g_testRevivalProcess; }
 bool TryClassifyRevivalQuitEndpoint(const char* endpoint, bool* active, bool* spectator)
 {
     g_quitEndpoint = endpoint;
@@ -124,6 +145,42 @@ void ResetCapture(SharedBlock& block)
     g_publishedWakeSnapshot = -1;
     DiscardPendingConsoleFragmentsLocked();
     ResetNativeWorkflowFlags();
+}
+
+void TestNativeLogOwnership()
+{
+    char temp[MAX_PATH] = {};
+    const DWORD length = GetTempPathA(MAX_PATH, temp);
+    Expect(length > 0 && length < MAX_PATH, "temporary log folder is available");
+    if (length == 0 || length >= MAX_PATH) return;
+    const std::string directory = std::string(temp) + "efz_console_log_" + std::to_string(GetCurrentProcessId());
+    const bool created = CreateDirectoryA(directory.c_str(), nullptr) != FALSE;
+    Expect(created, "isolated log directory is created");
+    if (!created) return;
+    const std::string path = directory + "\\logEfz.txt";
+    HANDLE native = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Expect(native != INVALID_HANDLE_VALUE, "native log opens");
+    if (native != INVALID_HANDLE_VALUE)
+    {
+        const char line[] = "102 2\n";
+        DWORD written = 0;
+        Expect(WriteFile(native, line, sizeof(line) - 1, &written, nullptr)
+            && written == sizeof(line) - 1, "native startup record is written");
+        g_testModulePath = directory + "\\mods\\efz_netplay_mod\\efz_netplay_mod.dll";
+        g_testRevivalProcess = false;
+        PrimeManagedLogEfzHistory();
+        StopManagedLogEfzWorker(true);
+        g_testRevivalProcess = true;
+        g_testModulePath.clear();
+        CloseHandle(native);
+        std::ifstream stream(path, std::ios::binary);
+        const std::string content((std::istreambuf_iterator<char>(stream)), {});
+        Expect(content == line, "console worker startup leaves Revival's active log unchanged");
+        stream.close();
+        Expect(DeleteFileA(path.c_str()) != FALSE, "temporary native log is removed");
+    }
+    Expect(RemoveDirectoryA(directory.c_str()) != FALSE, "temporary log directory is removed");
 }
 
 void TestNativePromptAndRetry()
@@ -284,6 +341,7 @@ void TestUnknownRangeAndSessionReset()
 
 int main()
 {
+    TestNativeLogOwnership();
     TestNativePromptAndRetry();
     TestQueuedReadBoundary();
     TestFragmentedPeerQuit();

@@ -1,6 +1,5 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/i18n.h"
-#include "netplay/core/mod_settings.h"
 #include "netplay/bridge/console_capture_state.h"
 
 #include <algorithm>
@@ -975,7 +974,6 @@ bool IsLikelyRevivalDiskLogPath(const std::string& path)
     return looksRevivalOwned || looksTextFile;
 }
 
-static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line);
 static bool EnqueueConsoleParseChunk(
     const char* sourceTag,
     const void* data,
@@ -1164,12 +1162,6 @@ static void ProcessConsoleTextChunk(
         {
             return;
         }
-        if (!IsCurrentProcessRevival()
-            && sourceTag != nullptr
-            && std::strcmp(sourceTag, "WriteFileDisk") == 0)
-        {
-            AppendOwnedLogEfzLine(sourceTag, trimmed);
-        }
         NoteConsolePromptLine(
             trimmed,
             rawWriteWakeSnapshot);
@@ -1244,7 +1236,7 @@ static void ProcessConsoleTextChunk(
 
 static void FlushPendingConsoleOutputLocked()
 {
-    auto flushOne = [&](const char* sourceTag, std::string* line) {
+    auto flushOne = [&](std::string* line) {
         if (line == nullptr || line->empty())
         {
             return;
@@ -1257,13 +1249,6 @@ static void FlushPendingConsoleOutputLocked()
             return;
         }
 
-        if (!IsCurrentProcessRevival()
-            && sourceTag != nullptr
-            && std::strcmp(sourceTag, "WriteFileDisk") == 0)
-        {
-            AppendOwnedLogEfzLine(sourceTag, trimmed);
-        }
-
         LONG* wakeSnapshot = SelectPendingConsoleWakeSnapshot(line);
         const LONG rawWriteWakeSnapshot = wakeSnapshot != nullptr ? *wakeSnapshot : -1;
         if (wakeSnapshot != nullptr)
@@ -1273,39 +1258,27 @@ static void FlushPendingConsoleOutputLocked()
         NoteConsolePromptLine(trimmed, rawWriteWakeSnapshot);
     };
 
-    flushOne("WriteFile", &g_consolePendingWriteFile);
-    flushOne("WriteFileDisk", &g_consolePendingWriteFileDisk);
-    flushOne("WriteConsoleA", &g_consolePendingWriteConsoleA);
-    flushOne("WriteConsoleW", &g_consolePendingWriteConsoleW);
-    flushOne("WriteConsoleOutputCharacterA", &g_consolePendingWriteConsoleOutputCharacterA);
-    flushOne("WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW);
-    flushOne("OutputDebugStringA", &g_consolePendingOutputDebugStringA);
-    flushOne("OutputDebugStringW", &g_consolePendingOutputDebugStringW);
+    flushOne(&g_consolePendingWriteFile);
+    flushOne(&g_consolePendingWriteFileDisk);
+    flushOne(&g_consolePendingWriteConsoleA);
+    flushOne(&g_consolePendingWriteConsoleW);
+    flushOne(&g_consolePendingWriteConsoleOutputCharacterA);
+    flushOne(&g_consolePendingWriteConsoleOutputCharacterW);
+    flushOne(&g_consolePendingOutputDebugStringA);
+    flushOne(&g_consolePendingOutputDebugStringW);
 }
-
-static std::mutex g_ownedLogEfzMutex;
-static HANDLE g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
-static std::string g_ownedLogEfzCurrentPath;
-static uint32_t g_ownedLogEfzSessionOrdinal = 0;
-static bool g_ownedLogEfzOpenedThisProcess = false;
 
 struct OwnedLogEfzEntry
 {
     enum class Kind
     {
-        Line,
         CloseBoundary,
         ParseFlush,
-    } kind = Kind::Line;
-    std::string sourceTag;
-    std::string line;
-    SYSTEMTIME timestamp = {};
+    } kind = Kind::ParseFlush;
     unsigned long long sequence = 0;
     size_t ingressBoundary = 0;
     unsigned long ingressLossGeneration = 0;
 };
-
-constexpr size_t kOwnedLogEfzQueueLimit = 8192;
 
 constexpr size_t kConsoleIngressCapacity = 256;
 constexpr size_t kConsoleIngressPayloadBytes = 16384;
@@ -1347,11 +1320,9 @@ static console_capture::WorkerLifecycle g_consoleWorker;
 static volatile LONG g_ownedLogEfzEmergencyStop = 0;
 static unsigned long long g_ownedLogEfzEnqueuedSequence = 0;
 static unsigned long long g_ownedLogEfzProcessedSequence = 0;
-static unsigned long g_ownedLogEfzDroppedLines = 0;
 static volatile DWORD g_ownedLogEfzWorkerThreadId = 0;
 
 bool StartConsoleCaptureWorker(bool enableRawIngress);
-static void CloseOwnedLogEfzForBoundary();
 
 static void ResetConsoleIngress()
 {
@@ -1473,383 +1444,7 @@ static void ApplyConsoleIngressLossBoundary(unsigned long lossGeneration)
     g_consoleIngressConsumedLossGeneration = lossGeneration;
 }
 
-static unsigned long long QueryExistingOwnedLogEfzSize(const std::string& path, bool* outExists)
-{
-    if (outExists != nullptr)
-    {
-        *outExists = false;
-    }
 
-    if (path.empty())
-    {
-        return 0;
-    }
-
-    WIN32_FILE_ATTRIBUTE_DATA attrs = {};
-    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs))
-    {
-        return 0;
-    }
-    if ((attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-    {
-        return 0;
-    }
-
-    if (outExists != nullptr)
-    {
-        *outExists = true;
-    }
-
-    return (static_cast<unsigned long long>(attrs.nFileSizeHigh) << 32)
-        | static_cast<unsigned long long>(attrs.nFileSizeLow);
-}
-
-static void LogOwnedLogEfzIntegrityIssue(
-    const char* outcome,
-    const std::string& path,
-    const char* detail)
-{
-    if (outcome == nullptr || outcome[0] == '\0')
-    {
-        outcome = "unknown";
-    }
-
-    if (detail != nullptr && detail[0] != '\0')
-    {
-        mod::Log(
-            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s' %s",
-            outcome,
-            path.c_str(),
-            detail);
-    }
-    else
-    {
-        mod::Log(
-            "CAPTURE_LOG: managed logEfz integrity issue outcome=%s current='%s'",
-            outcome,
-            path.c_str());
-    }
-}
-
-static std::string GetConsoleCaptureModuleDirectory()
-{
-    char modulePath[MAX_PATH] = {};
-    HMODULE selfModule = nullptr;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&GetConsoleCaptureModuleDirectory),
-        &selfModule);
-    if (selfModule == nullptr || GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0)
-    {
-        return {};
-    }
-
-    std::string dir(modulePath);
-    const size_t slash = dir.find_last_of("\\/");
-    if (slash == std::string::npos)
-    {
-        return {};
-    }
-    dir.resize(slash);
-    return dir;
-}
-
-static std::string ParentDirectory(const std::string& path)
-{
-    if (path.empty())
-    {
-        return {};
-    }
-
-    const size_t slash = path.find_last_of("\\/");
-    if (slash != std::string::npos)
-    {
-        return path.substr(0, slash);
-    }
-    return {};
-}
-
-static std::string GetOwnedLogEfzPath()
-{
-    const std::string modDir = GetConsoleCaptureModuleDirectory();
-    if (modDir.empty())
-    {
-        return {};
-    }
-
-    const std::string modsDir = ParentDirectory(modDir);
-    const std::string gameRoot = ParentDirectory(modsDir.empty() ? modDir : modsDir);
-    const std::string rootDir = gameRoot.empty() ? modDir : gameRoot;
-    return rootDir + "\\logEfz.txt";
-}
-
-static std::string FormatOwnedLogEfzTimestamp()
-{
-    SYSTEMTIME st = {};
-    GetLocalTime(&st);
-
-    char buffer[64] = {};
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "%04u-%02u-%02u %02u:%02u:%02u.%03u",
-        static_cast<unsigned>(st.wYear),
-        static_cast<unsigned>(st.wMonth),
-        static_cast<unsigned>(st.wDay),
-        static_cast<unsigned>(st.wHour),
-        static_cast<unsigned>(st.wMinute),
-        static_cast<unsigned>(st.wSecond),
-        static_cast<unsigned>(st.wMilliseconds));
-
-    return buffer;
-}
-
-static bool WriteOwnedLogEfzBytes(
-    const std::string& path,
-    const char* reason,
-    const char* data,
-    size_t size)
-{
-    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE || data == nullptr || size == 0)
-    {
-        return true;
-    }
-
-    const DWORD requested = static_cast<DWORD>(size);
-    DWORD written = 0;
-    SetLastError(NO_ERROR);
-    const BOOL writeOk = WriteFile(
-        g_ownedLogEfzCurrentHandle,
-        data,
-        requested,
-        &written,
-        nullptr);
-    const DWORD writeError = GetLastError();
-    if (!writeOk || written != requested)
-    {
-        char detail[256] = {};
-        std::snprintf(
-            detail,
-            sizeof(detail),
-            "reason=%s short_write requested=%lu written=%lu winerr=%lu ok=%d",
-            reason != nullptr ? reason : "unknown",
-            static_cast<unsigned long>(size),
-            static_cast<unsigned long>(written),
-            static_cast<unsigned long>(writeError),
-            writeOk ? 1 : 0);
-        LogOwnedLogEfzIntegrityIssue("short_write", path, detail);
-        return false;
-    }
-
-    return true;
-}
-
-static void CloseOwnedLogEfzCurrentFileLocked(const char* reason)
-{
-    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
-    {
-        return;
-    }
-
-    const HANDLE handle = g_ownedLogEfzCurrentHandle;
-    g_ownedLogEfzCurrentHandle = INVALID_HANDLE_VALUE;
-
-    SetLastError(NO_ERROR);
-    const BOOL flushOk = FlushFileBuffers(handle);
-    const DWORD flushError = GetLastError();
-    SetLastError(NO_ERROR);
-    const BOOL closeOk = CloseHandle(handle);
-    const DWORD closeError = GetLastError();
-
-    if (!flushOk)
-    {
-        char detail[256] = {};
-        std::snprintf(
-            detail,
-            sizeof(detail),
-            "reason=%s close_flush_failed winerr=%lu",
-            reason != nullptr ? reason : "unknown",
-            static_cast<unsigned long>(flushError));
-        LogOwnedLogEfzIntegrityIssue("close_flush_failed", g_ownedLogEfzCurrentPath, detail);
-    }
-
-    if (!closeOk)
-    {
-        char detail[256] = {};
-        std::snprintf(
-            detail,
-            sizeof(detail),
-            "reason=%s close_failed winerr=%lu",
-            reason != nullptr ? reason : "unknown",
-            static_cast<unsigned long>(closeError));
-        LogOwnedLogEfzIntegrityIssue("close_failed", g_ownedLogEfzCurrentPath, detail);
-    }
-}
-
-static std::string BuildOwnedLogEfzHeader(uint32_t sessionOrdinal)
-{
-    const std::string timestamp = FormatOwnedLogEfzTimestamp();
-
-    char buffer[256] = {};
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "============================================================\r\n"
-        "SESSION %lu  start=%s  pid=%lu\r\n"
-        "============================================================\r\n"
-        "\r\n",
-        static_cast<unsigned long>(sessionOrdinal),
-        timestamp.c_str(),
-        static_cast<unsigned long>(GetCurrentProcessId()));
-
-    return buffer;
-}
-
-static bool EnsureOwnedLogEfzFilesOpenLocked()
-{
-    if (g_ownedLogEfzCurrentHandle != INVALID_HANDLE_VALUE)
-    {
-        return true;
-    }
-
-    g_ownedLogEfzCurrentPath = GetOwnedLogEfzPath();
-    if (g_ownedLogEfzCurrentPath.empty())
-    {
-        return false;
-    }
-
-    const bool preserveAcrossLaunches =
-        netplay::mod_settings::PreserveRevivalLogsAcrossLaunches();
-    const bool firstOpenThisProcess = !g_ownedLogEfzOpenedThisProcess;
-    bool previousExists = false;
-    const unsigned long long previousBytes =
-        QueryExistingOwnedLogEfzSize(g_ownedLogEfzCurrentPath, &previousExists);
-
-    const bool truncateNow = firstOpenThisProcess && !preserveAcrossLaunches;
-    g_ownedLogEfzCurrentHandle = CreateFileA(
-        g_ownedLogEfzCurrentPath.c_str(),
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        truncateNow ? CREATE_ALWAYS : OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-
-    if (g_ownedLogEfzCurrentHandle == INVALID_HANDLE_VALUE)
-    {
-        mod::Log(
-            "CAPTURE_LOG: failed to open managed logEfz current='%s'",
-            g_ownedLogEfzCurrentPath.c_str());
-        char detail[256] = {};
-        std::snprintf(
-            detail,
-            sizeof(detail),
-            "reason=append_open_failed winerr=%lu",
-            static_cast<unsigned long>(GetLastError()));
-        LogOwnedLogEfzIntegrityIssue("open_failed", g_ownedLogEfzCurrentPath, detail);
-        g_ownedLogEfzCurrentPath.clear();
-        return false;
-    }
-
-    if (firstOpenThisProcess)
-    {
-        g_ownedLogEfzOpenedThisProcess = true;
-        mod::Log(
-            "CAPTURE_LOG: %s managed logEfz current='%s' preserveAcrossLaunches=%d previousExists=%d previousBytes=%llu",
-            truncateNow ? "starting fresh" : "appending to preserved",
-            g_ownedLogEfzCurrentPath.c_str(),
-            preserveAcrossLaunches ? 1 : 0,
-            previousExists ? 1 : 0,
-            previousBytes);
-    }
-
-    const uint32_t sessionOrdinal = g_ownedLogEfzSessionOrdinal + 1;
-    const std::string header = BuildOwnedLogEfzHeader(sessionOrdinal);
-    if (!WriteOwnedLogEfzBytes(
-            g_ownedLogEfzCurrentPath,
-            "session_header",
-            header.data(),
-            header.size()))
-    {
-        CloseOwnedLogEfzCurrentFileLocked("session_header_failed");
-        return false;
-    }
-
-    g_ownedLogEfzSessionOrdinal = sessionOrdinal;
-
-    mod::Log(
-        "CAPTURE_LOG: opened managed logEfz current='%s' session=%lu mode=append fileBytes=%llu preserveAcrossLaunches=%d",
-        g_ownedLogEfzCurrentPath.c_str(),
-        static_cast<unsigned long>(g_ownedLogEfzSessionOrdinal),
-        previousBytes,
-        preserveAcrossLaunches ? 1 : 0);
-    return true;
-}
-
-static void WriteOwnedLogEfzLine(
-    const char* sourceTag,
-    const std::string& line,
-    const SYSTEMTIME& timestamp)
-{
-    if (line.empty())
-    {
-        return;
-    }
-
-    LARGE_INTEGER appendQpcStart = {};
-    QueryPerformanceCounter(&appendQpcStart);
-
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-    if (!EnsureOwnedLogEfzFilesOpenLocked())
-    {
-        return;
-    }
-
-    char prefix[96] = {};
-    std::snprintf(
-        prefix,
-        sizeof(prefix),
-        "[%02u:%02u:%02u.%03u][%s] ",
-        static_cast<unsigned>(timestamp.wHour),
-        static_cast<unsigned>(timestamp.wMinute),
-        static_cast<unsigned>(timestamp.wSecond),
-        static_cast<unsigned>(timestamp.wMilliseconds),
-        sourceTag != nullptr ? sourceTag : "unknown");
-
-    std::string entry(prefix);
-    entry.append(line);
-    entry.append("\r\n");
-
-    if (!WriteOwnedLogEfzBytes(
-            g_ownedLogEfzCurrentPath,
-            "append_entry",
-            entry.data(),
-            entry.size()))
-    {
-        CloseOwnedLogEfzCurrentFileLocked("append_entry_failed");
-    }
-
-    {
-        static uint32_t s_appendSlowCount = 0;
-        LARGE_INTEGER appendQpcEnd = {}, freq = {};
-        QueryPerformanceCounter(&appendQpcEnd);
-        QueryPerformanceFrequency(&freq);
-        const double elapsedMs =
-            static_cast<double>(appendQpcEnd.QuadPart - appendQpcStart.QuadPart)
-            * 1000.0 / static_cast<double>(freq.QuadPart);
-        if (elapsedMs > 5.0)
-        {
-            ++s_appendSlowCount;
-            if (s_appendSlowCount <= 5 || (s_appendSlowCount % 500 == 0))
-            {
-                mod::Log(
-                    "PERF_WARN: AppendOwnedLogEfzLine took %.1fms "
-                    "(slowCount=%u) - logEfz disk write stalling",
-                    elapsedMs, s_appendSlowCount);
-            }
-        }
-    }
-}
 
 static void ProcessConsoleIngressRecord(const ConsoleIngressSlot& slot)
 {
@@ -1894,7 +1489,6 @@ static void ManagedLogEfzWorkerMain()
         bool haveQueueEntry = false;
         ConsoleIngressSlot* ingressSlot = nullptr;
         size_t ingressPosition = 0;
-        unsigned long droppedLines = 0;
         {
             std::unique_lock<std::mutex> lock(g_ownedLogEfzQueueMutex);
             const auto wakePredicate = [] {
@@ -1929,8 +1523,6 @@ static void ManagedLogEfzWorkerMain()
             {
                 entry = std::move(g_ownedLogEfzQueue.front());
                 g_ownedLogEfzQueue.pop_front();
-                droppedLines = g_ownedLogEfzDroppedLines;
-                g_ownedLogEfzDroppedLines = 0;
                 haveQueueEntry = true;
             }
             else
@@ -1965,28 +1557,10 @@ static void ManagedLogEfzWorkerMain()
 
         ApplyConsoleIngressLossBoundary(entry.ingressLossGeneration);
 
-        if (droppedLines != 0)
-        {
-            mod::Log(
-                "CAPTURE_LOG: managed logEfz mirror queue overflow "
-                "dropped=%lu",
-                droppedLines);
-        }
-        if (entry.kind == OwnedLogEfzEntry::Kind::CloseBoundary)
-        {
-            CloseOwnedLogEfzForBoundary();
-        }
-        else if (entry.kind == OwnedLogEfzEntry::Kind::ParseFlush)
+        if (entry.kind == OwnedLogEfzEntry::Kind::ParseFlush)
         {
             std::lock_guard<std::mutex> parserLock(g_consoleLogMutex);
             FlushPendingConsoleOutputLocked();
-        }
-        else
-        {
-            WriteOwnedLogEfzLine(
-                entry.sourceTag.c_str(),
-                entry.line,
-                entry.timestamp);
         }
 
         {
@@ -2028,54 +1602,10 @@ bool StartConsoleCaptureWorker(bool enableRawIngress)
         g_consoleIngressAccepting.store(false, std::memory_order_release);
         g_consoleIngressPollingEnabled.store(false, std::memory_order_release);
         mod::Log(
-            "CAPTURE_LOG: failed to start managed logEfz worker; "
-            "mirror disabled to keep disk I/O off the simulation thread");
+            "CAPTURE_LOG: failed to start console parser worker; "
+            "raw capture disabled");
         return false;
     }
-}
-
-static void AppendOwnedLogEfzLine(const char* sourceTag, const std::string& line)
-{
-    if (line.empty())
-    {
-        return;
-    }
-
-    if (g_ownedLogEfzWorkerThreadId != 0
-        && GetCurrentThreadId() == g_ownedLogEfzWorkerThreadId)
-    {
-        SYSTEMTIME now = {};
-        GetLocalTime(&now);
-        WriteOwnedLogEfzLine(sourceTag, line, now);
-        return;
-    }
-
-    OwnedLogEfzEntry entry;
-    entry.sourceTag = sourceTag != nullptr ? sourceTag : "unknown";
-    entry.line = line;
-    GetLocalTime(&entry.timestamp);
-
-    {
-        std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
-        if (!g_consoleWorker.Accepting()
-            || InterlockedCompareExchange(
-                   &g_ownedLogEfzEmergencyStop, 0, 0) != 0)
-        {
-            ++g_ownedLogEfzDroppedLines;
-            return;
-        }
-        if (g_ownedLogEfzQueue.size() >= kOwnedLogEfzQueueLimit)
-        {
-            ++g_ownedLogEfzDroppedLines;
-            return;
-        }
-        entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
-        entry.ingressBoundary = CaptureConsoleIngressBoundary();
-        entry.ingressLossGeneration =
-            g_consoleIngressLossGeneration.load(std::memory_order_acquire);
-        g_ownedLogEfzQueue.push_back(std::move(entry));
-    }
-    g_ownedLogEfzQueueCv.notify_one();
 }
 
 static void CopyConsoleIngressSourceTag(char* destination, const char* sourceTag)
@@ -2306,20 +1836,6 @@ void StopManagedLogEfzWorker(bool waitForDrain)
 
 static void ResetLogEfzDiskHandleCache();
 
-static void CloseOwnedLogEfzForBoundary()
-{
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-    CloseOwnedLogEfzCurrentFileLocked("close_mirror_logs");
-
-    if (!g_ownedLogEfzCurrentPath.empty())
-    {
-        mod::Log(
-            "CAPTURE_LOG: closed managed logEfz current='%s'",
-            g_ownedLogEfzCurrentPath.c_str());
-    }
-    g_ownedLogEfzCurrentPath.clear();
-}
-
 void CloseMirrorLogFiles()
 {
     unsigned long long closeSequence = 0;
@@ -2365,31 +1881,12 @@ void CloseMirrorLogFiles()
     {
         g_ownedLogEfzQueueCv.notify_one();
     }
-    else
-    {
-        CloseOwnedLogEfzForBoundary();
-    }
     ResetLogEfzDiskHandleCache();
 }
 
 void PrimeManagedLogEfzHistory()
 {
     (void)StartConsoleCaptureWorker(false);
-    std::lock_guard<std::mutex> lock(g_ownedLogEfzMutex);
-    (void)EnsureOwnedLogEfzFilesOpenLocked();
-}
-
-void BeginManagedLogEfzWrite()
-{
-}
-
-void EndManagedLogEfzWrite()
-{
-}
-
-bool IsManagedLogEfzWriteActive()
-{
-    return false;
 }
 
 // Never cache an "ignore" classification: a recycled numeric handle can bypass our CreateFile stub.

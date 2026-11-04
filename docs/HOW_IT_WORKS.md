@@ -63,9 +63,17 @@ Everything EfzRevival prints is captured and parsed
 (`src/netplay/bridge/console_capture.cpp`): `ExtractDelayRange()` and
 `ExtractIntAfterToken()` read the delay prompt and its ping statistics,
 `TryExtractQuitEndpoint()` / `TryExtractDiedEndpoint()` recognize opponents
-leaving, and the whole stream is mirrored into an append-only `logEfz.txt`
-with one header per session (`RegisterCreatedConsoleFile*()` in
-`src/netplay/bridge/iat_stubs.cpp` owns the file-handle bookkeeping).
+leaving. Revival writes `logEfz.txt` directly. Only its file opens are
+intercepted: each session receives an append-only handle and a dated separator
+(`src/netplay/bridge/native_log_history.cpp`). Native per-frame writes are
+unchanged, and the console parser never opens or writes this file.
+
+Every match is retained during a game launch. The existing
+**Preserve Revival Logs Across Launches** setting controls whether the first
+native open keeps earlier launches or starts fresh. Attaching to an already
+running launcher preserves its current log; data erased before attachment
+cannot be recovered. Helper-process logs remain separate under
+`logs/native_revival/`.
 
 ## Supported builds, and failing closed
 

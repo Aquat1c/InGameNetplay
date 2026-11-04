@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -237,9 +238,16 @@ for forbidden in (
 
 takeover = takeover_path.read_text(encoding="utf-8", errors="strict")
 host_log_hook = function_slice(takeover, "void EnsureHostLogEfzIatPatched(")
-for forbidden in ("PatchIat", "nb_stub_WriteFile", "nb_stub_CreateFile"):
+for forbidden in ("WriteFile", "nb_stub_CreateFile"):
     if forbidden in host_log_hook:
         fail(f"host simulation log IAT capture returned: {forbidden}")
+if set(re.findall(r'\{"([^"]+)",', host_log_hook)) != {"CreateFileA", "CreateFileW"}:
+    fail("host log policy must intercept only native file opens")
+prime_logs = function_slice(console, "void PrimeManagedLogEfzHistory(")
+if "EnsureOwnedLogEfzFilesOpenLocked" in prime_logs:
+    fail("console startup can still truncate the native log")
+if "AppendOwnedLogEfzLine(sourceTag, trimmed)" in console:
+    fail("console parsing can still mirror into the native log")
 
 ipc = ipc_path.read_text(encoding="utf-8", errors="strict")
 injected_init = function_slice(ipc, "void InitializeInjected(")
