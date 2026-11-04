@@ -27,6 +27,7 @@ constexpr HelperProfile profiles[] = {
     {"1.02h", 0x6292935E, 0xFE000, 0x9B038, 0x9B058, 0x44630, 0x49C00, false},
     {"1.02i", 0x63BF27B6, 0xFE000, 0x99FD8, 0x99FF8, 0x45780, 0x4AEA0, false},
     {"1.02j", 0x6A3696C8, 0x294000, 0x1ECE30, 0x1ECE50, 0x82490, 0x94AA0, true},
+    {"1.02j", 0x6A6F0E2B, 0x294000, 0x1ECE30, 0x1ECE50, 0x82490, 0x94AA0, true},
 };
 
 bool ValidateHelperImage(unsigned char* base, const HelperProfile& profile)
@@ -70,17 +71,18 @@ bool InstallHelperDelayDisconnectHandler(HMODULE helperModule, const char* versi
 {
     static_assert(sizeof(void*) == 4, "Revival helpers use 32-bit vtables");
     if (helperModule == nullptr || versionTag == nullptr) return false;
+    auto* base = reinterpret_cast<unsigned char*>(helperModule);
     const HelperProfile* profile = nullptr;
     for (const auto& candidate : profiles)
     {
-        if (std::strcmp(candidate.versionTag, versionTag) == 0)
+        if (std::strcmp(candidate.versionTag, versionTag) == 0
+            && ValidateHelperImage(base, candidate))
         {
             profile = &candidate;
             break;
         }
     }
-    auto* base = reinterpret_cast<unsigned char*>(helperModule);
-    if (profile == nullptr || !ValidateHelperImage(base, *profile)) return false;
+    if (profile == nullptr) return false;
     auto* slot = reinterpret_cast<PVOID volatile*>(base + profile->quitSlotRva);
     PVOID original = base + profile->nullHandlerRva;
     PVOID replacement = base + profile->deathHandlerRva;

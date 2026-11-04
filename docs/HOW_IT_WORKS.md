@@ -159,7 +159,9 @@ values retain their existing representation.
   delay setup, received quit packets use Revival's native peer-disconnect
   handler, which closes the pending reader and ends the session. Helper
   validation accepts both the preferred and loader-rebased image headers while
-  checking the exact version, relocated callback addresses and native code bytes.
+  checking the exact compile profile, relocated callback addresses and native
+  code bytes. Both supported 1.02j compilations share the version label, so
+  helper selection also matches the binary identity.
   The overlay reports that the opponent quit or timed out. Terminal sessions
   cannot accept delay input or reopen selection from late console output.
 - Console cancellation wakes are relayed for both players. Starting a new

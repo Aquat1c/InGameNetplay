@@ -1,4 +1,5 @@
 #include "netplay/bridge/helper_delay_disconnect.h"
+#include "netplay/bridge/revival_addresses.h"
 
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,7 @@ constexpr Fixture fixtures[] = {
     {"1.02h", "1.02h", 0x6292935E, 0xFE000, 0x9B038, 0x9B058, 0x44630, 0x49C00},
     {"1.02i", "1.02i", 0x63BF27B6, 0xFE000, 0x99FD8, 0x99FF8, 0x45780, 0x4AEA0},
     {"1.02j", "1.02j", 0x6A3696C8, 0x294000, 0x1ECE30, 0x1ECE50, 0x82490, 0x94AA0},
+    {"1.02j", "1.02j-20260802", 0x6A6F0E2B, 0x294000, 0x1ECE30, 0x1ECE50, 0x82490, 0x94AA0},
 };
 
 struct Image
@@ -75,6 +77,22 @@ void InitializeSynthetic(Image& image, const Fixture& f)
     const unsigned char head[] = {0x55, 0x8B, 0xEC};
     const unsigned char headJ[] = {0x55, 0x89, 0xE5};
     std::memcpy(image.bytes + f.replacement, std::strcmp(f.tag, "1.02j") == 0 ? headJ : head, sizeof(head));
+}
+
+void TestProfileCoverage()
+{
+    for (const auto* profile : netplay::bridge::takeover::kAllRevivalProfiles)
+    {
+        bool covered = false;
+        for (const Fixture& f : fixtures)
+        {
+            if (std::strcmp(f.tag, profile->versionTag) == 0
+                && f.timestamp == profile->launcherExeTimestamp
+                && f.imageSize == profile->launcherExeSizeOfImage)
+                covered = true;
+        }
+        Expect(covered, "every admitted Revival compile profile has a helper fixture");
+    }
 }
 
 void TestSyntheticImages()
@@ -156,6 +174,7 @@ void VerifyShippedImages(const char* root)
     using netplay::bridge::takeover::InstallHelperDelayDisconnectHandler;
     for (const Fixture& f : fixtures)
     {
+        const int failuresBefore = failures;
         const std::string path = std::string(root) + '/' + f.directory + "/EfzRevival.exe";
         std::ifstream stream(path, std::ios::binary);
         const std::vector<unsigned char> file((std::istreambuf_iterator<char>(stream)), {});
@@ -202,13 +221,15 @@ void VerifyShippedImages(const char* root)
         image.Slot(f.deathSlot) = image.Address(f.replacement);
         Expect(InstallHelperDelayDisconnectHandler(image.Module(), f.tag), "shipped helper bytes satisfy installation guards");
         Expect(image.Slot(f.quitSlot) == image.Address(f.replacement), "shipped helper copy installs the native handler");
-        std::cout << "Verified helper " << f.tag << '\n';
+        if (failures == failuresBefore)
+            std::cout << "Verified helper " << f.tag << " (" << f.directory << ")\n";
     }
 }
 }
 
 int main(int argc, char** argv)
 {
+    TestProfileCoverage();
     TestSyntheticImages();
     if (argc == 2) VerifyShippedImages(argv[1]);
     return failures == 0 ? 0 : 1;
