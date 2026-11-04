@@ -463,7 +463,7 @@ failure_branch = async_tick.find("ASYNC_HOST_START_FAILED_BEFORE_LISTENER")
 if failure_branch < 0:
     fail("could not locate async-host pre-listener failure branch")
 failure_guard = async_tick[max(0, failure_branch - 500):failure_branch]
-if "!g_listenerStartupFailed" not in failure_guard:
+if "!g_listener.IsFailed()" not in failure_guard:
     fail("async-host pre-listener failure can log every title frame")
 
 print("simulation parity contract: PASS")

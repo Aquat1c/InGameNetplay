@@ -1,5 +1,7 @@
 #pragma once
 
+#include "netplay/core/lobby_lifecycle.h"
+
 #include "netplay/core/network_capability.h"
 #include "netplay/core/tls_http_client.h"
 
@@ -282,22 +284,14 @@ private:
     std::atomic<bool> m_shouldStop{false};
     std::atomic<bool> m_refreshRequested{false};
     std::atomic<bool> m_rejoinRequested{false};
-    std::atomic<bool> m_inBattle{false};
-    std::atomic<bool> m_returningFromMatch{false};
-    std::atomic<bool> m_challengePending{false};
     std::atomic<bool> m_abandonedOutgoingChallenge{false};
     std::atomic<bool> m_abandonedIncomingChallenge{false};
     std::atomic<bool> m_rejectedOutgoingChallenge{false};
     std::atomic<ChallengeSendState> m_challengeSendState{ChallengeSendState::None};
     std::atomic<DWORD> m_challengeSentTick{0};
     netplay::tls::KeepAliveClient m_keepAlive; // Poll thread only.
-    std::atomic<bool> m_matchConnected{false};
-    std::atomic<bool> m_endDeferred{false};
-    std::atomic<bool> m_endPending{false};
-    std::atomic<bool> m_spectateActive{false};
-    std::atomic<bool> m_returningFromSpectate{false};
-    std::atomic<bool> m_spectateLeavePending{false};
-    std::atomic<bool> m_spectateDetachedFromRoom{false};
+    MatchLifecycle m_match;
+    SpectateLifecycle m_spectate;
     std::atomic<bool> m_isMatchHost{false};
 
     HANDLE m_wakeEvent = nullptr;

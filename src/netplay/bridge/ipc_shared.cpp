@@ -2359,10 +2359,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
             const uintptr_t priorSessionPtr = g_lastValidatedSessionPtr;
             const int priorNetplayRole = g_netplayRole;
             const bool priorLocalInitApplied = g_localInitAppliedForSession;
-            const bool priorSpectatorAttempted =
-                g_spectatorPostInitAttemptedForSession;
-            const bool priorSpectatorSucceeded =
-                g_spectatorPostInitSucceededForSession;
+            const auto priorSpectatorPostInit = g_spectatorPostInitState;
             const bool priorClientSwapApplied = IsClientInputSwapApplied();
             const uintptr_t priorExternalRemoteBase =
                 g_externalLauncherGuardRemoteBase;
@@ -2380,10 +2377,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 g_lastValidatedSessionPtr = priorSessionPtr;
                 g_netplayRole = priorNetplayRole;
                 g_localInitAppliedForSession = priorLocalInitApplied;
-                g_spectatorPostInitAttemptedForSession =
-                    priorSpectatorAttempted;
-                g_spectatorPostInitSucceededForSession =
-                    priorSpectatorSucceeded;
+                g_spectatorPostInitState = priorSpectatorPostInit;
                 SetClientInputSwapApplied(priorClientSwapApplied);
                 g_externalLauncherGuardRemoteBase = priorExternalRemoteBase;
                 InterlockedExchange(
@@ -2437,8 +2431,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 g_lastValidatedSessionPtr = probe.sessionPtr;
                 g_netplayRole = kNetplayRoleNone;
                 g_localInitAppliedForSession = true;
-                g_spectatorPostInitAttemptedForSession = false;
-                g_spectatorPostInitSucceededForSession = false;
+                g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
                 g_externalLauncherGuardRemoteBase = 0;
                 SetClientInputSwapApplied(false);
                 int currentMode = 0;
@@ -2639,8 +2632,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 g_delayPromptMetrics = {};
                 g_injectedSpectateConfirmPromptWaitStartTick = 0;
                 g_externalLauncherGuardRemoteBase = externalRemoteBase;
-                g_spectatorPostInitAttemptedForSession = false;
-                g_spectatorPostInitSucceededForSession = false;
+                g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
                 g_localInitFn = existingInitFn;
                 g_localRoleFlag = probe.role;
                 g_lastValidatedSessionPtr = probe.sessionPtr;
@@ -2648,8 +2640,7 @@ bool EnsureLocalRevivalLoaded(bool prepareManagedSession)
                 {
                     g_netplayRole = kNetplayRoleSpectator;
                     g_localInitAppliedForSession = true;
-                    g_spectatorPostInitAttemptedForSession = true;
-                    g_spectatorPostInitSucceededForSession = true;
+                    g_spectatorPostInitState = SpectatorPostInitState::Succeeded;
                     SetClientInputSwapApplied(false);
                 }
                 else
@@ -4128,7 +4119,8 @@ void InitializeInjected()
             ? g_activeRevival->versionTag
             : "unknown");
     LogRevival102jDeepStep("HelperIpc.initialize_complete");
-    InterlockedExchange(&g_injectedLazyBootstrapState, g_injectedReady ? 2 : 0);
+    InterlockedExchange(&g_injectedLazyBootstrapState, static_cast<LONG>(g_injectedReady
+        ? InjectedBootstrapState::Ready : InjectedBootstrapState::Idle));
 }
 
 void ShutdownInjected()
@@ -4183,7 +4175,7 @@ void ShutdownInjected()
     g_lastRuntimeReadyProbeLogTick = 0;
     g_lastRuntimeReadyProbeMask = 0;
     g_lastRuntimeReadyProbeMaskValid = false;
-    InterlockedExchange(&g_injectedLazyBootstrapState, 0);
+    InterlockedExchange(&g_injectedLazyBootstrapState, static_cast<LONG>(InjectedBootstrapState::Idle));
     mod::Log("Takeover: injected shutdown");
 }
 

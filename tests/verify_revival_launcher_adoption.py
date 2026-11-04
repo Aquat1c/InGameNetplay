@@ -506,9 +506,11 @@ for required in (
     "RestoreTournamentExePatches()",
     "ForceLocalPlayInit()",
     "RestoreDllExitProcessPatches()",
-    "g_tournamentReturnCleanupStage",
+    "TournamentCleanupState::RestoreExe",
+    "TournamentCleanupState::Quarantined",
+    "CompleteTournamentCleanupStep(stage, succeeded)",
     "retainTournamentQuarantine",
-    "g_tournamentReturnCleanupPending = false",
+    "advance(true)",
 ):
     if required not in tournament_cleanup:
         fail(f"Tournament return transaction lost stage/fail-stop invariant: {required}")

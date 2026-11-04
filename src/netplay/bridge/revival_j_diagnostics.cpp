@@ -423,12 +423,12 @@ void LogProcessAndControlState(const char* context)
         g_localRoleFlag,
         g_netplayRole,
         g_localInitAppliedForSession ? 1 : 0,
-        g_spectatorPostInitAttemptedForSession ? 1 : 0,
-        g_spectatorPostInitSucceededForSession ? 1 : 0,
+        HasSpectatorPostInitAttempted() ? 1 : 0,
+        HasSpectatorPostInitSucceeded() ? 1 : 0,
         IsInsideFrameTick() ? 1 : 0,
         static_cast<long>(InterlockedCompareExchange(&g_deferredLifecycleWorkRequested, 0, 0)),
         static_cast<long>(InterlockedCompareExchange(&g_deferredTitleSelection, 0, 0)),
-        g_tournamentReturnCleanupPending ? 1 : 0);
+        IsTournamentReturnCleanupPending() ? 1 : 0);
     mod::Log(
         "J102_DIAG[%s]: HANDLES helper=0x%p storedPid=%lu handlePid=%lu exitOk=%d "
         "exitCode=0x%08lX hostMap=0x%p hostBlock=0x%08lX initEvent=0x%p "

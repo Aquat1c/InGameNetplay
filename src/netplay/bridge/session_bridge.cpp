@@ -1,4 +1,5 @@
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/session_start_state.h"
 
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/netplay_state_export.h"
@@ -30,15 +31,13 @@ bool g_initialized = false;
 HostSessionNetworkConfig g_activeHostNetworkConfig = {};
 bool g_activeHostNetworkConfigValid = false;
 uint32_t g_lastRejectedHostListenerSerial = 0;
-bool g_synchronousStartRejected = false;
 HANDLE g_peerProbeHandle = nullptr;
 DWORD g_peerProbeProcessId = 0;
 LARGE_INTEGER g_tickQpcFrequency = {};
 bool g_tickQpcFrequencyValid = false;
 
 std::thread g_startWorker;
-bool g_startWorkerRunning = false;
-uint32_t g_startRequestSerial = 0;
+SessionStartLifecycle g_start;
 
 bool IsKnownFamily(network::NetworkFamily family)
 {
@@ -60,7 +59,7 @@ void MarkSynchronousStartRejectedUnlocked(
     NetbridgeRole role,
     const char* reason)
 {
-    g_synchronousStartRejected = true;
+    g_start.Reject();
     mod::Log(
         "REVIVAL_NETPLAY_SYNC_START_REJECTED latched=1 role=%d "
         "reason=%s phase=%s",
@@ -102,7 +101,7 @@ void SetPhase(NetbridgePhase phase, const char* error)
 
 void JoinFinishedWorkerUnlocked()
 {
-    if (g_startWorker.joinable() && !g_startWorkerRunning)
+    if (g_startWorker.joinable() && !g_start.IsRunning())
     {
         g_startWorker.join();
     }
@@ -120,7 +119,7 @@ bool InitializeHostUnlocked(const char* reason)
     g_status = {};
     g_activeHostNetworkConfig = {};
     g_activeHostNetworkConfigValid = false;
-    g_synchronousStartRejected = false;
+    g_start.ClearRejection();
     SetPhase(NetbridgePhase::Idle, nullptr);
     if (!takeover::InitializeHost())
     {
@@ -231,15 +230,15 @@ void Shutdown()
             return;
         }
 
-        ++g_startRequestSerial;
-        if (g_startWorkerRunning)
+        g_start.Invalidate();
+        if (g_start.IsRunning())
         {
             takeover::RequestAbortStart();
             if (g_startWorker.joinable())
             {
                 workerToJoin = std::move(g_startWorker);
             }
-            g_startWorkerRunning = false;
+            g_start.Finish();
         }
         else
         {
@@ -260,7 +259,7 @@ void Shutdown()
         g_status = {};
         g_activeHostNetworkConfig = {};
         g_activeHostNetworkConfigValid = false;
-        g_synchronousStartRejected = false;
+        g_start.ClearRejection();
         ClosePeerProbeHandleUnlocked();
         SetPhase(NetbridgePhase::Idle, nullptr);
         g_connectStartTick = 0;
@@ -285,14 +284,14 @@ void EmergencyShutdown()
     {
         g_startWorker.detach();
     }
-    g_startWorkerRunning = false;
-    ++g_startRequestSerial;
+    g_start.Finish();
+    g_start.Invalidate();
     takeover::RequestAbortStart();
     takeover::EmergencyShutdownHost();
     g_status = {};
     g_activeHostNetworkConfig = {};
     g_activeHostNetworkConfigValid = false;
-    g_synchronousStartRejected = false;
+    g_start.ClearRejection();
     ClosePeerProbeHandleUnlocked();
     SetPhase(NetbridgePhase::Idle, nullptr);
     g_connectStartTick = 0;
@@ -320,10 +319,10 @@ void Tick()
     uint32_t requestSerial = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_initialized || g_startWorkerRunning) return;
+        if (!g_initialized || g_start.IsRunning()) return;
         JoinFinishedWorkerUnlocked();
         takeover::Tick(&g_status, &g_connectStartTick, &trainingRetirementRequired);
-        requestSerial = g_startRequestSerial;
+        requestSerial = g_start.generation;
         statusSnapshot = g_status;
     }
     if (trainingRetirementRequired)
@@ -332,7 +331,7 @@ void Tick()
         if (!trainingHandoff.Ready()) return;
         std::lock_guard<std::mutex> lock(g_mutex);
         const NetbridgePhase phase = static_cast<NetbridgePhase>(g_status.phase);
-        if (!g_initialized || g_startWorkerRunning || requestSerial != g_startRequestSerial
+        if (!g_initialized || g_start.IsRunning() || !g_start.IsCurrent(requestSerial)
             || (phase != NetbridgePhase::Connecting && phase != NetbridgePhase::DelaySetup)) return;
         takeover::Tick(&g_status, &g_connectStartTick, nullptr, true);
         statusSnapshot = g_status;
@@ -416,7 +415,7 @@ void TickExportOnly(bool force)
 
         takeover::RefreshRuntimeStatus(&g_status);
         statusSnapshot = g_status;
-        shouldHandleHostProtocolAck = !g_startWorkerRunning;
+        shouldHandleHostProtocolAck = !g_start.IsRunning();
     }
 
     // The Protocol mutex is a leaf lock: pump only after the bridge mutex is released.
@@ -500,7 +499,7 @@ static bool StartSessionInternal(
     }
 
     JoinFinishedWorkerUnlocked();
-    if (g_startWorkerRunning)
+    if (g_start.IsRunning())
     {
         if (outHostFailure != nullptr)
         {
@@ -761,13 +760,13 @@ static bool StartSessionInternal(
     }
     takeover::ClearHostListenerObservation();
     takeover::ClearDelayPromptState("session_bridge_start_session");
-    if (g_synchronousStartRejected)
+    if (g_start.IsRejected())
     {
         mod::Log(
             "REVIVAL_NETPLAY_SYNC_START_REJECTED latched=0 "
             "action=clear_before_queued_attempt role=%d",
             static_cast<int>(role));
-        g_synchronousStartRejected = false;
+        g_start.ClearRejection();
     }
 #if defined(_MSC_VER)
     strncpy_s(g_status.address, sizeof(g_status.address), addressCopy.c_str(), _TRUNCATE);
@@ -781,8 +780,7 @@ static bool StartSessionInternal(
     g_connectStartTick = GetTickCount();
     takeover::LogRevival102jDeepStep("SessionBridge.StartSession.01.queued", &g_status);
 
-    const uint32_t requestSerial = ++g_startRequestSerial;
-    g_startWorkerRunning = true;
+    const uint32_t requestSerial = g_start.Begin();
 
     g_startWorker = std::thread([
         requestSerial,
@@ -830,7 +828,7 @@ static bool StartSessionInternal(
         bool cancelStaleSession = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            if (requestSerial == g_startRequestSerial)
+            if (g_start.IsCurrent(requestSerial))
             {
                 g_status = workerStatus;
                 g_connectStartTick = workerConnectStartTick;
@@ -850,14 +848,14 @@ static bool StartSessionInternal(
                 mod::Log(
                     "SessionBridge: dropped stale start result serial=%u current=%u",
                     static_cast<unsigned>(requestSerial),
-                    static_cast<unsigned>(g_startRequestSerial));
+                    static_cast<unsigned>(g_start.generation));
                 cancelStaleSession = started;
                 takeover::LogRevival102jDeepStep(
                     "SessionBridge.StartSession.04.worker_result_stale",
                     &workerStatus);
             }
 
-            g_startWorkerRunning = false;
+            g_start.Finish();
         }
 
         if (cancelStaleSession)
@@ -962,7 +960,7 @@ bool GetHostListenerObservation(HostListenerObservation* outObservation)
     observation.serial = static_cast<uint32_t>(serial);
     observation.processId = static_cast<uint32_t>(processId);
     const DWORD expectedProcessId =
-        g_startWorkerRunning
+        g_start.IsRunning()
         ? 0
         : static_cast<DWORD>(g_status.processId);
     observation.expectedProcessKnown =
@@ -1007,7 +1005,7 @@ bool IsSessionStartInProgress()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     JoinFinishedWorkerUnlocked();
-    return g_startWorkerRunning;
+    return g_start.IsRunning();
 }
 
 bool ApplyInputDelay(int delayFrames, int promptSerial)
@@ -1019,7 +1017,7 @@ bool ApplyInputDelay(int delayFrames, int promptSerial)
     }
 
     JoinFinishedWorkerUnlocked();
-    if (g_startWorkerRunning)
+    if (g_start.IsRunning())
     {
         mod::Log("SessionBridge: ApplyInputDelay rejected (start worker running)");
         return false;
@@ -1055,7 +1053,7 @@ bool AnswerSpectatePromptChoice(int choice)
     }
 
     JoinFinishedWorkerUnlocked();
-    if (g_startWorkerRunning)
+    if (g_start.IsRunning())
     {
         mod::Log("SessionBridge: AnswerSpectatePromptChoice rejected (start worker running)");
         return false;
@@ -1099,7 +1097,7 @@ bool PrepareVsHumanHandoff()
     }
 
     JoinFinishedWorkerUnlocked();
-    if (g_startWorkerRunning)
+    if (g_start.IsRunning())
     {
         mod::Log("SessionBridge: PrepareVsHumanHandoff rejected (start worker running)");
         return false;
@@ -1209,16 +1207,16 @@ void CancelSession(const char* reason)
         return;
     }
 
-    ++g_startRequestSerial;
+    g_start.Invalidate();
     g_activeHostNetworkConfig = {};
     g_activeHostNetworkConfigValid = false;
     takeover::ClearHostListenerObservation();
     mod::Log("SessionBridge: CancelSession reason='%s'", (reason != nullptr) ? reason : "");
 
-    if (g_synchronousStartRejected && !g_startWorkerRunning)
+    if (g_start.IsRejected() && !g_start.IsRunning())
     {
         const std::string rejectedError = g_status.errorMsg;
-        g_synchronousStartRejected = false;
+        g_start.ClearRejection();
         SetPhase(NetbridgePhase::Idle, nullptr);
         mod::Log(
             "REVIVAL_NETPLAY_SYNC_START_REJECTED latched=0 "
@@ -1228,7 +1226,7 @@ void CancelSession(const char* reason)
         return;
     }
 
-    if (g_startWorkerRunning)
+    if (g_start.IsRunning())
     {
         takeover::RequestAbortStart();
         if (ShouldCancelToIdle(reason))
@@ -1257,7 +1255,7 @@ bool ConsumeRevivalExitInterception(int* outMode)
         return false;
     }
 
-    ++g_startRequestSerial;
+    g_start.Invalidate();
     g_connectStartTick = 0;
 
     JoinFinishedWorkerUnlocked();
@@ -1274,7 +1272,7 @@ void CompleteGameplayExitRecovery(int mode, const char* origin)
             return;
         }
 
-        ++g_startRequestSerial;
+        g_start.Invalidate();
         g_connectStartTick = 0;
         JoinFinishedWorkerUnlocked();
 

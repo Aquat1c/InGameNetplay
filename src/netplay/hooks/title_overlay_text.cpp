@@ -625,10 +625,10 @@ std::string BuildFooterText()
         netplay::bridge::async_host::IsActive() && netplay::bridge::async_host::IsMinimized();
     if (!minimizedHosting
         && ((bridgePhase != netplay::bridge::NetbridgePhase::Idle && !recoveryCompletedSessionEnded)
-            || g_delaySetupOverlay.active
+            || g_delaySetupOverlay.IsActive()
             || g_spectateConfirmOverlay.active
-            || g_hostingOverlay.active
-            || g_joiningOverlay.active))
+            || g_hostingOverlay.IsActive()
+            || g_joiningOverlay.IsActive()))
     {
         return {};
     }
@@ -857,7 +857,7 @@ void DrawTransientTextCentered(
 bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool)
 {
     static bool s_loggedForCurrentOverlay = false;
-    if (!g_netplayMenuState.active || !g_delaySetupOverlay.active)
+    if (!g_netplayMenuState.active || !g_delaySetupOverlay.IsActive())
     {
         s_loggedForCurrentOverlay = false;
         return false;
@@ -959,7 +959,7 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool)
         netplay::debug_overlay::RtTextProfile::OverlayHint,
         dimColor, kRtOverlayDim);
 
-    if (g_delaySetupOverlay.waitingForRuntimeReady)
+    if (g_delaySetupOverlay.IsWaitingForRuntime())
     {
         DrawTransientTextCentered(
             sv, Tr("Delay submitted. Waiting for sync..."), cL, cR, delayPanelY + 72,
@@ -1007,7 +1007,7 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool)
 
 bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
 {
-    if (!g_netplayMenuState.active || !g_hostingOverlay.active)
+    if (!g_netplayMenuState.active || !g_hostingOverlay.IsActive())
     {
         return false;
     }
@@ -1035,7 +1035,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
     const uint8_t yellowColor = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 220, 100);
     const uint8_t redColor    = netplay::draw::ResolveBestPaletteColor(screenContext, 255, 80, 80);
 
-    if (!g_hostingOverlay.failed
+    if (!g_hostingOverlay.HasFailed()
         && netplay::bridge::async_host::IsMinimized())
     {
         const char* badge = g_hostingOverlay.challengeMode ? Tr("CHALLENGING") : Tr("HOSTING");
@@ -1108,7 +1108,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
         netplay::debug_overlay::RtTextProfile::OverlayTitle,
         titleColor, kRtOverlayTitle);
 
-    if (g_hostingOverlay.failed)
+    if (g_hostingOverlay.HasFailed())
     {
         DrawTransientTextCentered(
             sv, Tr("Hosting failed"), cL, cR, panelY + 28,
@@ -1133,7 +1133,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
     }
 
     char line[192] = {};
-    if (g_hostingOverlay.discoveryInProgress)
+    if (g_hostingOverlay.IsDiscovering())
     {
         DrawTransientTextCentered(
             sv, Tr("Connecting..."), cL, cR, panelY + 28,
@@ -1150,7 +1150,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
     }
     else if (g_hostingOverlay.challengeMode)
     {
-        if (!g_hostingOverlay.listenerReady)
+        if (!g_hostingOverlay.IsListening())
         {
             std::snprintf(line, sizeof(line), "%s", Tr("Connecting..."));
         }
@@ -1166,7 +1166,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
             sv, line, cL, cR, panelY + 28,
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             brightColor, kRtOverlayBright);
-        if (g_hostingOverlay.listenerReady && g_lobbySession)
+        if (g_hostingOverlay.IsListening() && g_lobbySession)
         {
             constexpr DWORD kChallengeNoReplyMs = 30000u;
             const netplay::lobby::ChallengeSendState sendState =
@@ -1193,7 +1193,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
         }
         DrawTransientTextCentered(
             sv,
-            g_hostingOverlay.listenerReady
+            g_hostingOverlay.IsListening()
                 ? Tr("D: Minimize    B/ESC: Cancel")
                 : Tr("B/ESC: Cancel challenge"),
             cL, cR, panelY + 58,
@@ -1207,7 +1207,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             dimColor, kRtOverlayDim);
     }
-    else if (!g_hostingOverlay.listenerReady)
+    else if (!g_hostingOverlay.IsListening())
     {
         DrawTransientTextCentered(
             sv, Tr("Connecting..."), cL, cR, panelY + 28,
@@ -1287,7 +1287,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
             && (GetTickCount() - g_hostingOverlay.copiedFlashTick) < 2000;
         constexpr DWORD kFamilyFallbackNoticeDurationMs = 3000u;
         const bool showFamilyFallbackNotice =
-            g_hostingOverlay.listenerReady
+            g_hostingOverlay.IsListening()
             && g_hostingOverlay.usedFamilyFallback
             && g_hostingOverlay.familyFallbackNoticeStarted
             && (GetTickCount()
@@ -1328,7 +1328,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
                 netplay::debug_overlay::RtTextProfile::OverlayHint,
                 yellowColor, kRtOverlayYellow);
         }
-        else if (g_hostingOverlay.listenerReady
+        else if (g_hostingOverlay.IsListening()
             && g_hostingOverlay.ipFetchDone
             && !g_hostingOverlay.ipFetchFailed)
         {
@@ -1338,7 +1338,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
                 dimColor, kRtOverlayDim);
         }
 
-        if (!g_hostingOverlay.listenerReady)
+        if (!g_hostingOverlay.IsListening())
         {
             DrawTransientTextCentered(
                 sv, Tr("B/ESC: Cancel"), cL, cR, panelY + 58,
@@ -1536,7 +1536,7 @@ void DrawAsyncHostGameplayOverlay(uint32_t screenContext)
 
 bool DrawJoiningOverlayGdi(uint32_t screenContext, bool)
 {
-    if (!g_netplayMenuState.active || !g_joiningOverlay.active)
+    if (!g_netplayMenuState.active || !g_joiningOverlay.IsActive())
     {
         return false;
     }
@@ -1575,7 +1575,7 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool)
     const char* panelTitle = Tr("JOINING");
     if (g_joiningOverlay.spectateMode)
     {
-        panelTitle = g_joiningOverlay.waitingForGameBegin ? Tr("WAIT TO SPECTATE") : Tr("SPECTATING");
+        panelTitle = g_joiningOverlay.IsWaitingForGame() ? Tr("WAIT TO SPECTATE") : Tr("SPECTATING");
     }
     DrawTransientTextCentered(
         sv, panelTitle, cL, cR, panelY + 8,
@@ -1583,7 +1583,7 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool)
         titleColor, kRtOverlayTitle);
 
     char line[192] = {};
-    if (g_joiningOverlay.failed)
+    if (g_joiningOverlay.HasFailed())
     {
         DrawTransientTextCentered(
             sv, Tr("Connection failed"), cL, cR, panelY + 28,
@@ -1601,7 +1601,7 @@ bool DrawJoiningOverlayGdi(uint32_t screenContext, bool)
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
     }
-    else if (g_joiningOverlay.waitingForGameBegin)
+    else if (g_joiningOverlay.IsWaitingForGame())
     {
         if (g_joiningOverlay.displayTargetName && g_joiningOverlay.targetName[0] != '\0')
         {
@@ -1987,7 +1987,7 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                 g_debugOverlay.forceDelayOverlay = !g_debugOverlay.forceDelayOverlay;
                 if (g_debugOverlay.forceDelayOverlay)
                 {
-                    g_delaySetupOverlay.active = true;
+                    g_delaySetupOverlay.BeginSelection();
                     g_delaySetupOverlay.limitsReady = true;
                     g_delaySetupOverlay.selectedDelay = 3;
                     g_delaySetupOverlay.recommendedDelay = 4;
@@ -1997,12 +1997,11 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                     std::snprintf(g_delaySetupOverlay.p1Name, sizeof(g_delaySetupOverlay.p1Name), "Player1");
                     std::snprintf(g_delaySetupOverlay.p2Name, sizeof(g_delaySetupOverlay.p2Name), "Player2");
                     g_delaySetupOverlay.errorMessage[0] = '\0';
-                    g_delaySetupOverlay.waitingForRuntimeReady = false;
-                    mod::Log("DebugOverlay: Delay overlay ON (test data)");
+                                    mod::Log("DebugOverlay: Delay overlay ON (test data)");
                 }
                 else
                 {
-                    g_delaySetupOverlay.active = false;
+                    g_delaySetupOverlay.Reset();
                     mod::Log("DebugOverlay: Delay overlay OFF");
                 }
             }

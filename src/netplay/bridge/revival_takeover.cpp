@@ -153,11 +153,11 @@ DWORD g_injectedSpectateConfirmPromptWaitStartTick = 0;
 volatile LONG g_injectedFingerprintReadHits = 0;
 uintptr_t g_injectedInitAddress = 0;
 bool g_injectedLazyBound = false;
-volatile LONG g_injectedLazyBootstrapState = 0;
+volatile LONG g_injectedLazyBootstrapState = static_cast<LONG>(InjectedBootstrapState::Idle);
 volatile LONG g_remoteThreadCallIndex = 0;
 volatile LONG g_startAbortRequested = 0;
 static volatile LONG g_peerQuitBroadcastHelperPid = 0;
-static volatile LONG g_peerQuitBroadcastState = 0;
+static volatile LONG g_peerQuitBroadcastState = static_cast<LONG>(PeerQuitBroadcastState::Idle);
 HANDLE g_fakeProcessThreadHandle = nullptr;
 bool g_initCapturedFromWrite = false;
 DWORD g_lastConnectingDiagnosticTick = 0;
@@ -171,8 +171,7 @@ static LONG g_lastNativeDelayTimeoutTraceSerial = 0;
 static DWORD g_lastNativeDelayTimeoutTraceTick = 0;
 DWORD g_lastSpectateConsoleSnapshotTick = 0;
 bool g_localInitAppliedForSession = false;
-bool g_spectatorPostInitAttemptedForSession = false;
-bool g_spectatorPostInitSucceededForSession = false;
+SpectatorPostInitState g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
 volatile LONG g_deferredLifecycleWorkRequested = 0;
 volatile LONG g_deferredTitleSelection = -1;
 uintptr_t g_remoteInjectedSelfBase = 0;
@@ -185,10 +184,15 @@ DWORD g_latePatchRetrySuccesses = 0;
 bool g_lastLatePatchRetryResultValid = false;
 bool g_lastLatePatchRetryResult = false;
 bool g_observedTakeoverCreatePath = false;
-bool g_tournamentReturnCleanupPending = false;
 volatile LONG g_externalTournamentInitialTitleLeft = 0;
-static volatile LONG g_tournamentReturnCleanupStage = 0;
-static volatile LONG g_tournamentReturnCleanupTerminalFailure = 0;
+static volatile LONG g_tournamentCleanupState =
+    static_cast<LONG>(TournamentCleanupState::Inactive);
+
+bool IsTournamentReturnCleanupPending()
+{
+    return InterlockedCompareExchange(&g_tournamentCleanupState, 0, 0)
+        != static_cast<LONG>(TournamentCleanupState::Inactive);
+}
 std::mutex g_fakeThreadMutex;
 std::vector<FakeThreadInfo> g_fakeThreads;
 std::mutex g_redirectAllocMutex;
@@ -3353,14 +3357,14 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
             &g_peerQuitBroadcastHelperPid, 0, 0);
         if (trackedPid != static_cast<LONG>(helperPid))
         {
-            InterlockedExchange(&g_peerQuitBroadcastState, 0);
+            InterlockedExchange(&g_peerQuitBroadcastState, static_cast<LONG>(PeerQuitBroadcastState::Idle));
             InterlockedExchange(
                 &g_peerQuitBroadcastHelperPid,
                 static_cast<LONG>(helperPid));
         }
 
-        LONG state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
-        if (state == 2)
+        auto state = static_cast<PeerQuitBroadcastState>(InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0));
+        if (state == PeerQuitBroadcastState::Succeeded)
         {
             if (helperProcess != nullptr)
             {
@@ -3373,7 +3377,10 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
             return true;
         }
 
-        if (InterlockedCompareExchange(&g_peerQuitBroadcastState, 1, 0) != 0)
+        if (InterlockedCompareExchange(&g_peerQuitBroadcastState,
+                static_cast<LONG>(PeerQuitBroadcastState::Sending),
+                static_cast<LONG>(PeerQuitBroadcastState::Idle))
+            != static_cast<LONG>(PeerQuitBroadcastState::Idle))
         {
             if (helperProcess != nullptr)
             {
@@ -3383,8 +3390,8 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
             const DWORD waitStart = GetTickCount();
             do
             {
-                state = InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0);
-                if (state != 1)
+                state = static_cast<PeerQuitBroadcastState>(InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0));
+                if (state != PeerQuitBroadcastState::Sending)
                 {
                     break;
                 }
@@ -3393,7 +3400,8 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
             while (GetTickCount() - waitStart < waitMs);
 
             const bool priorSucceeded =
-                InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0) == 2;
+                InterlockedCompareExchange(&g_peerQuitBroadcastState, 0, 0)
+                    == static_cast<LONG>(PeerQuitBroadcastState::Succeeded);
             mod::Log(
                 "Takeover: peer-quit broadcast coalesced reason='%s' helperPid=%lu state=%s",
                 reason != nullptr ? reason : "",
@@ -3411,14 +3419,15 @@ bool RequestInjectedPeerQuitBroadcast(const char* reason, DWORD waitMs)
         waitMs);
     if (helperPid != 0)
     {
-        InterlockedExchange(&g_peerQuitBroadcastState, sent ? 2 : 0);
+        InterlockedExchange(&g_peerQuitBroadcastState, static_cast<LONG>(sent
+            ? PeerQuitBroadcastState::Succeeded : PeerQuitBroadcastState::Idle));
     }
     return sent;
 }
 
 void ResetInjectedPeerQuitBroadcastState()
 {
-    InterlockedExchange(&g_peerQuitBroadcastState, 0);
+    InterlockedExchange(&g_peerQuitBroadcastState, static_cast<LONG>(PeerQuitBroadcastState::Idle));
     InterlockedExchange(&g_peerQuitBroadcastHelperPid, 0);
 }
 
@@ -3542,8 +3551,7 @@ void ShutdownHost()
     CleanupNativeHostShadowLogDirectory("host_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
-    g_spectatorPostInitAttemptedForSession = false;
-    g_spectatorPostInitSucceededForSession = false;
+    g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
     InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
     InterlockedExchange(&g_deferredTitleSelection, -1);
@@ -3595,8 +3603,7 @@ void EmergencyShutdownHost()
     CleanupNativeHostShadowLogDirectory("host_emergency_shutdown");
     g_localRoleFlag = -1;
     g_localInitAppliedForSession = false;
-    g_spectatorPostInitAttemptedForSession = false;
-    g_spectatorPostInitSucceededForSession = false;
+    g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
     InterlockedExchange(&g_externalTournamentInitialTitleLeft, 0);
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
     InterlockedExchange(&g_deferredTitleSelection, -1);
@@ -3662,7 +3669,7 @@ void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus)
     if (g_localRoleFlag == kLocalRoleTournament)
     {
         LogRevival102jDeepSnapshot("TitleSelection.10.tournament_cleanup_pre", ioStatus);
-        if (!g_tournamentReturnCleanupPending)
+        if (!IsTournamentReturnCleanupPending())
         {
             ArmTournamentReturnCleanup("title_selection_while_tournament_active");
         }
@@ -3888,7 +3895,7 @@ bool StartSession(
             "session before new init");
         ReverseInputSwapIfClient();
     }
-    if (g_tournamentReturnCleanupPending)
+    if (IsTournamentReturnCleanupPending())
     {
         LogRevival102jDeepSnapshot("StartSession.02.stale_tournament_pre", ioStatus);
         mod::Log(
@@ -4206,8 +4213,7 @@ bool StartSession(
     g_hostBlock->initParams[1] = 102;
     ResetDebugCounters(g_hostBlock);
     g_localInitAppliedForSession = false;
-    g_spectatorPostInitAttemptedForSession = false;
-    g_spectatorPostInitSucceededForSession = false;
+    g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
     g_sessionHistoryRepairHits = 0;
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
     InterlockedExchange(&g_injectedDelayPromptServedSerial, 0);
@@ -4882,8 +4888,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
                         "Takeover: spectator helper exited before handoff; "
                         "local recovery result=%d postInitAttempted=%d postInitOk=%d",
                         localInitOk ? 1 : 0,
-                        g_spectatorPostInitAttemptedForSession ? 1 : 0,
-                        g_spectatorPostInitSucceededForSession ? 1 : 0);
+                        HasSpectatorPostInitAttempted() ? 1 : 0,
+                        HasSpectatorPostInitSucceeded() ? 1 : 0);
                     LogRevival102jDeepSnapshot(
                         "Tick.11.spectator_helper_exit_recovered",
                         ioStatus);
@@ -5302,8 +5308,8 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
                 else
                 {
                     const bool vtableInitOk = InvokeSessionVtableInit("Tick_spectate");
-                    g_spectatorPostInitAttemptedForSession = true;
-                    g_spectatorPostInitSucceededForSession = vtableInitOk;
+                    g_spectatorPostInitState = vtableInitOk
+                        ? SpectatorPostInitState::Succeeded : SpectatorPostInitState::Failed;
                     mod::Log(
                         "Takeover: spectator vtable init result=%d [deferred]",
                         vtableInitOk ? 1 : 0);
@@ -5357,23 +5363,23 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
     if (g_localInitAppliedForSession
         && g_localRoleFlag == kLocalRoleSpectate
         && IsActiveRevival102jProfile()
-        && !g_spectatorPostInitAttemptedForSession
+        && !HasSpectatorPostInitAttempted()
         && IsRevival102jSpectatorPostInitReady("Tick_spectate_ready"))
     {
         LogRevival102jDeepSnapshot("Tick.50.spectator_post_init_ready", ioStatus);
-        g_spectatorPostInitAttemptedForSession = true;
-        g_spectatorPostInitSucceededForSession =
-            InvokeRevival102jSpectatorPostInit("Tick_spectate");
+        g_spectatorPostInitState = SpectatorPostInitState::Running;
+        g_spectatorPostInitState = InvokeRevival102jSpectatorPostInit("Tick_spectate")
+            ? SpectatorPostInitState::Succeeded : SpectatorPostInitState::Failed;
         mod::Log(
             "Takeover: 1.02j spectator vtable[2] one-shot result=%d",
-            g_spectatorPostInitSucceededForSession ? 1 : 0);
+            HasSpectatorPostInitSucceeded() ? 1 : 0);
         LogInitWriteSnapshot(
-            g_spectatorPostInitSucceededForSession
+            HasSpectatorPostInitSucceeded()
                 ? "Tick_spectateVtable2_post_102j"
                 : "Tick_spectateVtable2_failed_102j");
         LogRevival102jDeepSnapshot("Tick.51.spectator_post_init_returned", ioStatus);
 
-        if (!g_spectatorPostInitSucceededForSession)
+        if (!HasSpectatorPostInitSucceeded())
         {
             SetPhase(
                 ioStatus,
@@ -5518,7 +5524,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
     if ((currentPhase == NetbridgePhase::Connecting || currentPhase == NetbridgePhase::DelaySetup)
         && g_localInitAppliedForSession
         && g_localRoleFlag == kLocalRoleSpectate
-        && g_spectatorPostInitSucceededForSession
+        && HasSpectatorPostInitSucceeded()
         && AreDllExitPatchesSaved())
     {
         SetPhase(ioStatus, NetbridgePhase::Connected, nullptr);
@@ -5803,8 +5809,7 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
     ClearRedirectAllocations();
 
     g_localInitAppliedForSession = false;
-    g_spectatorPostInitAttemptedForSession = false;
-    g_spectatorPostInitSucceededForSession = false;
+    g_spectatorPostInitState = SpectatorPostInitState::NotAttempted;
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 0);
     InterlockedExchange(&g_deferredTitleSelection, -1);
     InterlockedExchange(&g_injectedDelayPromptSerial, 0);
@@ -6009,9 +6014,8 @@ DelayPromptMetrics GetDelayPromptMetrics()
 
 void ArmTournamentReturnCleanup(const char* reason)
 {
-    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
-    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
-    g_tournamentReturnCleanupPending = true;
+    InterlockedExchange(&g_tournamentCleanupState,
+        static_cast<LONG>(TournamentCleanupState::RestoreExe));
     InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
     mod::Log(
         "Takeover: tournament return cleanup armed reason=%s",
@@ -6045,7 +6049,7 @@ bool NotifyTitleScreenActive(NetbridgeStatus* ioStatus)
     mod::Log("Takeover: tournament returned to title screen (mode 0) - cleaning up proactively");
     LogRevival102jDeepSnapshot("TournamentReturn.01.title_observed", ioStatus);
 
-    if (g_tournamentReturnCleanupPending)
+    if (IsTournamentReturnCleanupPending())
     {
         mod::Log(
             "Takeover: tournament return cleanup already pending");
@@ -6066,7 +6070,7 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    if (!g_tournamentReturnCleanupPending)
+    if (!IsTournamentReturnCleanupPending())
     {
         return false;
     }
@@ -6082,7 +6086,8 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
     }
 
     if (InterlockedCompareExchange(
-            &g_tournamentReturnCleanupTerminalFailure, 0, 0) != 0)
+            &g_tournamentCleanupState, 0, 0)
+        == static_cast<LONG>(TournamentCleanupState::Quarantined))
     {
         return false;
     }
@@ -6097,9 +6102,13 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
         InterlockedExchange(&g_deferredLifecycleWorkRequested, 1);
     };
 
-    LONG stage = InterlockedCompareExchange(
-        &g_tournamentReturnCleanupStage, 0, 0);
-    if (stage < 1)
+    auto stage = static_cast<TournamentCleanupState>(InterlockedCompareExchange(
+        &g_tournamentCleanupState, 0, 0));
+    const auto advance = [&](bool succeeded) {
+        stage = CompleteTournamentCleanupStep(stage, succeeded);
+        InterlockedExchange(&g_tournamentCleanupState, static_cast<LONG>(stage));
+    };
+    if (stage == TournamentCleanupState::RestoreExe)
     {
         const bool exePatchOk = RestoreTournamentExePatches();
         mod::Log(
@@ -6110,11 +6119,10 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
             retainTournamentQuarantine();
             return false;
         }
-        InterlockedExchange(&g_tournamentReturnCleanupStage, 1);
-        stage = 1;
+        advance(true);
     }
 
-    if (stage < 2)
+    if (stage == TournamentCleanupState::InitializeLocal)
     {
         const bool initOk = ForceLocalPlayInit();
         mod::Log(
@@ -6122,20 +6130,18 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
             initOk ? 1 : 0);
         if (!initOk)
         {
-            InterlockedExchange(
-                &g_tournamentReturnCleanupTerminalFailure, 1);
+            advance(false);
             retainTournamentQuarantine();
             mod::Log(
                 "Takeover: tournament cleanup quarantined after unverified local init; refusing repeated destruction/init");
             return false;
         }
-        InterlockedExchange(&g_tournamentReturnCleanupStage, 2);
-        stage = 2;
+        advance(true);
         LogRevival102jDeepSnapshot(
             "TournamentReturn.12.local_init_complete", ioStatus);
     }
 
-    if (stage < 3)
+    if (stage == TournamentCleanupState::RestoreDll)
     {
         const bool dllPatchOk = RestoreDllExitProcessPatches();
         mod::Log(
@@ -6146,7 +6152,7 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
             retainTournamentQuarantine();
             return false;
         }
-        InterlockedExchange(&g_tournamentReturnCleanupStage, 3);
+        advance(true);
     }
 
     const bool modeOk = ForceGameModeToTitle();
@@ -6166,9 +6172,7 @@ bool CompletePendingTournamentReturnCleanup(NetbridgeStatus* ioStatus)
         clearOk ? 1 : 0,
         textOk ? 1 : 0);
 
-    g_tournamentReturnCleanupPending = false;
-    InterlockedExchange(&g_tournamentReturnCleanupStage, 0);
-    InterlockedExchange(&g_tournamentReturnCleanupTerminalFailure, 0);
+    advance(true);
     g_localRoleFlag = kLocalRoleLocalPlay;
     g_localInitAppliedForSession = false;
     g_launchDisposition =

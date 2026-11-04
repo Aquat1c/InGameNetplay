@@ -8892,7 +8892,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void*)
             "TICK_HOOK: processing deferred lifecycle work post-tick "
             "selection=%ld tournamentPending=%d",
             static_cast<long>(deferredSelection),
-            g_tournamentReturnCleanupPending ? 1 : 0);
+            IsTournamentReturnCleanupPending() ? 1 : 0);
         LogRevival102jDeepSnapshot("FrameHook.80.deferred_lifecycle_pre");
 
         if (deferredSelection >= 0)

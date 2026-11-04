@@ -802,7 +802,10 @@ void TryLazyBootstrapInjected()
         return;
     }
 
-    if (InterlockedCompareExchange(&g_injectedLazyBootstrapState, 1, 0) != 0)
+    if (InterlockedCompareExchange(&g_injectedLazyBootstrapState,
+            static_cast<LONG>(InjectedBootstrapState::Initializing),
+            static_cast<LONG>(InjectedBootstrapState::Idle))
+        != static_cast<LONG>(InjectedBootstrapState::Idle))
     {
         return;
     }
@@ -817,7 +820,8 @@ void TryLazyBootstrapInjected()
 
     const bool ready = HasInjectedContext();
     mod::Log("Takeover: injected lazy bootstrap result=%d", ready ? 1 : 0);
-    InterlockedExchange(&g_injectedLazyBootstrapState, ready ? 2 : 0);
+    InterlockedExchange(&g_injectedLazyBootstrapState, static_cast<LONG>(ready
+        ? InjectedBootstrapState::Ready : InjectedBootstrapState::Idle));
 }
 
 bool EnsureInjectedContextFast()

@@ -1,4 +1,5 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
+#include "netplay/bridge/gameplay_exit_state.h"
 
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/external_launcher_guard.h"
@@ -15,12 +16,8 @@ namespace netplay::bridge::recovery
 {
 namespace
 {
-volatile LONG g_recoveryInProgress = 0;
-volatile LONG g_menuEntryPending = 0;
-volatile LONG g_menuEntryStarted = 0;
-volatile LONG g_menuEntryConsumed = 0;
-volatile LONG g_recoveryCompleted = 0;
-volatile LONG g_recoveryState = 0;
+volatile LONG g_recoveryState = static_cast<LONG>(RecoveryState::Idle);
+volatile LONG g_menuEntryProgress = static_cast<LONG>(MenuEntryProgress::None);
 int g_menuEntryMode = -1;
 char g_menuEntryOrigin[64] = {};
 char g_activeOrigin[64] = {};
@@ -29,33 +26,63 @@ uint32_t g_menuEntryObservationCount = 0;
 bool g_menuEntryStallLogged = false;
 constexpr uint32_t kTitleContinuationWatchdogFrames = 120;
 
-enum RecoveryStateValue
+RecoveryState CurrentRecoveryState()
 {
-    RecoveryStateIdle = 0,
-    RecoveryStateRunning = 1,
-    RecoveryStateMenuPending = 2,
-    RecoveryStateCompleted = 3,
-};
+    return static_cast<RecoveryState>(InterlockedCompareExchange(&g_recoveryState, 0, 0));
+}
 
-const char* RecoveryStateToString(LONG state)
+bool TryBeginRecovery()
+{
+    LONG prior = InterlockedCompareExchange(&g_recoveryState, 0, 0);
+    while (CanBeginRecovery(static_cast<RecoveryState>(prior)))
+    {
+        const LONG observed = InterlockedCompareExchange(&g_recoveryState,
+            static_cast<LONG>(RecoveryState::Running), prior);
+        if (observed == prior) return true;
+        prior = observed;
+    }
+    return false;
+}
+
+MenuEntryProgress CurrentMenuEntryProgress()
+{
+    return static_cast<MenuEntryProgress>(InterlockedCompareExchange(&g_menuEntryProgress, 0, 0));
+}
+
+MenuEntryProgress NoteMenuEntryProgress(MenuEntryProgress event)
+{
+    LONG prior = InterlockedCompareExchange(&g_menuEntryProgress, 0, 0);
+    for (;;)
+    {
+        const LONG next = static_cast<LONG>(AdvanceMenuEntry(static_cast<MenuEntryProgress>(prior), event));
+        const LONG observed = InterlockedCompareExchange(&g_menuEntryProgress, next, prior);
+        if (observed == prior) return static_cast<MenuEntryProgress>(prior);
+        prior = observed;
+    }
+}
+
+const char* RecoveryStateToString(RecoveryState state)
 {
     switch (state)
     {
-    case RecoveryStateIdle:
+    case RecoveryState::Idle:
         return "idle";
-    case RecoveryStateRunning:
+    case RecoveryState::Running:
         return "running";
-    case RecoveryStateMenuPending:
+    case RecoveryState::MenuPending:
         return "menu_pending";
-    case RecoveryStateCompleted:
+    case RecoveryState::MenuClaimed:
+        return "menu_claimed";
+    case RecoveryState::Completed:
         return "completed";
     }
     return "unknown";
 }
 
-void SetRecoveryState(LONG newState, const char* origin)
+void SetRecoveryState(RecoveryState newState, const char* origin)
 {
-    const LONG oldState = InterlockedExchange(&g_recoveryState, newState);
+    const auto oldState = static_cast<RecoveryState>(InterlockedExchange(
+        &g_recoveryState, static_cast<LONG>(newState)));
     if (oldState == newState)
     {
         return;
@@ -151,10 +178,8 @@ bool RunGameplayExitContinuation(const char* origin)
             takeover::CompletePendingTournamentReturnCleanup(nullptr);
         if (cleanupOk)
         {
-            InterlockedExchange(&g_menuEntryPending, 0);
-            InterlockedExchange(&g_recoveryCompleted, 1);
-            InterlockedExchange(&g_recoveryInProgress, 0);
-            SetRecoveryState(RecoveryStateCompleted, originTag);
+
+            SetRecoveryState(RecoveryState::Completed, originTag);
             mod::Log(
                 "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=1 mode=%d path=tournament_transaction",
                 originTag,
@@ -166,8 +191,8 @@ bool RunGameplayExitContinuation(const char* origin)
             &takeover::g_revivalExitMode,
             static_cast<LONG>(recoveredRole));
         InterlockedExchange(&takeover::g_revivalExitIntercepted, 1);
-        InterlockedExchange(&g_recoveryInProgress, 0);
-        SetRecoveryState(RecoveryStateIdle, originTag);
+
+        SetRecoveryState(RecoveryState::Idle, originTag);
         mod::Log(
             "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=0 mode=%d path=tournament_quarantine",
             originTag,
@@ -337,13 +362,12 @@ bool RunGameplayExitContinuation(const char* origin)
         }
         InterlockedExchange(&takeover::g_revivalExitIntercepted, 0);
         InterlockedExchange(&takeover::g_revivalExitMode, -1);
-        InterlockedExchange(&g_menuEntryPending, 1);
+        SetRecoveryState(RecoveryState::MenuPending, originTag);
         mod::Log(
             "RECOVERY_MENU_PENDING_SET origin=%s mode=%d frameTick=%u",
             originTag,
             recoveredRole,
             g_menuEntryScheduledFrameTick);
-        SetRecoveryState(RecoveryStateMenuPending, originTag);
         mod::Log(
             "GAMEPLAY_EXIT_RECOVERY_MENU_ENTRY scheduled=1 origin=%s mode=%d",
             originTag,
@@ -367,9 +391,8 @@ bool RunGameplayExitContinuation(const char* origin)
             InterlockedIncrement(
                 &takeover::g_hostBlock->consoleErrorSerial);
         }
-        InterlockedExchange(&g_recoveryInProgress, 0);
-        InterlockedExchange(&g_menuEntryPending, 0);
-        SetRecoveryState(RecoveryStateIdle, originTag);
+
+        SetRecoveryState(RecoveryState::Idle, originTag);
     }
 
     mod::Log(
@@ -399,28 +422,26 @@ bool BeginGameplayExitRecovery(const char* origin)
         ? origin
         : "unknown";
 
-    if (InterlockedCompareExchange(&g_recoveryInProgress, 1, 0) != 0)
+    if (!TryBeginRecovery())
     {
         mod::Log(
             "GAMEPLAY_EXIT_RECOVERY_ALREADY_IN_PROGRESS origin=%s existingOrigin=%s pendingMenu=%ld completed=%ld",
             originTag,
             g_activeOrigin,
-            static_cast<long>(InterlockedCompareExchange(&g_menuEntryPending, 0, 0)),
-            static_cast<long>(InterlockedCompareExchange(&g_recoveryCompleted, 0, 0)));
+            static_cast<long>((CurrentRecoveryState() == RecoveryState::MenuPending ? 1L : 0L)),
+            static_cast<long>((CurrentRecoveryState() == RecoveryState::Completed ? 1L : 0L)));
         mod::Log(
             "GAMEPLAY_EXIT_RECOVERY_BEGIN origin=%s skipped=1 reason=in_progress frameTick=%u role=%d pendingMenu=%ld",
             originTag,
             takeover::GetGameplayExitRecoveryFrameTick(),
             takeover::g_localRoleFlag,
-            static_cast<long>(InterlockedCompareExchange(&g_menuEntryPending, 0, 0)));
+            static_cast<long>((CurrentRecoveryState() == RecoveryState::MenuPending ? 1L : 0L)));
         return false;
     }
 
-    InterlockedExchange(&g_recoveryCompleted, 0);
-    InterlockedExchange(&g_menuEntryStarted, 0);
-    InterlockedExchange(&g_menuEntryConsumed, 0);
+    InterlockedExchange(&g_menuEntryProgress, static_cast<LONG>(MenuEntryProgress::None));
     takeover::CopyString(g_activeOrigin, sizeof(g_activeOrigin), originTag);
-    SetRecoveryState(RecoveryStateRunning, originTag);
+    SetRecoveryState(RecoveryState::Running, originTag);
 
     mod::Log(
         "GAMEPLAY_EXIT_RECOVERY_BEGIN origin=%s frameTick=%u role=%d pid=%lu insideFrameTick=%d",
@@ -448,8 +469,8 @@ bool BeginGameplayExitRecovery(const char* origin)
         mod::Log(
             "GAMEPLAY_EXIT_RECOVERY_COMPLETE origin=%s result=0 reason=inside_original_tick",
             originTag);
-        InterlockedExchange(&g_recoveryInProgress, 0);
-        SetRecoveryState(RecoveryStateIdle, originTag);
+
+        SetRecoveryState(RecoveryState::Idle, originTag);
         return false;
     }
 
@@ -458,27 +479,26 @@ bool BeginGameplayExitRecovery(const char* origin)
 
 bool HasPendingGameplayExitMenuEntry()
 {
-    return InterlockedCompareExchange(&g_menuEntryPending, 0, 0) != 0;
+    return CurrentRecoveryState() == RecoveryState::MenuPending;
 }
 
 bool IsGameplayExitRecoveryInProgress()
 {
-    return InterlockedCompareExchange(&g_recoveryInProgress, 0, 0) != 0;
+    return RecoveryInProgress(CurrentRecoveryState());
 }
 
 bool WasGameplayExitRecoveryCompleted()
 {
-    return InterlockedCompareExchange(&g_recoveryCompleted, 0, 0) != 0;
+    return CurrentRecoveryState() == RecoveryState::Completed;
 }
 
 void ResetGameplayExitRecoveryCompletion()
 {
-    InterlockedExchange(&g_recoveryCompleted, 0);
-    InterlockedExchange(&g_menuEntryStarted, 0);
-    InterlockedExchange(&g_menuEntryConsumed, 0);
+
+    InterlockedExchange(&g_menuEntryProgress, static_cast<LONG>(MenuEntryProgress::None));
     if (!IsGameplayExitRecoveryInProgress() && !HasPendingGameplayExitMenuEntry())
     {
-        SetRecoveryState(RecoveryStateIdle, g_activeOrigin);
+        SetRecoveryState(RecoveryState::Idle, g_activeOrigin);
         g_activeOrigin[0] = '\0';
     }
 }
@@ -490,17 +510,17 @@ const char* CurrentGameplayExitRecoveryOrigin()
 
 const char* CurrentGameplayExitRecoveryStateName()
 {
-    return RecoveryStateToString(InterlockedCompareExchange(&g_recoveryState, 0, 0));
+    return RecoveryStateToString(CurrentRecoveryState());
 }
 
 bool HasGameplayExitMenuEntryStarted()
 {
-    return InterlockedCompareExchange(&g_menuEntryStarted, 0, 0) != 0;
+    return EntryStarted(CurrentMenuEntryProgress());
 }
 
 bool HasGameplayExitMenuEntryBeenConsumed()
 {
-    return InterlockedCompareExchange(&g_menuEntryConsumed, 0, 0) != 0;
+    return EntryConsumed(CurrentMenuEntryProgress());
 }
 
 bool ShouldSuppressLegacyGameplayExitCleanup()
@@ -517,7 +537,7 @@ bool ShouldSuppressLegacyGameplayExitCleanup()
 
 void NoteGameplayExitMenuEntryStarted(uint32_t screenContext, const char* source)
 {
-    if (InterlockedExchange(&g_menuEntryStarted, 1) == 0)
+    if (!EntryStarted(NoteMenuEntryProgress(MenuEntryProgress::Started)))
     {
         mod::Log(
             "GAMEPLAY_EXIT_MENU_ENTRY_STARTED screenContext=0x%08X origin=%s source=%s state=%s frontendReturnState=%s",
@@ -563,12 +583,15 @@ bool ConsumePendingGameplayExitMenuEntry(
     uint32_t screenContext,
     PendingGameplayExitMenuEntry* outEntry)
 {
-    if (InterlockedCompareExchange(&g_menuEntryPending, 0, 0) == 0)
+    if (CurrentRecoveryState() != RecoveryState::MenuPending)
     {
         return false;
     }
 
-    if (InterlockedCompareExchange(&g_menuEntryPending, 0, 1) != 1)
+    if (InterlockedCompareExchange(&g_recoveryState,
+            static_cast<LONG>(RecoveryState::MenuClaimed),
+            static_cast<LONG>(RecoveryState::MenuPending))
+        != static_cast<LONG>(RecoveryState::MenuPending))
     {
         return false;
     }
@@ -596,11 +619,10 @@ bool ConsumePendingGameplayExitMenuEntry(
         g_menuEntryOrigin,
         g_menuEntryMode);
 
-    InterlockedExchange(&g_menuEntryConsumed, 1);
+    (void)NoteMenuEntryProgress(MenuEntryProgress::Consumed);
     (void)takeover::SuppressDeferredCancelCleanupAfterGameplayRecovery(g_menuEntryOrigin);
-    InterlockedExchange(&g_recoveryInProgress, 0);
-    InterlockedExchange(&g_recoveryCompleted, 1);
-    SetRecoveryState(RecoveryStateCompleted, g_menuEntryOrigin);
+
+    SetRecoveryState(RecoveryState::Completed, g_menuEntryOrigin);
     return true;
 }
 
@@ -608,12 +630,15 @@ bool CompleteFrontendReturnMenuEntry(
     uint32_t screenContext,
     PendingGameplayExitMenuEntry* outEntry)
 {
-    if (InterlockedCompareExchange(&g_menuEntryPending, 0, 0) == 0)
+    if (CurrentRecoveryState() != RecoveryState::MenuPending)
     {
         return false;
     }
 
-    if (InterlockedCompareExchange(&g_menuEntryPending, 0, 1) != 1)
+    if (InterlockedCompareExchange(&g_recoveryState,
+            static_cast<LONG>(RecoveryState::MenuClaimed),
+            static_cast<LONG>(RecoveryState::MenuPending))
+        != static_cast<LONG>(RecoveryState::MenuPending))
     {
         return false;
     }
@@ -641,11 +666,10 @@ bool CompleteFrontendReturnMenuEntry(
         g_menuEntryOrigin,
         g_menuEntryMode);
 
-    InterlockedExchange(&g_menuEntryConsumed, 1);
+    (void)NoteMenuEntryProgress(MenuEntryProgress::Consumed);
     (void)takeover::SuppressDeferredCancelCleanupAfterGameplayRecovery(g_menuEntryOrigin);
-    InterlockedExchange(&g_recoveryInProgress, 0);
-    InterlockedExchange(&g_recoveryCompleted, 1);
-    SetRecoveryState(RecoveryStateCompleted, g_menuEntryOrigin);
+
+    SetRecoveryState(RecoveryState::Completed, g_menuEntryOrigin);
     return true;
 }
 }

@@ -1,4 +1,5 @@
 #include "netplay/bridge/frontend_return.h"
+#include "netplay/bridge/frontend_return_state.h"
 
 #include "netplay/bridge/async_hosting.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
@@ -54,9 +55,25 @@ struct ActiveReturnRequest
     bool confirmedDisconnect = false;
 };
 
-volatile LONG g_active = 0;
-volatile LONG g_titleContinuationPending = 0;
-volatile LONG g_netplayMenuContinuationConsumed = 0;
+volatile LONG g_returnOwnership = static_cast<LONG>(ReturnOwnership::Inactive);
+
+ReturnOwnership CurrentReturnOwnership()
+{
+    return static_cast<ReturnOwnership>(InterlockedCompareExchange(&g_returnOwnership, 0, 0));
+}
+
+bool TryBeginReturn()
+{
+    LONG prior = InterlockedCompareExchange(&g_returnOwnership, 0, 0);
+    while (!ReturnOwned(static_cast<ReturnOwnership>(prior)))
+    {
+        const LONG observed = InterlockedCompareExchange(&g_returnOwnership,
+            static_cast<LONG>(ReturnOwnership::Active), prior);
+        if (observed == prior) return true;
+        prior = observed;
+    }
+    return false;
+}
 ReturnState g_state = ReturnState::Idle;
 ActiveReturnRequest g_request = {};
 ReturnOwner g_continuationOwner = ReturnOwner::Diagnostic;
@@ -378,11 +395,22 @@ ReturnResult BuildResult(bool accepted, ScreenId currentScreen)
     return result;
 }
 
+void ReleaseReturnOwnership()
+{
+    LONG prior = InterlockedCompareExchange(&g_returnOwnership, 0, 0);
+    for (;;)
+    {
+        const LONG next = static_cast<LONG>(FinishReturn(static_cast<ReturnOwnership>(prior)));
+        const LONG observed = InterlockedCompareExchange(&g_returnOwnership, next, prior);
+        if (observed == prior) return;
+        prior = observed;
+    }
+}
+
 void CompleteReturn(const char* reason)
 {
     SetState(ReturnState::Complete, reason);
-    InterlockedExchange(&g_active, 0);
-    InterlockedExchange(&g_titleContinuationPending, 0);
+    ReleaseReturnOwnership();
     mod::Log(
         "FRONTEND_RETURN_COMPLETE owner=%s target=%s elapsedMs=%lu",
         OwnerToString(g_request.owner),
@@ -393,8 +421,7 @@ void CompleteReturn(const char* reason)
 void FailReturn(const char* reason)
 {
     SetState(ReturnState::Failed, reason);
-    InterlockedExchange(&g_active, 0);
-    InterlockedExchange(&g_titleContinuationPending, 0);
+    ReleaseReturnOwnership();
     mod::Log(
         "FRONTEND_RETURN_FAILED reason=%s owner=%s target=%s",
         (reason != nullptr && reason[0] != '\0') ? reason : "unknown",
@@ -728,7 +755,7 @@ void HandleTitleReached(const char* reason)
     {
         g_continuationOwner = g_request.owner;
         g_continuationTarget = g_request.target;
-        InterlockedExchange(&g_titleContinuationPending, 1);
+        InterlockedExchange(&g_returnOwnership, static_cast<LONG>(ReturnOwnership::ContinuationPending));
         if (!g_menuContinuationLogged)
         {
             g_menuContinuationLogged = true;
@@ -1189,7 +1216,7 @@ void EnsureFrontendReturnUpdateHooks()
 
 bool SuspendUpdateHooksForOnlineSimulation()
 {
-    if (InterlockedCompareExchange(&g_active, 0, 0) != 0)
+    if (ReturnOwned(CurrentReturnOwnership()))
     {
         mod::Log(
             "FRONTEND_RETURN_HOOK_SUSPEND_SKIPPED reason=return_active state=%s",
@@ -1284,8 +1311,7 @@ FrontendContext CaptureFrontendContext()
 
 ReturnResult BeginReturnToFrontend(const ReturnRequest& request)
 {
-    if (InterlockedCompareExchange(&g_active, 1, 0) != 0
-        || InterlockedCompareExchange(&g_titleContinuationPending, 0, 0) != 0)
+    if (!TryBeginReturn())
     {
         const FrontendContext ctx = CaptureFrontendContext();
         mod::Log(
@@ -1301,7 +1327,6 @@ ReturnResult BeginReturnToFrontend(const ReturnRequest& request)
         return BuildResult(false, ctx.screen);
     }
 
-    InterlockedExchange(&g_titleContinuationPending, 0);
     g_request.target = request.target;
     g_request.owner = request.owner;
     CopyReason(g_request.reason, sizeof(g_request.reason), request.reason);
@@ -1332,7 +1357,6 @@ ReturnResult BeginReturnToFrontend(const ReturnRequest& request)
     g_nativeBattleUpdateReached = false;
     g_nativeBattlePatchRestoreOk = true;
     g_nativeCleanupFallbackSuppressed = false;
-    InterlockedExchange(&g_netplayMenuContinuationConsumed, 0);
 
     EnsureFrontendReturnUpdateHooks();
 
@@ -1426,8 +1450,7 @@ void TickFrontendReturn()
 
 bool HasPendingReturn()
 {
-    return InterlockedCompareExchange(&g_active, 0, 0) != 0
-        || InterlockedCompareExchange(&g_titleContinuationPending, 0, 0) != 0;
+    return ReturnOwned(CurrentReturnOwnership());
 }
 
 bool IsReturningToFrontend()
@@ -1437,11 +1460,14 @@ bool IsReturningToFrontend()
 
 bool ConsumeTitleContinuation(ReturnOwner* ownerOut, ReturnTarget* targetOut)
 {
-    if (InterlockedCompareExchange(&g_titleContinuationPending, 0, 0) == 0)
+    if (CurrentReturnOwnership() != ReturnOwnership::ContinuationPending)
     {
         return false;
     }
-    if (InterlockedCompareExchange(&g_titleContinuationPending, 0, 1) != 1)
+    if (InterlockedCompareExchange(&g_returnOwnership,
+            static_cast<LONG>(ReturnOwnership::ContinuationClaimed),
+            static_cast<LONG>(ReturnOwnership::ContinuationPending))
+        != static_cast<LONG>(ReturnOwnership::ContinuationPending))
     {
         return false;
     }
@@ -1457,7 +1483,7 @@ bool ConsumeTitleContinuation(ReturnOwner* ownerOut, ReturnTarget* targetOut)
 
     if (g_continuationTarget == ReturnTarget::NetplayMenu)
     {
-        InterlockedExchange(&g_netplayMenuContinuationConsumed, 1);
+        InterlockedExchange(&g_returnOwnership, static_cast<LONG>(ReturnOwnership::ContinuationClaimedConsumed));
     }
     CompleteReturn("title_continuation_consumed");
     return true;
@@ -1470,18 +1496,25 @@ const char* CurrentStateName()
 
 bool HasNetplayMenuContinuationPending()
 {
-    return InterlockedCompareExchange(&g_titleContinuationPending, 0, 0) != 0
+    return CurrentReturnOwnership() == ReturnOwnership::ContinuationPending
         && g_continuationTarget == ReturnTarget::NetplayMenu;
 }
 
 bool HasConsumedNetplayMenuContinuation()
 {
-    return InterlockedCompareExchange(&g_netplayMenuContinuationConsumed, 0, 0) != 0;
+    return ReturnConsumed(CurrentReturnOwnership());
 }
 
 void ResetConsumedContinuationLatch()
 {
-    InterlockedExchange(&g_netplayMenuContinuationConsumed, 0);
+    LONG prior = InterlockedCompareExchange(&g_returnOwnership, 0, 0);
+    while (ReturnConsumed(static_cast<ReturnOwnership>(prior)))
+    {
+        const LONG next = static_cast<LONG>(ResetReturnConsumed(static_cast<ReturnOwnership>(prior)));
+        const LONG observed = InterlockedCompareExchange(&g_returnOwnership, next, prior);
+        if (observed == prior) return;
+        prior = observed;
+    }
 }
 
 extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)

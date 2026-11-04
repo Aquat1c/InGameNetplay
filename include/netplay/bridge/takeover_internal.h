@@ -4,6 +4,7 @@
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/revival_launch_policy.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/takeover_state.h"
 #include "logger.h"
 
 #include <csetjmp>
@@ -217,11 +218,18 @@ extern DWORD g_lastRuntimeReadyProbeLogTick;
 extern uint32_t g_lastRuntimeReadyProbeMask;
 extern bool g_lastRuntimeReadyProbeMaskValid;
 extern bool g_localInitAppliedForSession;
-extern bool g_spectatorPostInitAttemptedForSession;
-extern bool g_spectatorPostInitSucceededForSession;
+extern SpectatorPostInitState g_spectatorPostInitState;
+inline bool HasSpectatorPostInitAttempted()
+{
+    return g_spectatorPostInitState != SpectatorPostInitState::NotAttempted;
+}
+inline bool HasSpectatorPostInitSucceeded()
+{
+    return g_spectatorPostInitState == SpectatorPostInitState::Succeeded;
+}
 extern volatile LONG g_deferredLifecycleWorkRequested;
 extern volatile LONG g_deferredTitleSelection;
-extern bool g_tournamentReturnCleanupPending;
+bool IsTournamentReturnCleanupPending();
 extern volatile LONG g_externalTournamentInitialTitleLeft;
 void ArmTournamentReturnCleanup(const char* reason);
 extern uintptr_t g_remoteInjectedSelfBase;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "netplay/hooks/internal/frontend_lifecycle.h"
+
 #include "netplay/core/constants.h"
 #include "netplay/core/inline_edit.h"
 #include "netplay/core/lobby_client.h"
@@ -84,16 +86,11 @@ struct InputSnapshot
     uint8_t p2Cancel = 0;
 };
 
-struct DelaySetupOverlayState
+struct DelaySetupOverlayState : DelaySetupState
 {
-    bool active = false;
-    bool waitingForRuntimeReady = false;
     bool limitsReady = false;
     int promptSerial = 0;
-    bool vsHumanSyncArmed = false;
-    bool connectedHandoffDelayActive = false;
     DWORD nextHandoffRetryTick = 0;
-    int connectedHandoffDelayFramesRemaining = 0;
     int selectedDelay = 0;
     int recommendedDelay = 0;
     int minDelay = 0;
@@ -114,9 +111,8 @@ struct SpectateConfirmOverlayState
     char errorMessage[128] = {};
 };
 
-struct HostingOverlayState
+struct HostingOverlayState : HostStartupState
 {
-    bool active = false;
     uint16_t port = 0;
     bool challengeMode = false;
     netplay::network::NetworkFamily preferredFamily =
@@ -124,14 +120,9 @@ struct HostingOverlayState
     netplay::network::NetworkFamily effectiveFamily =
         netplay::network::NetworkFamily::IPv4;
     bool usedFamilyFallback = false;
-    bool discoveryInProgress = false;
-    bool sessionQueued = false;
-    bool listenerReady = false;
     bool listenerMismatch = false;
     bool familyRetryAllowed = false;
     bool automaticFamilyRetryAttempted = false;
-    bool failed = false;
-    bool failureNeedsBridgeCancel = false;
     bool writeNicknameToIni = true;
     char publicIp[128] = {};
     char hostNickname[64] = {};
@@ -155,19 +146,16 @@ struct HostingOverlayState
     DWORD listenerMismatchFirstTick = 0;
 };
 
-struct JoiningOverlayState
+struct JoiningOverlayState : JoiningState
 {
-    bool active = false;
     uint16_t port = 0;
     netplay::network::NetworkFamily family =
         netplay::network::NetworkFamily::IPv4;
     bool displayTargetName = false;
     bool spectateMode = false;
-    bool waitingForGameBegin = false;
     char address[128] = {};
     char targetName[64] = {};
     char errorText[128] = {};
-    bool failed = false;
 };
 
 struct DebugOverlayState

@@ -86,7 +86,7 @@ for token in (
 ):
     if token not in update:
         fail(f"leave-room confirmation is incomplete: {token}")
-if "!g_lobbySessionShutdownInFlight.load()" not in update:
+if "g_lobbySessionShutdown.load() == LobbyShutdownPhase::Idle" not in update:
     fail("the pending action can run while the room is still closing")
 
 if "TickBackgroundLobby();" not in frontend:

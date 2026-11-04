@@ -1,4 +1,5 @@
 #include "netplay/bridge/async_hosting.h"
+#include "netplay/bridge/async_host_state.h"
 
 #include "netplay/bridge/frontend_return.h"
 #include "netplay/bridge/session_bridge.h"
@@ -36,19 +37,9 @@ constexpr DWORD kReturnKeyLoadLockoutMs = 1500;
 std::string g_nickname;
 HostSessionNetworkConfig g_networkConfig = {};
 bool g_networkConfigValid = false;
-bool g_listenerAcknowledged = false;
-uint32_t g_listenerAckSerial = 0;
-uint32_t g_listenerCandidateSerial = 0;
-DWORD g_listenerCandidateFirstTick = 0;
-DWORD g_listenerWaitStartTick = 0;
-bool g_listenerStartupFailed = false;
-bool g_deferInitialFamilyMismatchToTitleFlow = false;
-bool g_initialFamilyMismatchDeferred = false;
+ListenerStartup g_listener;
 int g_autoRehostCooldownTicks = 0;
 constexpr DWORD kListenerAckTimeoutMs = 15000;
-
-bool g_acceptOnArrival = false;
-bool g_rehostOnArrival = false;
 
 bool g_peerWasAlive = false;
 
@@ -185,8 +176,6 @@ void AutoRehost(const char* reason)
         return;
     }
 
-    g_deferInitialFamilyMismatchToTitleFlow = false;
-    g_initialFamilyMismatchDeferred = false;
     mod::Log(
         "ASYNC_HOST_AUTO_REHOST reason=%s port=%u family=%s fallback=%d "
         "automaticRetry=%d publicAddress='%s'",
@@ -207,12 +196,7 @@ void AutoRehost(const char* reason)
         g_networkConfigValid ? g_networkConfig.publicAddress.c_str() : "");
     CancelSession(reason != nullptr ? reason : "async_host_auto_rehost");
 
-    g_listenerAcknowledged = false;
-    g_listenerAckSerial = 0;
-    g_listenerCandidateSerial = 0;
-    g_listenerCandidateFirstTick = 0;
-    g_listenerWaitStartTick = GetTickCount();
-    g_listenerStartupFailed = false;
+    g_listener.Begin(GetTickCount(), false);
     const bool ok = g_networkConfigValid
         ? StartHostSession(
               g_port,
@@ -266,20 +250,10 @@ static void BeginHostTracking(
         g_networkConfig = {};
         g_networkConfigValid = false;
     }
-    g_listenerAcknowledged = false;
-    g_listenerAckSerial = 0;
-    g_listenerCandidateSerial = 0;
-    g_listenerCandidateFirstTick = 0;
-    g_listenerWaitStartTick = GetTickCount();
-    g_listenerStartupFailed = false;
-    g_deferInitialFamilyMismatchToTitleFlow =
-        networkConfig != nullptr
-        && !networkConfig->automaticFamilyRetryAttempted;
-    g_initialFamilyMismatchDeferred = false;
+    g_listener.Begin(GetTickCount(), networkConfig != nullptr
+        && !networkConfig->automaticFamilyRetryAttempted);
     g_autoRehostCooldownTicks = 0;
     g_minimized = false;
-    g_acceptOnArrival = false;
-    g_rehostOnArrival = false;
     g_returnInProgress = false;
     g_returnKeyWasDown = false;
     g_peerWasAlive = false;
@@ -383,36 +357,25 @@ void Tick()
         && phase != NetbridgePhase::SessionEnded
         && phase != NetbridgePhase::Idle
         && peerAliveNow;
-    if (!g_listenerAcknowledged && listenerSessionLive)
+    if (!g_listener.IsReady() && listenerSessionLive)
     {
         HostListenerObservation observation = {};
         if (GetHostListenerObservation(&observation))
         {
             const DWORD nowTick = GetTickCount();
-            if (g_listenerCandidateSerial
-                    != observation.serial)
-            {
-                g_listenerCandidateSerial =
-                    observation.serial;
-                g_listenerCandidateFirstTick = nowTick;
-            }
-            else if (nowTick - g_listenerCandidateFirstTick
-                         >= 100u
-                     && NotifyHostListenerReady(observation))
+            const bool stable = g_listener.ObserveCandidate(observation.serial, nowTick);
+            if (stable && NotifyHostListenerReady(observation))
             {
             }
-            else if (nowTick - g_listenerCandidateFirstTick
-                             >= 100u
+            else if (stable
                      && observation.expectedFamilyKnown
                      && (!observation.familyMatches
                          || !observation.portMatches))
             {
-                if (g_deferInitialFamilyMismatchToTitleFlow
-                    && observation.portMatches
+                if (observation.portMatches
                     && !observation.familyMatches
-                    && !g_initialFamilyMismatchDeferred)
+                    && g_listener.DeferInitialFamilyMismatch())
                 {
-                    g_initialFamilyMismatchDeferred = true;
                     mod::Log(
                         "ASYNC_HOST_LISTENER_MISMATCH observedFamily=%s "
                         "observedPort=%u familyMatches=0 portMatches=1 "
@@ -430,7 +393,7 @@ void Tick()
                     observation.familyMatches ? 1 : 0,
                     observation.portMatches ? 1 : 0,
                     observation.serial);
-                g_listenerStartupFailed = true;
+                g_listener.Fail();
                 CancelSession("host_listener_ack_mismatch");
                 SetState(State::TimedOut, "listener_ack_mismatch");
                 return;
@@ -450,8 +413,8 @@ void Tick()
         return;
     }
 
-    if (!g_listenerAcknowledged
-        && !g_listenerStartupFailed
+    if (!g_listener.IsReady()
+        && !g_listener.IsFailed()
         && (phase == NetbridgePhase::Failed
             || phase == NetbridgePhase::SessionEnded))
     {
@@ -460,22 +423,22 @@ void Tick()
             "action=stop_auto_rehost",
             PhaseToString(phase),
             status.errorMsg);
-        g_listenerStartupFailed = true;
+        g_listener.Fail();
         SetState(State::TimedOut, "listener_start_failed");
         return;
     }
 
-    if (!g_listenerAcknowledged
-        && g_listenerWaitStartTick != 0
+    if (!g_listener.IsReady()
+        && g_listener.waitStartTick != 0
         && phase != NetbridgePhase::Idle
-        && GetTickCount() - g_listenerWaitStartTick
+        && GetTickCount() - g_listener.waitStartTick
             >= kListenerAckTimeoutMs)
     {
         mod::Log(
             "ASYNC_HOST_LISTENER_TIMEOUT elapsedMs=%lu phase=%s "
             "helperPid=%lu family=%s port=%u action=cancel",
             static_cast<unsigned long>(
-                GetTickCount() - g_listenerWaitStartTick),
+                GetTickCount() - g_listener.waitStartTick),
             PhaseToString(phase),
             static_cast<unsigned long>(status.processId),
             g_networkConfigValid
@@ -483,13 +446,13 @@ void Tick()
                       g_networkConfig.effectiveFamily)
                 : "legacy-INI",
             static_cast<unsigned>(g_port));
-        g_listenerStartupFailed = true;
+        g_listener.Fail();
         CancelSession("host_listener_ack_timeout");
         SetState(State::TimedOut, "listener_ack_timeout");
         return;
     }
 
-    if (g_listenerAcknowledged
+    if (g_listener.IsReady()
         && g_autoRehostCooldownTicks == 0
         && (g_state == State::Hosting || g_state == State::PeerFoundHeld))
     {
@@ -583,12 +546,12 @@ bool IsTimedOut()
 
 bool IsHostListenerReady()
 {
-    return g_listenerAcknowledged;
+    return g_listener.IsReady();
 }
 
 bool HasHostListenerStartupFailed()
 {
-    return g_listenerStartupFailed;
+    return g_listener.IsFailed();
 }
 
 bool NotifyHostListenerReady(
@@ -604,15 +567,10 @@ bool NotifyHostListenerReady(
         return false;
     }
 
-    if (!g_listenerAcknowledged
-        || g_listenerAckSerial != observation.serial)
+    if (!g_listener.IsReady()
+        || g_listener.acknowledgedSerial != observation.serial)
     {
-        g_listenerAcknowledged = true;
-        g_listenerAckSerial = observation.serial;
-        g_listenerWaitStartTick = 0;
-        g_listenerStartupFailed = false;
-        g_deferInitialFamilyMismatchToTitleFlow = false;
-        g_initialFamilyMismatchDeferred = false;
+        g_listener.Acknowledge(observation.serial);
         mod::Log(
             "ASYNC_HOST_LISTENER_READY family=%s port=%u serial=%u",
             network::FamilyName(observation.family),
@@ -656,21 +614,6 @@ bool ConsumeReturnKeyArrival()
 bool OnNetplayMenuRestored()
 {
     g_returnInProgress = false;
-    if (g_rehostOnArrival)
-    {
-        g_rehostOnArrival = false;
-        g_acceptOnArrival = false;
-        mod::Log("ASYNC_HOST: rehost-on-arrival requested");
-        return true;
-    }
-    if (g_acceptOnArrival)
-    {
-        g_acceptOnArrival = false;
-        if (g_state == State::PeerFoundHeld)
-        {
-            RequestAccept();
-        }
-    }
     return false;
 }
 
@@ -690,19 +633,10 @@ void Reset()
     g_origin = HostOrigin::Direct;
     g_minimized = false;
     g_lastPromptSerial = 0;
-    g_acceptOnArrival = false;
-    g_rehostOnArrival = false;
     g_returnInProgress = false;
     g_returnKeyWasDown = false;
     g_peerWasAlive = false;
-    g_listenerAcknowledged = false;
-    g_listenerAckSerial = 0;
-    g_listenerCandidateSerial = 0;
-    g_listenerCandidateFirstTick = 0;
-    g_listenerWaitStartTick = 0;
-    g_listenerStartupFailed = false;
-    g_deferInitialFamilyMismatchToTitleFlow = false;
-    g_initialFamilyMismatchDeferred = false;
+    g_listener.Reset();
     g_networkConfig = {};
     g_networkConfigValid = false;
     SetState(State::Idle, "reset");

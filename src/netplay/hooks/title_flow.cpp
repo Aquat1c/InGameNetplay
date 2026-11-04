@@ -114,8 +114,7 @@ std::array<uint8_t, 256> g_netplayHotkeyDown = {};
 std::array<uint8_t, 2> g_joinWaitToSpectateButtonDown = {};
 uint64_t g_submittedSpectatePromptFingerprint = 0;
 std::thread g_lobbySessionShutdownThread;
-std::atomic<bool> g_lobbySessionShutdownInFlight{false};
-std::atomic<bool> g_lobbySessionShutdownCompleted{false};
+std::atomic<LobbyShutdownPhase> g_lobbySessionShutdown{LobbyShutdownPhase::Idle};
 std::atomic<bool> g_lobbySessionShutdownReturnToPlayerRooms{false};
 bool g_deferredLobbyRefreshPending = false;
 uint32_t g_deferredLobbyRefreshDeadlineTick = 0;
@@ -1781,7 +1780,7 @@ bool TryResolvePlayingPairForLobbyEntry(
 
 void PumpLobbySessionShutdown()
 {
-    if (!g_lobbySessionShutdownCompleted.load())
+    if (g_lobbySessionShutdown.load() != LobbyShutdownPhase::Completed)
     {
         return;
     }
@@ -1792,8 +1791,7 @@ void PumpLobbySessionShutdown()
     }
 
     const bool returnToPlayerRooms = g_lobbySessionShutdownReturnToPlayerRooms.exchange(false);
-    g_lobbySessionShutdownCompleted.store(false);
-    g_lobbySessionShutdownInFlight.store(false);
+    g_lobbySessionShutdown.store(LobbyShutdownPhase::Idle);
 
     mod::Log(
         "LobbySessionShutdown: completed returnToPlayerRooms=%d",
@@ -1822,8 +1820,7 @@ void BeginLobbySessionShutdown(bool returnToPlayerRooms)
     g_lobbyBackgrounded = false;
     g_lobbyPresenceLost = false;
     g_lobbyPresenceChallenger.clear();
-    g_lobbySessionShutdownInFlight.store(true);
-    g_lobbySessionShutdownCompleted.store(false);
+    g_lobbySessionShutdown.store(LobbyShutdownPhase::Running);
     g_lobbySessionShutdownReturnToPlayerRooms.store(returnToPlayerRooms);
 
     if (returnToPlayerRooms)
@@ -1837,7 +1834,7 @@ void BeginLobbySessionShutdown(bool returnToPlayerRooms)
 
     g_lobbySessionShutdownThread = std::thread([session = std::move(g_lobbySession)]() mutable {
         session.reset();
-        g_lobbySessionShutdownCompleted.store(true);
+        g_lobbySessionShutdown.store(LobbyShutdownPhase::Completed);
     });
 }
 
@@ -1856,8 +1853,7 @@ bool ShutdownLobbySessionForProcessExitImpl(bool emergency, const char* reason)
             shutdownReason,
             emergency ? 1 : 0);
         g_lobbySessionShutdownThread.join();
-        g_lobbySessionShutdownCompleted.store(false);
-        g_lobbySessionShutdownInFlight.store(false);
+        g_lobbySessionShutdown.store(LobbyShutdownPhase::Idle);
         g_lobbySessionShutdownReturnToPlayerRooms.store(false);
         netplay::player_rooms::NotifyLobbySessionShutdownCompleted();
     }
@@ -1880,8 +1876,7 @@ bool ShutdownLobbySessionForProcessExitImpl(bool emergency, const char* reason)
     std::unique_ptr<netplay::lobby::LobbySession> session = std::move(g_lobbySession);
     session.reset();
 
-    g_lobbySessionShutdownCompleted.store(false);
-    g_lobbySessionShutdownInFlight.store(false);
+    g_lobbySessionShutdown.store(LobbyShutdownPhase::Idle);
     g_lobbySessionShutdownReturnToPlayerRooms.store(false);
     mod::Log(
         "LobbySessionShutdown: process-exit complete reason='%s' emergency=%d",
@@ -2278,9 +2273,9 @@ bool ConsumeJoinWaitToSpectateHotkeyEdge(const uint8_t* inputBytes)
 
 bool IsTransientNetplayOverlayActive()
 {
-    return g_joiningOverlay.active
-        || g_hostingOverlay.active
-        || g_delaySetupOverlay.active
+    return g_joiningOverlay.IsActive()
+        || g_hostingOverlay.IsActive()
+        || g_delaySetupOverlay.IsActive()
         || g_spectateConfirmOverlay.active;
 }
 
@@ -2551,7 +2546,6 @@ static void BeginHostDiscovery(
             &capabilitySnapshot, &capabilitySnapshotAgeMs);
 
     ResetHostingOverlayState();
-    g_hostingOverlay.active = true;
     g_hostingOverlay.port = port;
     g_hostingOverlay.challengeMode =
         owner == HostDiscoveryOwner::LobbyChallenge;
@@ -2559,7 +2553,7 @@ static void BeginHostDiscovery(
     g_hostingOverlay.effectiveFamily = discoveryFamily;
     g_hostingOverlay.usedFamilyFallback =
         originalPreferredFamily != discoveryFamily;
-    g_hostingOverlay.discoveryInProgress = true;
+    g_hostingOverlay.BeginDiscovery();
     g_hostingOverlay.familyRetryAllowed = true;
     g_hostingOverlay.automaticFamilyRetryAttempted =
         automaticFamilyRetryAttempted;
@@ -2705,7 +2699,6 @@ void ActivateChallengeHostingOverlay(
     const char* publicIp)
 {
     ResetHostingOverlayState();
-    g_hostingOverlay.active = true;
     g_hostingOverlay.port = port;
     g_hostingOverlay.challengeMode = true;
     g_hostingOverlay.preferredFamily = preferredFamily;
@@ -2713,7 +2706,7 @@ void ActivateChallengeHostingOverlay(
     g_hostingOverlay.usedFamilyFallback = usedFamilyFallback;
     g_hostingOverlay.ipFetchDone = true;
     g_hostingOverlay.ipFetchFailed = publicIp == nullptr || publicIp[0] == '\0';
-    g_hostingOverlay.sessionQueued = true;
+    g_hostingOverlay.QueueSession();
     g_hostingOverlay.familyRetryAllowed = true;
     g_hostingOverlay.listenerWaitStartTick = GetTickCount();
     CopyBoundedText(
@@ -2741,10 +2734,7 @@ static void ShowHostStartupFailure(
             : I18N_KEY("Unknown Host startup error.");
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
-    g_hostingOverlay.active = true;
-    g_hostingOverlay.failed = true;
-    g_hostingOverlay.failureNeedsBridgeCancel =
-        needsBridgeCancel;
+    g_hostingOverlay.Fail(needsBridgeCancel);
     CopyBoundedText(
         g_hostingOverlay.errorText,
         sizeof(g_hostingOverlay.errorText),
@@ -2815,7 +2805,7 @@ static void PumpDirectHostDiscovery()
 
     if (task->cancelled.load()
         || task->generation != g_directHostDiscoveryGeneration
-        || !g_hostingOverlay.active)
+        || !g_hostingOverlay.IsActive())
     {
         mod::Log(
             "PUBLIC_IP_DISCOVERY_RESULT owner=%s generation=%llu "
@@ -2836,7 +2826,7 @@ static void PumpDirectHostDiscovery()
 
     const netplay::lobby::PublicIpDiscoveryResult result = task->result;
     g_pendingHostDiscovery.reset();
-    g_hostingOverlay.discoveryInProgress = false;
+    g_hostingOverlay.BeginSessionStart();
     g_hostingOverlay.ipFetchDone = true;
     g_hostingOverlay.ipFetchFailed = result.publicIp.empty();
     g_hostingOverlay.preferredFamily =
@@ -3034,7 +3024,7 @@ static void PumpDirectHostDiscovery()
     }
     else
     {
-        g_hostingOverlay.sessionQueued = true;
+        g_hostingOverlay.QueueSession();
         netplay::bridge::async_host::OnHostStarted(
             task->port,
             task->nickname.c_str(),
@@ -3065,7 +3055,7 @@ static bool BeginAutomaticHostFamilyRetry(
     const char* trigger,
     uint32_t listenerSerial)
 {
-    if (!g_hostingOverlay.active
+    if (!g_hostingOverlay.IsActive()
         || !g_hostingOverlay.familyRetryAllowed
         || g_hostingOverlay.automaticFamilyRetryAttempted)
     {
@@ -3154,9 +3144,9 @@ static bool TryBeginTerminalHostFamilyRetry(
     const netplay::bridge::NetbridgeStatus& status,
     netplay::bridge::NetbridgePhase phase)
 {
-    if (!g_hostingOverlay.active
-        || !g_hostingOverlay.sessionQueued
-        || g_hostingOverlay.listenerReady
+    if (!g_hostingOverlay.IsActive()
+        || !g_hostingOverlay.IsSessionQueued()
+        || g_hostingOverlay.IsListening()
         || g_hostingOverlay.automaticFamilyRetryAttempted
         || (phase != netplay::bridge::NetbridgePhase::Failed
             && phase
@@ -3233,13 +3223,13 @@ static bool TryBeginTerminalHostFamilyRetry(
 
 static void PumpHostListenerObservation()
 {
-    if (g_hostingOverlay.active
-        && g_hostingOverlay.sessionQueued
-        && g_hostingOverlay.listenerReady
+    if (g_hostingOverlay.IsActive()
+        && g_hostingOverlay.IsSessionQueued()
+        && g_hostingOverlay.IsListening()
         && netplay::bridge::async_host::IsActive()
         && !netplay::bridge::async_host::IsHostListenerReady())
     {
-        g_hostingOverlay.listenerReady = false;
+        g_hostingOverlay.AwaitListener();
         g_hostingOverlay.listenerMismatch = false;
         mod::Log(
             "REVIVAL_HOST_ACK_RESET reason=async_rehost_waiting "
@@ -3249,9 +3239,9 @@ static void PumpHostListenerObservation()
             static_cast<unsigned>(g_hostingOverlay.port));
     }
 
-    if (!g_hostingOverlay.active
-        || !g_hostingOverlay.sessionQueued
-        || g_hostingOverlay.listenerReady)
+    if (!g_hostingOverlay.IsActive()
+        || !g_hostingOverlay.IsSessionQueued()
+        || g_hostingOverlay.IsListening())
     {
         return;
     }
@@ -3462,7 +3452,7 @@ static void PumpHostListenerObservation()
         g_hostingOverlay.familyFallbackNoticeStartTick =
             GetTickCount();
     }
-    g_hostingOverlay.listenerReady = true;
+    g_hostingOverlay.ListenerReady();
     g_hostingOverlay.familyRetryAllowed = false;
     g_hostingOverlay.port = observation.port;
     // The server has no IPv6 route to test.
@@ -3518,7 +3508,6 @@ static void PumpHostListenerObservation()
 static void RestoreHostingOverlayFromAsyncHost()
 {
     g_hostingOverlay = {};
-    g_hostingOverlay.active = true;
     if (netplay::bridge::async_host::Origin()
         == netplay::bridge::async_host::HostOrigin::LobbyChallenge)
     {
@@ -3530,10 +3519,12 @@ static void RestoreHostingOverlayFromAsyncHost()
     }
     g_hostingOverlay.port =
         netplay::bridge::async_host::HostPort();
-    g_hostingOverlay.sessionQueued = true;
+    g_hostingOverlay.QueueSession();
     g_hostingOverlay.familyRetryAllowed = false;
-    g_hostingOverlay.listenerReady =
-        netplay::bridge::async_host::IsHostListenerReady();
+    if (netplay::bridge::async_host::IsHostListenerReady())
+    {
+        g_hostingOverlay.ListenerReady();
+    }
     g_hostingOverlay.ipFetchDone = true;
     g_hostingOverlay.writeNicknameToIni = false;
     CopyBoundedText(
@@ -3584,7 +3575,7 @@ static void RestoreHostingOverlayFromAsyncHost()
             ? 1
             : 0,
         static_cast<unsigned>(g_hostingOverlay.port),
-        g_hostingOverlay.listenerReady ? 1 : 0,
+        g_hostingOverlay.IsListening() ? 1 : 0,
         g_hostingOverlay.publicIp[0] != '\0'
             ? g_hostingOverlay.publicIp
             : "(none)");
@@ -3652,7 +3643,7 @@ void ActivateJoiningOverlay(const char* address, uint16_t port)
 {
     g_submittedSpectatePromptFingerprint = 0;
     ResetJoiningOverlayState();
-    g_joiningOverlay.active = true;
+    g_joiningOverlay.Begin();
     g_joiningOverlay.port = port;
     netplay::network::NetworkHost parsedHost;
     bool parsed =
@@ -3694,7 +3685,7 @@ void ActivateChallengeJoiningOverlay(const char* targetName, const char* address
 {
     g_submittedSpectatePromptFingerprint = 0;
     ResetJoiningOverlayState();
-    g_joiningOverlay.active = true;
+    g_joiningOverlay.Begin();
     g_joiningOverlay.port = port;
     g_joiningOverlay.displayTargetName = true;
     netplay::network::NetworkHost parsedHost;
@@ -4147,8 +4138,7 @@ void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeSta
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     ResetDelaySetupOverlayState();
-    g_delaySetupOverlay.active = true;
-    g_delaySetupOverlay.waitingForRuntimeReady = false;
+    g_delaySetupOverlay.BeginSelection();
     g_delaySetupOverlay.pingMs = bridgeStatus.pingMs;
     g_delaySetupOverlay.currentDelay = (std::max)(0, bridgeStatus.rollbackFrames);
     UpdateDelaySetupMetrics(promptMetrics, bridgeStatus.delayPromptSerial);
@@ -4179,24 +4169,24 @@ void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeSta
 
 bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* inactivityCounter)
 {
-    if (!g_delaySetupOverlay.active || inputBytes == nullptr || inactivityCounter == nullptr)
+    if (!g_delaySetupOverlay.IsActive() || inputBytes == nullptr || inactivityCounter == nullptr)
     {
         return false;
     }
 
-    if (g_delaySetupOverlay.waitingForRuntimeReady)
+    if (g_delaySetupOverlay.IsWaitingForRuntime())
     {
         const auto statusWhileWaiting = netplay::bridge::GetStatus();
         const DWORD nowTick = GetTickCount();
         if (statusWhileWaiting.localInitApplied != 0
             && nowTick >= g_delaySetupOverlay.nextHandoffRetryTick
-            && (!g_delaySetupOverlay.vsHumanSyncArmed || statusWhileWaiting.roleFlag != 2))
+            && (!g_delaySetupOverlay.IsSyncArmed() || statusWhileWaiting.roleFlag != 2))
         {
-            const bool wasArmed = g_delaySetupOverlay.vsHumanSyncArmed;
+            const bool wasArmed = g_delaySetupOverlay.IsSyncArmed();
             const bool prepared = netplay::bridge::PrepareVsHumanHandoff();
             if (prepared)
             {
-                g_delaySetupOverlay.vsHumanSyncArmed = true;
+                g_delaySetupOverlay.ArmSync();
                 if (!wasArmed)
                 {
                     mod::Log(
@@ -4367,10 +4357,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
         const bool readyForHandoff =
             statusAfterApply.vsHumanSyncReady != 0
             || (phaseAfterApply == NetbridgePhase::Connected && !strictNativeSyncAfterApply);
-        g_delaySetupOverlay.waitingForRuntimeReady = true;
-        g_delaySetupOverlay.vsHumanSyncArmed = false;
-        g_delaySetupOverlay.connectedHandoffDelayActive = false;
-        g_delaySetupOverlay.connectedHandoffDelayFramesRemaining = 0;
+        g_delaySetupOverlay.AwaitRuntime();
         g_delaySetupOverlay.nextHandoffRetryTick = 0;
         g_delaySetupOverlay.errorMessage[0] = '\0';
         ResetVsHumanHandoffWarmup("delay_confirmed");
@@ -5655,7 +5642,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         {
             break;
         }
-        if (g_lobbySessionShutdownInFlight.load())
+        if (g_lobbySessionShutdown.load() != LobbyShutdownPhase::Idle)
         {
             ShowStubActionMessage(owner, Tr("Still leaving room.\nPlease wait."));
             break;
@@ -5674,7 +5661,7 @@ void ExecuteNetplayAction(uint32_t screenContext, NetplayMenuAction action, int 
         {
             break;
         }
-        if (g_lobbySessionShutdownInFlight.load())
+        if (g_lobbySessionShutdown.load() != LobbyShutdownPhase::Idle)
         {
             ShowStubActionMessage(owner, Tr("Still leaving room.\nPlease wait."));
             break;
@@ -6184,7 +6171,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     PumpDirectHostDiscovery();
     PumpHostListenerObservation();
     DrainEndedLobbyChallenge();
-    if (g_pendingRoomLeaveAction.active && !g_lobbySessionShutdownInFlight.load())
+    if (g_pendingRoomLeaveAction.active && g_lobbySessionShutdown.load() == LobbyShutdownPhase::Idle)
     {
         const PendingRoomLeaveAction pending = g_pendingRoomLeaveAction;
         g_pendingRoomLeaveAction = {};
@@ -6372,9 +6359,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
-    if (g_hostingOverlay.active
-        && g_hostingOverlay.discoveryInProgress
-        && !g_hostingOverlay.sessionQueued)
+    if (g_hostingOverlay.IsActive()
+        && g_hostingOverlay.IsDiscovering()
+        && !g_hostingOverlay.IsSessionQueued())
     {
         bool cancelRequested = ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0; playerIndex < 2; ++playerIndex)
@@ -6516,9 +6503,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
             {
                 mod::Log(
                     "WaitToSpectate: ignored Join D hotkey while transient overlay active joining=%d hosting=%d delay=%d spectateConfirm=%d",
-                    g_joiningOverlay.active ? 1 : 0,
-                    g_hostingOverlay.active ? 1 : 0,
-                    g_delaySetupOverlay.active ? 1 : 0,
+                    g_joiningOverlay.IsActive() ? 1 : 0,
+                    g_hostingOverlay.IsActive() ? 1 : 0,
+                    g_delaySetupOverlay.IsActive() ? 1 : 0,
                     g_spectateConfirmOverlay.active ? 1 : 0);
             }
             else
@@ -6548,20 +6535,20 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
     };
     auto promoteTerminalBridgeFailureToJoiningOverlay = [&](const netplay::bridge::NetbridgeStatus& status, NetbridgePhase phase) {
-        if (g_joiningOverlay.active
-            || (g_hostingOverlay.active
-                && g_hostingOverlay.failed))
+        if (g_joiningOverlay.IsActive()
+            || (g_hostingOverlay.IsActive()
+                && g_hostingOverlay.HasFailed()))
         {
             return;
         }
-        if (!g_delaySetupOverlay.active && !g_spectateConfirmOverlay.active && !g_hostingOverlay.active)
+        if (!g_delaySetupOverlay.IsActive() && !g_spectateConfirmOverlay.active && !g_hostingOverlay.IsActive())
         {
             return;
         }
 
-        const bool hadDelayOverlay = g_delaySetupOverlay.active;
+        const bool hadDelayOverlay = g_delaySetupOverlay.IsActive();
         const bool hadSpectateConfirmOverlay = g_spectateConfirmOverlay.active;
-        const bool hadHostingOverlay = g_hostingOverlay.active;
+        const bool hadHostingOverlay = g_hostingOverlay.IsActive();
         const char* failureText =
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
@@ -6585,8 +6572,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
         ResetHostingOverlayState();
         ResetJoiningOverlayState();
-        g_joiningOverlay.active = true;
-        g_joiningOverlay.failed = true;
+        g_joiningOverlay.Begin();
+        g_joiningOverlay.Fail();
         strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText), failureText, _TRUNCATE);
         g_joiningOverlay.errorText[sizeof(g_joiningOverlay.errorText) - 1] = '\0';
 
@@ -6682,8 +6669,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         return 0;
     }
 
-    if (g_hostingOverlay.active
-        && !g_hostingOverlay.failed
+    if (g_hostingOverlay.IsActive()
+        && !g_hostingOverlay.HasFailed()
         && netplay::bridge::async_host::
                HasHostListenerStartupFailed())
     {
@@ -6698,7 +6685,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             "ASYNC_HOST_LISTENER_START_FAILURE_PROMOTED "
             "phase=%s needsBridgeCancel=%d error='%s'",
             netplay::bridge::PhaseToString(bridgePhase),
-            g_hostingOverlay.failureNeedsBridgeCancel
+            g_hostingOverlay.NeedsBridgeCancel()
                 ? 1
                 : 0,
             failureText);
@@ -6709,7 +6696,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         promoteTerminalBridgeFailureToJoiningOverlay(bridgeStatus, bridgePhase);
     }
 
-    if (g_hostingOverlay.active && g_hostingOverlay.failed)
+    if (g_hostingOverlay.IsActive() && g_hostingOverlay.HasFailed())
     {
         bool dismissed = ConsumeNetplayEscapeEdge();
         for (int playerIndex = 0;
@@ -6727,7 +6714,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (dismissed)
         {
             const bool needsBridgeCancel =
-                g_hostingOverlay.failureNeedsBridgeCancel;
+                g_hostingOverlay.NeedsBridgeCancel();
             const std::string failureText =
                 g_hostingOverlay.errorText;
             PlayUiSound(screenContext, kSfxConfirm);
@@ -6792,7 +6779,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
     if (bridgeStatus.vsHumanSyncReady != 0
         && (bridgePhase == NetbridgePhase::Connected
             || bridgePhase == NetbridgePhase::DelaySetup)
-        && !g_delaySetupOverlay.active)
+        && !g_delaySetupOverlay.IsActive())
     {
         mod::Log(
             "FastHandoff: vsHumanSyncReady detected, immediate transition phase=%s sync(mode=%d flag1084=%d session=%d)",
@@ -6861,19 +6848,19 @@ char UpdateNetplayMenu(uint32_t screenContext)
     }
 
     const bool joiningOverlayShouldShowWaitForGameBegin =
-        g_joiningOverlay.active
+        g_joiningOverlay.IsActive()
         && g_joiningOverlay.spectateMode
         && bridgePhase == NetbridgePhase::Connecting
         && bridgeStatus.spectateConfirmPromptKind
             == static_cast<int>(NetbridgeSpectatePromptKind::HostNotYetPlaying)
         && bridgeStatus.spectateConfirmPromptSerial > 0
         && bridgeStatus.spectateConfirmPromptServedSerial >= bridgeStatus.spectateConfirmPromptSerial;
-    if (g_joiningOverlay.waitingForGameBegin != joiningOverlayShouldShowWaitForGameBegin)
+    if (g_joiningOverlay.IsWaitingForGame() != joiningOverlayShouldShowWaitForGameBegin)
     {
-        g_joiningOverlay.waitingForGameBegin = joiningOverlayShouldShowWaitForGameBegin;
+        g_joiningOverlay.SetWaitingForGame(joiningOverlayShouldShowWaitForGameBegin);
         mod::Log(
             "JoiningOverlay: waiting_for_game_begin=%d phase=%s promptSerial=%d served=%d role=%d",
-            g_joiningOverlay.waitingForGameBegin ? 1 : 0,
+            g_joiningOverlay.IsWaitingForGame() ? 1 : 0,
             netplay::bridge::PhaseToString(bridgePhase),
             bridgeStatus.spectateConfirmPromptSerial,
             bridgeStatus.spectateConfirmPromptServedSerial,
@@ -7035,12 +7022,12 @@ char UpdateNetplayMenu(uint32_t screenContext)
         && !netplay::bridge::async_host::ShouldSuppressDelayOverlay())
     {
         const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
-        if (!g_delaySetupOverlay.active
-            || (g_delaySetupOverlay.waitingForRuntimeReady
+        if (!g_delaySetupOverlay.IsActive()
+            || (g_delaySetupOverlay.IsWaitingForRuntime()
                 && netplay::bridge::delay_selection::IsRetry(bridgeStatus.delayPromptSerial,
                     bridgeStatus.delayPromptServedSerial, g_delaySetupOverlay.promptSerial)))
         {
-            const bool firstPrompt = !g_delaySetupOverlay.active;
+            const bool firstPrompt = !g_delaySetupOverlay.IsActive();
             ActivateDelaySetupOverlay(bridgeStatus, promptMetrics);
 
             if (firstPrompt && g_lobbySession)
@@ -7068,7 +7055,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             UpdateDelaySetupMetrics(promptMetrics, bridgeStatus.delayPromptSerial);
         }
 
-        if (g_delaySetupOverlay.waitingForRuntimeReady
+        if (g_delaySetupOverlay.IsWaitingForRuntime()
             && (bridgeStatus.vsHumanSyncReady != 0
                 || (bridgePhase == NetbridgePhase::Connected
                     && !netplay::bridge::RequiresNativeVsHumanSyncForHandoff())))
@@ -7101,7 +7088,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
             return 0;
         }
-        if (g_delaySetupOverlay.waitingForRuntimeReady)
+        if (g_delaySetupOverlay.IsWaitingForRuntime())
         {
             ResetVsHumanHandoffWarmup("runtime_not_ready");
         }
@@ -7152,9 +7139,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
 
     if (bridgePhase == NetbridgePhase::Failed || bridgePhase == NetbridgePhase::SessionEnded)
     {
-        if (g_joiningOverlay.active && !g_joiningOverlay.failed)
+        if (g_joiningOverlay.IsActive() && !g_joiningOverlay.HasFailed())
         {
-            g_joiningOverlay.failed = true;
+            g_joiningOverlay.Fail();
             if (bridgeStatus.errorMsg[0] != '\0')
             {
                 strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText),
@@ -7170,7 +7157,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             mod::Log("JoiningOverlay: connection failed - %s", g_joiningOverlay.errorText);
         }
 
-        if (g_joiningOverlay.active && g_joiningOverlay.failed)
+        if (g_joiningOverlay.IsActive() && g_joiningOverlay.HasFailed())
         {
             bool dismissed = ConsumeNetplayEscapeEdge();
             for (int playerIndex = 0; !dismissed && playerIndex < 2; ++playerIndex)
@@ -7350,7 +7337,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 cancelRequested = true;
                 break;
             }
-            if (g_joiningOverlay.active && inputBytes[playerIndex + 22] == 1)
+            if (g_joiningOverlay.IsActive() && inputBytes[playerIndex + 22] == 1)
             {
                 cancelRequested = true;
                 mod::Log(
@@ -7369,8 +7356,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         }
 
         if (!cancelRequested
-            && g_hostingOverlay.active
-            && g_hostingOverlay.listenerReady
+            && g_hostingOverlay.IsActive()
+            && g_hostingOverlay.IsListening()
             && netplay::bridge::async_host::GetState()
                    == netplay::bridge::async_host::State::Hosting)
         {
@@ -7401,9 +7388,9 @@ char UpdateNetplayMenu(uint32_t screenContext)
             }
         }
 
-        if (g_hostingOverlay.active
+        if (g_hostingOverlay.IsActive()
             && !g_hostingOverlay.challengeMode
-            && g_hostingOverlay.listenerReady
+            && g_hostingOverlay.IsListening()
             && g_hostingOverlay.ipFetchDone
             && !g_hostingOverlay.ipFetchFailed)
         {

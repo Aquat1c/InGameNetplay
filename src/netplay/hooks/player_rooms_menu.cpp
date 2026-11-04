@@ -64,19 +64,15 @@ struct State
 
 State g_state = {};
 std::mutex g_refreshMutex;
-std::atomic<bool> g_refreshInFlight{false};
+hooks::RoomRequestState g_refreshRequest;
 std::atomic<uint32_t> g_refreshGeneration{1};
-bool g_refreshResultReady = false;
 bool g_refreshResultShowStatus = false;
-bool g_refreshResultOk = false;
 uint32_t g_refreshResultGeneration = 0;
 std::vector<netplay::lobby::PublicRoomSummary> g_refreshResultRooms;
 std::string g_refreshResultError;
 std::mutex g_roomActionMutex;
-std::atomic<bool> g_roomActionInFlight{false};
+hooks::RoomRequestState g_roomActionRequest;
 std::atomic<uint32_t> g_roomActionGeneration{1};
-bool g_roomActionResultReady = false;
-bool g_roomActionResultOk = false;
 uint32_t g_roomActionResultGeneration = 0;
 AsyncRoomActionKind g_roomActionResultKind = AsyncRoomActionKind::None;
 netplay::lobby::LobbyJoinedRoom g_roomActionResultJoinedRoom = {};
@@ -111,9 +107,8 @@ void PublishRefreshWorkerResult(
     std::string error)
 {
     std::lock_guard<std::mutex> lock(g_refreshMutex);
-    g_refreshResultReady = true;
     g_refreshResultShowStatus = showStatusMessage;
-    g_refreshResultOk = ok;
+    g_refreshRequest.Complete(ok);
     g_refreshResultGeneration = generation;
     g_refreshResultRooms = std::move(rooms);
     g_refreshResultError = std::move(error);
@@ -127,8 +122,7 @@ void PublishRoomActionWorkerResult(
     std::string error)
 {
     std::lock_guard<std::mutex> lock(g_roomActionMutex);
-    g_roomActionResultReady = true;
-    g_roomActionResultOk = ok;
+    g_roomActionRequest.Complete(ok);
     g_roomActionResultGeneration = generation;
     g_roomActionResultKind = kind;
     g_roomActionResultJoinedRoom = std::move(joinedRoom);
@@ -368,9 +362,8 @@ void InvalidateRefreshResults()
 {
     g_refreshGeneration.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(g_refreshMutex);
-    g_refreshResultReady = false;
+    g_refreshRequest.DiscardResult();
     g_refreshResultShowStatus = false;
-    g_refreshResultOk = false;
     g_refreshResultGeneration = 0;
     g_refreshResultRooms.clear();
     g_refreshResultError.clear();
@@ -380,8 +373,7 @@ void InvalidateRoomActionResults()
 {
     g_roomActionGeneration.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(g_roomActionMutex);
-    g_roomActionResultReady = false;
-    g_roomActionResultOk = false;
+    g_roomActionRequest.DiscardResult();
     g_roomActionResultGeneration = 0;
     g_roomActionResultKind = AsyncRoomActionKind::None;
     g_roomActionResultJoinedRoom = {};
@@ -574,12 +566,12 @@ void SwitchView(uint32_t screenContext, BrowserView newView, int selection = -1)
 
 bool IsRefreshInFlight()
 {
-    return g_refreshInFlight.load(std::memory_order_acquire);
+    return g_refreshRequest.IsInFlight();
 }
 
 bool IsRoomActionInFlight()
 {
-    return g_roomActionInFlight.load(std::memory_order_acquire);
+    return g_roomActionRequest.IsInFlight();
 }
 
 void PumpRefreshResult()
@@ -592,26 +584,25 @@ void PumpRefreshResult()
     std::string error;
     {
         std::lock_guard<std::mutex> lock(g_refreshMutex);
-        ready = g_refreshResultReady;
+        ready = g_refreshRequest.HasResult();
         if (!ready)
         {
             return;
         }
 
         showStatusMessage = g_refreshResultShowStatus;
-        ok = g_refreshResultOk;
+        ok = g_refreshRequest.Succeeded();
         resultGeneration = g_refreshResultGeneration;
         rooms = std::move(g_refreshResultRooms);
         error = std::move(g_refreshResultError);
         g_refreshResultRooms.clear();
         g_refreshResultError.clear();
-        g_refreshResultReady = false;
+        g_refreshRequest.DiscardResult();
         g_refreshResultShowStatus = false;
-        g_refreshResultOk = false;
         g_refreshResultGeneration = 0;
     }
 
-    g_refreshInFlight.store(false, std::memory_order_release);
+    g_refreshRequest.Reset();
 
     if (resultGeneration != g_refreshGeneration.load(std::memory_order_acquire))
     {
@@ -682,14 +673,13 @@ bool StartAsyncRefresh(bool showStatusMessage)
     const uint32_t generation = g_refreshGeneration.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(g_refreshMutex);
-        g_refreshResultReady = false;
+        g_refreshRequest.DiscardResult();
         g_refreshResultShowStatus = false;
-        g_refreshResultOk = false;
         g_refreshResultGeneration = 0;
         g_refreshResultRooms.clear();
         g_refreshResultError.clear();
     }
-    g_refreshInFlight.store(true, std::memory_order_release);
+    g_refreshRequest.Begin();
 
     if (showStatusMessage)
     {
@@ -706,7 +696,7 @@ bool StartAsyncRefresh(bool showStatusMessage)
     }
     if (!LaunchRoomWorker(std::move(context), "Refresh"))
     {
-        g_refreshInFlight.store(false, std::memory_order_release);
+        g_refreshRequest.Reset();
         if (showStatusMessage)
         {
             SetStatusMessage(I18N_KEY("Public room list request failed."));
@@ -727,26 +717,25 @@ bool PumpRoomActionResult(uint32_t screenContext)
     std::string error;
     {
         std::lock_guard<std::mutex> lock(g_roomActionMutex);
-        ready = g_roomActionResultReady;
+        ready = g_roomActionRequest.HasResult();
         if (!ready)
         {
             return false;
         }
 
-        ok = g_roomActionResultOk;
+        ok = g_roomActionRequest.Succeeded();
         resultGeneration = g_roomActionResultGeneration;
         kind = g_roomActionResultKind;
         joinedRoom = std::move(g_roomActionResultJoinedRoom);
         error = std::move(g_roomActionResultError);
-        g_roomActionResultReady = false;
-        g_roomActionResultOk = false;
+        g_roomActionRequest.DiscardResult();
         g_roomActionResultGeneration = 0;
         g_roomActionResultKind = AsyncRoomActionKind::None;
         g_roomActionResultJoinedRoom = {};
         g_roomActionResultError.clear();
     }
 
-    g_roomActionInFlight.store(false, std::memory_order_release);
+    g_roomActionRequest.Reset();
 
     if (resultGeneration != g_roomActionGeneration.load(std::memory_order_acquire))
     {
@@ -788,14 +777,13 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
     const uint32_t generation = g_roomActionGeneration.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(g_roomActionMutex);
-        g_roomActionResultReady = false;
-        g_roomActionResultOk = false;
+        g_roomActionRequest.DiscardResult();
         g_roomActionResultGeneration = 0;
         g_roomActionResultKind = AsyncRoomActionKind::None;
         g_roomActionResultJoinedRoom = {};
         g_roomActionResultError.clear();
     }
-    g_roomActionInFlight.store(true, std::memory_order_release);
+    g_roomActionRequest.Begin();
     SetStatusMessage(I18N_KEY("Joining room..."));
 
     const std::string nickname = hooks::g_netplayMenuState.nickname;
@@ -812,7 +800,7 @@ bool StartAsyncJoinRoom(const std::string& roomCode)
     }
     if (!LaunchRoomWorker(std::move(context), "Join"))
     {
-        g_roomActionInFlight.store(false, std::memory_order_release);
+        g_roomActionRequest.Reset();
         SetStatusMessage(I18N_KEY("Join request failed."));
         return false;
     }
@@ -832,14 +820,13 @@ bool StartAsyncCreateRoom()
     const uint32_t generation = g_roomActionGeneration.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(g_roomActionMutex);
-        g_roomActionResultReady = false;
-        g_roomActionResultOk = false;
+        g_roomActionRequest.DiscardResult();
         g_roomActionResultGeneration = 0;
         g_roomActionResultKind = AsyncRoomActionKind::None;
         g_roomActionResultJoinedRoom = {};
         g_roomActionResultError.clear();
     }
-    g_roomActionInFlight.store(true, std::memory_order_release);
+    g_roomActionRequest.Begin();
     SetStatusMessage(I18N_KEY("Creating room..."));
 
     const std::string nickname = hooks::g_netplayMenuState.nickname;
@@ -857,7 +844,7 @@ bool StartAsyncCreateRoom()
     }
     if (!LaunchRoomWorker(std::move(context), "Create"))
     {
-        g_roomActionInFlight.store(false, std::memory_order_release);
+        g_roomActionRequest.Reset();
         SetStatusMessage(I18N_KEY("Create room request failed."));
         return false;
     }
@@ -883,16 +870,14 @@ void ResetState()
     g_state = {};
     g_lobbySessionShutdownInFlight = false;
     g_refreshAfterLobbySessionShutdown = false;
-    g_refreshInFlight.store(false, std::memory_order_release);
+    g_refreshRequest.Reset();
     g_refreshGeneration.store(1, std::memory_order_release);
-    g_refreshResultReady = false;
+    g_refreshRequest.DiscardResult();
     g_refreshResultShowStatus = false;
-    g_refreshResultOk = false;
     g_refreshResultGeneration = 0;
-    g_roomActionInFlight.store(false, std::memory_order_release);
+    g_roomActionRequest.Reset();
     g_roomActionGeneration.store(1, std::memory_order_release);
-    g_roomActionResultReady = false;
-    g_roomActionResultOk = false;
+    g_roomActionRequest.DiscardResult();
     g_roomActionResultGeneration = 0;
     g_roomActionResultKind = AsyncRoomActionKind::None;
     g_roomActionResultJoinedRoom = {};
