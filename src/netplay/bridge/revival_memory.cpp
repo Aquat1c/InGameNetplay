@@ -6015,7 +6015,7 @@ static int g_deferredCancelCleanupSourceRole = -1;
 static uint32_t g_deferredCancelCleanupSourceFrame = 0;
 static volatile LONG g_onlineMatchEscGracefulQuitArmed = 0;
 static volatile LONG* g_quitRingHeader = nullptr;
-static volatile LONG g_scheduledGracefulQuitTeardownActive = 0;
+static volatile LONG g_scheduledGracefulQuitState = static_cast<LONG>(ScheduledQuitState::Idle);
 static DWORD g_scheduledGracefulQuitTeardownStartMs = 0;
 static LONG g_scheduledGracefulQuitHead = 0;
 static LONG g_scheduledGracefulQuitTail = 0;
@@ -6025,7 +6025,6 @@ static uint32_t g_frameTick = 0;
 
 static unsigned int g_watchdogDeadFrameCount = 0;
 static constexpr unsigned int kWatchdogGraceFrames = 30;
-static constexpr DWORD kScheduledGracefulQuitTeardownDelayMs = 500u;
 
 using PerFrameTickFn = int (__thiscall *)(void* thisPtr);
 static PerFrameTickFn g_origPerFrameTick = nullptr;
@@ -7804,7 +7803,7 @@ static bool NeedsPostNativeControlPath(bool nativeTickSkippedForFatalError)
         || InterlockedCompareExchange(
                &g_deferredLifecycleWorkRequested, 0, 0) != 0
         || InterlockedCompareExchange(
-               &g_scheduledGracefulQuitTeardownActive, 0, 0) != 0
+               &g_scheduledGracefulQuitState, 0, 0) == static_cast<LONG>(ScheduledQuitState::WaitingForPeerExit)
         || InterlockedCompareExchange(
                &g_onlineMatchEscGracefulQuitArmed, 0, 0) != 0
         || InterlockedCompareExchange(
@@ -8133,7 +8132,7 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void*)
     LONG preTickQuitHead = 0;
     LONG preTickQuitTail = 0;
     if (g_dllExitProcessPatchesSaved
-        && InterlockedCompareExchange(&g_scheduledGracefulQuitTeardownActive, 0, 0) == 0
+        && InterlockedCompareExchange(&g_scheduledGracefulQuitState, 0, 0) == static_cast<LONG>(ScheduledQuitState::Idle)
         && InterlockedCompareExchange(&g_onlineMatchEscGracefulQuitArmed, 0, 0) == 0)
     {
         if (ConsumeGracefulQuitRingSignal(&preTickQuitHead, &preTickQuitTail))
@@ -9007,11 +9006,11 @@ static int __fastcall OurPerFrameTickHook(void* exeThis, void*)
         return 0;
     }
 
-    if (InterlockedCompareExchange(&g_scheduledGracefulQuitTeardownActive, 0, 0) != 0)
+    if (InterlockedCompareExchange(&g_scheduledGracefulQuitState, 0, 0) == static_cast<LONG>(ScheduledQuitState::WaitingForPeerExit))
     {
         const DWORD elapsedMs = GetTickCount() - g_scheduledGracefulQuitTeardownStartMs;
         const bool helperAlive = g_revivalProcess != nullptr && IsPeerProcessAlive();
-        if (helperAlive && elapsedMs < kScheduledGracefulQuitTeardownDelayMs)
+        if (!ScheduledQuitReady(helperAlive, elapsedMs))
         {
             return 0;
         }
@@ -9410,7 +9409,7 @@ void ResetOnlineMatchEscGracefulQuit()
 
 static void ResetScheduledGracefulQuitTeardown()
 {
-    InterlockedExchange(&g_scheduledGracefulQuitTeardownActive, 0);
+    InterlockedExchange(&g_scheduledGracefulQuitState, static_cast<LONG>(ScheduledQuitState::Idle));
     g_scheduledGracefulQuitTeardownStartMs = 0;
     g_scheduledGracefulQuitHead = 0;
     g_scheduledGracefulQuitTail = 0;
@@ -9433,7 +9432,7 @@ static void ScheduleGracefulQuitTeardown(const char* phaseTag, LONG quitHeadBefo
             phaseTag,
             _TRUNCATE);
     }
-    InterlockedExchange(&g_scheduledGracefulQuitTeardownActive, 1);
+    InterlockedExchange(&g_scheduledGracefulQuitState, static_cast<LONG>(ScheduledQuitState::WaitingForPeerExit));
 }
 
 static bool EnsureQuitRingHeader()

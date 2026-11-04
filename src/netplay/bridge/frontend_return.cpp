@@ -95,8 +95,7 @@ uint8_t g_lastObservedRawScreen = 255;
 bool g_titleReachedLogged = false;
 bool g_menuContinuationLogged = false;
 bool g_loadingUnblockDone = false;
-bool g_nativeBattleUpdateReached = false;
-bool g_nativeBattlePatchRestoreOk = true;
+NativeBattleCleanupLifecycle g_nativeBattleCleanup;
 bool g_nativeCleanupFallbackSuppressed = false;
 
 uint32_t g_battleUpdateSlotAddress = 0;
@@ -687,8 +686,7 @@ bool RequestNativeExit(const FrontendContext& ctx, ScreenId screen, const char* 
         const bool patchRestoreOk =
             takeover::EnsureRevivalGraphicsPatchSetEnabled(
                 "frontend_return_before_native_battle_exit");
-        g_nativeBattlePatchRestoreOk = patchRestoreOk;
-        g_nativeBattleUpdateReached = false;
+        g_nativeBattleCleanup.Prepare(patchRestoreOk);
         mod::Log(
             "FRONTEND_RETURN_PATCH_STATE_RESTORED result=%d",
             patchRestoreOk ? 1 : 0);
@@ -888,8 +886,7 @@ void RequestForceTitleFallback(const char* reason)
         && g_nativeStartScreen == ScreenId::Battle
         && (g_state == ReturnState::NativeExitRequested
             || g_state == ReturnState::WaitingForNativeExit)
-        && g_nativeBattleUpdateReached
-        && g_nativeBattlePatchRestoreOk)
+        && g_nativeBattleCleanup.CanSuppressFallback())
     {
         if (!g_nativeCleanupFallbackSuppressed)
         {
@@ -1354,8 +1351,7 @@ ReturnResult BeginReturnToFrontend(const ReturnRequest& request)
     g_menuContinuationLogged = false;
     g_loadingUnblockDone = false;
     g_nativeStartScreen = ScreenId::Unknown;
-    g_nativeBattleUpdateReached = false;
-    g_nativeBattlePatchRestoreOk = true;
+    g_nativeBattleCleanup.Prepare(true);
     g_nativeCleanupFallbackSuppressed = false;
 
     EnsureFrontendReturnUpdateHooks();
@@ -1524,7 +1520,7 @@ extern "C" char __cdecl FrontendReturnBattleUpdateImpl(uint32_t screenContext)
         && (g_state == ReturnState::NativeExitRequested
             || g_state == ReturnState::WaitingForNativeExit))
     {
-        g_nativeBattleUpdateReached = true;
+        g_nativeBattleCleanup.ObserveUpdate();
     }
 
     static constexpr bool kLogBattleUpdateDiag = false;

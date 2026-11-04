@@ -129,9 +129,25 @@ int main()
     join.Reset();
     assert(!join.IsActive());
 
+    HostListenerDebounce listener;
+    assert(!listener.IsSettled(100));
+    assert(listener.Observe(2, 0));
+    assert(!listener.IsSettled(99) && listener.IsSettled(100));
+    assert(!listener.Observe(2, 101) && listener.IsSettled(101));
+    assert(listener.Observe(4, 120) && !listener.IsSettled(219));
+    assert(listener.IsSettled(220));
+    listener.Reset();
+    assert(listener.Observe(4, 0xFFFFFFF0u));
+    assert(!listener.IsSettled(0x53u) && listener.IsSettled(0x54u));
+
     HostStartupState host;
     assert(!host.IsActive());
     host.BeginDiscovery();
+    assert(!host.HasAddressResult());
+    host.CompleteAddressFetch(false);
+    assert(host.AddressFetchFailed() && host.HasAddressResult());
+    host.CompleteAddressFetch(true);
+    assert(host.AddressFetchSucceeded() && !host.AddressFetchFailed());
     assert(host.IsDiscovering() && !host.IsSessionQueued());
     host.BeginSessionStart();
     assert(host.IsActive() && !host.IsDiscovering() && !host.IsSessionQueued());

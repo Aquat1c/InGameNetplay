@@ -31,7 +31,9 @@ namespace netplay::debug_overlay
 {
 namespace
 {
-bool g_inited = false;
+enum class ImGuiPhase { Dormant, Ready, AwaitingDevice };
+ImGuiPhase g_imguiPhase = ImGuiPhase::Dormant;
+bool HasImGuiContext() { return g_imguiPhase != ImGuiPhase::Dormant; }
 ImGuiContext* g_context = nullptr;
 DWORD g_contextThread = 0;
 EfzOverlayResetGate g_resetGate;
@@ -56,7 +58,7 @@ HRESULT __cdecl BeforeOverlayReset(void* device, uint32_t epoch) {
     const auto result = g_resetGate.BeforeReset(device, epoch, GetCurrentThreadId(), invalidate);
     if (result != EfzOverlayResetGate::Result::Ok) return ResetGateResult(result);
     if (invalidate) {
-        if (!g_context || !g_inited) return E_UNEXPECTED;
+        if (!g_context || !HasImGuiContext()) return E_UNEXPECTED;
         EfzScopedImGuiContext context(g_context);
         ImGui_ImplDX9_InvalidateDeviceObjects();
         g_resetGate.DidInvalidateBackend();
@@ -73,7 +75,7 @@ HRESULT __cdecl AfterOverlayReset(void* device, uint32_t epoch, uint32_t ready) 
     if (!ready) return S_OK;
     if (g_resetGate.BoundDevice() == device) {
         if (!g_resetGate.BackendInvalidatedFor(device)) return HRESULT_FROM_WIN32(ERROR_BUSY);
-        if (!g_context || !g_inited) return E_UNEXPECTED;
+        if (!g_context || !HasImGuiContext()) return E_UNEXPECTED;
         const HRESULT cooperative = static_cast<IDirect3DDevice9*>(device)->TestCooperativeLevel();
         if (cooperative != D3D_OK) return cooperative;
         EfzScopedImGuiContext context(g_context);
@@ -719,7 +721,7 @@ void LoadRtFonts()
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     DeviceRenderScope input;
-    if (input.Admitted() && g_inited)
+    if (input.Admitted() && HasImGuiContext())
     {
         if (msg == WM_KEYDOWN && wParam == VK_OEM_5
             && netplay::mod_settings::IsDebugMenuEnabled())
@@ -749,7 +751,7 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 bool ShutdownImGui()
 {
-    if (!g_inited)
+    if (!HasImGuiContext())
     {
         return true;
     }
@@ -791,7 +793,7 @@ bool ShutdownImGui()
             mod::Log(
                 "DebugOverlay: WndProc restore skipped, detour not top-level "
                 "hwnd=%p current=%p hook=%p previous=%p readErr=%lu "
-                "(deinitialising; detour is inert once g_inited clears)",
+                "(deinitialising; detour is inert once the context is shut down)",
                 g_hwnd,
                 reinterpret_cast<void*>(currentValue),
                 reinterpret_cast<void*>(&DebugWndProc),
@@ -806,7 +808,7 @@ bool ShutdownImGui()
     g_context = nullptr;
     g_contextThread = 0;
     g_resetGate.UnbindBackend();
-    g_inited = false;
+    g_imguiPhase = ImGuiPhase::Dormant;
     g_device = nullptr;
     g_hwnd = nullptr;
     g_badgeFont = nullptr;
@@ -843,11 +845,11 @@ void GetRenderTargetSize(IDirect3DDevice9* device, int* outW, int* outH)
 bool EnsureInited(IDirect3DDevice9* device)
 {
     if (!g_resetGate.CanRender(device, GetCurrentThreadId())) return false;
-    if (g_inited && g_device == device)
+    if (HasImGuiContext() && g_device == device)
     {
         return true;
     }
-    if (g_inited && g_device != device)
+    if (HasImGuiContext() && g_device != device)
     {
         HWND replacementHwnd = nullptr;
         D3DDEVICE_CREATION_PARAMETERS replacementCp = {};
@@ -864,6 +866,7 @@ bool EnsureInited(IDirect3DDevice9* device)
             if (g_device) ImGui_ImplDX9_Shutdown();
             g_resetGate.UnbindBackend();
             g_device = nullptr;
+            g_imguiPhase = ImGuiPhase::AwaitingDevice;
             if (!ImGui_ImplDX9_Init(device))
             {
                 mod::Log(
@@ -872,6 +875,7 @@ bool EnsureInited(IDirect3DDevice9* device)
                 return false;
             }
             g_device = device;
+            g_imguiPhase = ImGuiPhase::Ready;
             g_resetGate.BindBackend(device, GetCurrentThreadId());
             mod::Log(
                 "DebugOverlay: DX9 backend rebound device=%p hwnd=%p",
@@ -934,7 +938,7 @@ bool EnsureInited(IDirect3DDevice9* device)
 
     g_hwnd = hwnd;
     g_device = device;
-    g_inited = true;
+    g_imguiPhase = ImGuiPhase::Ready;
     g_resetGate.BindBackend(device, GetCurrentThreadId());
     mod::Log("DebugOverlay: ImGui initialised hwnd=0x%p device=0x%p", hwnd, device);
     return true;
@@ -1301,7 +1305,7 @@ bool ReplaceChainedWindowProc(
     WNDPROC expectedPrevious,
     WNDPROC replacement)
 {
-    if (!g_inited
+    if (!HasImGuiContext()
         || hwnd == nullptr
         || hwnd != g_hwnd
         || expectedPrevious == nullptr
@@ -1322,7 +1326,7 @@ bool ReplaceChainedWindowProc(
 
 bool HasChainedWindowProc(HWND hwnd, WNDPROC expectedPrevious)
 {
-    if (!g_inited
+    if (!HasImGuiContext()
         || hwnd == nullptr
         || hwnd != g_hwnd
         || expectedPrevious == nullptr
@@ -1362,7 +1366,7 @@ void Render(IDirect3DDevice9* device)
     const bool menuWantsRtText = netplay::mod_settings::IsMenuTtfTextEnabled()
         && netplay::hooks::IsNetplayMenuActive()
         && !netplay::hooks::IsOnlineSimulationUiSuspended();
-    const bool needsInitialization = (debugAvailable || menuWantsRtText) && !g_inited;
+    const bool needsInitialization = (debugAvailable || menuWantsRtText) && !HasImGuiContext();
     if (!needsInitialization && !wantPanel && !wantIndicator && !wantRtText)
     {
         return;
@@ -1412,7 +1416,7 @@ void Render(IDirect3DDevice9* device)
     }
 #endif
 
-    if (!needsInitialization && !wantIndicator && !wantRtText && !g_inited)
+    if (!needsInitialization && !wantIndicator && !wantRtText && !HasImGuiContext())
     {
         return;
     }
@@ -1499,7 +1503,7 @@ bool IsDebugPanelActive()
 
 bool IsRtTextAvailable()
 {
-    return g_inited && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
+    return HasImGuiContext() && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
 }
 
 bool RtTextHasExtendedGlyphs()

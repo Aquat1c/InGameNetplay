@@ -1206,12 +1206,13 @@ void SetSelection(uint32_t screenContext, int selection)
 
 constexpr DWORD kOptionsSlideDurationMs = 150;
 constexpr int kOptionsSlideDistance = 306;
-int g_optionsSlideDir = 0;
+enum class SlidePhase : int { Idle = 0, Left = -1, Right = 1 };
+SlidePhase g_optionsSlidePhase = SlidePhase::Idle;
 DWORD g_optionsSlideStartTick = 0;
 
 void StartOptionsSlide(int direction)
 {
-    g_optionsSlideDir = direction > 0 ? 1 : -1;
+    g_optionsSlidePhase = direction > 0 ? SlidePhase::Right : SlidePhase::Left;
     g_optionsSlideStartTick = GetTickCount();
 }
 
@@ -3796,19 +3797,19 @@ bool IsSaveOverlayActive()
 
 int GetOptionsSlideOffsetX()
 {
-    if (g_optionsSlideDir == 0)
+    if (g_optionsSlidePhase == SlidePhase::Idle)
     {
         return 0;
     }
     const DWORD elapsed = GetTickCount() - g_optionsSlideStartTick;
     if (elapsed >= kOptionsSlideDurationMs)
     {
-        g_optionsSlideDir = 0;
+        g_optionsSlidePhase = SlidePhase::Idle;
         return 0;
     }
     const float remaining = 1.0f - static_cast<float>(elapsed) / static_cast<float>(kOptionsSlideDurationMs);
     const float eased = remaining * remaining;
-    return static_cast<int>(eased * static_cast<float>(kOptionsSlideDistance)) * g_optionsSlideDir;
+    return static_cast<int>(eased * static_cast<float>(kOptionsSlideDistance)) * static_cast<int>(g_optionsSlidePhase);
 }
 
 bool IsBusy()

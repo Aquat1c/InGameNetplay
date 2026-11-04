@@ -1,6 +1,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/host_protocol_state.h"
 #include "netplay/bridge/helper_delay_disconnect.h"
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
@@ -72,7 +73,7 @@ struct ProtocolRecoveryMarkerDisk
 
 struct TemporaryHostProtocolOverride
 {
-    bool active = false;
+    HostProtocolLifecycle lifecycle;
     bool previousValueExisted = false;
     std::wstring iniPath;
     std::wstring previousValue;
@@ -83,7 +84,6 @@ struct TemporaryHostProtocolOverride
     network::NetworkFamily listenerCandidateFamily =
         network::NetworkFamily::IPv4;
     uint16_t listenerCandidatePort = 0;
-    DWORD listenerCandidateFirstTick = 0;
     LONG lastRejectedListenerSerial = 0;
 };
 
@@ -616,7 +616,7 @@ void CopyHostProtocolOverrideStateUnlocked(
     }
 
     HostProtocolOverrideState state = {};
-    state.active = g_temporaryHostProtocolOverride.active;
+    state.active = g_temporaryHostProtocolOverride.lifecycle.Active();
     state.originalValueExisted =
         g_temporaryHostProtocolOverride.previousValueExisted;
     state.effectiveFamily =
@@ -3147,7 +3147,7 @@ bool RecoverTemporaryHostProtocolOverride(const char* reason)
     std::lock_guard<std::recursive_mutex> overrideLock(
         g_temporaryHostProtocolMutex);
 
-    if (g_temporaryHostProtocolOverride.active)
+    if (g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         return true;
     }
@@ -3177,7 +3177,7 @@ bool PrepareTemporaryHostProtocolOverride(
 
     RestoreTemporaryHostProtocolOverride(
         "superseded by new Revival netplay session Host attempt");
-    if (g_temporaryHostProtocolOverride.active)
+    if (g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         mod::Log(
             "Takeover: Revival netplay session Protocol preparation rejected "
@@ -3247,7 +3247,7 @@ bool PrepareTemporaryHostProtocolOverride(
         return false;
     }
 
-    pending.active = true;
+    pending.lifecycle.Begin();
     g_temporaryHostProtocolOverride = std::move(pending);
     mod::Log(
         "Takeover: Revival netplay session temporary Protocol written "
@@ -3264,7 +3264,7 @@ void RestoreTemporaryHostProtocolOverride(const char* reason)
     std::lock_guard<std::recursive_mutex> overrideLock(
         g_temporaryHostProtocolMutex);
 
-    if (!g_temporaryHostProtocolOverride.active)
+    if (!g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         return;
     }
@@ -3359,7 +3359,7 @@ static void HandleTemporaryHostProtocolListenerAckImpl(
     std::lock_guard<std::recursive_mutex> overrideLock(
         g_temporaryHostProtocolMutex);
 
-    if (!g_temporaryHostProtocolOverride.active)
+    if (!g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         return;
     }
@@ -3416,13 +3416,14 @@ static void HandleTemporaryHostProtocolListenerAckImpl(
         g_temporaryHostProtocolOverride.listenerCandidateFamily =
             network::NetworkFamily::IPv4;
         g_temporaryHostProtocolOverride.listenerCandidatePort = 0;
-        g_temporaryHostProtocolOverride.listenerCandidateFirstTick = 0;
+        g_temporaryHostProtocolOverride.lifecycle.RejectCandidate();
         return;
     }
 
     const DWORD nowTick = GetTickCount();
     const bool sameCandidate =
-        g_temporaryHostProtocolOverride.listenerCandidateSerial
+        g_temporaryHostProtocolOverride.lifecycle.HasCandidate()
+        && g_temporaryHostProtocolOverride.listenerCandidateSerial
                 == serial
         && g_temporaryHostProtocolOverride
                .listenerCandidateProcessId
@@ -3441,8 +3442,7 @@ static void HandleTemporaryHostProtocolListenerAckImpl(
             observedFamily;
         g_temporaryHostProtocolOverride.listenerCandidatePort =
             observedPort;
-        g_temporaryHostProtocolOverride.listenerCandidateFirstTick =
-            nowTick;
+        g_temporaryHostProtocolOverride.lifecycle.BeginCandidate(nowTick);
         mod::Log(
             "Takeover: Revival netplay session listener Protocol "
             "candidate matched serial=%ld family=%s port=%u pid=%lu "
@@ -3458,10 +3458,7 @@ static void HandleTemporaryHostProtocolListenerAckImpl(
     }
 
     if (!allowImmediateHandoffAck
-        && nowTick
-            - g_temporaryHostProtocolOverride
-                  .listenerCandidateFirstTick
-        < 100u)
+        && !g_temporaryHostProtocolOverride.lifecycle.CandidateMature(nowTick))
     {
         return;
     }
@@ -3799,7 +3796,7 @@ bool BeginOptionsIniAccess(
     }
 
     g_temporaryHostProtocolMutex.lock();
-    if (!g_temporaryHostProtocolOverride.active)
+    if (!g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         std::wstring wideIniPath = GameDirectoryWide();
         if (!wideIniPath.empty())
@@ -3818,7 +3815,7 @@ bool BeginOptionsIniAccess(
 
     CopyHostProtocolOverrideStateUnlocked(outState);
     if (writeAccess
-        && g_temporaryHostProtocolOverride.active)
+        && g_temporaryHostProtocolOverride.lifecycle.Active())
     {
         g_temporaryHostProtocolMutex.unlock();
         return false;
@@ -3922,7 +3919,7 @@ bool WriteIni(
         }
 
         wroteProtocol =
-            g_temporaryHostProtocolOverride.active
+            g_temporaryHostProtocolOverride.lifecycle.Active()
             && g_temporaryHostProtocolOverride.writtenFamily
                 == sessionFamily
             && g_temporaryHostProtocolOverride.iniPath == wideIniPath;

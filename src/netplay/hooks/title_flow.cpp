@@ -2668,8 +2668,7 @@ void ActivateChallengeHostingOverlay(
     g_hostingOverlay.preferredFamily = preferredFamily;
     g_hostingOverlay.effectiveFamily = effectiveFamily;
     g_hostingOverlay.usedFamilyFallback = usedFamilyFallback;
-    g_hostingOverlay.ipFetchDone = true;
-    g_hostingOverlay.ipFetchFailed = publicIp == nullptr || publicIp[0] == '\0';
+    g_hostingOverlay.CompleteAddressFetch(publicIp != nullptr && publicIp[0] != '\0');
     g_hostingOverlay.QueueSession();
     g_hostingOverlay.familyRetryAllowed = true;
     g_hostingOverlay.listenerWaitStartTick = GetTickCount();
@@ -2791,8 +2790,7 @@ static void PumpDirectHostDiscovery()
     const netplay::lobby::PublicIpDiscoveryResult result = task->result;
     g_pendingHostDiscovery.reset();
     g_hostingOverlay.BeginSessionStart();
-    g_hostingOverlay.ipFetchDone = true;
-    g_hostingOverlay.ipFetchFailed = result.publicIp.empty();
+    g_hostingOverlay.CompleteAddressFetch(!result.publicIp.empty());
     g_hostingOverlay.preferredFamily =
         task->originalPreferredFamily;
     g_hostingOverlay.effectiveFamily = result.effectiveFamily;
@@ -3272,15 +3270,8 @@ static void PumpHostListenerObservation()
     }
 
     const DWORD listenerCandidateTick = GetTickCount();
-    if (g_hostingOverlay.listenerMismatchSerial
-            != observation.serial)
+    if (g_hostingOverlay.listenerDebounce.Observe(observation.serial, listenerCandidateTick))
     {
-        g_hostingOverlay.listenerMismatchSerial =
-            observation.serial;
-        g_hostingOverlay.listenerMismatchPort =
-            observation.port;
-        g_hostingOverlay.listenerMismatchFirstTick =
-            listenerCandidateTick;
         mod::Log(
             "REVIVAL_HOST_LISTENER_CANDIDATE family=%s port=%u "
             "serial=%u debounceMs=100",
@@ -3289,9 +3280,7 @@ static void PumpHostListenerObservation()
             observation.serial);
         return;
     }
-    if (listenerCandidateTick
-            - g_hostingOverlay.listenerMismatchFirstTick
-        < 100u)
+    if (!g_hostingOverlay.listenerDebounce.IsSettled(listenerCandidateTick))
     {
         return;
     }
@@ -3321,9 +3310,7 @@ static void PumpHostListenerObservation()
     }
 
     g_hostingOverlay.listenerMismatch = false;
-    g_hostingOverlay.listenerMismatchSerial = 0;
-    g_hostingOverlay.listenerMismatchPort = 0;
-    g_hostingOverlay.listenerMismatchFirstTick = 0;
+    g_hostingOverlay.listenerDebounce.Reset();
 
     if (observation.expectedFamilyKnown
         && !observation.familyMatches)
@@ -3489,7 +3476,6 @@ static void RestoreHostingOverlayFromAsyncHost()
     {
         g_hostingOverlay.ListenerReady();
     }
-    g_hostingOverlay.ipFetchDone = true;
     g_hostingOverlay.writeNicknameToIni = false;
     CopyBoundedText(
         g_hostingOverlay.hostNickname,
@@ -3509,8 +3495,7 @@ static void RestoreHostingOverlayFromAsyncHost()
             != networkConfig.effectiveFamily;
         g_hostingOverlay.automaticFamilyRetryAttempted =
             networkConfig.automaticFamilyRetryAttempted;
-        g_hostingOverlay.ipFetchFailed =
-            networkConfig.publicAddress.empty();
+        g_hostingOverlay.CompleteAddressFetch(!networkConfig.publicAddress.empty());
         CopyBoundedText(
             g_hostingOverlay.publicIp,
             sizeof(g_hostingOverlay.publicIp),
@@ -3523,7 +3508,7 @@ static void RestoreHostingOverlayFromAsyncHost()
             g_netplayMenuState.hostFamily;
         g_hostingOverlay.effectiveFamily =
             g_netplayMenuState.hostFamily;
-        g_hostingOverlay.ipFetchFailed = true;
+        g_hostingOverlay.CompleteAddressFetch(false);
     }
 
     mod::Log(
@@ -4692,9 +4677,6 @@ void HandoffSpectateSession(uint32_t screenContext)
     ClearNetplayStatusMessage();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
-    g_pendingVsHumanAutoConfirm = false;
-    g_pendingVsHumanAutoConfirmTick = 0;
-    g_pendingVsHumanAutoConfirmLastLogTick = 0;
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
@@ -4857,9 +4839,6 @@ void EnterNetplayMenu(uint32_t screenContext, bool skipFadeOut)
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     ResetWindowFocusInputSuppression();
-    g_pendingVsHumanAutoConfirm = false;
-    g_pendingVsHumanAutoConfirmTick = 0;
-    g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
     ResetVsHumanHandoffWarmup("enter_netplay_menu");
@@ -5014,9 +4993,6 @@ void LeaveNetplayMenu(uint32_t screenContext, bool keepHostSession)
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
     ResetWindowFocusInputSuppression();
-    g_pendingVsHumanAutoConfirm = false;
-    g_pendingVsHumanAutoConfirmTick = 0;
-    g_pendingVsHumanAutoConfirmLastLogTick = 0;
     g_pendingGlobalStateTransition = -1;
     g_returnToNetplayAfterMatch = false;
     ResetVsHumanHandoffWarmup("leave_netplay_menu");
@@ -5212,9 +5188,6 @@ void HandoffConnectedSessionToVsHumanState(uint32_t screenContext)
     ClearNetplayStatusMessage();
     g_hasLoggedInputSnapshot = false;
     g_netplayEscapeDown = false;
-    g_pendingVsHumanAutoConfirm = false;
-    g_pendingVsHumanAutoConfirmTick = 0;
-    g_pendingVsHumanAutoConfirmLastLogTick = 0;
     ResetDelaySetupOverlayState();
     ResetSpectateConfirmOverlayState();
     ResetHostingOverlayState();
@@ -7351,8 +7324,8 @@ char UpdateNetplayMenu(uint32_t screenContext)
         if (g_hostingOverlay.IsActive()
             && !g_hostingOverlay.challengeMode
             && g_hostingOverlay.IsListening()
-            && g_hostingOverlay.ipFetchDone
-            && !g_hostingOverlay.ipFetchFailed)
+            && g_hostingOverlay.HasAddressResult()
+            && !g_hostingOverlay.AddressFetchFailed())
         {
             bool copyRequested = false;
             for (int playerIndex = 0; playerIndex < 2; ++playerIndex)

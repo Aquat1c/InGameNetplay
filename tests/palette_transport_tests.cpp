@@ -41,7 +41,7 @@ int WSAAPI ReceiveFixture(SOCKET, char* buffer, int capacity, int, sockaddr* fro
         std::memset(buffer + validSize, 0xAA, 160 - validSize);
         return 160;
     }
-    g_stop.store(true);
+    g_phase.store(TransportPhase::Stopping);
     return static_cast<int>(validSize);
 }
 
@@ -54,7 +54,7 @@ int main()
     g_peer.sin_family = AF_INET;
     g_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     g_peer.sin_port = htons(10800);
-    g_stop.store(false);
+    g_phase.store(TransportPhase::Running);
     RecvThreadMain();
     Expect(received == 3, "oversized datagram does not stop receive loop");
     Expect(g_inbound.size() == 1 && g_inbound[0].size() == validSize

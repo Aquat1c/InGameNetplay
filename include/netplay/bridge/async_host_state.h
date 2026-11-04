@@ -3,6 +3,24 @@
 
 namespace netplay::bridge::async_host
 {
+enum class ReturnKeyState { Idle, WaitingForFrontend };
+struct ReturnKeyLifecycle
+{
+    ReturnKeyState state = ReturnKeyState::Idle;
+    int ticks = 0;
+    bool Pending() const { return state == ReturnKeyState::WaitingForFrontend; }
+    void Begin() { state = ReturnKeyState::WaitingForFrontend; }
+    void Clear() { state = ReturnKeyState::Idle; }
+    bool AdvanceTimeout()
+    {
+        if (!Pending()) { ticks = 0; return false; }
+        if (++ticks <= 1200) return false;
+        Clear();
+        ticks = 0;
+        return true;
+    }
+};
+
 enum class ListenerState : uint8_t { Inactive, Waiting, Stabilizing, Ready, Failed };
 enum class InitialFamilyMismatch : uint8_t { Disabled, Available, Deferred };
 

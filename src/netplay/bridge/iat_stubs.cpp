@@ -2511,7 +2511,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
         {
             const LONG serial = block->consoleSerial;
             const LONG servedSerial = InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0);
-            if (serial > 0 && serial != servedSerial)
+            if (console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Pending)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
                 MOD_LIFECYCLE_TRACE(
@@ -2536,7 +2536,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     serial,
                     servedSerial);
             const bool controlWakeReader = hostReader
-                || (currentBlock && serial > 0 && servedSerial >= serial
+                || (currentBlock && console_handoff::ReadOrderedPromptProgress(serial, servedSerial) == console_handoff::PromptState::Served
                     && console_handoff::IsControlWakeSession(false,
                         InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
                         block->initParams[0] == kLocalRoleOnline));
@@ -2618,14 +2618,17 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
-            if (auxSerial > 0 && serial > 0 && serial == servedSerial && block->consoleInputAux[0] != '\0')
+            if (auxSerial > 0 && console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Served && block->consoleInputAux[0] != '\0')
             {
                 const int roleMode = block->initParams[0];
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
                 const bool delayPromptPending = console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending;
                 const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
-                const bool auxNotServedYet = servedAuxSerial != auxSerial;
+                const auto auxState = console_handoff::ReadAuxiliaryScript(
+                    auxSerial, servedAuxSerial, g_injectedActiveConsoleAuxSerial,
+                    InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0));
+                const bool auxNotServedYet = console_handoff::AuxiliaryScriptPending(auxState);
                 bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
                 if (!allowAuxNow && auxNotServedYet && (roleMode == kLocalRoleOnline || roleMode == kLocalRoleSpectate))
                 {
@@ -2643,7 +2646,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, 0);
                 }
 
-                if (servedAuxSerial != auxSerial)
+                if (console_handoff::AuxiliaryScriptPending(auxState))
                 {
                     char auxLine[128] = {};
                     LONG auxOffset = InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0);
@@ -2680,7 +2683,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             }
 
         maybe_default_input:
-            if (serial > 0 && serial == servedSerial && nNumberOfCharsToRead <= 0x80u)
+            if (console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Served && nNumberOfCharsToRead <= 0x80u)
             {
                 const LONG scPromptSerial = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
                 const LONG scPromptServed = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
@@ -2708,7 +2711,10 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                             "Takeover: spectate confirm prompt waiting for overlay selection promptSerial=%ld",
                             static_cast<long>(scPromptSerial));
                     }
-                    if (nowTickSc - g_injectedSpectateConfirmPromptWaitStartTick < kPromptSpectateConfirmWaitTimeoutMs)
+                    if (console_handoff::ReadSpectatorWaitDeadline(
+                            g_injectedSpectateConfirmPromptWaitStartTick,
+                            nowTickSc, kPromptSpectateConfirmWaitTimeoutMs)
+                        == console_handoff::SpectatorWaitState::Waiting)
                     {
                         if (consoleEvent != nullptr)
                         {
@@ -3011,7 +3017,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
         {
             const LONG serial = block->consoleSerial;
             const LONG servedSerial = InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0);
-            if (serial > 0 && serial != servedSerial)
+            if (console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Pending)
             {
                 InterlockedExchange(&g_injectedLastConsoleSerialServed, serial);
                 MOD_LIFECYCLE_TRACE(
@@ -3036,7 +3042,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     serial,
                     servedSerial);
             const bool controlWakeReader = hostReader
-                || (currentBlock && serial > 0 && servedSerial >= serial
+                || (currentBlock && console_handoff::ReadOrderedPromptProgress(serial, servedSerial) == console_handoff::PromptState::Served
                     && console_handoff::IsControlWakeSession(false,
                         InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
                         block->initParams[0] == kLocalRoleOnline));
@@ -3118,14 +3124,17 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             }
 
             const LONG auxSerial = block->consoleAuxSerial;
-            if (auxSerial > 0 && serial > 0 && serial == servedSerial && block->consoleInputAux[0] != '\0')
+            if (auxSerial > 0 && console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Served && block->consoleInputAux[0] != '\0')
             {
                 const int roleMode = block->initParams[0];
                 const LONG promptSerial = InterlockedCompareExchange(&g_injectedDelayPromptSerial, 0, 0);
                 const LONG promptServed = InterlockedCompareExchange(&g_injectedDelayPromptServedSerial, 0, 0);
                 const bool delayPromptPending = console_handoff::ReadPromptGeneration(promptSerial, promptServed) == console_handoff::PromptState::Pending;
                 const LONG servedAuxSerial = InterlockedCompareExchange(&g_injectedLastConsoleAuxSerialServed, 0, 0);
-                const bool auxNotServedYet = servedAuxSerial != auxSerial;
+                const auto auxState = console_handoff::ReadAuxiliaryScript(
+                    auxSerial, servedAuxSerial, g_injectedActiveConsoleAuxSerial,
+                    InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0));
+                const bool auxNotServedYet = console_handoff::AuxiliaryScriptPending(auxState);
                 bool allowAuxNow = (roleMode == kLocalRoleLocalPlay || roleMode == kLocalRoleTournament) || delayPromptPending;
                 if (!allowAuxNow && auxNotServedYet && (roleMode == kLocalRoleOnline || roleMode == kLocalRoleSpectate))
                 {
@@ -3143,7 +3152,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     InterlockedExchange(&g_injectedLastConsoleAuxSerialServed, 0);
                 }
 
-                if (servedAuxSerial != auxSerial)
+                if (console_handoff::AuxiliaryScriptPending(auxState))
                 {
                     char auxLine[128] = {};
                     LONG auxOffset = InterlockedCompareExchange(&g_injectedConsoleAuxScriptOffset, 0, 0);
@@ -3168,7 +3177,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
             }
 
         maybe_default_input_w:
-            if (serial > 0 && serial == servedSerial && nNumberOfCharsToRead <= 0x80u)
+            if (console_handoff::ReadPromptGeneration(serial, servedSerial) == console_handoff::PromptState::Served && nNumberOfCharsToRead <= 0x80u)
             {
                 const LONG scPromptSerialW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptSerial, 0, 0);
                 const LONG scPromptServedW = InterlockedCompareExchange(&g_injectedSpectateConfirmPromptServedSerial, 0, 0);
@@ -3196,7 +3205,10 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                             "Takeover: spectate confirm prompt waiting for overlay selection promptSerial=%ld",
                             static_cast<long>(scPromptSerialW));
                     }
-                    if (nowTickScW - g_injectedSpectateConfirmPromptWaitStartTick < kPromptSpectateConfirmWaitTimeoutMs)
+                    if (console_handoff::ReadSpectatorWaitDeadline(
+                            g_injectedSpectateConfirmPromptWaitStartTick,
+                            nowTickScW, kPromptSpectateConfirmWaitTimeoutMs)
+                        == console_handoff::SpectatorWaitState::Waiting)
                     {
                         if (consoleEvent != nullptr)
                         {

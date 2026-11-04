@@ -168,6 +168,34 @@ private:
     JoiningPhase phase_ = JoiningPhase::Hidden;
 };
 
+enum class ListenerObservationPhase { Empty, Debouncing, Stable };
+
+class HostListenerDebounce
+{
+public:
+    bool Observe(uint32_t serial, uint32_t now)
+    {
+        if (phase_ != ListenerObservationPhase::Empty && serial_ == serial) return false;
+        phase_ = ListenerObservationPhase::Debouncing;
+        serial_ = serial;
+        firstTick_ = now;
+        return true;
+    }
+    bool IsSettled(uint32_t now)
+    {
+        if (phase_ == ListenerObservationPhase::Debouncing && now - firstTick_ >= 100u)
+            phase_ = ListenerObservationPhase::Stable;
+        return phase_ == ListenerObservationPhase::Stable;
+    }
+    void Reset() { *this = {}; }
+private:
+    ListenerObservationPhase phase_ = ListenerObservationPhase::Empty;
+    uint32_t serial_ = 0;
+    uint32_t firstTick_ = 0;
+};
+
+enum class AddressFetchOutcome { Pending, Succeeded, Failed };
+
 enum class HostStartupPhase
 {
     Hidden,
@@ -194,7 +222,14 @@ public:
         return phase_ == HostStartupPhase::Failed || NeedsBridgeCancel();
     }
     bool NeedsBridgeCancel() const { return phase_ == HostStartupPhase::FailedAwaitingCancel; }
-    void Reset() { phase_ = HostStartupPhase::Hidden; }
+    bool HasAddressResult() const { return addressOutcome_ != AddressFetchOutcome::Pending; }
+    bool AddressFetchSucceeded() const { return addressOutcome_ == AddressFetchOutcome::Succeeded; }
+    bool AddressFetchFailed() const { return addressOutcome_ == AddressFetchOutcome::Failed; }
+    void CompleteAddressFetch(bool success)
+    {
+        addressOutcome_ = success ? AddressFetchOutcome::Succeeded : AddressFetchOutcome::Failed;
+    }
+    void Reset() { phase_ = HostStartupPhase::Hidden; addressOutcome_ = AddressFetchOutcome::Pending; }
     void BeginDiscovery() { phase_ = HostStartupPhase::DiscoveringAddress; }
     void BeginSessionStart() { phase_ = HostStartupPhase::StartingSession; }
     void QueueSession() { phase_ = HostStartupPhase::AwaitingListener; }
@@ -207,5 +242,6 @@ public:
 
 private:
     HostStartupPhase phase_ = HostStartupPhase::Hidden;
+    AddressFetchOutcome addressOutcome_ = AddressFetchOutcome::Pending;
 };
 }

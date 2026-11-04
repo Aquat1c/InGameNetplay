@@ -1214,7 +1214,7 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
             netplay::debug_overlay::RtTextProfile::OverlayBody,
             dimColor, kRtOverlayDim);
     }
-    else if (g_hostingOverlay.ipFetchFailed)
+    else if (g_hostingOverlay.AddressFetchFailed())
     {
         std::snprintf(
             line,
@@ -1329,8 +1329,8 @@ bool DrawHostingOverlayGdi(uint32_t screenContext, bool)
                 yellowColor, kRtOverlayYellow);
         }
         else if (g_hostingOverlay.IsListening()
-            && g_hostingOverlay.ipFetchDone
-            && !g_hostingOverlay.ipFetchFailed)
+            && g_hostingOverlay.HasAddressResult()
+            && !g_hostingOverlay.AddressFetchFailed())
         {
             DrawTransientTextCentered(
                 sv, Tr("Press C to copy IP address"), cL, cR, panelY + 42,

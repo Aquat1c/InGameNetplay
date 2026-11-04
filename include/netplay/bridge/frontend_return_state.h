@@ -2,6 +2,23 @@
 
 namespace netplay::bridge::frontend_return
 {
+enum class NativeBattleCleanupState { AwaitingUpdate, AwaitingUpdateWithPatchFailure, Reached, ReachedWithPatchFailure };
+struct NativeBattleCleanupLifecycle
+{
+    NativeBattleCleanupState state = NativeBattleCleanupState::AwaitingUpdate;
+    void Prepare(bool patchesRestored)
+    {
+        state = patchesRestored ? NativeBattleCleanupState::AwaitingUpdate : NativeBattleCleanupState::AwaitingUpdateWithPatchFailure;
+    }
+    void ObserveUpdate()
+    {
+        state = state == NativeBattleCleanupState::AwaitingUpdateWithPatchFailure
+            || state == NativeBattleCleanupState::ReachedWithPatchFailure
+            ? NativeBattleCleanupState::ReachedWithPatchFailure : NativeBattleCleanupState::Reached;
+    }
+    bool CanSuppressFallback() const { return state == NativeBattleCleanupState::Reached; }
+};
+
 enum class ReturnOwnership : long
 {
     Inactive,

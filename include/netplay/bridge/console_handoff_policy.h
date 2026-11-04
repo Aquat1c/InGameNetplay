@@ -6,6 +6,25 @@
 
 namespace netplay::bridge::console_handoff
 {
+enum class AuxiliaryScriptState { Unavailable, NewGeneration, FirstLine, Reading, Served };
+inline AuxiliaryScriptState ReadAuxiliaryScript(LONG request, LONG served, LONG active, LONG offset)
+{
+    if (request <= 0) return AuxiliaryScriptState::Unavailable;
+    if (request == served) return AuxiliaryScriptState::Served;
+    if (request != active) return AuxiliaryScriptState::NewGeneration;
+    return offset > 0 ? AuxiliaryScriptState::Reading : AuxiliaryScriptState::FirstLine;
+}
+inline bool AuxiliaryScriptPending(AuxiliaryScriptState state)
+{
+    return state == AuxiliaryScriptState::NewGeneration || state == AuxiliaryScriptState::FirstLine
+        || state == AuxiliaryScriptState::Reading;
+}
+enum class SpectatorWaitState { Waiting, TimedOut };
+inline SpectatorWaitState ReadSpectatorWaitDeadline(DWORD start, DWORD now, DWORD timeout)
+{
+    return now - start < timeout ? SpectatorWaitState::Waiting : SpectatorWaitState::TimedOut;
+}
+
 enum class PromptState { Unseen, Pending, Served };
 inline PromptState ReadPromptGeneration(LONG request, LONG served)
 {

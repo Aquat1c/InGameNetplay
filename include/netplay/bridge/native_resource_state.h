@@ -3,6 +3,13 @@
 
 namespace netplay::bridge::takeover
 {
+constexpr uint32_t kScheduledGracefulQuitTeardownDelayMs = 500u;
+enum class ScheduledQuitState : long { Idle, WaitingForPeerExit };
+constexpr bool ScheduledQuitReady(bool helperAlive, uint32_t elapsedMs)
+{
+    return !helperAlive || elapsedMs >= kScheduledGracefulQuitTeardownDelayMs;
+}
+
 enum class RenderContextState { Empty, Saved, Retained };
 struct RenderContextLifecycle
 {

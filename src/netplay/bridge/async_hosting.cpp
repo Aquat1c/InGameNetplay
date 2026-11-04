@@ -29,8 +29,7 @@ int g_lastPromptSerial = 0;
 int g_returnKeyVk = 0;
 std::string g_returnKeyDisplay = "F1";
 bool g_returnKeyWasDown = false;
-bool g_returnInProgress = false;
-int g_returnInProgressTicks = 0;
+ReturnKeyLifecycle g_returnKey;
 DWORD g_lastLoadingScreenTick = 0;
 constexpr DWORD kReturnKeyLoadLockoutMs = 1500;
 
@@ -90,18 +89,9 @@ void PollReturnKey()
         g_lastLoadingScreenTick = nowTick;
     }
 
-    if (g_returnInProgress)
+    if (g_returnKey.AdvanceTimeout())
     {
-        if (++g_returnInProgressTicks > 1200) // ~20s at 64fps
-        {
-            mod::Log("ASYNC_HOST_RETURN_KEY return stuck >20s - clearing to re-enable F1");
-            g_returnInProgress = false;
-            g_returnInProgressTicks = 0;
-        }
-    }
-    else
-    {
-        g_returnInProgressTicks = 0;
+        mod::Log("ASYNC_HOST_RETURN_KEY return stuck >20s - clearing to re-enable F1");
     }
 
     if (g_returnKeyVk == 0)
@@ -111,7 +101,7 @@ void PollReturnKey()
     const bool down = (GetAsyncKeyState(g_returnKeyVk) & 0x8000) != 0;
     const bool pressed = down && !g_returnKeyWasDown;
     g_returnKeyWasDown = down;
-    if (!pressed || g_returnInProgress || frontend_return::IsReturningToFrontend())
+    if (!pressed || g_returnKey.Pending() || frontend_return::IsReturningToFrontend())
     {
         return;
     }
@@ -149,7 +139,7 @@ void PollReturnKey()
         frontend_return::BeginReturnToFrontend(req);
     if (r.accepted || r.pending)
     {
-        g_returnInProgress = true;
+        g_returnKey.Begin();
         mod::Log(
             "ASYNC_HOST_RETURN_KEY accepted - returning to netplay menu (had_peer=%d)",
             g_state == State::PeerFoundHeld ? 1 : 0);
@@ -211,7 +201,7 @@ void AutoRehost(const char* reason)
               false);
 
     g_peerWasAlive = false;
-    g_returnInProgress = false;
+    g_returnKey.Clear();
     g_autoRehostCooldownTicks = 96;
 
     if (ok)
@@ -254,7 +244,7 @@ static void BeginHostTracking(
         && !networkConfig->automaticFamilyRetryAttempted);
     g_autoRehostCooldownTicks = 0;
     g_minimized = false;
-    g_returnInProgress = false;
+    g_returnKey.Clear();
     g_returnKeyWasDown = false;
     g_peerWasAlive = false;
 
@@ -322,7 +312,7 @@ bool ConsumeChallengeEnded()
 void ArmLobbyPresenceReturn()
 {
     ResolveReturnKey();
-    g_returnInProgress = false;
+    g_returnKey.Clear();
     g_returnKeyWasDown = false;
     frontend_return::EnsureFrontendReturnUpdateHooks();
 }
@@ -601,9 +591,9 @@ void RequestAccept()
 
 bool ConsumeReturnKeyArrival()
 {
-    if (g_returnInProgress)
+    if (g_returnKey.Pending())
     {
-        g_returnInProgress = false;
+        g_returnKey.Clear();
         g_returnKeyWasDown = false;
         mod::Log("ASYNC_HOST_RETURN_KEY arrival consumed at netplay menu");
         return true;
@@ -613,7 +603,7 @@ bool ConsumeReturnKeyArrival()
 
 bool OnNetplayMenuRestored()
 {
-    g_returnInProgress = false;
+    g_returnKey.Clear();
     return false;
 }
 
@@ -633,7 +623,7 @@ void Reset()
     g_origin = HostOrigin::Direct;
     g_minimized = false;
     g_lastPromptSerial = 0;
-    g_returnInProgress = false;
+    g_returnKey.Clear();
     g_returnKeyWasDown = false;
     g_peerWasAlive = false;
     g_listener.Reset();

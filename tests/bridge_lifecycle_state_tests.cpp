@@ -7,6 +7,7 @@
 #include "netplay/bridge/export_worker_state.h"
 #include "netplay/bridge/native_resource_state.h"
 #include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/host_protocol_state.h"
 #include <cstdio>
 int main() {
     using namespace netplay::bridge;
@@ -103,5 +104,34 @@ int main() {
     expect(console_handoff::ReadDelayHandoff(3, 2, 4, 4) == console_handoff::DelayHandoffState::InputServed, "served explicit input releases the held delay reader");
     expect(console_handoff::ReadTimeoutCleanup(true, 4, 5) == console_handoff::TimeoutCleanupState::WaitingForWake, "timeout cleanup cannot consume an earlier wake");
     expect(console_handoff::ReadTimeoutCleanup(false, 0, 0) == console_handoff::TimeoutCleanupState::Ready, "dead helper does not require a future wake");
+    async_host::ReturnKeyLifecycle returnKey;
+    returnKey.Begin();
+    for (int tick = 0; tick < 1200; ++tick) expect(!returnKey.AdvanceTimeout(), "return key remains blocked through 1200 ticks");
+    expect(returnKey.AdvanceTimeout() && !returnKey.Pending(), "return key timeout releases on tick 1201");
+    returnKey.Begin();
+    returnKey.Clear();
+    expect(!returnKey.AdvanceTimeout() && returnKey.ticks == 0, "cleared return resets its timeout at the next poll");
+    frontend_return::NativeBattleCleanupLifecycle nativeCleanup;
+    nativeCleanup.Prepare(false);
+    nativeCleanup.ObserveUpdate();
+    expect(!nativeCleanup.CanSuppressFallback(), "native update with failed patch restoration keeps fallback available");
+    nativeCleanup.Prepare(true);
+    expect(!nativeCleanup.CanSuppressFallback(), "restored patches alone do not prove native cleanup ran");
+    nativeCleanup.ObserveUpdate();
+    expect(nativeCleanup.CanSuppressFallback(), "native cleanup suppresses fallback only after restored update entry");
+    takeover::HostProtocolLifecycle protocol;
+    protocol.Begin();
+    expect(protocol.Active() && !protocol.HasCandidate(), "temporary protocol override remains owned before listener observation");
+    protocol.BeginCandidate(100);
+    expect(!protocol.CandidateMature(199) && protocol.CandidateMature(200), "protocol listener requires the original 100 ms debounce");
+    protocol.RejectCandidate();
+    expect(protocol.Active() && !protocol.HasCandidate(), "rejected candidate cannot release protocol restoration ownership");
+    expect(takeover::ScheduledQuitReady(true, 499) == false && takeover::ScheduledQuitReady(true, 500), "graceful quit retains the 500 ms helper grace period");
+    expect(takeover::ScheduledQuitReady(false, 0), "dead helper ends the graceful quit wait immediately");
+    expect(console_handoff::ReadAuxiliaryScript(3, 2, 1, 30) == console_handoff::AuxiliaryScriptState::NewGeneration, "new auxiliary generation ignores an old line offset");
+    expect(console_handoff::ReadAuxiliaryScript(3, 2, 3, 30) == console_handoff::AuxiliaryScriptState::Reading, "same auxiliary generation retains its line offset");
+    expect(console_handoff::ReadAuxiliaryScript(3, 3, 3, 30) == console_handoff::AuxiliaryScriptState::Served, "consumed auxiliary generation cannot replay lines");
+    expect(console_handoff::ReadSpectatorWaitDeadline(100, 199, 100) == console_handoff::SpectatorWaitState::Waiting, "spectator prompt waits until its exact deadline");
+    expect(console_handoff::ReadSpectatorWaitDeadline(100, 200, 100) == console_handoff::SpectatorWaitState::TimedOut, "spectator prompt timeout keeps the exact deadline");
     return failures ? 1 : 0;
 }

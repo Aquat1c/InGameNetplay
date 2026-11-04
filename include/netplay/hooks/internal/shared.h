@@ -128,8 +128,6 @@ struct HostingOverlayState : HostStartupState
     char hostNickname[64] = {};
     char targetName[64] = {};
     char errorText[128] = {};
-    bool ipFetchDone = false;
-    bool ipFetchFailed = false;
     uint32_t preferredSourceAttempts = 0;
     uint32_t preferredTransportFailures = 0;
     uint32_t preferredParseFailures = 0;
@@ -141,9 +139,7 @@ struct HostingOverlayState : HostStartupState
     bool familyFallbackNoticeStarted = false;
     DWORD familyFallbackNoticeStartTick = 0;
     DWORD listenerWaitStartTick = 0;
-    uint32_t listenerMismatchSerial = 0;
-    uint16_t listenerMismatchPort = 0;
-    DWORD listenerMismatchFirstTick = 0;
+    HostListenerDebounce listenerDebounce;
 };
 
 struct JoiningOverlayState : JoiningState
@@ -233,9 +229,6 @@ extern DWORD g_netplayStatusExpireTick;
 extern bool g_restoreReplaySelectionOnNextTitleUpdate;
 extern uint32_t g_replaySelectionGuardFramesRemaining;
 extern int8_t g_replaySelectionRestoreTarget;
-extern bool g_pendingVsHumanAutoConfirm;
-extern DWORD g_pendingVsHumanAutoConfirmTick;
-extern DWORD g_pendingVsHumanAutoConfirmLastLogTick;
 extern bool g_returnToNetplayAfterMatch;
 extern int g_recoveryRenderTraceFramesRemaining;
 extern InputSnapshot g_lastInputSnapshot;

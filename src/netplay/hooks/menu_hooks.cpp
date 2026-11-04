@@ -52,9 +52,6 @@ DWORD g_netplayStatusExpireTick = 0;
 bool g_restoreReplaySelectionOnNextTitleUpdate = false;
 uint32_t g_replaySelectionGuardFramesRemaining = 0;
 int8_t g_replaySelectionRestoreTarget = -1;
-bool g_pendingVsHumanAutoConfirm = false;
-DWORD g_pendingVsHumanAutoConfirmTick = 0;
-DWORD g_pendingVsHumanAutoConfirmLastLogTick = 0;
 bool g_returnToNetplayAfterMatch = false;
 InputSnapshot g_lastInputSnapshot = {};
 DelaySetupOverlayState g_delaySetupOverlay = {};
@@ -249,9 +246,6 @@ static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
 
     mod::ResetCrashRecoveryState();
     g_returnToNetplayAfterMatch = false;
-    g_pendingVsHumanAutoConfirm = false;
-    g_pendingVsHumanAutoConfirmTick = 0;
-    g_pendingVsHumanAutoConfirmLastLogTick = 0;
 
     netplay::bridge::recovery::PendingGameplayExitMenuEntry gameplayExit = {};
     const bool completedRecovery =
@@ -412,9 +406,6 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         {
             mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
-            g_pendingVsHumanAutoConfirm = false;
-            g_pendingVsHumanAutoConfirmTick = 0;
-            g_pendingVsHumanAutoConfirmLastLogTick = 0;
 
             if (g_lobbySession)
             {
@@ -447,9 +438,6 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
         {
             mod::ResetCrashRecoveryState();
             g_returnToNetplayAfterMatch = false;
-            g_pendingVsHumanAutoConfirm = false;
-            g_pendingVsHumanAutoConfirmTick = 0;
-            g_pendingVsHumanAutoConfirmLastLogTick = 0;
 
             if (exitMode == 0 || exitMode == 1)
             {
@@ -505,79 +493,6 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             SchedulePostExitTextCleanup("post_match_return");
             EnterNetplayMenu(screenContext, true);
             return 0;
-        }
-
-        if (g_pendingVsHumanAutoConfirm)
-        {
-            if (g_pendingVsHumanAutoConfirmTick == 0)
-            {
-                g_pendingVsHumanAutoConfirmTick = GetTickCount();
-                g_pendingVsHumanAutoConfirmLastLogTick = 0;
-            }
-
-            const auto bridgeStatus = netplay::bridge::GetStatus();
-            const auto bridgePhase = static_cast<netplay::bridge::NetbridgePhase>(bridgeStatus.phase);
-            if (bridgePhase != netplay::bridge::NetbridgePhase::Connected
-                && bridgePhase != netplay::bridge::NetbridgePhase::DelaySetup)
-            {
-                mod::Log(
-                    "HookedTitleUpdateImpl: canceled pending VS Human auto-confirm phase=%s",
-                    netplay::bridge::PhaseToString(bridgePhase));
-                g_pendingVsHumanAutoConfirm = false;
-                g_pendingVsHumanAutoConfirmTick = 0;
-                g_pendingVsHumanAutoConfirmLastLogTick = 0;
-            }
-            else
-            {
-                const bool syncReady =
-                    bridgeStatus.syncMode0Flag1084 == 4 &&
-                    (bridgeStatus.syncSessionByte == 0 ||
-                     bridgeStatus.syncSessionByte == 1 ||
-                     bridgeStatus.syncSessionByte == 2);
-
-                const DWORD nowTick = GetTickCount();
-                const DWORD elapsed = nowTick - g_pendingVsHumanAutoConfirmTick;
-                if (syncReady)
-                {
-                    (void)netplay::bridge::PrepareVsHumanHandoff();
-                    const int gameSystem = GetGameSystem(screenContext);
-                    auto* const inputBytes = reinterpret_cast<uint8_t*>(gameSystem);
-                    inputBytes[12] = 0;
-                    inputBytes[13] = 0;
-                    inputBytes[14] = 0;
-                    inputBytes[15] = 0;
-                    inputBytes[16] = 1;
-                    inputBytes[17] = 0;
-                    inputBytes[18] = 0;
-                    inputBytes[19] = 0;
-                    mod::Log(
-                        "HookedTitleUpdateImpl: injecting one-shot VS Human confirm syncReady=%d elapsed=%lums sync(mode=%d flag1084=%d session=%d)",
-                        syncReady ? 1 : 0,
-                        static_cast<unsigned long>(elapsed),
-                        bridgeStatus.syncGameMode,
-                        bridgeStatus.syncMode0Flag1084,
-                        bridgeStatus.syncSessionByte);
-                    g_pendingVsHumanAutoConfirm = false;
-                    g_pendingVsHumanAutoConfirmTick = 0;
-                    g_pendingVsHumanAutoConfirmLastLogTick = 0;
-                }
-                else
-                {
-                    if (g_pendingVsHumanAutoConfirmLastLogTick == 0 ||
-                        nowTick - g_pendingVsHumanAutoConfirmLastLogTick >= 1000)
-                    {
-                        mod::Log(
-                            "HookedTitleUpdateImpl: waiting VS Human sync elapsed=%lums sync(mode=%d flag1084=%d session=%d flags=%d/%d)",
-                            static_cast<unsigned long>(elapsed),
-                            bridgeStatus.syncGameMode,
-                            bridgeStatus.syncMode0Flag1084,
-                            bridgeStatus.syncSessionByte,
-                            bridgeStatus.syncGlobalFlag4964,
-                            bridgeStatus.syncGlobalFlag4965);
-                        g_pendingVsHumanAutoConfirmLastLogTick = nowTick;
-                    }
-                }
-            }
         }
 
         const char result = GetOriginalTitleUpdate()(screenContext);

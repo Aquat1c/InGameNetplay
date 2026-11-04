@@ -19,8 +19,8 @@ namespace
 {
 namespace P = netplay::interop::protocol;
 
-std::atomic<bool> g_running{false};
-std::atomic<bool> g_stop{false};
+enum class TransportPhase { Stopped, Running, Stopping };
+std::atomic<TransportPhase> g_phase{TransportPhase::Stopped};
 SOCKET g_sock = INVALID_SOCKET;
 sockaddr_in g_peer{};
 std::thread g_recvThread;
@@ -35,7 +35,7 @@ void RecvThreadMain()
     mod::Log("PaletteSocket: recv thread started");
     std::uint8_t buf[2048];
     sockaddr_in from{};
-    while (!g_stop.load(std::memory_order_acquire))
+    while (g_phase.load(std::memory_order_acquire) == TransportPhase::Running)
     {
         int fromLen = sizeof(from);
         const int n = recvfrom(g_sock, reinterpret_cast<char*>(buf),
@@ -43,7 +43,7 @@ void RecvThreadMain()
                                reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n == SOCKET_ERROR)
         {
-            if (g_stop.load(std::memory_order_acquire))
+            if (g_phase.load(std::memory_order_acquire) != TransportPhase::Running)
             {
                 break;
             }
@@ -83,7 +83,7 @@ void RecvThreadMain()
 
 bool Start(const char* peerIp, std::uint16_t port)
 {
-    if (g_running.load(std::memory_order_acquire))
+    if (g_phase.load(std::memory_order_acquire) != TransportPhase::Stopped)
     {
         return true;
     }
@@ -132,8 +132,7 @@ bool Start(const char* peerIp, std::uint16_t port)
     }
     g_peer.sin_addr.s_addr = addr;
 
-    g_stop.store(false, std::memory_order_release);
-    g_running.store(true, std::memory_order_release);
+    g_phase.store(TransportPhase::Running, std::memory_order_release);
     g_recvThread = std::thread(&RecvThreadMain);
     mod::Log("PaletteSocket: started peer=%s:%u localPort=%u",
              peerIp, static_cast<unsigned>(port), static_cast<unsigned>(port));
@@ -142,7 +141,9 @@ bool Start(const char* peerIp, std::uint16_t port)
 
 void Stop()
 {
-    g_stop.store(true, std::memory_order_release);
+    auto running = TransportPhase::Running;
+    (void)g_phase.compare_exchange_strong(running, TransportPhase::Stopping,
+        std::memory_order_acq_rel);
     if (g_sock != INVALID_SOCKET)
     {
         ::closesocket(g_sock);
@@ -161,17 +162,17 @@ void Stop()
         WSACleanup();
         g_wsaStarted = false;
     }
-    g_running.store(false, std::memory_order_release);
+    g_phase.store(TransportPhase::Stopped, std::memory_order_release);
 }
 
 bool IsRunning()
 {
-    return g_running.load(std::memory_order_acquire);
+    return g_phase.load(std::memory_order_acquire) != TransportPhase::Stopped;
 }
 
 bool SendSink(const std::uint8_t* datagram, std::size_t len, void*)
 {
-    if (!g_running.load(std::memory_order_acquire)
+    if (g_phase.load(std::memory_order_acquire) == TransportPhase::Stopped
         || g_sock == INVALID_SOCKET || datagram == nullptr || len == 0)
     {
         return false;

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -47,8 +48,8 @@ struct ScopedLock
 };
 
 volatile LONG g_started = 0;
-volatile LONG g_newerRelease = 0;
-volatile LONG g_updateAvailable = 0;
+enum class ReleaseAvailability { NoNewerRelease, NewerAcknowledged, NewerAvailable };
+std::atomic<ReleaseAvailability> g_availability{ReleaseAvailability::NoNewerRelease};
 std::string g_latest;                 // guarded by g_lock
 std::string g_acknowledged;           // guarded by g_lock
 
@@ -173,8 +174,9 @@ void RecomputeAvailabilityLocked()
 {
     const bool newer = !g_latest.empty()
         && netplay::version::IsNewer(g_latest, netplay::build_info::kVersion);
-    InterlockedExchange(&g_newerRelease, newer ? 1 : 0);
-    InterlockedExchange(&g_updateAvailable, (newer && g_latest != g_acknowledged) ? 1 : 0);
+    g_availability.store(!newer ? ReleaseAvailability::NoNewerRelease
+        : g_latest == g_acknowledged ? ReleaseAvailability::NewerAcknowledged
+        : ReleaseAvailability::NewerAvailable);
 }
 
 bool FetchLatestReleaseJson(std::string* outBody)
@@ -227,8 +229,8 @@ DWORD WINAPI WorkerThreadProc(LPVOID)
         ScopedLock guard(g_lock);
         g_latest = tag;
         RecomputeAvailabilityLocked();
-        newer = g_newerRelease != 0;
-        available = g_updateAvailable != 0;
+        newer = g_availability.load() != ReleaseAvailability::NoNewerRelease;
+        available = g_availability.load() == ReleaseAvailability::NewerAvailable;
     }
     mod::Log("UpdateCheck: latest release %s, running %s -> %s%s",
              tag.c_str(),
@@ -272,12 +274,12 @@ std::string LatestVersion()
 
 bool HasNewerRelease()
 {
-    return InterlockedCompareExchange(&g_newerRelease, 0, 0) != 0;
+    return g_availability.load() != ReleaseAvailability::NoNewerRelease;
 }
 
 bool IsUpdateAvailable()
 {
-    return InterlockedCompareExchange(&g_updateAvailable, 0, 0) != 0;
+    return g_availability.load() == ReleaseAvailability::NewerAvailable;
 }
 
 const char* BadgeText()

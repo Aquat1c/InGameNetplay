@@ -207,7 +207,8 @@ struct State
 State g_state = {};
 
 constexpr DWORD kPageSlideDurationMs = 185;
-int g_pageSlideDir = 0;
+enum class SlidePhase : int { Idle = 0, Left = -1, Right = 1 };
+SlidePhase g_pageSlidePhase = SlidePhase::Idle;
 DWORD g_pageSlideStartTick = 0;
 View g_pageSlideView = View::Browser;
 
@@ -219,26 +220,26 @@ void StartPageSlide(int direction, View view)
     {
         return;
     }
-    g_pageSlideDir = direction > 0 ? 1 : -1;
+    g_pageSlidePhase = direction > 0 ? SlidePhase::Right : SlidePhase::Left;
     g_pageSlideStartTick = GetTickCount();
     g_pageSlideView = view;
 }
 
 int GetPageSlideOffsetX(View view)
 {
-    if (g_pageSlideDir == 0 || g_pageSlideView != view)
+    if (g_pageSlidePhase == SlidePhase::Idle || g_pageSlideView != view)
     {
         return 0;
     }
     const DWORD elapsed = GetTickCount() - g_pageSlideStartTick;
     if (elapsed >= kPageSlideDurationMs)
     {
-        g_pageSlideDir = 0;
+        g_pageSlidePhase = SlidePhase::Idle;
         return 0;
     }
     const float remaining = 1.0f - static_cast<float>(elapsed) / static_cast<float>(kPageSlideDurationMs);
     const float eased = remaining * remaining;
-    return static_cast<int>(eased * static_cast<float>(kContentColumnW)) * g_pageSlideDir;
+    return static_cast<int>(eased * static_cast<float>(kContentColumnW)) * static_cast<int>(g_pageSlidePhase);
 }
 
 void FillRectClampedX(
@@ -281,8 +282,13 @@ struct RenderAssetState
 {
     std::string resolvedSpriteDirectory;
     bool spriteDirectoryResolved = false;
-    bool loadAttempted = false;
-    bool iconsReady = false;
+    enum class LoadPhase { Untried, Unavailable, Ready };
+    LoadPhase loadPhase = LoadPhase::Untried;
+    bool LoadAttempted() const { return loadPhase != LoadPhase::Untried; }
+    bool IconsReady() const { return loadPhase == LoadPhase::Ready; }
+    void BeginLoad() { loadPhase = LoadPhase::Unavailable; }
+    void CompleteLoad(bool loaded) { loadPhase = loaded ? LoadPhase::Ready : LoadPhase::Unavailable; }
+    void ResetLoad() { loadPhase = LoadPhase::Untried; }
     bool firstSpriteBlitLogged = false;
     bool gdiplusStarted = false;
     ULONG_PTR gdiplusToken = 0;
@@ -295,8 +301,12 @@ using EndSceneFn = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
 
 struct D3dOverlayState
 {
-    bool hookAttempted = false;
-    bool hookInstalled = false;
+    enum class HookPhase { Untried, Unavailable, Installed };
+    HookPhase hookPhase = HookPhase::Untried;
+    bool HookAttempted() const { return hookPhase != HookPhase::Untried; }
+    bool HookInstalled() const { return hookPhase == HookPhase::Installed; }
+    void BeginHookInstall() { hookPhase = HookPhase::Unavailable; }
+    void CompleteHookInstall(bool installed) { hookPhase = installed ? HookPhase::Installed : HookPhase::Unavailable; }
     bool minhookInitialized = false;
     bool endSceneObserved = false;
     bool firstD3dSpriteBlitLogged = false;
@@ -944,8 +954,7 @@ void PrimeRenderAssetDiagnostics()
     ReleaseRenderAssets();
     g_renderAssets.resolvedSpriteDirectory = ResolveBattleLogSpriteDirectory();
     g_renderAssets.spriteDirectoryResolved = !g_renderAssets.resolvedSpriteDirectory.empty();
-    g_renderAssets.loadAttempted = false;
-    g_renderAssets.iconsReady = false;
+    g_renderAssets.ResetLoad();
     g_renderAssets.firstSpriteBlitLogged = false;
     if (!g_renderAssets.spriteDirectoryResolved)
     {
@@ -1296,7 +1305,7 @@ void CollectDrawableBrowserCharacters(
         outP2Characters->clear();
     }
 
-    if (!g_renderAssets.iconsReady)
+    if (!g_renderAssets.IconsReady())
     {
         return;
     }
@@ -1509,24 +1518,24 @@ bool EnsureRenderAssetsLoaded(uint32_t screenContext)
 
     if (!g_renderAssets.spriteDirectoryResolved)
     {
-        if (!g_renderAssets.loadAttempted)
+        if (!g_renderAssets.LoadAttempted())
         {
-            g_renderAssets.loadAttempted = true;
+            g_renderAssets.BeginLoad();
             mod::Log("BattleLog::EnsureRenderAssetsLoaded: skipped spriteDirectoryResolved=0");
         }
         return false;
     }
 
-    if (g_renderAssets.iconsReady)
+    if (g_renderAssets.IconsReady())
     {
         return true;
     }
 
-    if (g_renderAssets.loadAttempted)
+    if (g_renderAssets.LoadAttempted())
     {
         return false;
     }
-    g_renderAssets.loadAttempted = true;
+    g_renderAssets.BeginLoad();
 
     if (!EnsureGdiplusStarted())
     {
@@ -1614,17 +1623,17 @@ bool EnsureRenderAssetsLoaded(uint32_t screenContext)
         ++loadedCount;
     }
 
-    g_renderAssets.iconsReady = loadedCount > 0;
+    g_renderAssets.CompleteLoad(loadedCount > 0);
     mod::Log(
         "BattleLog::EnsureRenderAssetsLoaded: using PNG sprite path loaded=%d/%zu dir='%s'",
         loadedCount,
         kCharacterSpriteFiles.size(),
         g_renderAssets.resolvedSpriteDirectory.c_str());
-    if (g_renderAssets.iconsReady)
+    if (g_renderAssets.IconsReady())
     {
         (void)EnsureD3d9OverlayHookInstalled();
     }
-    return g_renderAssets.iconsReady;
+    return g_renderAssets.IconsReady();
 }
 
 void ResetRenderAssetFrameState()
@@ -1673,8 +1682,7 @@ void ReleaseRenderAssets()
 
     g_renderAssets.gdiplusStarted = false;
     g_renderAssets.gdiplusToken = 0;
-    g_renderAssets.iconsReady = false;
-    g_renderAssets.loadAttempted = false;
+    g_renderAssets.ResetLoad();
 }
 
 void ReleaseD3dTextures()
@@ -1693,7 +1701,7 @@ void ReleaseD3dTextures()
 
 bool EnsureD3dTexturesReady(LPDIRECT3DDEVICE9 device)
 {
-    if (device == nullptr || !g_renderAssets.iconsReady)
+    if (device == nullptr || !g_renderAssets.IconsReady())
     {
         return false;
     }
@@ -1823,7 +1831,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
         return false;
     }
 
-    if (!g_renderAssets.iconsReady)
+    if (!g_renderAssets.IconsReady())
     {
         if (!g_d3dOverlay.firstIconsNotReadySkipLogged)
         {
@@ -2466,15 +2474,15 @@ HRESULT WINAPI HookedBattleLogEndScene(LPDIRECT3DDEVICE9 device)
 
 bool EnsureD3d9OverlayHookInstalled()
 {
-    if (g_d3dOverlay.hookInstalled)
+    if (g_d3dOverlay.HookInstalled())
     {
         return true;
     }
-    if (g_d3dOverlay.hookAttempted)
+    if (g_d3dOverlay.HookAttempted())
     {
         return false;
     }
-    g_d3dOverlay.hookAttempted = true;
+    g_d3dOverlay.BeginHookInstall();
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
@@ -2604,7 +2612,7 @@ bool EnsureD3d9OverlayHookInstalled()
         return false;
     }
 
-    g_d3dOverlay.hookInstalled = true;
+    g_d3dOverlay.CompleteHookInstall(true);
     mod::Log(
         "BattleLog::EnsureD3d9OverlayHookInstalled: MinHook EndScene installed target=%p original=%p",
         g_d3dOverlay.endSceneTarget,
@@ -2616,7 +2624,7 @@ bool ShutdownD3d9OverlayHook()
 {
     ReleaseD3dTextures();
 
-    if (g_d3dOverlay.hookInstalled && g_d3dOverlay.endSceneTarget != nullptr)
+    if (g_d3dOverlay.HookInstalled() && g_d3dOverlay.endSceneTarget != nullptr)
     {
         const MH_STATUS disableStatus =
             MH_DisableHook(g_d3dOverlay.endSceneTarget);
@@ -2640,9 +2648,9 @@ bool ShutdownD3d9OverlayHook()
                 static_cast<int>(removeStatus),
                 g_d3dOverlay.endSceneTarget,
                 static_cast<int>(reenableStatus));
-            g_d3dOverlay.hookInstalled =
+            g_d3dOverlay.CompleteHookInstall(
                 reenableStatus == MH_OK
-                || reenableStatus == MH_ERROR_ENABLED;
+                || reenableStatus == MH_ERROR_ENABLED);
             return false;
         }
     }
@@ -2655,7 +2663,7 @@ bool DrawBrowserIconsGdi(uint32_t screenContext, bool allowWindowDc)
 {
     const bool isBrowserView = g_state.view == View::Browser;
     const bool isDetailView = g_state.view == View::SetDetail;
-    if ((!isBrowserView && !isDetailView) || !g_renderAssets.iconsReady)
+    if ((!isBrowserView && !isDetailView) || !g_renderAssets.IconsReady())
     {
         return false;
     }
@@ -7234,8 +7242,8 @@ bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc)
         mod::Log(
             "BattleLog::DrawImageOverlayGdi: D3D9 hook unavailable, falling back allowWindowDc=%d hookAttempted=%d hookInstalled=%d endSceneObserved=%d",
             allowWindowDc ? 1 : 0,
-            g_d3dOverlay.hookAttempted ? 1 : 0,
-            g_d3dOverlay.hookInstalled ? 1 : 0,
+            g_d3dOverlay.HookAttempted() ? 1 : 0,
+            g_d3dOverlay.HookInstalled() ? 1 : 0,
             g_d3dOverlay.endSceneObserved ? 1 : 0);
         g_d3dOverlay.firstHookUnavailableLogged = true;
     }
