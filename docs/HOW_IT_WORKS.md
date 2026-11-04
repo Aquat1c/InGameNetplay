@@ -93,6 +93,40 @@ To support a new Revival build, add a profile in `revival_addresses.h`,
 teach `DetectRevivalVersion()` to recognize it, and extend the two
 launcher-adoption tests.
 
+## Lifecycle ownership
+
+Session startup, menu overlays and native cleanup have separate owners.
+The phase types in `include/netplay/bridge/*_state.h` and
+`include/netplay/hooks/internal/frontend_lifecycle.h` describe their legal
+progress. A timer measures time within a phase; a generation identifies the
+request that owns it. Neither can authorize completion of a newer request.
+
+A cancelled startup keeps its worker ownership until that worker retires.
+Lobby match cleanup similarly retains the obligation to end the session
+after a return or refresh request. Duplicate cancellation and late connection
+callbacks cannot reopen that ending session. Frontend return keeps its
+continuation claimed through the native call, including when the continuation
+has already been consumed.
+
+Host discovery, listener stabilization, delay selection, native synchronization
+and gameplay warmup have their own phases. Recovery quarantine first waits its
+fixed frame interval, then waits for held input to be released. Console shutdown
+drains queued output before stopping; a repeated shutdown request cannot move
+a stopped worker back into draining.
+
+The console mailbox still uses its original `LONG` fields and serials.
+`console_handoff_policy.h` supplies named views of prompt, delivery and timeout
+progress without changing the shared layout. Exact-generation acknowledgement
+and ordered serial progress are different checks and remain separate.
+
+Resource ownership stays separate from session progress. A retained native
+render context, a suspended exporter, an ImGui backend awaiting a device and
+an outstanding patch restoration each carry their own cleanup obligation.
+The shared overlay reset gate distinguishes a pending reset from completed
+backend invalidation, so repeated reset notifications do not invalidate twice.
+Native game states, independent events, input histories and configuration
+values retain their existing representation.
+
 ## Starting a session
 
 - **Host** first discovers your public address on a background thread
