@@ -238,7 +238,6 @@ void Shutdown()
             {
                 workerToJoin = std::move(g_startWorker);
             }
-            g_start.Finish();
         }
         else
         {
@@ -782,87 +781,100 @@ static bool StartSessionInternal(
 
     const uint32_t requestSerial = g_start.Begin();
 
-    g_startWorker = std::thread([
-        requestSerial,
-        role,
-        port,
-        addressCopy,
-        iniAddressCopy,
-        nicknameCopy,
-        writeNicknameToIni,
-        sessionFamily,
-        writeHostProtocol]() {
-        NetbridgeStatus workerStatus = {};
-        workerStatus.role = static_cast<int>(role);
-        workerStatus.port = port;
-#if defined(_MSC_VER)
-        strncpy_s(workerStatus.address, sizeof(workerStatus.address), addressCopy.c_str(), _TRUNCATE);
-        strncpy_s(workerStatus.nickname, sizeof(workerStatus.nickname), nicknameCopy.c_str(), _TRUNCATE);
-#else
-        std::snprintf(workerStatus.address, sizeof(workerStatus.address), "%s", addressCopy.c_str());
-        std::snprintf(workerStatus.nickname, sizeof(workerStatus.nickname), "%s", nicknameCopy.c_str());
-#endif
-
-        takeover::LogRevival102jDeepStep(
-            "SessionBridge.StartSession.02.worker_begin",
-            &workerStatus);
-
-        uint32_t workerConnectStartTick = GetTickCount();
-        const bool started = takeover::StartSession(
+    try
+    {
+        g_startWorker = std::thread([
+            requestSerial,
             role,
             port,
-            addressCopy.c_str(),
-            iniAddressCopy.c_str(),
-            nicknameCopy.c_str(),
+            addressCopy,
+            iniAddressCopy,
+            nicknameCopy,
             writeNicknameToIni,
             sessionFamily,
-            writeHostProtocol,
-            &workerStatus,
-            &workerConnectStartTick);
-        takeover::LogRevival102jDeepStep(
-            started
-                ? "SessionBridge.StartSession.03.takeover_returned_success"
-                : "SessionBridge.StartSession.03.takeover_returned_failure",
-            &workerStatus);
+            writeHostProtocol]() {
+            NetbridgeStatus workerStatus = {};
+            workerStatus.role = static_cast<int>(role);
+            workerStatus.port = port;
+#if defined(_MSC_VER)
+            strncpy_s(workerStatus.address, sizeof(workerStatus.address), addressCopy.c_str(), _TRUNCATE);
+            strncpy_s(workerStatus.nickname, sizeof(workerStatus.nickname), nicknameCopy.c_str(), _TRUNCATE);
+#else
+            std::snprintf(workerStatus.address, sizeof(workerStatus.address), "%s", addressCopy.c_str());
+            std::snprintf(workerStatus.nickname, sizeof(workerStatus.nickname), "%s", nicknameCopy.c_str());
+#endif
 
-        bool cancelStaleSession = false;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            if (g_start.IsCurrent(requestSerial))
+            takeover::LogRevival102jDeepStep(
+                "SessionBridge.StartSession.02.worker_begin",
+                &workerStatus);
+
+            uint32_t workerConnectStartTick = GetTickCount();
+            const bool started = takeover::StartSession(
+                role,
+                port,
+                addressCopy.c_str(),
+                iniAddressCopy.c_str(),
+                nicknameCopy.c_str(),
+                writeNicknameToIni,
+                sessionFamily,
+                writeHostProtocol,
+                &workerStatus,
+                &workerConnectStartTick);
+            takeover::LogRevival102jDeepStep(
+                started
+                    ? "SessionBridge.StartSession.03.takeover_returned_success"
+                    : "SessionBridge.StartSession.03.takeover_returned_failure",
+                &workerStatus);
+
+            bool cancelStaleSession = false;
             {
-                g_status = workerStatus;
-                g_connectStartTick = workerConnectStartTick;
-                takeover::LogRevival102jDeepStep(
-                    "SessionBridge.StartSession.04.worker_result_committed",
-                    &g_status);
-                if (!started)
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (g_start.IsCurrent(requestSerial))
+                {
+                    g_status = workerStatus;
+                    g_connectStartTick = workerConnectStartTick;
+                    takeover::LogRevival102jDeepStep(
+                        "SessionBridge.StartSession.04.worker_result_committed",
+                        &g_status);
+                    if (!started)
+                    {
+                        mod::Log(
+                            "SessionBridge: StartSession failed phase=%s error='%s'",
+                            PhaseToString(static_cast<NetbridgePhase>(g_status.phase)),
+                            g_status.errorMsg);
+                    }
+                }
+                else
                 {
                     mod::Log(
-                        "SessionBridge: StartSession failed phase=%s error='%s'",
-                        PhaseToString(static_cast<NetbridgePhase>(g_status.phase)),
-                        g_status.errorMsg);
+                        "SessionBridge: dropped stale start result serial=%u current=%u",
+                        static_cast<unsigned>(requestSerial),
+                        static_cast<unsigned>(g_start.generation));
+                    cancelStaleSession = started && g_start.OwnsWorker(requestSerial);
+                    takeover::LogRevival102jDeepStep(
+                        "SessionBridge.StartSession.04.worker_result_stale",
+                        &workerStatus);
                 }
             }
-            else
+
+            if (cancelStaleSession)
             {
-                mod::Log(
-                    "SessionBridge: dropped stale start result serial=%u current=%u",
-                    static_cast<unsigned>(requestSerial),
-                    static_cast<unsigned>(g_start.generation));
-                cancelStaleSession = started;
-                takeover::LogRevival102jDeepStep(
-                    "SessionBridge.StartSession.04.worker_result_stale",
-                    &workerStatus);
+                takeover::CancelSession("stale_worker_result", nullptr);
             }
-
-            g_start.Finish();
-        }
-
-        if (cancelStaleSession)
-        {
-            takeover::CancelSession("stale_worker_result", nullptr);
-        }
-    });
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_start.Finish(requestSerial);
+        });
+    }
+    catch (...)
+    {
+        g_start.Finish(requestSerial);
+        g_connectStartTick = 0;
+        g_activeHostNetworkConfig = {};
+        g_activeHostNetworkConfigValid = false;
+        SetPhase(NetbridgePhase::Failed, I18N_KEY("Could not start the netplay worker. Please try again."));
+        MarkSynchronousStartRejectedUnlocked(role, "worker_launch_failed");
+        return false;
+    }
 
     return true;
 }

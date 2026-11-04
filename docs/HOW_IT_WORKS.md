@@ -101,7 +101,10 @@ The phase types in `include/netplay/bridge/*_state.h` and
 progress. A timer measures time within a phase; a generation identifies the
 request that owns it. Neither can authorize completion of a newer request.
 
-A cancelled startup keeps its worker ownership until that worker retires.
+A cancelled startup keeps its worker ownership through stale-result cleanup.
+Failure to construct the startup worker reports a failed start and releases
+ownership so the menu can retry. Worker completion checks its own generation
+before retiring ownership; a detached old worker cannot retire a newer request.
 Lobby match cleanup similarly retains the obligation to end the session
 after a return or refresh request. Duplicate cancellation and late connection
 callbacks cannot reopen that ending session. Frontend return keeps its
