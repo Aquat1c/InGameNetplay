@@ -41,8 +41,8 @@ second copy of the game - the **helper** - and loads itself into it. Your
 real game then takes over the session. The split:
 
 - `StartSession()` (`src/netplay/bridge/revival_takeover.cpp`) is the front
-  door: it spawns the helper suspended, injects the mod DLL
-  (`src/netplay/bridge/process_inject.cpp`), patches the helper's import
+  door: it spawns the helper suspended, injects the mod DLL using its Unicode
+  path (`src/netplay/bridge/dll_injection.cpp`), patches the helper's import
   table so the Windows calls EfzRevival makes - process creation, remote
   threads, memory writes, console I/O - land in the mod's stand-ins
   (`src/netplay/bridge/iat_stubs.cpp`), and only then resumes the helper.

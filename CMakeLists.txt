@@ -68,6 +68,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/revival_j_diagnostics.cpp
     src/netplay/bridge/revival_launcher_probe.cpp
     src/netplay/bridge/ipc_shared.cpp
+    src/netplay/bridge/dll_injection.cpp
     src/netplay/bridge/process_inject.cpp
     src/netplay/bridge/iat_stubs.cpp
     src/netplay/core/inline_edit.cpp
@@ -391,6 +392,14 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND WIN32)
+    add_executable(process_injection_tests
+        tests/process_injection_tests.cpp)
+    target_include_directories(process_injection_tests PRIVATE include)
+    target_compile_features(process_injection_tests PRIVATE cxx_std_17)
+    target_compile_definitions(process_injection_tests PRIVATE NOMINMAX)
+    add_test(NAME process_injection_tests COMMAND process_injection_tests)
+    set_tests_properties(process_injection_tests PROPERTIES RUN_SERIAL TRUE TIMEOUT 45)
+
     add_executable(helper_delay_disconnect_tests
         tests/helper_delay_disconnect_tests.cpp
         src/netplay/bridge/helper_delay_disconnect.cpp)
