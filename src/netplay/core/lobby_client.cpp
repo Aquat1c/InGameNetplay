@@ -2848,12 +2848,11 @@ void LobbySession::PollThreadEntry()
     }
     else if (!DoJoin())
     {
-        mod::Log("LobbySession::PollThread: join failed, exiting");
-        return;
+        mod::Log("LobbySession::PollThread: join failed, waiting for refresh");
     }
 
     mod::Log(
-        "LobbySession::PollThread: joined lobby id=%d playerId=%d roomCode='%s' origin=%d",
+        "LobbySession::PollThread: room id=%d playerId=%d roomCode='%s' origin=%d",
         m_joinedRoom.lobbyNumericId,
         m_joinedRoom.playerId,
         m_joinedRoom.roomCode.c_str(),

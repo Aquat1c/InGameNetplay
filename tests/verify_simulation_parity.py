@@ -427,12 +427,12 @@ for required in ("SetThreadPriority", "THREAD_PRIORITY_BELOW_NORMAL"):
 lobby = lobby_path.read_text(encoding="utf-8", errors="strict")
 poll_worker = function_slice(lobby, "void LobbySession::PollThreadEntry(")
 priority_at = poll_worker.find("THREAD_PRIORITY_BELOW_NORMAL")
-joined_at = poll_worker.find("LobbySession::PollThread: joined lobby")
+join_at = poll_worker.find("else if (!DoJoin())")
 loop_at = poll_worker.find("while (!m_shouldStop.load())")
-if priority_at < 0 or joined_at < 0 or loop_at < 0:
+if priority_at < 0 or join_at < 0 or loop_at < 0:
     fail("could not verify lobby poll scheduling boundary")
-if priority_at < joined_at or priority_at > loop_at:
-    fail("lobby poll priority must change only after join and before keepalive polling")
+if priority_at < join_at or priority_at > loop_at:
+    fail("lobby poll priority must change only after the initial join attempt and before keepalive polling")
 
 public_ip_sources = function_slice(lobby, "bool TryDiscoverPublicIpForFamily(")
 if public_ip_sources.count("THREAD_PRIORITY_BELOW_NORMAL") < 3:

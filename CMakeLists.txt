@@ -393,6 +393,25 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND WIN32)
+    add_executable(lobby_session_tests
+        tests/lobby_session_tests.cpp
+        src/netplay/core/network_endpoint.cpp
+        src/netplay/core/network_capability.cpp)
+    target_include_directories(lobby_session_tests PRIVATE include)
+    target_compile_features(lobby_session_tests PRIVATE cxx_std_17)
+    target_compile_definitions(lobby_session_tests PRIVATE NOMINMAX)
+    target_link_libraries(lobby_session_tests PRIVATE ws2_32)
+    if(MSVC)
+        target_compile_options(lobby_session_tests PRIVATE /EHsc /utf-8)
+        if(EFZ_XP_COMPAT)
+            target_compile_definitions(lobby_session_tests PRIVATE
+                WINVER=0x0501 _WIN32_WINNT=0x0501 EFZ_XP_COMPAT=1)
+            target_compile_options(lobby_session_tests PRIVATE /Zc:threadSafeInit-)
+        endif()
+    endif()
+    add_test(NAME lobby_session_tests COMMAND lobby_session_tests)
+    set_tests_properties(lobby_session_tests PROPERTIES TIMEOUT 30)
+
     add_library(native_log_fixture SHARED tests/native_log_fixture.cpp)
     add_executable(native_log_history_tests tests/native_log_history_tests.cpp)
     target_include_directories(native_log_history_tests PRIVATE include)
