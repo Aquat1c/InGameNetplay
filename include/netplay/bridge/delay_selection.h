@@ -15,6 +15,9 @@ inline bool Accepts(const DelayPromptMetrics& metrics, int promptSerial, int val
 inline int Clamp(const DelayPromptMetrics& metrics, int value) {
     return (std::max)(metrics.minDelay, (std::min)(metrics.maxDelay, value));
 }
+inline bool ShouldNotifyPeerOnCancel(bool online, bool intendedOnline, int promptSerial) {
+    return online || (intendedOnline && promptSerial > 0);
+}
 inline bool IsRetry(int promptSerial, int servedSerial, int submittedSerial) {
     return submittedSerial > 0 && promptSerial > submittedSerial && servedSerial < promptSerial;
 }

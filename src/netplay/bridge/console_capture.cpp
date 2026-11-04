@@ -722,7 +722,7 @@ void NoteConsolePromptLine(
         {"Connection timed out", I18N_KEY("Connection timed out.")},
         {"Source quit or timed out", I18N_KEY("Opponent quit or timed out.")},
         {"Host timed out", I18N_KEY("Host timed out - no one connected.")},
-        {"Remote timed out", I18N_KEY("Opponent timed out.")},
+        {"Remote timed out", I18N_KEY("Opponent quit or timed out.")},
         {"Invalid address", I18N_KEY("Invalid address - check the IP and port.")},
         {"Only one net instance allowed", I18N_KEY("A netplay session is already running.")},
         {"Remote is using a deprecated version", I18N_KEY("Opponent is on an outdated Revival version.")},
@@ -847,6 +847,12 @@ void NoteConsolePromptLine(
                 "Takeover: spectate console raw line='%s'",
                 text.c_str());
         }
+        return;
+    }
+
+    if (IsDelayPromptTerminated(g_injectedBlock != nullptr ? g_injectedBlock : g_hostBlock))
+    {
+        g_delayMetricsAccumulator.clear();
         return;
     }
 
@@ -1209,8 +1215,6 @@ static void ProcessConsoleTextChunk(
         static const char* kImmediateFlushKeywords[] = {
             "header crc mismatch",
             "state not recoverable",
-            "Recv quit from:",
-            "Received quit from:",
             "Connection timed out",
             "Source quit or timed out",
             "Host timed out",

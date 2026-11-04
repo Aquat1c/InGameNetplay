@@ -2862,8 +2862,6 @@ bool TryClassifyRevivalQuitEndpoint(
             ? g_activeRevival->versionTag
             : "unknown";
 
-    if (std::strcmp(versionTag, "1.02i") == 0
-        || std::strcmp(versionTag, "1.02j") == 0)
     {
         if (!HasInjectedContext())
         {
@@ -2928,37 +2926,6 @@ bool TryClassifyRevivalQuitEndpoint(
             isActivePeer ? 1 : 0,
             isSpectator ? 1 : 0);
     }
-    else
-    {
-        typedef bool (__stdcall *RoleCheckFn)(const void*, int);
-        const auto roleCheck =
-            reinterpret_cast<RoleCheckFn>(helperBase + roleCheckRva);
-        __try
-        {
-            isActivePeer = roleCheck(&endpoint, 2);
-            isSpectator = roleCheck(&endpoint, 3);
-        }
-        __except (exceptionCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
-        {
-            mod::Log(
-                "Takeover: native quit packet classification failed endpoint='%s' reason=exception version=%s helperBase=0x%08lX roleCheckRva=0x%08lX exception=0x%08lX",
-                endpointText != nullptr ? endpointText : "",
-                versionTag,
-                static_cast<unsigned long>(helperBase),
-                static_cast<unsigned long>(roleCheckRva),
-                static_cast<unsigned long>(exceptionCode));
-            return false;
-        }
-
-        mod::Log(
-            "Takeover: native quit packet classified endpoint='%s' version=%s roleCheckRva=0x%08lX activePeer=%d spectator=%d",
-            endpointText != nullptr ? endpointText : "",
-            versionTag,
-            static_cast<unsigned long>(roleCheckRva),
-            isActivePeer ? 1 : 0,
-            isSpectator ? 1 : 0);
-    }
-
     if (outIsActivePeer != nullptr)
     {
         *outIsActivePeer = isActivePeer;
@@ -4880,7 +4847,7 @@ void Tick(NetbridgeStatus* ioStatus, uint32_t* ioConnectStartTick,
                 static_cast<long>(controlWakeRequest),
                 static_cast<long>(controlWakeServed),
                 static_cast<long>(requiredControlWakeSerial));
-            PublishConsoleError(I18N_KEY("Opponent timed out."));
+            PublishConsoleError(I18N_KEY("Opponent quit or timed out."));
             InterlockedExchange(
                 &g_hostBlock->nativeDelayTimeoutHandledSerial,
                 nativeTimeoutSerial);
@@ -5671,7 +5638,11 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         && !suppressSharedRecoveryTeardown
         // Blocks up to 300ms: never on the per-frame tick thread.
         && !IsInsideFrameTick()
-        && g_localRoleFlag == kLocalRoleOnline
+        && delay_selection::ShouldNotifyPeerOnCancel(
+            g_localRoleFlag == kLocalRoleOnline,
+            g_hostBlock != nullptr && g_hostBlock->initParams[0] == kLocalRoleOnline,
+            g_hostBlock != nullptr
+                ? InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0) : 0)
         && g_revivalProcess != nullptr;
     if (shouldBroadcastPeerQuit)
     {

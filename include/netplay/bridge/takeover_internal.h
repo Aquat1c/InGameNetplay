@@ -102,6 +102,14 @@ struct SharedBlock
     volatile LONG nativeDelayTimeoutHandledSerial = 0;
     volatile LONG helperCaptureReady = 0;
 };
+
+inline bool IsDelayPromptTerminated(SharedBlock* block)
+{
+    return block != nullptr
+        && (InterlockedCompareExchange(&block->consoleErrorSerial, 0, 0) > 0
+            || InterlockedCompareExchange(&block->nativeDelayTimeoutSerial, 0, 0)
+                > InterlockedCompareExchange(&block->nativeDelayTimeoutHandledSerial, 0, 0));
+}
 #pragma pack(pop)
 
 using RevivalInitFn = int(__cdecl*)(int*);
@@ -610,6 +618,7 @@ BOOL StubTerminateProcess(
 HANDLE StubOpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
 BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl);
+BOOL StubFlushConsoleInputBuffer(HANDLE hConsoleInput);
 BOOL StubWriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten);
 BOOL StubWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
 BOOL StubWriteConsoleA(HANDLE hConsoleOutput, const VOID* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved);

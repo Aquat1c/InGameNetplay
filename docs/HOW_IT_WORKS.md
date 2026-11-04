@@ -117,6 +117,15 @@ launcher-adoption tests.
   Selection and confirmation use that prompt's limits; unknown limits leave
   confirmation unavailable. If Revival rejects an answer and asks again,
   the overlay returns to selection with the new limits.
+- Canceling delay setup sends Revival's quit packet before closing the helper,
+  including when the local game has not yet initialized online play. During
+  delay setup, received quit packets use Revival's native peer-disconnect
+  handler, which closes the pending reader and ends the session. The overlay
+  reports that the opponent quit or timed out. Terminal sessions cannot accept
+  delay input or reopen selection from late console output.
+- Console cancellation wakes are relayed for both players. Starting a new
+  native reader discards old wakes through the same console-flush boundary as
+  Revival, so a retry cannot inherit cancellation intended for its predecessor.
 
 ## Keeping the game alive
 

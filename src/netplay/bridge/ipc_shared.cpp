@@ -1,6 +1,7 @@
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/mod_settings.h"
 #include "netplay/bridge/console_handoff_policy.h"
+#include "netplay/bridge/helper_delay_disconnect.h"
 #include "netplay/bridge/external_launcher_guard.h"
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/revival_launcher_probe.h"
@@ -977,7 +978,7 @@ void ClearDelayPromptState(const char* reason)
 DelayPromptMetrics ReadPublishedDelayPromptMetrics()
 {
     DelayPromptMetrics metrics = {};
-    if (g_hostBlock == nullptr) return metrics;
+    if (g_hostBlock == nullptr || IsDelayPromptTerminated(g_hostBlock)) return metrics;
     const LONG serial = InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0);
     if (serial <= 0 || serial != InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0))
         return metrics;
@@ -991,7 +992,8 @@ DelayPromptMetrics ReadPublishedDelayPromptMetrics()
     metrics.inputSerial = InterlockedCompareExchange(&g_hostBlock->delayInputSerial, 0, 0);
     metrics.inputValue = g_hostBlock->delayInputValue;
     if (serial != InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0)
-        || serial != InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0)) return {};
+        || serial != InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0)
+        || IsDelayPromptTerminated(g_hostBlock)) return {};
     return metrics;
 }
 
@@ -4090,6 +4092,13 @@ void InitializeInjected()
         if (g_injectedReady)
         {
             DetectRevivalVersion();
+            g_injectedReady = InstallHelperDelayDisconnectHandler(
+                GetModuleHandleA(nullptr),
+                g_activeRevival != nullptr ? g_activeRevival->versionTag : nullptr);
+            if (!g_injectedReady)
+            {
+                mod::Log("Takeover: delay disconnect handler unavailable; helper context remains unready");
+            }
             HMODULE revival = GetModuleHandleA("EfzRevival.dll");
             if (revival != nullptr)
             {

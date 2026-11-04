@@ -39,6 +39,30 @@ inline bool IsHostReader(
         && consoleServedSerial >= consoleSerial;
 }
 
+inline bool IsControlWakeSession(
+    bool isHostSession,
+    LONG delayPromptSerial,
+    bool onlineMenuServed)
+{
+    return isHostSession || delayPromptSerial > 0 || onlineMenuServed;
+}
+
+inline void CompleteControlWakeFlush(
+    volatile LONG* servedSerial,
+    LONG requestSerialSnapshot,
+    bool nativeFlushSucceeded)
+{
+    if (!nativeFlushSucceeded) return;
+    LONG served = InterlockedCompareExchange(servedSerial, 0, 0);
+    while (served < requestSerialSnapshot)
+    {
+        const LONG previous = InterlockedCompareExchange(
+            servedSerial, requestSerialSnapshot, served);
+        if (previous == served) return;
+        served = previous;
+    }
+}
+
 inline bool IsExactBelControlWake(
     const INPUT_RECORD& record,
     DWORD recordCount)

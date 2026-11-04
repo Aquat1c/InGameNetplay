@@ -170,6 +170,41 @@ void TestReaderAndDelayContracts()
         "served explicit input is no longer held");
 }
 
+void TestControlWakeReaderLifetime()
+{
+    using namespace netplay::bridge::console_handoff;
+
+    Expect(!IsControlWakeSession(false, 0, false),
+        "unserved bootstrap and pre-prompt non-online roles keep native input");
+    Expect(IsControlWakeSession(true, 0, false),
+        "Host waiting reader accepts native cancellation");
+    Expect(IsControlWakeSession(false, 0, true),
+        "Join accepts cancellation after online bootstrap before prompt publication");
+    Expect(IsControlWakeSession(false, 1, true),
+        "Join delay reader accepts native cancellation");
+    Expect(IsControlWakeSession(false, 2, true),
+        "Join retry reader accepts native cancellation");
+    Expect(IsControlWakeSession(false, 1, false),
+        "observed delay prompt retains cancellation ownership for other roles");
+
+    volatile LONG served = 0;
+    CompleteControlWakeFlush(&served, 1, true);
+    Expect(served == 1, "first reader flush discards a stale bootstrap BEL");
+    CompleteControlWakeFlush(&served, 2, true);
+    Expect(served == 2, "successful flush discards rearm BEL from completed reader");
+
+    const LONG laterTimeoutWake = 3;
+    Expect(laterTimeoutWake > served, "timeout BEL after flush remains pending for retry reader");
+    CompleteControlWakeFlush(&served, 2, true);
+    Expect(laterTimeoutWake > served, "flush only acknowledges its captured generation");
+    CompleteControlWakeFlush(&served, laterTimeoutWake, false);
+    Expect(served == 2, "failed native flush preserves pending cancellation");
+
+    served = 4;
+    CompleteControlWakeFlush(&served, 2, true);
+    Expect(served == 4, "older flush cannot regress a later delivered wake");
+}
+
 void TestTimeoutCleanupContract()
 {
     using namespace netplay::bridge::console_handoff;
@@ -213,6 +248,7 @@ int main()
     TestInitialInputPlan();
     TestExactBelWakePredicate();
     TestReaderAndDelayContracts();
+    TestControlWakeReaderLifetime();
     TestTimeoutCleanupContract();
 
     if (g_failures != 0)

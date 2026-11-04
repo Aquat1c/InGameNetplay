@@ -11,6 +11,9 @@ bool g_metricsPublishedFirst = true;
 LONG g_publishedWakeSnapshot = -1;
 bool g_testWorkerReadBoundary = false;
 bool g_workerRejectedReadBoundary = false;
+std::string g_consoleError;
+std::string g_quitEndpoint;
+bool g_quitIsActivePeer = true;
 
 void Expect(bool condition, const char* message)
 {
@@ -64,9 +67,19 @@ bool g_holePunchServerConfigLoaded = false;
 std::string g_configuredHolePunchServer;
 
 bool IsCurrentProcessRevival() { return true; }
-bool TryClassifyRevivalQuitEndpoint(const char*, bool*, bool*) { return false; }
+bool TryClassifyRevivalQuitEndpoint(const char* endpoint, bool* active, bool* spectator)
+{
+    g_quitEndpoint = endpoint;
+    *active = g_quitIsActivePeer;
+    *spectator = !g_quitIsActivePeer;
+    return true;
+}
 bool TryPublishHeldHostDelayTimeout(LONG) { return false; }
-void PublishConsoleError(const char*) {}
+void PublishConsoleError(const char* error)
+{
+    g_consoleError = error;
+    InterlockedIncrement(&g_injectedBlock->consoleErrorSerial);
+}
 void PublishSpectateConfirmPromptSerial(LONG, int) {}
 void PublishHostListenerObservation(network::NetworkFamily, uint16_t) {}
 void PublishDelayPromptSerial(LONG serial, LONG wakeSnapshot)
@@ -104,6 +117,9 @@ void ResetCapture(SharedBlock& block)
     g_injectedDelayPromptSerial = 0;
     g_delayPromptMetrics = {};
     g_publications = 0;
+    g_consoleError.clear();
+    g_quitEndpoint.clear();
+    g_quitIsActivePeer = true;
     g_metricsPublishedFirst = true;
     g_publishedWakeSnapshot = -1;
     DiscardPendingConsoleFragmentsLocked();
@@ -213,6 +229,39 @@ void TestQueuedReadBoundary()
     g_testWorkerReadBoundary = false;
 }
 
+void TestFragmentedPeerQuit()
+{
+    SharedBlock terminal{};
+    Expect(!IsDelayPromptTerminated(&terminal), "fresh delay state accepts input");
+    terminal.nativeDelayTimeoutSerial = 1;
+    Expect(IsDelayPromptTerminated(&terminal), "native timeout blocks input before cleanup completes");
+    terminal.nativeDelayTimeoutHandledSerial = 1;
+    terminal.consoleErrorSerial = 1;
+    Expect(IsDelayPromptTerminated(&terminal), "terminal error keeps delay input blocked after cleanup");
+
+    SharedBlock block;
+    ResetCapture(block);
+    FeedNativeCharacters("Recv quit from: 127.0.0.1:10800\n");
+    Expect(g_quitEndpoint == "127.0.0.1:10800", "fragmented quit retains full peer endpoint");
+    Expect(!g_consoleError.empty(), "active peer quit publishes terminal error");
+    FeedNativeCharacters("Enter the initial input delay (between 2 and 20): ");
+    FlushPendingConsoleOutputLocked();
+    Expect(g_publications == 0, "late delay prompt cannot revive a terminal session");
+
+    ResetCapture(block);
+    g_quitIsActivePeer = false;
+    FeedNativeCharacters("Received quit from: [::1]:10800\n");
+    Expect(g_quitEndpoint == "[::1]:10800", "fragmented IPv6 quit retains complete endpoint");
+    Expect(g_consoleError.empty(), "spectator quit does not terminate player delay setup");
+
+    ResetCapture(block);
+    FeedNativeCharacters("Remote timed out\n");
+    Expect(!g_consoleError.empty(), "native timeout publishes terminal error");
+    FeedNativeCharacters("Enter the input delay to use: ");
+    FlushPendingConsoleOutputLocked();
+    Expect(g_publications == 0, "retry cannot revive a timed-out session");
+}
+
 void TestUnknownRangeAndSessionReset()
 {
     bool hasMetrics = true;
@@ -237,6 +286,7 @@ int main()
 {
     TestNativePromptAndRetry();
     TestQueuedReadBoundary();
+    TestFragmentedPeerQuit();
     TestUnknownRangeAndSessionReset();
     if (g_failures == 0)
     {

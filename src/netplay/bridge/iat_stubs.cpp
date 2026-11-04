@@ -2282,10 +2282,13 @@ BOOL StubWriteConsoleInputA(
                 || block->magic != kIpcMagic
                 || block->version != kIpcVersion
                 || block->hostPid == 0
-                || InterlockedCompareExchange(
-                    &block->isHostSession,
-                    0,
-                    0) == 0)
+                || !console_handoff::IsControlWakeSession(
+                    InterlockedCompareExchange(&block->isHostSession, 0, 0) != 0,
+                    InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
+                    block->initParams[0] == kLocalRoleOnline
+                        && block->consoleSerial > 0
+                        && InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0)
+                            >= block->consoleSerial))
             {
                 return false;
             }
@@ -2369,6 +2372,48 @@ BOOL StubWriteConsoleInputA(
         static_cast<unsigned long>(nativeError));
     SetLastError(nativeError);
     return nativeResult;
+}
+
+BOOL StubFlushConsoleInputBuffer(HANDLE hConsoleInput)
+{
+    if (!HasInjectedContext())
+    {
+        (void)EnsureInjectedContextFast();
+    }
+    TempIpcContext temp = {};
+    SharedBlock* block = HasInjectedContext() ? g_injectedBlock : nullptr;
+    if (block == nullptr && OpenTempIpcContext(&temp, false, false))
+    {
+        block = temp.block;
+    }
+    if (block != nullptr
+        && (block->magic != kIpcMagic || block->version != kIpcVersion
+            || block->hostPid == 0
+            || !console_handoff::IsControlWakeSession(
+                InterlockedCompareExchange(&block->isHostSession, 0, 0) != 0,
+                InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
+                block->initParams[0] == kLocalRoleOnline
+                    && block->consoleSerial > 0
+                    && InterlockedCompareExchange(&g_injectedLastConsoleSerialServed, 0, 0)
+                        >= block->consoleSerial)))
+    {
+        block = nullptr;
+    }
+    // Native rearm joins the old reader before flushing its queued BEL.
+    const LONG requestSnapshot = block != nullptr
+        ? InterlockedCompareExchange(&block->consoleControlWakeRequestSerial, 0, 0)
+        : 0;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL result = FlushConsoleInputBuffer(hConsoleInput);
+    const DWORD error = result != FALSE ? ERROR_SUCCESS : GetLastError();
+    if (block != nullptr)
+    {
+        console_handoff::CompleteControlWakeFlush(
+            &block->consoleControlWakeServedSerial, requestSnapshot, result != FALSE);
+    }
+    CloseTempIpcContext(&temp);
+    SetLastError(error);
+    return result;
 }
 
 BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
@@ -2490,7 +2535,12 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         0) != 0,
                     serial,
                     servedSerial);
-            if (hostReader)
+            const bool controlWakeReader = hostReader
+                || (currentBlock && serial > 0 && servedSerial >= serial
+                    && console_handoff::IsControlWakeSession(false,
+                        InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
+                        block->initParams[0] == kLocalRoleOnline));
+            if (controlWakeReader)
             {
                 const LONG controlWakeRequest =
                     InterlockedCompareExchange(
@@ -2700,7 +2750,8 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (console_handoff::HasPendingExplicitDelayInput(
+                    if (!IsDelayPromptTerminated(block)
+                        && console_handoff::HasPendingExplicitDelayInput(
                             promptSerial,
                             promptServed,
                             delayInputSerial,
@@ -2748,7 +2799,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     }
                     continue;
                 }
-                if (!hostReader)
+                if (!controlWakeReader)
                 {
                     return FALSE;
                 }
@@ -2757,7 +2808,7 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     parkedLogged = true;
                     MOD_LIFECYCLE_TRACE(
                         "CONSOLE_READ_PARKED api=A generation=%ld "
-                        "state=host_native_wait control=%ld/%ld "
+                        "state=native_wait control=%ld/%ld "
                         "prompt=%ld/%ld input=%ld/%ld",
                         static_cast<long>(readGeneration),
                         static_cast<long>(
@@ -2984,7 +3035,12 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                         0) != 0,
                     serial,
                     servedSerial);
-            if (hostReader)
+            const bool controlWakeReader = hostReader
+                || (currentBlock && serial > 0 && servedSerial >= serial
+                    && console_handoff::IsControlWakeSession(false,
+                        InterlockedCompareExchange(&block->delayPromptSerial, 0, 0),
+                        block->initParams[0] == kLocalRoleOnline));
+            if (controlWakeReader)
             {
                 const LONG controlWakeRequest =
                     InterlockedCompareExchange(
@@ -3182,7 +3238,8 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                 {
                     const LONG delayInputSerial = InterlockedCompareExchange(&block->delayInputSerial, 0, 0);
                     const LONG delayInputServedSerial = InterlockedCompareExchange(&block->delayInputServedSerial, 0, 0);
-                    if (console_handoff::HasPendingExplicitDelayInput(
+                    if (!IsDelayPromptTerminated(block)
+                        && console_handoff::HasPendingExplicitDelayInput(
                             promptSerial,
                             promptServed,
                             delayInputSerial,
@@ -3230,7 +3287,7 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
                     }
                     continue;
                 }
-                if (!hostReader)
+                if (!controlWakeReader)
                 {
                     return FALSE;
                 }
@@ -3690,6 +3747,11 @@ extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE hConsol
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead, LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL pInputControl)
 {
     return netplay::bridge::takeover::StubReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_FlushConsoleInputBuffer(HANDLE hConsoleInput)
+{
+    return netplay::bridge::takeover::StubFlushConsoleInputBuffer(hConsoleInput);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE hConsoleInput, const INPUT_RECORD* lpBuffer, DWORD nLength, LPDWORD lpNumberOfEventsWritten)

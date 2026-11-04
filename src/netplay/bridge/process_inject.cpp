@@ -1,4 +1,5 @@
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/helper_delay_disconnect.h"
 
 #include <algorithm>
 #include <cctype>
@@ -18,6 +19,7 @@ extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_OpenProcess(DWORD, BOOL, 
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleA(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_ReadConsoleW(HANDLE, LPVOID, DWORD, LPDWORD, PCONSOLE_READCONSOLE_CONTROL);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteConsoleInputA(HANDLE, const INPUT_RECORD*, DWORD, LPDWORD);
+extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_FlushConsoleInputBuffer(HANDLE);
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 extern "C" __declspec(dllexport) HANDLE WINAPI nb_stub_CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 extern "C" __declspec(dllexport) BOOL WINAPI nb_stub_WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
@@ -271,6 +273,7 @@ std::unordered_map<std::string, uint32_t> BuildPatchMap(uintptr_t remoteBase)
     patches["ReadConsoleA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleA));
     patches["ReadConsoleW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_ReadConsoleW));
     patches["WriteConsoleInputA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteConsoleInputA));
+    patches["FlushConsoleInputBuffer"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_FlushConsoleInputBuffer));
     patches["CreateFileA"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileA));
     patches["CreateFileW"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_CreateFileW));
     patches["WriteFile"] = RemoteExportAddress(remoteBase, reinterpret_cast<const void*>(&nb_stub_WriteFile));
@@ -423,6 +426,7 @@ bool PatchIatModule(
                     || _stricmp(name, "ReadConsoleA") == 0
                     || _stricmp(name, "ReadConsoleW") == 0
                     || _stricmp(name, "WriteConsoleInputA") == 0
+                    || _stricmp(name, "FlushConsoleInputBuffer") == 0
                     || _stricmp(name, "CreateFileA") == 0
                     || _stricmp(name, "CreateFileW") == 0
                     || _stricmp(name, "WriteFile") == 0
@@ -851,6 +855,17 @@ bool EnsureInjectedContextFast()
         && g_injectedInitEvent != nullptr
         && g_injectedConsoleEvent != nullptr;
     g_injectedReady = ipcReady && StartConsoleCaptureWorker(true);
+    if (g_injectedReady)
+    {
+        DetectRevivalVersion();
+        g_injectedReady = InstallHelperDelayDisconnectHandler(
+            GetModuleHandleA(nullptr),
+            g_activeRevival != nullptr ? g_activeRevival->versionTag : nullptr);
+        if (!g_injectedReady)
+        {
+            mod::Log("Takeover: delay disconnect handler unavailable; lazy helper context remains unready");
+        }
+    }
     if (g_injectedBlock != nullptr)
     {
         InterlockedExchange(
@@ -886,6 +901,7 @@ int SelfPatchIat()
         { "ReadConsoleA",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleA)) },
         { "ReadConsoleW",                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_ReadConsoleW)) },
         { "WriteConsoleInputA",             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteConsoleInputA)) },
+        { "FlushConsoleInputBuffer",        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_FlushConsoleInputBuffer)) },
         { "CreateFileA",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileA)) },
         { "CreateFileW",                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_CreateFileW)) },
         { "WriteFile",                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&nb_stub_WriteFile)) },

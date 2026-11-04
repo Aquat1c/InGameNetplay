@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EFZInGameNetplayMod VERSION 0.6.1 LANGUAGES C CXX)
+project(EFZInGameNetplayMod VERSION 0.6.2 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -62,6 +62,7 @@ add_library(efz_netplay_mod SHARED
     src/netplay/bridge/revival_takeover.cpp
     src/netplay/bridge/netplay_state_export.cpp
     src/netplay/bridge/console_capture.cpp
+    src/netplay/bridge/helper_delay_disconnect.cpp
     src/netplay/bridge/revival_memory.cpp
     src/netplay/bridge/revival_session_validation.cpp
     src/netplay/bridge/revival_j_diagnostics.cpp
@@ -390,6 +391,14 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND WIN32)
+    add_executable(helper_delay_disconnect_tests
+        tests/helper_delay_disconnect_tests.cpp
+        src/netplay/bridge/helper_delay_disconnect.cpp)
+    target_include_directories(helper_delay_disconnect_tests PRIVATE include)
+    target_compile_features(helper_delay_disconnect_tests PRIVATE cxx_std_17)
+    target_compile_definitions(helper_delay_disconnect_tests PRIVATE NOMINMAX)
+    add_test(NAME helper_delay_disconnect_tests COMMAND helper_delay_disconnect_tests)
+
     add_executable(console_delay_prompt_tests tests/console_delay_prompt_tests.cpp)
     target_include_directories(console_delay_prompt_tests PRIVATE include)
     target_compile_features(console_delay_prompt_tests PRIVATE cxx_std_17)

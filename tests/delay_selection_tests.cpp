@@ -27,6 +27,10 @@ int main() {
     expect(!delay_selection::IsRetry(1, 0, 1), "undelivered input is not a retry");
     expect(delay_selection::IsRetry(2, 1, 1), "new unserved native prompt reopens delay selection");
     expect(!delay_selection::IsRetry(2, 2, 1), "already served next prompt is not a retry");
+    expect(delay_selection::ShouldNotifyPeerOnCancel(false, true, 1), "delay cancel notifies peer before local online initialization");
+    expect(delay_selection::ShouldNotifyPeerOnCancel(true, true, 1), "online cancel still notifies peer");
+    expect(!delay_selection::ShouldNotifyPeerOnCancel(false, true, 0), "idle listener has no delay peer to notify");
+    expect(!delay_selection::ShouldNotifyPeerOnCancel(false, false, 1), "non-player role does not broadcast player quit");
     metrics.minDelay = 21;
     expect(!delay_selection::HasRange(metrics, 1), "inverted native limits are unavailable");
     metrics.minDelay = -1;
