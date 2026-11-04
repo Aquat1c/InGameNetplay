@@ -5,6 +5,7 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/bridge/session_bridge.h"
+#include "netplay/bridge/delay_selection.h"
 #include "netplay/bridge/takeover_internal.h"
 #include "netplay/core/battle_log_menu.h"
 #include "netplay/core/i18n.h"
@@ -65,8 +66,6 @@ void HandoffSpectateSession(uint32_t screenContext);
 
 namespace
 {
-constexpr int kDelaySelectionMin = 0;
-constexpr int kDelaySelectionMax = 20;
 constexpr int kVsHumanTitleWarmupFrames = 17;
 constexpr int kVsHumanHandoffRetryStride = 8;
 constexpr int kVsHumanHandoffMaxBlockedFrames = 60;
@@ -4128,129 +4127,31 @@ bool HandleSpectateConfirmOverlayInput(
     return true;
 }
 
-int ClampDelaySelection(int value)
+void UpdateDelaySetupMetrics(const netplay::bridge::DelayPromptMetrics& metrics, int promptSerial)
 {
-    if (value < kDelaySelectionMin)
-    {
-        return kDelaySelectionMin;
-    }
-    if (value > kDelaySelectionMax)
-    {
-        return kDelaySelectionMax;
-    }
-    return value;
+    g_delaySetupOverlay.limitsReady = netplay::bridge::delay_selection::HasRange(metrics, promptSerial);
+    if (!g_delaySetupOverlay.limitsReady) return;
+    const bool newPrompt = g_delaySetupOverlay.promptSerial != promptSerial;
+    g_delaySetupOverlay.promptSerial = promptSerial;
+    g_delaySetupOverlay.minDelay = metrics.minDelay;
+    g_delaySetupOverlay.maxDelay = metrics.maxDelay;
+    g_delaySetupOverlay.recommendedDelay = metrics.recommendedDelay;
+    g_delaySetupOverlay.selectedDelay = netplay::bridge::delay_selection::Clamp(metrics,
+        newPrompt ? metrics.recommendedDelay : g_delaySetupOverlay.selectedDelay);
+    if (metrics.averagePingMs >= 0) g_delaySetupOverlay.pingMs = metrics.averagePingMs;
 }
 
-// Mirrors Revival's CalculateDelayDelta.
-int CalculateDelayDeltaLikeRevival(float rttMs, float currentDelayFrames)
-{
-    if (rttMs < 0.0f)
-    {
-        rttMs = 0.0f;
-    }
-
-    const double frameTimeMs = 1000.0 / 64.0;
-    const double roundTripInFrames = static_cast<double>(rttMs) / (frameTimeMs * 2.0);
-    const double framesNeeded = std::ceil(roundTripInFrames);
-    const double delta = framesNeeded - static_cast<double>(currentDelayFrames);
-    const double clamped = (delta > 0.0) ? delta : 0.0;
-    return static_cast<int>(clamped);
-}
-
-// Mirrors Revival's CalculateRecommendedDelay.
-int CalculateRecommendedDelayLikeRevival(int delayFloor, float rttMs, float currentDelayFrames)
-{
-    if (rttMs < 0.0f)
-    {
-        rttMs = 0.0f;
-    }
-
-    const float minDelay = (std::min)(3.0f, currentDelayFrames);
-    const double roundTripMs = (1000.0 / 64.0) * 2.0;
-    const double rttInFrames = static_cast<double>(rttMs) / roundTripMs;
-    const double framesNeeded = std::ceil(rttInFrames);
-    const double rawDelta = std::ceil(framesNeeded - static_cast<double>(minDelay));
-    const int delta = static_cast<int>(rawDelta);
-    int best = (std::max)(delayFloor, delta);
-    if (currentDelayFrames == minDelay)
-    {
-        ++best;
-    }
-    return best;
-}
-
-void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeStatus)
+void ActivateDelaySetupOverlay(const netplay::bridge::NetbridgeStatus& bridgeStatus,
+                               const netplay::bridge::DelayPromptMetrics& promptMetrics)
 {
     ResetHostingOverlayState();
     ResetJoiningOverlayState();
     ResetDelaySetupOverlayState();
     g_delaySetupOverlay.active = true;
     g_delaySetupOverlay.waitingForRuntimeReady = false;
-    g_delaySetupOverlay.maxDelay = kDelaySelectionMax;
     g_delaySetupOverlay.pingMs = bridgeStatus.pingMs;
-
-    const int currentDelay = ClampDelaySelection((bridgeStatus.rollbackFrames >= 0) ? bridgeStatus.rollbackFrames : 0);
-    g_delaySetupOverlay.currentDelay = currentDelay;
-
-    const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
-    int minDelay = 0;
-    int recommendedDelay = currentDelay;
-    int maxDelay = kDelaySelectionMax;
-    if (promptMetrics.serial > 0)
-    {
-        if (promptMetrics.averagePingMs >= 0)
-        {
-            g_delaySetupOverlay.pingMs = promptMetrics.averagePingMs;
-        }
-        if (promptMetrics.minDelay >= kDelaySelectionMin && promptMetrics.minDelay <= kDelaySelectionMax)
-        {
-            minDelay = promptMetrics.minDelay;
-        }
-        if (promptMetrics.maxDelay >= kDelaySelectionMin && promptMetrics.maxDelay <= kDelaySelectionMax)
-        {
-            maxDelay = promptMetrics.maxDelay;
-        }
-        if (promptMetrics.recommendedDelay >= kDelaySelectionMin && promptMetrics.recommendedDelay <= kDelaySelectionMax)
-        {
-            recommendedDelay = promptMetrics.recommendedDelay;
-        }
-    }
-    if (bridgeStatus.pingMs >= 0)
-    {
-        const int fallbackMin = CalculateDelayDeltaLikeRevival(static_cast<float>(bridgeStatus.pingMs), static_cast<float>(currentDelay));
-        const int fallbackRecommended =
-            CalculateRecommendedDelayLikeRevival(fallbackMin, static_cast<float>(bridgeStatus.pingMs), static_cast<float>(currentDelay));
-        if (promptMetrics.serial <= 0)
-        {
-            minDelay = fallbackMin;
-            recommendedDelay = fallbackRecommended;
-        }
-    }
-
-    if (maxDelay < minDelay)
-    {
-        maxDelay = minDelay;
-    }
-
-    g_delaySetupOverlay.minDelay = ClampDelaySelection(minDelay);
-    g_delaySetupOverlay.maxDelay = ClampDelaySelection(maxDelay);
-    g_delaySetupOverlay.recommendedDelay =
-        (std::min)(g_delaySetupOverlay.maxDelay, ClampDelaySelection((std::max)(recommendedDelay, g_delaySetupOverlay.minDelay)));
-    g_delaySetupOverlay.selectedDelay = g_delaySetupOverlay.recommendedDelay;
-
-    constexpr int kImplausiblePingMs = 500;
-    constexpr int kSpikeFallbackDelay = 3;
-    if (g_delaySetupOverlay.pingMs > kImplausiblePingMs)
-    {
-        const int fallback = (std::min)(
-            g_delaySetupOverlay.maxDelay,
-            (std::max)(g_delaySetupOverlay.minDelay, kSpikeFallbackDelay));
-        mod::Log(
-            "DelayOverlay: implausible ping=%d (held-prompt spike) -> default delay %d (was recommended=%d)",
-            g_delaySetupOverlay.pingMs, fallback, g_delaySetupOverlay.recommendedDelay);
-        g_delaySetupOverlay.recommendedDelay = fallback;
-        g_delaySetupOverlay.selectedDelay = fallback;
-    }
+    g_delaySetupOverlay.currentDelay = (std::max)(0, bridgeStatus.rollbackFrames);
+    UpdateDelaySetupMetrics(promptMetrics, bridgeStatus.delayPromptSerial);
 
     if (bridgeStatus.p1Name[0] != '\0' && bridgeStatus.p2Name[0] != '\0')
     {
@@ -4358,7 +4259,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
             step = -1;
         }
 
-        if (step != 0)
+        if (step != 0 && g_delaySetupOverlay.limitsReady)
         {
             *inactivityCounter = 0;
             if (*inputLatch == 0)
@@ -4387,7 +4288,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
             *inputLatch = 0;
         }
 
-        if (inputBytes[playerIndex + 16] == 1)
+        if (inputBytes[playerIndex + 16] == 1 && g_delaySetupOverlay.limitsReady)
         {
             confirmRequested = true;
             confirmPlayer = playerIndex;
@@ -4422,7 +4323,7 @@ bool HandleDelaySetupOverlayInput(uint32_t screenContext, const uint8_t* inputBy
     if (confirmRequested)
     {
         const int selectedDelay = g_delaySetupOverlay.selectedDelay;
-        const bool applied = netplay::bridge::ApplyInputDelay(selectedDelay);
+        const bool applied = netplay::bridge::ApplyInputDelay(selectedDelay, g_delaySetupOverlay.promptSerial);
         if (!applied)
         {
             PlayUiSound(screenContext, kSfxMove);
@@ -7134,11 +7035,15 @@ char UpdateNetplayMenu(uint32_t screenContext)
         && !netplay::bridge::async_host::ShouldSuppressDelayOverlay())
     {
         const netplay::bridge::DelayPromptMetrics promptMetrics = netplay::bridge::GetDelayPromptMetrics();
-        if (!g_delaySetupOverlay.active)
+        if (!g_delaySetupOverlay.active
+            || (g_delaySetupOverlay.waitingForRuntimeReady
+                && netplay::bridge::delay_selection::IsRetry(bridgeStatus.delayPromptSerial,
+                    bridgeStatus.delayPromptServedSerial, g_delaySetupOverlay.promptSerial)))
         {
-            ActivateDelaySetupOverlay(bridgeStatus);
+            const bool firstPrompt = !g_delaySetupOverlay.active;
+            ActivateDelaySetupOverlay(bridgeStatus, promptMetrics);
 
-            if (g_lobbySession)
+            if (firstPrompt && g_lobbySession)
             {
                 mod::Log("DelaySetupOverlay: notifying lobby - setting inBattle=true (P2P match path)");
                 g_lobbySession->NotifyMatchConnected();
@@ -7160,38 +7065,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
                 g_delaySetupOverlay.p1Name[0] = '\0';
                 g_delaySetupOverlay.p2Name[0] = '\0';
             }
-            if (promptMetrics.serial > 0)
-            {
-                if (promptMetrics.averagePingMs >= 0)
-                {
-                    g_delaySetupOverlay.pingMs = promptMetrics.averagePingMs;
-                }
-                if (promptMetrics.minDelay >= kDelaySelectionMin && promptMetrics.minDelay <= kDelaySelectionMax)
-                {
-                    g_delaySetupOverlay.minDelay = promptMetrics.minDelay;
-                }
-                if (promptMetrics.maxDelay >= kDelaySelectionMin && promptMetrics.maxDelay <= kDelaySelectionMax)
-                {
-                    g_delaySetupOverlay.maxDelay = promptMetrics.maxDelay;
-                }
-                if (g_delaySetupOverlay.maxDelay < g_delaySetupOverlay.minDelay)
-                {
-                    g_delaySetupOverlay.maxDelay = g_delaySetupOverlay.minDelay;
-                }
-                if (promptMetrics.recommendedDelay >= kDelaySelectionMin && promptMetrics.recommendedDelay <= kDelaySelectionMax)
-                {
-                    const int clampedRecommended =
-                        (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, promptMetrics.recommendedDelay));
-                    g_delaySetupOverlay.recommendedDelay = clampedRecommended;
-                    if (!g_delaySetupOverlay.waitingForRuntimeReady)
-                    {
-                        g_delaySetupOverlay.selectedDelay =
-                            (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, g_delaySetupOverlay.selectedDelay));
-                    }
-                }
-            }
-            g_delaySetupOverlay.selectedDelay =
-                (std::max)(g_delaySetupOverlay.minDelay, (std::min)(g_delaySetupOverlay.maxDelay, g_delaySetupOverlay.selectedDelay));
+            UpdateDelaySetupMetrics(promptMetrics, bridgeStatus.delayPromptSerial);
         }
 
         if (g_delaySetupOverlay.waitingForRuntimeReady

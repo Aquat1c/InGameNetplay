@@ -119,8 +119,8 @@ struct DelayPromptMetrics
     int minPingMs = -1;
     int maxPingMs = -1;
     int recommendedDelay = -1;
-    int minDelay = 0;
-    int maxDelay = 20;
+    int minDelay = -1;
+    int maxDelay = -1;
     int inputSerial = 0;
     int inputValue = -1;
 };
@@ -162,7 +162,7 @@ bool BeginOptionsIniAccess(
     bool writeAccess,
     HostProtocolOverrideState* outState);
 void EndOptionsIniAccess();
-bool ApplyInputDelay(int delayFrames);
+bool ApplyInputDelay(int delayFrames, int promptSerial);
 bool AnswerSpectatePromptChoice(int choice);
 bool PrepareTrainingForOnlineSimulation();
 bool PrepareVsHumanHandoff();

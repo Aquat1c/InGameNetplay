@@ -924,15 +924,36 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool)
         netplay::debug_overlay::RtTextProfile::OverlayBody,
         textColor, kRtOverlayText);
 
-    std::snprintf(line, sizeof(line), Tr("Delay: %d   (recommended %d)"),
-        g_delaySetupOverlay.selectedDelay, g_delaySetupOverlay.recommendedDelay);
+    if (g_delaySetupOverlay.limitsReady)
+    {
+        if (g_delaySetupOverlay.recommendedDelay >= 0)
+        {
+            std::snprintf(line, sizeof(line), Tr("Delay: %d   (recommended %d)"),
+                g_delaySetupOverlay.selectedDelay, g_delaySetupOverlay.recommendedDelay);
+        }
+        else
+        {
+            std::snprintf(line, sizeof(line), Tr("Delay: %d"), g_delaySetupOverlay.selectedDelay);
+        }
+    }
+    else
+    {
+        std::snprintf(line, sizeof(line), "%s", Tr("Delay: measuring..."));
+    }
     DrawTransientTextCentered(
         sv, line, cL, cR, delayPanelY + 42,
         netplay::debug_overlay::RtTextProfile::OverlayBody,
         brightColor, kRtOverlayBright);
 
-    std::snprintf(line, sizeof(line), Tr("Range: %d to %d"),
-        g_delaySetupOverlay.minDelay, g_delaySetupOverlay.maxDelay);
+    if (g_delaySetupOverlay.limitsReady)
+    {
+        std::snprintf(line, sizeof(line), Tr("Range: %d to %d"),
+            g_delaySetupOverlay.minDelay, g_delaySetupOverlay.maxDelay);
+    }
+    else
+    {
+        std::snprintf(line, sizeof(line), "%s", Tr("Range: measuring..."));
+    }
     DrawTransientTextCentered(
         sv, line, cL, cR, delayPanelY + 56,
         netplay::debug_overlay::RtTextProfile::OverlayHint,
@@ -973,7 +994,8 @@ bool DrawDelaySetupOverlayGdi(uint32_t screenContext, bool)
                 textColor, kRtOverlayText);
         }
         DrawTransientTextCentered(
-            sv, Tr("Left/Right: Adjust    A: Confirm    B: Cancel"),
+            sv, g_delaySetupOverlay.limitsReady
+                ? Tr("Left/Right: Adjust    A: Confirm    B: Cancel") : Tr("B/ESC: Cancel"),
             cL, cR, delayPanelY + 84,
             netplay::debug_overlay::RtTextProfile::OverlayHint,
             dimColor, kRtOverlayDim);
@@ -1966,6 +1988,7 @@ bool HandleDebugOverlayInput(uint32_t screenContext, const uint8_t* inputBytes, 
                 if (g_debugOverlay.forceDelayOverlay)
                 {
                     g_delaySetupOverlay.active = true;
+                    g_delaySetupOverlay.limitsReady = true;
                     g_delaySetupOverlay.selectedDelay = 3;
                     g_delaySetupOverlay.recommendedDelay = 4;
                     g_delaySetupOverlay.minDelay = 1;

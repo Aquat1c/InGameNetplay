@@ -950,8 +950,8 @@ void ClearDelayPromptState(const char* reason)
         g_hostBlock->delayMinPingMs = -1;
         g_hostBlock->delayMaxPingMs = -1;
         g_hostBlock->delayRecommended = -1;
-        g_hostBlock->delayRangeMin = 0;
-        g_hostBlock->delayRangeMax = 20;
+        g_hostBlock->delayRangeMin = -1;
+        g_hostBlock->delayRangeMax = -1;
     }
 
     g_delayPromptMetrics = {};
@@ -972,6 +972,27 @@ void ClearDelayPromptState(const char* reason)
         static_cast<long>(oldTransitionWake),
         static_cast<long>(oldNativeTimeout),
         static_cast<long>(oldNativeTimeoutHandled));
+}
+
+DelayPromptMetrics ReadPublishedDelayPromptMetrics()
+{
+    DelayPromptMetrics metrics = {};
+    if (g_hostBlock == nullptr) return metrics;
+    const LONG serial = InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0);
+    if (serial <= 0 || serial != InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0))
+        return metrics;
+    metrics.serial = serial;
+    metrics.averagePingMs = g_hostBlock->delayAveragePingMs;
+    metrics.minPingMs = g_hostBlock->delayMinPingMs;
+    metrics.maxPingMs = g_hostBlock->delayMaxPingMs;
+    metrics.recommendedDelay = g_hostBlock->delayRecommended;
+    metrics.minDelay = g_hostBlock->delayRangeMin;
+    metrics.maxDelay = g_hostBlock->delayRangeMax;
+    metrics.inputSerial = InterlockedCompareExchange(&g_hostBlock->delayInputSerial, 0, 0);
+    metrics.inputValue = g_hostBlock->delayInputValue;
+    if (serial != InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0)
+        || serial != InterlockedCompareExchange(&g_hostBlock->delayPromptSerial, 0, 0)) return {};
+    return metrics;
 }
 
 void PublishDelayPromptSerial(
@@ -2132,7 +2153,8 @@ bool ResetHostSharedBlockForSession(
     g_hostBlock->delayMinPingMs = -1;
     g_hostBlock->delayMaxPingMs = -1;
     g_hostBlock->delayRecommended = -1;
-    g_hostBlock->delayRangeMax = 20;
+    g_hostBlock->delayRangeMin = -1;
+    g_hostBlock->delayRangeMax = -1;
     g_hostBlock->hostExpectedListenerPort =
         isHostSession ? static_cast<LONG>(expectedListenerPort) : 0;
     g_hostBlock->isHostSession = isHostSession ? 1 : 0;

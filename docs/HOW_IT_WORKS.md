@@ -109,8 +109,14 @@ launcher-adoption tests.
   joining side (swapped back on teardown, owned by the takeover code).
 - **Spectate** rides the same path via `HandoffSpectateSession()`; a "wait
   for the game to begin" option covers joining before the players start.
-- The delay prompt is answered programmatically from the overlay - the same
-  question EfzRevival would ask on its console.
+- The delay overlay shows EfzRevival's measured ping, recommendation and
+  allowed range. The complete console prompt is collected before publishing
+  its values, including when Revival writes one character at a time. The
+  native input reader waits for queued prompt parsing before choosing which
+  input to serve, preserving the prompt's original cancellation generation.
+  Selection and confirmation use that prompt's limits; unknown limits leave
+  confirmation unavailable. If Revival rejects an answer and asks again,
+  the overlay returns to selection with the new limits.
 
 ## Keeping the game alive
 

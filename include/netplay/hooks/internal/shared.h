@@ -88,6 +88,8 @@ struct DelaySetupOverlayState
 {
     bool active = false;
     bool waitingForRuntimeReady = false;
+    bool limitsReady = false;
+    int promptSerial = 0;
     bool vsHumanSyncArmed = false;
     bool connectedHandoffDelayActive = false;
     DWORD nextHandoffRetryTick = 0;

@@ -15,7 +15,7 @@ void EmergencyShutdownHost();
 void InitializeInjected();
 void ShutdownInjected();
 void RequestAbortStart();
-bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus);
+bool ApplyInputDelay(int delayFrames, int expectedPromptSerial, NetbridgeStatus* ioStatus);
 bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus);
 bool PrepareVsHumanHandoff(NetbridgeStatus* ioStatus);
 void OnTitleSelectionConfirmed(int selection, NetbridgeStatus* ioStatus);

@@ -7,6 +7,7 @@
 #include "netplay/bridge/gameplay_exit_recovery.h"
 #include "netplay/bridge/session_lifecycle.h"
 #include "netplay/bridge/takeover_internal.h"
+#include "netplay/bridge/delay_selection.h"
 #include "netplay/core/i18n.h"
 #include "netplay/core/options_menu.h"
 
@@ -4537,7 +4538,7 @@ bool StartSession(
     return true;
 }
 
-bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
+bool ApplyInputDelay(int delayFrames, int expectedPromptSerial, NetbridgeStatus* ioStatus)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     LogRevival102jDeepStep("ApplyInputDelay.01.entry", ioStatus);
@@ -4562,7 +4563,14 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
     LONG delayPromptSerial = 0;
     LONG delayPromptServedSerial = 0;
     ReadDelayPromptSignal(&delayPromptSerial, &delayPromptServedSerial);
-    const bool promptPending = delayPromptSerial > 0 && delayPromptServedSerial < delayPromptSerial;
+    const bool promptPending = expectedPromptSerial > 0
+        && delayPromptSerial == expectedPromptSerial && delayPromptServedSerial < delayPromptSerial;
+    if (!promptPending || !delay_selection::Accepts(
+            ReadPublishedDelayPromptMetrics(), expectedPromptSerial, delayFrames))
+    {
+        mod::Log("Takeover: ApplyInputDelay rejected stale prompt or native range value=%d prompt=%d", delayFrames, expectedPromptSerial);
+        return false;
+    }
 
     auto queuePromptInput = [&](int value) -> bool {
         if (g_hostBlock == nullptr)
@@ -4611,51 +4619,7 @@ bool ApplyInputDelay(int delayFrames, NetbridgeStatus* ioStatus)
         return true;
     };
 
-    if (promptPending && queuePromptInput(delayFrames))
-    {
-        LogRevival102jDeepSnapshot("ApplyInputDelay.02.prompt_value_queued", ioStatus);
-        return true;
-    }
-
-    const uintptr_t sessionPtr = ReadSessionPointerFromRevival();
-    if (sessionPtr == 0)
-    {
-        mod::Log("Takeover: ApplyInputDelay failed (session pointer unavailable)");
-        RefreshRuntimeStatus(ioStatus);
-        return false;
-    }
-
-    void* const delayAddress = reinterpret_cast<void*>(sessionPtr + g_activeRevival->sessionOffsetInputDelay);
-    if (!IsWritableRange(delayAddress, sizeof(int)))
-    {
-        mod::Log(
-            "Takeover: ApplyInputDelay failed (delay field not writable addr=0x%p)",
-            delayAddress);
-        RefreshRuntimeStatus(ioStatus);
-        return false;
-    }
-
-    *reinterpret_cast<int*>(delayAddress) = delayFrames;
-
-    void* const targetWindowAddress = reinterpret_cast<void*>(
-        sessionPtr + g_activeRevival->sessionOffsetInputDelay + 8);
-    if (IsWritableRange(targetWindowAddress, sizeof(int)))
-    {
-        *reinterpret_cast<int*>(targetWindowAddress) = delayFrames;
-    }
-
-    mod::Log(
-        "Takeover: ApplyInputDelay applied value=%d session=0x%08lX (+696=%d)",
-        delayFrames,
-        static_cast<unsigned long>(sessionPtr),
-        delayFrames);
-    RefreshRuntimeStatus(ioStatus);
-    if (ioStatus != nullptr)
-    {
-        ioStatus->rollbackFrames = delayFrames;
-    }
-    LogRevival102jDeepSnapshot("ApplyInputDelay.99.direct_write_complete", ioStatus);
-    return true;
+    return queuePromptInput(delayFrames);
 }
 
 bool AnswerSpectatePromptChoice(int choice, NetbridgeStatus* ioStatus)
@@ -5911,8 +5875,8 @@ static void CancelSessionUnlocked(const char* reason, NetbridgeStatus* ioStatus)
         g_hostBlock->delayMinPingMs = -1;
         g_hostBlock->delayMaxPingMs = -1;
         g_hostBlock->delayRecommended = -1;
-        g_hostBlock->delayRangeMin = 0;
-        g_hostBlock->delayRangeMax = 20;
+        g_hostBlock->delayRangeMin = -1;
+        g_hostBlock->delayRangeMax = -1;
         InterlockedExchange(&g_hostBlock->spectateConfirmPromptSerial, 0);
         InterlockedExchange(&g_hostBlock->spectateConfirmPromptServedSerial, 0);
         g_hostBlock->spectateConfirmPromptKind = 0;
@@ -6069,25 +6033,7 @@ DelayPromptMetrics GetDelayPromptMetrics()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    DelayPromptMetrics metrics = g_delayPromptMetrics;
-    if (g_hostBlock != nullptr)
-    {
-        const LONG metricsSerial = InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0);
-        if (metricsSerial > 0)
-        {
-            metrics.serial = static_cast<int>(metricsSerial);
-            metrics.averagePingMs = g_hostBlock->delayAveragePingMs;
-            metrics.minPingMs = g_hostBlock->delayMinPingMs;
-            metrics.maxPingMs = g_hostBlock->delayMaxPingMs;
-            metrics.recommendedDelay = g_hostBlock->delayRecommended;
-            metrics.minDelay = g_hostBlock->delayRangeMin;
-            metrics.maxDelay = g_hostBlock->delayRangeMax;
-        }
-        const LONG inputSerial = InterlockedCompareExchange(&g_hostBlock->delayInputSerial, 0, 0);
-        metrics.inputSerial = static_cast<int>(inputSerial);
-        metrics.inputValue = g_hostBlock->delayInputValue;
-    }
-    return metrics;
+    return ReadPublishedDelayPromptMetrics();
 }
 
 void ArmTournamentReturnCleanup(const char* reason)

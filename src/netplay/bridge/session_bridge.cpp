@@ -1010,7 +1010,7 @@ bool IsSessionStartInProgress()
     return g_startWorkerRunning;
 }
 
-bool ApplyInputDelay(int delayFrames)
+bool ApplyInputDelay(int delayFrames, int promptSerial)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_initialized)
@@ -1037,7 +1037,7 @@ bool ApplyInputDelay(int delayFrames)
         return false;
     }
 
-    const bool applied = takeover::ApplyInputDelay(delayFrames, &g_status);
+    const bool applied = takeover::ApplyInputDelay(delayFrames, promptSerial, &g_status);
     mod::Log(
         "SessionBridge: ApplyInputDelay value=%d result=%d phase=%s",
         delayFrames,

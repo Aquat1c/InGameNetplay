@@ -713,25 +713,7 @@ void RefreshRuntimeStatus(NetbridgeStatus* ioStatus)
     ReadConsoleError(&consoleErrorSerial, ioStatus->consoleErrorText, sizeof(ioStatus->consoleErrorText));
     ioStatus->consoleErrorSerial = static_cast<int>(consoleErrorSerial);
 
-    DelayPromptMetrics promptMetrics = g_delayPromptMetrics;
-    if (g_hostBlock != nullptr)
-    {
-        const LONG metricsSerial = InterlockedCompareExchange(&g_hostBlock->delayMetricsSerial, 0, 0);
-        if (metricsSerial > 0)
-        {
-            promptMetrics.serial = static_cast<int>(metricsSerial);
-            promptMetrics.averagePingMs = g_hostBlock->delayAveragePingMs;
-            promptMetrics.minPingMs = g_hostBlock->delayMinPingMs;
-            promptMetrics.maxPingMs = g_hostBlock->delayMaxPingMs;
-            promptMetrics.recommendedDelay = g_hostBlock->delayRecommended;
-            promptMetrics.minDelay = g_hostBlock->delayRangeMin;
-            promptMetrics.maxDelay = g_hostBlock->delayRangeMax;
-        }
-        const LONG inputSerial = InterlockedCompareExchange(&g_hostBlock->delayInputSerial, 0, 0);
-        promptMetrics.inputSerial = static_cast<int>(inputSerial);
-        promptMetrics.inputValue = g_hostBlock->delayInputValue;
-    }
-    g_delayPromptMetrics = promptMetrics;
+    const DelayPromptMetrics promptMetrics = ReadPublishedDelayPromptMetrics();
 
     RevivalSyncFlags syncFlags = {};
     if (ReadRevivalSyncFlags(&syncFlags))
@@ -4311,8 +4293,8 @@ void ResetDebugCounters(SharedBlock* block)
     block->delayMinPingMs = -1;
     block->delayMaxPingMs = -1;
     block->delayRecommended = -1;
-    block->delayRangeMin = 0;
-    block->delayRangeMax = 20;
+    block->delayRangeMin = -1;
+    block->delayRangeMax = -1;
     block->delayInputSerial = 0;
     block->delayInputServedSerial = 0;
     block->delayInputValue = -1;

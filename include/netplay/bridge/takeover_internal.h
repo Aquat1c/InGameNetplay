@@ -67,8 +67,8 @@ struct SharedBlock
     int delayMinPingMs = -1;
     int delayMaxPingMs = -1;
     int delayRecommended = -1;
-    int delayRangeMin = 0;
-    int delayRangeMax = 20;
+    int delayRangeMin = -1;
+    int delayRangeMax = -1;
     volatile LONG delayInputSerial = 0;
     volatile LONG delayInputServedSerial = 0;
     int delayInputValue = -1;
@@ -283,7 +283,7 @@ std::string* SelectPendingConsoleLine(const char* sourceTag);
 bool IsLikelyRevivalDiskLogPath(const std::string& path);
 void RegisterConsoleCaptureFileHandle(HANDLE hFile, bool captureAsTextLog);
 void LogConsoleTextChunk(const char* sourceTag, const char* text, size_t length);
-void FlushPendingConsoleOutput(const char* reason);
+bool FlushPendingConsoleOutput(const char* reason, bool waitForDrain = false);
 void MaybeLogConsoleOutputChunk(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes);
 void CloseMirrorLogFiles();
 void StopManagedLogEfzWorker(bool waitForDrain);
@@ -463,6 +463,7 @@ void PublishDelayPromptSerial(
     LONG serial,
     LONG controlWakeRequestSerialSnapshot);
 void ReadDelayPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial);
+DelayPromptMetrics ReadPublishedDelayPromptMetrics();
 void PublishSpectateConfirmPromptSerial(LONG serial, int promptKind);
 void ReadSpectateConfirmPromptSignal(LONG* outPromptSerial, LONG* outPromptServedSerial, int* outPromptKind);
 void PublishConsoleError(const char* errorText);

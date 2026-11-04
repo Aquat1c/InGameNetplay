@@ -436,8 +436,8 @@ DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool
     metrics.minPingMs = -1;
     metrics.maxPingMs = -1;
     metrics.recommendedDelay = -1;
-    metrics.minDelay = 0;
-    metrics.maxDelay = 20;
+    metrics.minDelay = -1;
+    metrics.maxDelay = -1;
     metrics.inputSerial = 0;
     metrics.inputValue = -1;
 
@@ -463,8 +463,8 @@ DelayPromptMetrics ParseDelayPromptMetricsFromText(const std::string& text, bool
         hasMetrics = true;
     }
 
-    int minDelay = 0;
-    int maxDelay = 20;
+    int minDelay = -1;
+    int maxDelay = -1;
     if (ExtractDelayRange(text, &minDelay, &maxDelay))
     {
         metrics.minDelay = minDelay;
@@ -548,6 +548,7 @@ void PublishDelayPromptMetrics(const DelayPromptMetrics& metrics, LONG serial)
 
     if (g_injectedBlock != nullptr)
     {
+        InterlockedExchange(&g_injectedBlock->delayMetricsSerial, 0);
         g_injectedBlock->delayAveragePingMs = metrics.averagePingMs;
         g_injectedBlock->delayMinPingMs = metrics.minPingMs;
         g_injectedBlock->delayMaxPingMs = metrics.maxPingMs;
@@ -849,15 +850,35 @@ void NoteConsolePromptLine(
         return;
     }
 
+    bool hasMetrics = false;
+    DelayPromptMetrics metrics = ParseDelayPromptMetricsFromText(
+        g_delayMetricsAccumulator, &hasMetrics);
+    g_delayMetricsAccumulator.clear();
+    if (ContainsCaseInsensitive(text, "Enter the input delay to use")
+        && g_delayPromptMetrics.serial > 0)
+    {
+        if (metrics.averagePingMs < 0)
+        {
+            metrics.averagePingMs = g_delayPromptMetrics.averagePingMs;
+        }
+        if (metrics.minPingMs < 0)
+        {
+            metrics.minPingMs = g_delayPromptMetrics.minPingMs;
+        }
+        if (metrics.maxPingMs < 0)
+        {
+            metrics.maxPingMs = g_delayPromptMetrics.maxPingMs;
+        }
+        if (metrics.recommendedDelay < 0)
+        {
+            metrics.recommendedDelay = g_delayPromptMetrics.recommendedDelay;
+        }
+    }
     const LONG serial = InterlockedIncrement(&g_injectedDelayPromptSerial);
+    PublishDelayPromptMetrics(metrics, serial);
     PublishDelayPromptSerial(
         serial,
         controlWakeRequestSerialSnapshot);
-    bool hasMetrics = false;
-    const DelayPromptMetrics metrics = ParseDelayPromptMetricsFromText(
-        g_delayMetricsAccumulator, &hasMetrics);
-    g_delayMetricsAccumulator.clear();
-    PublishDelayPromptMetrics(metrics, serial);
     if (hasMetrics)
     {
         mod::Log(
@@ -954,7 +975,7 @@ static bool EnqueueConsoleParseChunk(
     size_t bytes,
     bool wide,
     LONG controlWakeRequestSerialSnapshot);
-static bool EnqueueConsoleParseFlush();
+static bool EnqueueConsoleParseFlush(bool waitForDrain);
 static void ProcessConsoleTextChunk(
     const char* sourceTag,
     const char* text,
@@ -1061,6 +1082,35 @@ static void LogConsoleWideTextChunk(
         controlWakeRequestSerialSnapshot);
 }
 
+struct PendingConsoleWakeSnapshot
+{
+    std::string* line;
+    LONG serial;
+};
+
+static PendingConsoleWakeSnapshot g_pendingConsoleWakeSnapshots[] = {
+    {&g_consolePendingWriteFile, -1},
+    {&g_consolePendingWriteFileDisk, -1},
+    {&g_consolePendingWriteConsoleA, -1},
+    {&g_consolePendingWriteConsoleW, -1},
+    {&g_consolePendingWriteConsoleOutputCharacterA, -1},
+    {&g_consolePendingWriteConsoleOutputCharacterW, -1},
+    {&g_consolePendingOutputDebugStringA, -1},
+    {&g_consolePendingOutputDebugStringW, -1},
+};
+
+static LONG* SelectPendingConsoleWakeSnapshot(std::string* line)
+{
+    for (auto& snapshot : g_pendingConsoleWakeSnapshots)
+    {
+        if (snapshot.line == line)
+        {
+            return &snapshot.serial;
+        }
+    }
+    return nullptr;
+}
+
 static void ProcessConsoleTextChunk(
     const char* sourceTag,
     const char* text,
@@ -1092,9 +1142,17 @@ static void ProcessConsoleTextChunk(
         line->reserve(256);
     }
 
+    LONG localWakeSnapshot = -1;
+    LONG* wakeSnapshot = SelectPendingConsoleWakeSnapshot(line);
+    if (wakeSnapshot == nullptr)
+    {
+        wakeSnapshot = &localWakeSnapshot;
+    }
     auto flushLine = [&](bool) {
         const std::string trimmed = TrimAscii(*line);
         line->clear();
+        const LONG rawWriteWakeSnapshot = *wakeSnapshot;
+        *wakeSnapshot = -1;
         if (trimmed.empty())
         {
             return;
@@ -1107,7 +1165,7 @@ static void ProcessConsoleTextChunk(
         }
         NoteConsolePromptLine(
             trimmed,
-            controlWakeRequestSerialSnapshot);
+            rawWriteWakeSnapshot);
     };
 
     for (size_t i = 0; i < length; ++i)
@@ -1121,6 +1179,10 @@ static void ProcessConsoleTextChunk(
         {
             flushLine(false);
             continue;
+        }
+        if (line->empty())
+        {
+            *wakeSnapshot = controlWakeRequestSerialSnapshot;
         }
         if (c == '\t')
         {
@@ -1158,8 +1220,6 @@ static void ProcessConsoleTextChunk(
             "Host already playing, join as a spectator",
             "Host not yet playing, join as a player",
             "Waiting for game to begin",
-            "Enter the initial input delay",
-            "Enter the input delay to use",
         };
         for (const char* kw : kImmediateFlushKeywords)
         {
@@ -1199,7 +1259,13 @@ static void FlushPendingConsoleOutputLocked()
             AppendOwnedLogEfzLine(sourceTag, trimmed);
         }
 
-        NoteConsolePromptLine(trimmed, -1);
+        LONG* wakeSnapshot = SelectPendingConsoleWakeSnapshot(line);
+        const LONG rawWriteWakeSnapshot = wakeSnapshot != nullptr ? *wakeSnapshot : -1;
+        if (wakeSnapshot != nullptr)
+        {
+            *wakeSnapshot = -1;
+        }
+        NoteConsolePromptLine(trimmed, rawWriteWakeSnapshot);
     };
 
     flushOne("WriteFile", &g_consolePendingWriteFile);
@@ -1210,16 +1276,6 @@ static void FlushPendingConsoleOutputLocked()
     flushOne("WriteConsoleOutputCharacterW", &g_consolePendingWriteConsoleOutputCharacterW);
     flushOne("OutputDebugStringA", &g_consolePendingOutputDebugStringA);
     flushOne("OutputDebugStringW", &g_consolePendingOutputDebugStringW);
-}
-
-void FlushPendingConsoleOutput(const char*)
-{
-    if (EnqueueConsoleParseFlush())
-    {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
-    FlushPendingConsoleOutputLocked();
 }
 
 static std::mutex g_ownedLogEfzMutex;
@@ -1371,6 +1427,10 @@ static void DiscardPendingConsoleFragmentsLocked()
     g_consolePendingWriteConsoleOutputCharacterW.clear();
     g_consolePendingOutputDebugStringA.clear();
     g_consolePendingOutputDebugStringW.clear();
+    for (auto& snapshot : g_pendingConsoleWakeSnapshots)
+    {
+        snapshot.serial = -1;
+    }
 }
 
 static void ReportConsoleIngressDropsOnWorker()
@@ -2103,8 +2163,9 @@ static bool EnqueueConsoleParseChunk(
     return true;
 }
 
-static bool EnqueueConsoleParseFlush()
+static bool EnqueueConsoleParseFlush(bool waitForDrain)
 {
+    unsigned long long flushSequence = 0;
     OwnedLogEfzEntry entry;
     entry.kind = OwnedLogEfzEntry::Kind::ParseFlush;
 
@@ -2123,6 +2184,7 @@ static bool EnqueueConsoleParseFlush()
         entry.ingressLossGeneration =
             g_consoleIngressLossGeneration.load(std::memory_order_acquire);
         entry.sequence = ++g_ownedLogEfzEnqueuedSequence;
+        flushSequence = entry.sequence;
         try
         {
             g_ownedLogEfzQueue.push_back(std::move(entry));
@@ -2141,6 +2203,41 @@ static bool EnqueueConsoleParseFlush()
         }
     }
     g_ownedLogEfzQueueCv.notify_one();
+    if (waitForDrain)
+    {
+        std::unique_lock<std::mutex> lock(g_ownedLogEfzQueueMutex);
+        g_ownedLogEfzDrainCv.wait(lock, [flushSequence] {
+            return g_ownedLogEfzProcessedSequence >= flushSequence
+                || !g_ownedLogEfzWorkerStarted
+                || InterlockedCompareExchange(
+                       &g_ownedLogEfzEmergencyStop, 0, 0) != 0;
+        });
+        return g_ownedLogEfzProcessedSequence >= flushSequence;
+    }
+    return true;
+}
+
+bool FlushPendingConsoleOutput(const char*, bool waitForDrain)
+{
+    if (waitForDrain && GetCurrentThreadId() == g_ownedLogEfzWorkerThreadId)
+    {
+        return false;
+    }
+    if (EnqueueConsoleParseFlush(waitForDrain))
+    {
+        return true;
+    }
+    if (waitForDrain)
+    {
+        std::lock_guard<std::mutex> lock(g_ownedLogEfzQueueMutex);
+        if (g_ownedLogEfzWorkerStarted
+            || InterlockedCompareExchange(&g_ownedLogEfzEmergencyStop, 0, 0) != 0)
+        {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_consoleLogMutex);
+    FlushPendingConsoleOutputLocked();
     return true;
 }
 

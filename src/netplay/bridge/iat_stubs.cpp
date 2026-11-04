@@ -2385,7 +2385,15 @@ BOOL StubReadConsoleA(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
         lpBuffer,
         lpNumberOfCharsRead,
         HasInjectedContext() ? 1 : 0);
-    FlushPendingConsoleOutput("before_ReadConsoleA");
+    if (!FlushPendingConsoleOutput("before_ReadConsoleA", true))
+    {
+        if (lpNumberOfCharsRead != nullptr)
+        {
+            *lpNumberOfCharsRead = 0;
+        }
+        SetLastError(ERROR_OPERATION_ABORTED);
+        return FALSE;
+    }
 
     auto copyInputOut = [&](const char* input) -> BOOL {
         if (input == nullptr || input[0] == '\0')
@@ -2858,7 +2866,15 @@ BOOL StubReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfChar
         lpBuffer,
         lpNumberOfCharsRead,
         HasInjectedContext() ? 1 : 0);
-    FlushPendingConsoleOutput("before_ReadConsoleW");
+    if (!FlushPendingConsoleOutput("before_ReadConsoleW", true))
+    {
+        if (lpNumberOfCharsRead != nullptr)
+        {
+            *lpNumberOfCharsRead = 0;
+        }
+        SetLastError(ERROR_OPERATION_ABORTED);
+        return FALSE;
+    }
 
     auto copyInputOut = [&](const char* input) -> BOOL {
         if (input == nullptr || input[0] == '\0')
