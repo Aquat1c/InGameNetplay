@@ -144,10 +144,10 @@ void Reload()
 
     Settings loaded = {};
     loaded.offlineVsHumanMode =
-        ReadStringValue(L"Others", L"OfflineVsHumanMode", L"Tournament", iniPath);
-    if (loaded.offlineVsHumanMode != "VS Human")
+        ReadStringValue(L"Others", L"OfflineVsHumanMode", L"VS Human", iniPath);
+    if (loaded.offlineVsHumanMode != "Tournament")
     {
-        loaded.offlineVsHumanMode = "Tournament";
+        loaded.offlineVsHumanMode = "VS Human";
     }
     loaded.writeLogFile =
         ReadBoolValue(L"Others", L"WriteLogFile", true, iniPath);
@@ -261,7 +261,7 @@ const Settings& Get()
 
 bool UseTournamentModeForOfflineVsHuman()
 {
-    return g_settings.offlineVsHumanMode != "VS Human";
+    return g_settings.offlineVsHumanMode == "Tournament";
 }
 
 bool IsFileLoggingEnabled()

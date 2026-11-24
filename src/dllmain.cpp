@@ -12,6 +12,7 @@
 #include "netplay/bridge/netplay_state_export.h"
 #include "netplay/hooks/menu_hooks.h"
 #include "netplay/interop/palette_charselect.h"
+#include "netplay/core/options_menu.h"
 #include "netplay/interop/overlay_helper_hooks.h"
 
 namespace
@@ -32,6 +33,7 @@ DWORD WINAPI InitializeModThread(LPVOID moduleHandleRaw)
         mod::InstallCrashHandlers(moduleHandle, false);
         mod::Log("Module attached at %p", moduleHandle);
         netplay::i18n::Reload();
+        netplay::options::TidyIniFile();
 
         if (!netplay::bridge::Initialize())
         {

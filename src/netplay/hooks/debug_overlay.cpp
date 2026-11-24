@@ -220,6 +220,22 @@ void EnsureRtTextLock()
     }
 }
 
+// Also guards the font pointers: text is measured outside the overlay's render call.
+struct RtFontLock
+{
+    RtFontLock()
+    {
+        EnsureRtTextLock();
+        EnterCriticalSection(&g_rtTextLock);
+    }
+    ~RtFontLock()
+    {
+        LeaveCriticalSection(&g_rtTextLock);
+    }
+    RtFontLock(const RtFontLock&) = delete;
+    RtFontLock& operator=(const RtFontLock&) = delete;
+};
+
 ImFont* RtFontFor(RtTextProfile profile)
 {
     size_t index = static_cast<size_t>(profile);
@@ -718,6 +734,16 @@ void LoadRtFonts()
         g_rtProfiles[8].fontPx);
 }
 
+void RebuildRtFontAtlas()
+{
+    RtFontLock lock;
+    LoadRtFonts();
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Build();
+    // Every source keeps its own copy of the font file (up to 20 MB each); the baked atlas does not need them.
+    io.Fonts->ClearInputData();
+}
+
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     DeviceRenderScope input;
@@ -802,6 +828,14 @@ bool ShutdownImGui()
         }
     }
 
+    {
+        RtFontLock lock;
+        g_badgeFont = nullptr;
+        for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
+        {
+            g_rtProfileFonts[i] = nullptr;
+        }
+    }
     if (g_device) ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext(g_context);
@@ -811,11 +845,6 @@ bool ShutdownImGui()
     g_imguiPhase = ImGuiPhase::Dormant;
     g_device = nullptr;
     g_hwnd = nullptr;
-    g_badgeFont = nullptr;
-    for (size_t i = 0; i < static_cast<size_t>(RtTextProfile::Count); ++i)
-    {
-        g_rtProfileFonts[i] = nullptr;
-    }
     InterlockedExchange(&g_rtFontRebuildRequested, 0);
 
     if (detachedFromChain)
@@ -912,9 +941,8 @@ bool EnsureInited(IDirect3DDevice9* device)
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
 
-    LoadRtFonts();
     // Build the atlas now: text waits on IsLoaded(), and the backend builds it only after text is submitted.
-    ImGui::GetIO().Fonts->Build();
+    RebuildRtFontAtlas();
 
     if (!ImGui_ImplWin32_Init(hwnd))
     {
@@ -1433,8 +1461,7 @@ void Render(IDirect3DDevice9* device)
     if (InterlockedExchange(&g_rtFontRebuildRequested, 0) != 0)
     {
         ImGui_ImplDX9_InvalidateDeviceObjects();
-        LoadRtFonts();
-        ImGui::GetIO().Fonts->Build();
+        RebuildRtFontAtlas();
     }
 
     ImGui_ImplDX9_NewFrame();
@@ -1503,6 +1530,7 @@ bool IsDebugPanelActive()
 
 bool IsRtTextAvailable()
 {
+    RtFontLock lock;
     return HasImGuiContext() && g_badgeFont != nullptr && g_badgeFont->IsLoaded();
 }
 
@@ -1518,6 +1546,7 @@ void NotifyFontSettingsChanged()
 
 int MeasureRtTextWidth(RtTextProfile profile, const char* text)
 {
+    RtFontLock lock;
     if (text == nullptr || !IsRtTextAvailable())
     {
         return -1;

@@ -467,6 +467,17 @@ bool ReadWideTextFile(const std::string& path, std::wstring* outText, FileEncodi
         return false;
     }
 
+    // The editor holds several copies of the text; a real EfzRevival.ini is a few KB.
+    constexpr std::streamoff kMaxIniBytes = 1024 * 1024;
+    file.seekg(0, std::ios::end);
+    const std::streamoff fileBytes = file.tellg();
+    if (fileBytes < 0 || fileBytes > kMaxIniBytes)
+    {
+        mod::Log("OptionsMenu: refusing '%s', size %lld is not a plausible INI", path.c_str(), static_cast<long long>(fileBytes));
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (bytes.size() >= 2 && bytes[0] == 0xFFu && bytes[1] == 0xFEu)
     {
@@ -1360,6 +1371,30 @@ std::string PrettyKeyLabel(const std::string& key)
         return I18N_KEY("Option");
     }
 
+    // A row shows "label: value" in 26 characters.
+    static const struct
+    {
+        const char* key;
+        const char* label;
+    } kShortLabels[] = {
+        {"OfflineVsHumanMode", I18N_KEY("Offline VS Mode")},
+        {"OnlineCustomColors", I18N_KEY("Online Colors")},
+        {"AsyncHostReturnKey", I18N_KEY("Host Return Key")},
+        {"CheckForUpdates", I18N_KEY("Update Check")},
+        {"MenuTtfText", I18N_KEY("Smooth Menu Text")},
+        {"MenuTtfFont", I18N_KEY("Menu Font")},
+        {"HideEmptySetsInBattleLog", I18N_KEY("Hide Empty Sets")},
+        {"PreserveModLogAcrossLaunches", I18N_KEY("Keep Mod Log")},
+        {"PreserveRevivalLogsAcrossLaunches", I18N_KEY("Keep Revival Logs")},
+    };
+    for (const auto& entry : kShortLabels)
+    {
+        if (key == entry.key)
+        {
+            return entry.label;
+        }
+    }
+
     std::string label;
     label.reserve(key.size() + 6);
     for (size_t i = 0; i < key.size(); ++i)
@@ -1439,10 +1474,11 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
         {"Global", I18N_KEY("WINDOW"), {"WindowX", "WindowY", "WindowWidth", "WindowHeight", "BackBufferWidth", "BackBufferHeight"}},
         {"Global", I18N_KEY("AUDIO"), {"ToggleBGM", "MuteBGM", "BGMFolder"}},
         {"Global", I18N_KEY("SYSTEM"), {"SoftwareRendering", "Debug"}},
-        {"Others", I18N_KEY("INTERFACE"), {"Language", "MenuTtfText", "MenuTtfFont", "HostingTipFont", "EnableDebugMenu", "HideEmptySetsInBattleLog"}},
-        {"Others", I18N_KEY("GAMEPLAY"), {"OfflineVsHumanMode", "AsyncHostReturnKey", "OnlineCustomColors"}},
-        {"Others", I18N_KEY("LOGGING"), {"WriteLogFile", "EnableConsole", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches", "VerboseBridgePatchLogging", "VerboseSyncDiagnostics", "VerboseRevival102jLifecycleLogging"}},
-        {"Others", I18N_KEY("MOD"), {"CheckForUpdates", "ConnectionCheck", "About"}},
+        // Header plus seven rows fills the first page exactly.
+        {"Others", I18N_KEY("GENERAL"), {"Language", "OfflineVsHumanMode", "OnlineCustomColors", "AsyncHostReturnKey", "CheckForUpdates", "ConnectionCheck", "About"}},
+        {"Others", I18N_KEY("DISPLAY"), {"MenuTtfText", "MenuTtfFont", "HostingTipFont", "HideEmptySetsInBattleLog"}},
+        // Debug keys (EnableConsole, EnableDebugMenu, Verbose*) are INI-only.
+        {"Others", I18N_KEY("LOGGING"), {"WriteLogFile", "PreserveModLogAcrossLaunches", "PreserveRevivalLogsAcrossLaunches"}},
     };
     return kGroups;
 }
@@ -1463,11 +1499,8 @@ const std::vector<PageGroupDef>& GetPageGroupDefs()
     I18N_KEY("Switch Players"), I18N_KEY("Mirror Players"), I18N_KEY("Window X"), I18N_KEY("Window Y"),
     I18N_KEY("Window Width"), I18N_KEY("Window Height"), I18N_KEY("Back Buffer Width"), I18N_KEY("Back Buffer Height"),
     I18N_KEY("Toggle BGM"), I18N_KEY("Mute BGM"), I18N_KEY("BGMFolder"), I18N_KEY("Software Rendering"),
-    I18N_KEY("Debug"), I18N_KEY("Language"), I18N_KEY("Menu Ttf Text"), I18N_KEY("Menu Ttf Font"),
-    I18N_KEY("Hosting Tip Font"), I18N_KEY("Enable Debug Menu"), I18N_KEY("Hide Empty Sets In Battle Log"), I18N_KEY("Offline Vs Human Mode"),
-    I18N_KEY("Async Host Return Key"), I18N_KEY("Online Custom Colors"), I18N_KEY("Write Log File"), I18N_KEY("Enable Console"),
-    I18N_KEY("Preserve Mod Log Across Launches"), I18N_KEY("Preserve Revival Logs Across Launches"), I18N_KEY("Verbose Bridge Patch Logging"), I18N_KEY("Verbose Sync Diagnostics"),
-    I18N_KEY("Verbose Revival102j Lifecycle Logging"), I18N_KEY("Check For Updates"), I18N_KEY("Connection Check"), I18N_KEY("About"),
+    I18N_KEY("Debug"), I18N_KEY("Language"), I18N_KEY("Hosting Tip Font"), I18N_KEY("Write Log File"),
+    I18N_KEY("Connection Check"), I18N_KEY("About"),
     I18N_KEY("Tournament"), I18N_KEY("P1 Name"), I18N_KEY("P2 Name"), I18N_KEY("Tournament Folder"),
 };
 
@@ -1886,8 +1919,8 @@ void AppendSyntheticItems()
 
     upsertChoiceItem(
         "OfflineVsHumanMode",
-        "Tournament",
-        {I18N_KEY("Tournament"), I18N_KEY("VS Human")},
+        "VS Human",
+        {I18N_KEY("VS Human"), I18N_KEY("Tournament")},
         I18N_KEY("Choose whether the title-screen VS Human option launches tournament mode or regular VS Human."));
     upsertBoolIntItem(
         "WriteLogFile",
@@ -1901,26 +1934,6 @@ void AppendSyntheticItems()
         "PreserveRevivalLogsAcrossLaunches",
         false,
         I18N_KEY("Keep previous Revival log content across full game relaunches. Off starts a fresh logEfz.txt each launch."));
-    upsertBoolIntItem(
-        "EnableConsole",
-        false,
-        I18N_KEY("Open the logger console window automatically when the mod starts."));
-    upsertBoolIntItem(
-        "EnableDebugMenu",
-        false,
-        I18N_KEY("Enable the ImGui debug overlay. Toggle it on any screen with the \\ (backslash) key."));
-    upsertBoolIntItem(
-        "VerboseBridgePatchLogging",
-        false,
-        I18N_KEY("Log extra byte windows and vtable slots around Revival bridge patches."));
-    upsertBoolIntItem(
-        "VerboseSyncDiagnostics",
-        false,
-        I18N_KEY("Log detailed rollback session, ring, FPU, and sync-frame diagnostics."));
-    upsertBoolIntItem(
-        "VerboseRevival102jLifecycleLogging",
-        false,
-        I18N_KEY("Log full 1.02j lifecycle checkpoints, IPC state, hooks, mappings, vtables, and session-object byte dumps."));
     upsertBoolIntItem(
         "HideEmptySetsInBattleLog",
         true,
@@ -2024,9 +2037,20 @@ void ApplyRuntimeNetplaySettings()
         }
     }
 
+    const std::string fontInputsBefore =
+        netplay::mod_settings::MenuTtfFontFace() + '|'
+        + netplay::mod_settings::HostingTipFontFace() + '|'
+        + netplay::mod_settings::Language();
     netplay::mod_settings::Reload();
     netplay::i18n::Reload();   // before the font rebuild: it bakes the table's glyphs
-    netplay::debug_overlay::NotifyFontSettingsChanged();
+    const std::string fontInputsAfter =
+        netplay::mod_settings::MenuTtfFontFace() + '|'
+        + netplay::mod_settings::HostingTipFontFace() + '|'
+        + netplay::mod_settings::Language();
+    if (fontInputsAfter != fontInputsBefore)
+    {
+        netplay::debug_overlay::NotifyFontSettingsChanged();
+    }
 
     HMODULE moduleHandle = nullptr;
     (void)GetModuleHandleExA(
@@ -2041,6 +2065,158 @@ void ApplyRuntimeNetplaySettings()
     {
         hooks::g_debugOverlay.open = false;
     }
+}
+
+struct OthersIniDoc
+{
+    const wchar_t* key;
+    const wchar_t* comment;
+};
+
+constexpr OthersIniDoc kOthersIniDocs[] = {
+    {L"Language", L"Language of the mod's menus: English or Japanese."},
+    {L"OfflineVsHumanMode", L"What \"VS Human\" on the title screen starts: VS Human or Tournament."},
+    {L"OnlineCustomColors",
+     L"Show your EDIT COLOR palettes to your opponent online, and see theirs.\n"
+     L"Opponents without the mod are not affected."},
+    {L"AsyncHostReturnKey",
+     L"Key that brings the netplay menu back while you wait for an opponent in-game.\n"
+     L"Uses the DIK_ key names listed in this file."},
+    {L"CheckForUpdates", L"Look for a newer mod release on GitHub once per launch. Nothing is downloaded."},
+    {L"ConnectionCheck", L"While hosting over IPv4, ask a test server whether other players can reach you."},
+    {L"MenuTtfText", L"Draw menu text with a smooth TTF font instead of the pixel font."},
+    {L"MenuTtfFont", L"Font used for menu text."},
+    {L"HostingTipFont", L"Font used for the \"Hosting...\" tip shown in-game."},
+    {L"HideEmptySetsInBattleLog", L"Hide sets that ended 0-0 in the Battle Log."},
+    {L"WriteLogFile", L"Write efz_netplay_mod.log while the mod is running."},
+    {L"PreserveModLogAcrossLaunches", L"Keep the old efz_netplay_mod.log instead of starting a fresh one each launch."},
+    {L"PreserveRevivalLogsAcrossLaunches", L"Keep the old logEfz.txt instead of starting a fresh one each launch."},
+    {L"EnableConsole", L"Open a console window showing the mod log when the game starts."},
+    {L"EnableDebugMenu", L"Enable the debug overlay. Toggle it with the \\ (backslash) key."},
+};
+
+std::wstring IniLineKey(const std::wstring& line)
+{
+    const std::wstring trimmed = TrimWide(line);
+    const size_t equals = trimmed.find(L'=');
+    if (trimmed.empty() || trimmed[0] == L';' || trimmed[0] == L'[' || equals == std::wstring::npos)
+    {
+        return {};
+    }
+    return TrimWide(std::wstring_view(trimmed).substr(0, equals));
+}
+
+struct OthersIniRange
+{
+    int begin = -1;
+    int oldEnd = -1;
+    int newEnd = -1;
+};
+
+// Rewrites [Others] from its header to its last key. Comments inside that range are regenerated, so the result is stable across saves.
+OthersIniRange FormatOthersIniSection(std::vector<std::wstring>& lines)
+{
+    OthersIniRange range;
+    int header = -1;
+    int lastKey = -1;
+    for (int index = 0; index < static_cast<int>(lines.size()); ++index)
+    {
+        const std::wstring trimmed = TrimWide(lines[static_cast<size_t>(index)]);
+        if (!trimmed.empty() && trimmed[0] == L'[')
+        {
+            if (header >= 0)
+            {
+                break;
+            }
+            if (_wcsicmp(trimmed.c_str(), L"[Others]") == 0)
+            {
+                header = index;
+            }
+            continue;
+        }
+        if (header >= 0 && !IniLineKey(trimmed).empty())
+        {
+            lastKey = index;
+        }
+    }
+    if (lastKey < 0)
+    {
+        return range;
+    }
+
+    std::vector<std::pair<std::wstring, std::wstring>> pairs;
+    for (int index = header + 1; index <= lastKey; ++index)
+    {
+        const std::wstring& line = lines[static_cast<size_t>(index)];
+        const std::wstring key = IniLineKey(line);
+        if (!key.empty())
+        {
+            pairs.emplace_back(key, TrimWide(std::wstring_view(line).substr(line.find(L'=') + 1)));
+        }
+    }
+
+    std::vector<std::wstring> out;
+    const auto emitComment = [&](const std::wstring& text)
+    {
+        out.emplace_back();
+        out.emplace_back(L";/*");
+        size_t start = 0;
+        while (start <= text.size())
+        {
+            const size_t end = (std::min)(text.find(L'\n', start), text.size());
+            out.push_back(L"; * " + text.substr(start, end - start));
+            start = end + 1;
+        }
+        out.emplace_back(L"; */");
+    };
+    const auto emitPair = [&](const std::pair<std::wstring, std::wstring>& pair)
+    {
+        std::wstring line = pair.first;
+        if (line.size() < 34)
+        {
+            line.resize(34, L' ');
+        }
+        out.push_back(line + L" = " + pair.second);
+    };
+
+    emitComment(
+        L"Settings of the In-game Netplay mod. EfzRevival itself does not read this section.\n"
+        L"Most of them can also be changed in-game under OPTIONS.");
+    std::vector<bool> used(pairs.size(), false);
+    for (const OthersIniDoc& doc : kOthersIniDocs)
+    {
+        for (size_t index = 0; index < pairs.size(); ++index)
+        {
+            if (!used[index] && _wcsicmp(pairs[index].first.c_str(), doc.key) == 0)
+            {
+                used[index] = true;
+                emitComment(doc.comment);
+                emitPair(pairs[index]);
+                break;
+            }
+        }
+    }
+    bool wroteInternalHeader = false;
+    for (size_t index = 0; index < pairs.size(); ++index)
+    {
+        if (used[index])
+        {
+            continue;
+        }
+        if (!wroteInternalHeader)
+        {
+            emitComment(L"Internal and experimental keys. Leave them alone unless you were asked to change one.");
+            wroteInternalHeader = true;
+        }
+        emitPair(pairs[index]);
+    }
+
+    range.begin = header + 1;
+    range.oldEnd = lastKey + 1;
+    range.newEnd = range.begin + static_cast<int>(out.size());
+    lines.erase(lines.begin() + range.begin, lines.begin() + range.oldEnd);
+    lines.insert(lines.begin() + range.begin, out.begin(), out.end());
+    return range;
 }
 
 bool SaveItemsToDisk()
@@ -2176,6 +2352,31 @@ bool SaveItemsToDisk()
         shiftLineIndices(syntheticOthersInsertLine);
         item.lineIndex = syntheticOthersInsertLine;
         ++syntheticOthersInsertLine;
+    }
+
+    const OthersIniRange othersRange = FormatOthersIniSection(updatedLines);
+    if (othersRange.begin >= 0)
+    {
+        for (Item& item : g_state.items)
+        {
+            if (item.lineIndex >= othersRange.oldEnd)
+            {
+                item.lineIndex += othersRange.newEnd - othersRange.oldEnd;
+            }
+            else if (item.lineIndex >= othersRange.begin)
+            {
+                const std::wstring itemKey = TrimWide(item.rawKeyName);
+                item.lineIndex = -1;
+                for (int index = othersRange.begin; index < othersRange.newEnd; ++index)
+                {
+                    if (IniLineKey(updatedLines[static_cast<size_t>(index)]) == itemKey)
+                    {
+                        item.lineIndex = index;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     const std::wstring joined = JoinLines(updatedLines);
@@ -3421,27 +3622,49 @@ bool HandleInput(uint32_t screenContext, const uint8_t* inputBytes, uint32_t* in
             if (*inputLatch == 0)
             {
                 const int pageSize = kVisibleRowCount;
-                const int maxScroll = (std::max)(0, GetCurrentContentCount() - pageSize);
-                const int currentPageStart = (g_state.scrollOffset / pageSize) * pageSize;
-                int nextScroll = currentPageStart;
-                if (horizontal > 0)
+                const int contentCount = GetCurrentContentCount();
+                const int maxScroll = (std::max)(0, contentCount - pageSize);
+                const int currentSelection =
+                    static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection));
+                const int currentContent =
+                    (std::min)(g_state.scrollOffset + (std::max)(currentSelection, 0), contentCount - 1);
+
+                // Left/right moves between section headers; pages when the category has none.
+                int sectionStart = currentContent;
+                while (sectionStart >= 0 && !IsContentIndexHeader(sectionStart))
                 {
-                    nextScroll = (std::min)(maxScroll, currentPageStart + pageSize);
+                    --sectionStart;
                 }
-                else
+                int targetHeader = horizontal > 0 ? currentContent + 1 : sectionStart - 1;
+                while (targetHeader >= 0 && targetHeader < contentCount && !IsContentIndexHeader(targetHeader))
                 {
-                    nextScroll = (std::max)(0, currentPageStart - pageSize);
+                    targetHeader += horizontal > 0 ? 1 : -1;
+                }
+                const bool haveTarget = targetHeader >= 0 && targetHeader < contentCount;
+
+                const int currentPageStart = (g_state.scrollOffset / pageSize) * pageSize;
+                int nextScroll = g_state.scrollOffset;
+                if (haveTarget)
+                {
+                    nextScroll = (std::min)(maxScroll, targetHeader);
+                }
+                else if (sectionStart < 0)
+                {
+                    nextScroll = horizontal > 0
+                        ? (std::min)(maxScroll, currentPageStart + pageSize)
+                        : (std::max)(0, currentPageStart - pageSize);
                 }
 
-                if (nextScroll != g_state.scrollOffset)
+                if (haveTarget || nextScroll != g_state.scrollOffset)
                 {
-                    const int currentSelection =
-                        static_cast<int>(*reinterpret_cast<int8_t*>(screenContext + netplay::constants::kOffsetMenuSelection));
                     g_state.scrollOffset = nextScroll;
                     RebuildMenuEntries();
                     SetSelection(
                         screenContext,
-                        SnapSlotToSelectable((std::min)(currentSelection, GetVisibleContentCount() - 1)));
+                        SnapSlotToSelectable(
+                            haveTarget
+                                ? targetHeader + 1 - g_state.scrollOffset
+                                : (std::min)(currentSelection, GetVisibleContentCount() - 1)));
                     hooks::PlayUiSound(screenContext, netplay::constants::kSfxMove);
                     mod::Log(
                         "OptionsMenu: page %s scroll=%d",
@@ -3836,5 +4059,24 @@ uint8_t GetMenuDetailForStateExport()
 bool UseTournamentModeForOfflineVsHuman()
 {
     return netplay::mod_settings::UseTournamentModeForOfflineVsHuman();
+}
+
+void TidyIniFile()
+{
+    const std::string path = ResolveRevivalIniPath();
+    ScopedOptionsIniAccess iniAccess(true);
+    std::wstring text;
+    FileEncoding encoding{};
+    if (path.empty() || !iniAccess.Acquired() || !ReadWideTextFile(path, &text, &encoding))
+    {
+        return;
+    }
+    const std::vector<std::wstring> before = SplitLines(text);
+    std::vector<std::wstring> lines = before;
+    (void)FormatOthersIniSection(lines);
+    if (lines != before && !WriteWideTextFile(path, JoinLines(lines), encoding))
+    {
+        mod::Log("OptionsMenu: could not tidy '%s'", path.c_str());
+    }
 }
 } // namespace netplay::options

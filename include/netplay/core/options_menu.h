@@ -30,6 +30,8 @@ bool DrawSaveOverlayGdi(uint32_t screenContext, bool allowWindowDc);
 bool IsSaveOverlayActive();
 int GetOptionsSlideOffsetX();
 bool IsBusy();
+// Rewrites the mod's [Others] section of EfzRevival.ini with comments; no-op when already tidy.
+void TidyIniFile();
 uint8_t GetMenuDetailForStateExport();
 bool UseTournamentModeForOfflineVsHuman();
 }

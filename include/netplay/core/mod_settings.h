@@ -7,7 +7,7 @@ namespace netplay::mod_settings
 {
 struct Settings
 {
-    std::string offlineVsHumanMode = "Tournament";
+    std::string offlineVsHumanMode = "VS Human";
     bool writeLogFile = true;
     bool preserveModLogAcrossLaunches = false;
     bool preserveRevivalLogsAcrossLaunches = false;
