@@ -6,9 +6,38 @@ top-level `LICENSE` file are released under the MIT License.
 If you reuse or redistribute that material, keep the copyright notice and
 license text with it.
 
-This repository also contains excluded third-party, reverse-engineered, and
-game-derived material. See `LICENSE` and the individual files/directories for
-their respective ownership and licensing status.
+License scope
+-------------
+
+The MIT License in `LICENSE` applies only to the original project-authored
+source code and documentation in this repository:
+
+  * `src/`, `include/`, `tests/`, `server/`, `docs/`
+  * `README.md`, `readme.txt`, `CMakeLists.txt`, `CMakePresets.json`
+
+It does not apply to:
+
+  * `third_party/` (each library keeps its own license)
+  * `assets/` (see "Bundled fonts" below)
+  * proprietary game binaries, game assets, or other files not owned by this
+    project
+  * any file that carries its own separate license or copyright notice
+
+
+EfzRevival
+----------
+
+EfzRevival is created by Fireseal. It is a separate program that this mod
+drives for online play. It is NOT distributed with this mod and is NOT covered
+by this project's MIT license; install it separately.
+
+
+Concerto EFZ
+------------
+
+Concerto EFZ (https://github.com/shiburizu/concerto-efz) is created by
+shiburizu. It served as the reference for this mod's room lifecycle,
+challenge flow, and lobby backend usage. No Concerto code is included.
 
 
 Bundled fonts (assets/)

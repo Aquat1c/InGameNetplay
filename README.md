@@ -159,11 +159,14 @@ Options:
 - Dynamic in-game editor for `EfzRevival.ini` (see **Options editor** in
   [How it works](docs/HOW_IT_WORKS.md))
 - Category pages, tooltips, key and pad rebinding with conflict checks
-- Mod-owned `Others` settings such as `OfflineVsHumanMode`, `WriteLogFile`,
-  `EnableConsole`, `EnableDebugMenu`, `OnlineCustomColors`,
+- Mod-owned `Others` settings such as `OfflineVsHumanMode` (default
+  `VS Human`), `WriteLogFile`, `OnlineCustomColors`,
   `HideEmptySetsInBattleLog`, `AsyncHostReturnKey` (default `F1`), and
   `CheckForUpdates` (shows a `[!]` badge on OPTIONS when a newer release is
   out), and `ConnectionCheck` (see below)
+- Left/right jumps between the sections of a category page
+- Debug switches are not shown in the editor; add `EnableConsole=1` or
+  `EnableDebugMenu=1` under `[Others]` in `EfzRevival.ini` by hand
 - `About` modal with version/build information and the newest GitHub release
 
 While you host over IPv4, the mod asks a small test server to try reaching your
@@ -390,6 +393,16 @@ Notes:
 - `include/` - public/internal headers
 - `tests/` - C++ contract tests and Python source-contract checks
 
+## Credits
+
+- **Aquat1c** - main developer of In-game Netplay.
+- **EfzRevival** is created by **Fireseal**. It provides the online
+  simulation, rollback netcode, and hole punching that this mod drives.
+  EfzRevival is not distributed with this mod; install it separately.
+- **[Concerto EFZ](https://github.com/shiburizu/concerto-efz)** is created by
+  **shiburizu**. Its room lifecycle, challenge flow, and lobby backend served
+  as the reference for this mod's online flow. No Concerto code is included.
+
 ## Copyright and licenses
 
 - The original project-authored source code and documentation are released
@@ -419,8 +432,3 @@ Notes:
   (`EFZ_QueryOverlayResetApiV1`).
 - `include/efz_netplay_state.h`: the shared-state ABI for companion tools.
 - `tests/`: the contract tests; keep them passing.
-
-### Comment discipline
-
-Short, load-bearing comments only. Explanations of how subsystems work
-belong in `docs/`, not in the code.

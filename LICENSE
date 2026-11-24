@@ -1,31 +1,6 @@
-In-game Netplay
-Copyright (c) 2025-2026 In-game Netplay contributors
-
-Scope
-
-This license applies only to the original project-authored source code and
-documentation in this repository, including:
-
-- `src/`
-- `include/`
-- `tools/`
-- `cmake/`
-- `README.md`
-- `CMakeLists.txt`
-- `CMakePresets.json`
-
-This license does not apply to:
-
-- `third_party/`
-- `assets/`
-- mirrored external references, archival reverse-engineering material, or generated build artifacts
-- any proprietary game binaries, game assets, or other files not owned by this project
-- any file that carries its own separate license or copyright notice
-
-For excluded content, follow the license or ownership terms that accompany that
-content.
-
 MIT License
+
+Copyright (c) 2025-2026 Aquat1c and In-game Netplay contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
