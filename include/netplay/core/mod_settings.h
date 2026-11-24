@@ -33,6 +33,20 @@ struct Settings
     std::string connectionCheckUrl = "";
 };
 
+// Serializes every EfzRevival.ini rewrite across threads and across the game and helper processes.
+class ScopedIniWriteLock
+{
+public:
+    ScopedIniWriteLock();
+    ~ScopedIniWriteLock();
+    ScopedIniWriteLock(const ScopedIniWriteLock&) = delete;
+    ScopedIniWriteLock& operator=(const ScopedIniWriteLock&) = delete;
+
+private:
+    void* handle_ = nullptr;
+    bool owned_ = false;
+};
+
 void Reload();
 const Settings& Get();
 

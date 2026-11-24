@@ -507,34 +507,58 @@ bool ReadWideTextFile(const std::string& path, std::wstring* outText, FileEncodi
 
 bool WriteWideTextFile(const std::string& path, const std::wstring& text, FileEncoding encoding)
 {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file)
+    // Never truncate the INI in place: an interrupted write would leave it empty.
+    if (text.empty())
     {
         return false;
     }
-
-    if (encoding == FileEncoding::Utf16Le)
+    const netplay::mod_settings::ScopedIniWriteLock writeLock;
+    const std::string temporaryPath = path + ".tmp";
+    bool written = false;
     {
-        const uint8_t bom[2] = {0xFFu, 0xFEu};
-        file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
-        if (!text.empty())
+        std::ofstream file(temporaryPath, std::ios::binary | std::ios::trunc);
+        if (!file)
         {
-            file.write(reinterpret_cast<const char*>(text.data()), static_cast<std::streamsize>(text.size() * sizeof(wchar_t)));
+            return false;
         }
-        return file.good();
+
+        if (encoding == FileEncoding::Utf16Le)
+        {
+            const uint8_t bom[2] = {0xFFu, 0xFEu};
+            file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+            if (!text.empty())
+            {
+                file.write(reinterpret_cast<const char*>(text.data()), static_cast<std::streamsize>(text.size() * sizeof(wchar_t)));
+            }
+        }
+        else
+        {
+            const std::string utf8 = WideToUtf8(text);
+            if (encoding == FileEncoding::Utf8Bom)
+            {
+                const uint8_t bom[3] = {0xEFu, 0xBBu, 0xBFu};
+                file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+            }
+            if (!utf8.empty())
+            {
+                file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+            }
+        }
+        file.flush();
+        written = file.good();
     }
 
-    const std::string utf8 = WideToUtf8(text);
-    if (encoding == FileEncoding::Utf8Bom)
+    // Another reader can hold the INI open for a moment; the original stays intact until the swap succeeds.
+    for (int attempt = 0; written && attempt < 5; ++attempt)
     {
-        const uint8_t bom[3] = {0xEFu, 0xBBu, 0xBFu};
-        file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+        if (MoveFileExA(temporaryPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE)
+        {
+            return true;
+        }
+        Sleep(20);
     }
-    if (!utf8.empty())
-    {
-        file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
-    }
-    return file.good();
+    (void)DeleteFileA(temporaryPath.c_str());
+    return false;
 }
 
 std::vector<std::wstring> SplitLines(const std::wstring& text)
@@ -4065,10 +4089,17 @@ void TidyIniFile()
 {
     const std::string path = ResolveRevivalIniPath();
     ScopedOptionsIniAccess iniAccess(true);
+    const netplay::mod_settings::ScopedIniWriteLock writeLock;
     std::wstring text;
     FileEncoding encoding{};
     if (path.empty() || !iniAccess.Acquired() || !ReadWideTextFile(path, &text, &encoding))
     {
+        return;
+    }
+    // Only touch a file that is recognisably a complete EfzRevival.ini.
+    if (text.find(L"[Network]") == std::wstring::npos)
+    {
+        mod::Log("OptionsMenu: not tidying '%s', it has no [Network] section", path.c_str());
         return;
     }
     const std::vector<std::wstring> before = SplitLines(text);

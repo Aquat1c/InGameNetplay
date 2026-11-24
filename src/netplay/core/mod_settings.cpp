@@ -138,6 +138,28 @@ void SeedIniKeyIfMissing(
 }
 }
 
+ScopedIniWriteLock::ScopedIniWriteLock()
+    : handle_(CreateMutexW(nullptr, FALSE, L"Local\\EfzNetplayIniWrite"))
+{
+    if (handle_ != nullptr)
+    {
+        const DWORD wait = WaitForSingleObject(handle_, 2000);
+        owned_ = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+    }
+}
+
+ScopedIniWriteLock::~ScopedIniWriteLock()
+{
+    if (handle_ != nullptr)
+    {
+        if (owned_)
+        {
+            (void)ReleaseMutex(handle_);
+        }
+        (void)CloseHandle(handle_);
+    }
+}
+
 void Reload()
 {
     const std::wstring iniPath = ResolveRevivalIniPathWide();
@@ -241,10 +263,17 @@ void Reload()
     loaded.modInteropSide = (GetPrivateProfileIntW(
         L"Others", L"ModInteropSide", 0, iniPath.c_str()) != 0) ? 1 : 0;
 
-    SeedIniKeyIfMissing(L"Others", L"OnlineCustomColors", L"1", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"CheckForUpdates", L"1", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ConnectionCheck", L"1", iniPath);
-    SeedIniKeyIfMissing(L"Others", L"ConnectionCheckUrl", L"", iniPath);
+    // Seeding a missing or empty file would leave an INI with only [Others] in it.
+    const ScopedIniWriteLock writeLock;
+    WIN32_FILE_ATTRIBUTE_DATA iniInfo = {};
+    if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &iniInfo) != FALSE
+        && (iniInfo.nFileSizeLow != 0 || iniInfo.nFileSizeHigh != 0))
+    {
+        SeedIniKeyIfMissing(L"Others", L"OnlineCustomColors", L"1", iniPath);
+        SeedIniKeyIfMissing(L"Others", L"CheckForUpdates", L"1", iniPath);
+        SeedIniKeyIfMissing(L"Others", L"ConnectionCheck", L"1", iniPath);
+        SeedIniKeyIfMissing(L"Others", L"ConnectionCheckUrl", L"", iniPath);
+    }
 
     g_settings = loaded;
 
