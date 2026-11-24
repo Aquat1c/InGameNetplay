@@ -50,20 +50,25 @@ constexpr int kPanelH = 194;
 constexpr int kRowX = 12;
 constexpr int kRowW = 296;
 constexpr int kSummaryRowH = 14;
-constexpr int kBrowserRowH = 12;
-constexpr int kFilterRowH = 12;
+constexpr int kBrowserRowH = 16;
+constexpr int kFilterRowH = 14;
 constexpr int kDetailRowH = 11;
 constexpr int kContentColumnX = kRowX;
 constexpr int kContentColumnW = kRowW;
-constexpr int kActionStackX = 120;
-constexpr int kActionStackW = 80;
-constexpr int kSummaryCardX = 12;
-constexpr int kSummaryCardY = 80;
-constexpr int kSummaryCardW = 296;
-constexpr int kSummaryCardH = 108;
-constexpr int kSummaryActionPanelX = 12;
+constexpr int kFilterHeaderPanelY = 20;
+constexpr int kFilterHeaderPanelH = 32;
+constexpr int kFilterFieldPanelY = 56;
+constexpr int kFilterFieldPanelH = 116;
+constexpr int kSummaryCardX = 8;
+constexpr int kSummaryCardY = 20;
+constexpr int kSummaryCardW = 304;
+constexpr int kSummaryCardH = 166;
+constexpr int kSummaryTopCharY = kSummaryCardY + 103;
+constexpr int kSummaryTopCharColumnW = 96;
+constexpr int kSummaryTopCharIconSize = 14;
+constexpr int kSummaryActionPanelX = 8;
 constexpr int kSummaryActionPanelY = 190;
-constexpr int kSummaryActionPanelW = 296;
+constexpr int kSummaryActionPanelW = 304;
 constexpr int kSummaryActionPanelH = 28;
 constexpr int kSummaryActionButtonW = 52;
 constexpr int kSummaryActionButtonH = 12;
@@ -71,11 +76,12 @@ constexpr int kSummaryActionButtonGap = 4;
 constexpr int kBrowserHeaderPanelX = 8;
 constexpr int kBrowserHeaderPanelY = 20;
 constexpr int kBrowserHeaderPanelW = 304;
-constexpr int kBrowserHeaderPanelH = 68;
-constexpr int kBrowserContentPanelY = 92;
-constexpr int kBrowserActionPanelX = 12;
+constexpr int kBrowserHeaderPanelH = 44;
+constexpr int kBrowserContentPanelY = 68;
+constexpr int kBrowserContentPanelH = 106;
+constexpr int kBrowserActionPanelX = 8;
 constexpr int kBrowserActionPanelY = 180;
-constexpr int kBrowserActionPanelW = 296;
+constexpr int kBrowserActionPanelW = 304;
 constexpr int kBrowserActionPanelH = 28;
 constexpr int kBrowserActionButtonW = 64;
 constexpr int kBrowserActionButtonH = 12;
@@ -86,9 +92,9 @@ constexpr int kDetailHeaderPanelW = 304;
 constexpr int kDetailHeaderPanelH = 58;
 constexpr int kDetailContentPanelY = 78;
 constexpr int kDetailContentPanelH = 88;
-constexpr int kDetailActionPanelX = 12;
+constexpr int kDetailActionPanelX = 8;
 constexpr int kDetailActionPanelY = 178;
-constexpr int kDetailActionPanelW = 296;
+constexpr int kDetailActionPanelW = 304;
 constexpr int kDetailActionPanelH = 28;
 constexpr int kDetailActionButtonW = 88;
 constexpr int kDetailActionButtonH = 12;
@@ -99,9 +105,8 @@ constexpr DWORD kStatusDisplayMs = 2200;
 constexpr DWORD kCaretBlinkMs = 350;
 constexpr size_t kMaxFilterTextBytes = 127;
 
-constexpr std::array<int, 6> kBrowserSessionRowY = {94, 107, 120, 133, 146, 159};
-constexpr std::array<int, 7> kFilterFieldRowY = {76, 89, 102, 115, 128, 141, 154};
-constexpr std::array<int, 3> kFilterActionRowY = {168, 181, 194};
+constexpr std::array<int, 6> kBrowserSessionRowY = {70, 87, 104, 121, 138, 155};
+constexpr std::array<int, 7> kFilterFieldRowY = {58, 74, 90, 106, 122, 138, 154};
 constexpr std::array<int, 7> kDetailGameRowY = {82, 94, 106, 118, 130, 142, 154};
 
 enum class FileEncoding : uint8_t
@@ -213,6 +218,78 @@ DWORD g_pageSlideStartTick = 0;
 View g_pageSlideView = View::Browser;
 
 IconAdjust g_iconAdjust;
+// Summary-card icons, written by the panel draw and read by the D3D pass.
+struct SummaryIcon
+{
+    int x = 0;
+    int y = 0;
+    std::string character;
+};
+std::vector<SummaryIcon> g_summaryIcons;
+
+// "Nayuki (Awake)" does not fit next to an icon and a count.
+std::string ShortCharacterLabel(std::string label)
+{
+    for (const auto& [longForm, shortForm] : {std::pair<const char*, const char*>{" (Awake)", " (A)"}, {" (Sleepy)", " (S)"}})
+    {
+        const size_t at = label.find(longForm);
+        if (at != std::string::npos)
+        {
+            label.replace(at, std::strlen(longForm), shortForm);
+        }
+    }
+    return label;
+}
+
+// View change: the incoming view eases in from the side it was opened from.
+constexpr DWORD kViewSlideDurationMs = 170;
+constexpr int kViewSlideDistance = 48;
+int g_viewSlideDirection = 0;
+DWORD g_viewSlideStartTick = 0;
+// Added to TTF text positions while the view content is being drawn.
+int g_viewTextOffsetX = 0;
+
+int ViewDepth(View view)
+{
+    return view == View::Summary ? 0 : (view == View::Browser ? 1 : 2);
+}
+
+int GetViewSlideOffsetX()
+{
+    if (g_viewSlideDirection == 0)
+    {
+        return 0;
+    }
+    const DWORD elapsed = GetTickCount() - g_viewSlideStartTick;
+    if (elapsed >= kViewSlideDurationMs)
+    {
+        g_viewSlideDirection = 0;
+        return 0;
+    }
+    const float remaining = 1.0f - static_cast<float>(elapsed) / static_cast<float>(kViewSlideDurationMs);
+    return static_cast<int>(remaining * remaining * static_cast<float>(kViewSlideDistance)) * g_viewSlideDirection;
+}
+
+// Moves everything drawn since `before` was captured by offsetX; untouched pixels stay put.
+void ShiftDrawnPixels(const netplay::font::IndexedSurfaceView& surface, const std::vector<uint8_t>& before, int offsetX)
+{
+    const size_t byteCount = before.size();
+    static std::vector<uint8_t> after;
+    after.assign(surface.pixels, surface.pixels + byteCount);
+    std::memcpy(surface.pixels, before.data(), byteCount);
+    for (int y = 0; y < surface.height; ++y)
+    {
+        const size_t row = static_cast<size_t>(y) * static_cast<size_t>(surface.pitch);
+        for (int x = 0; x < surface.width; ++x)
+        {
+            const int targetX = x + offsetX;
+            if (after[row + x] != before[row + x] && targetX >= 0 && targetX < surface.width)
+            {
+                surface.pixels[row + targetX] = after[row + x];
+            }
+        }
+    }
+}
 
 void StartPageSlide(int direction, View view)
 {
@@ -343,12 +420,12 @@ enum class SpriteSlotAlignment : uint8_t
     Right,
 };
 
-constexpr int kBrowserIconSlotSize = 10;
+constexpr int kBrowserIconSlotSize = 14;
 constexpr int kBrowserIconGap = 1;
 constexpr int kBrowserIconSlotsPerPlayer = 3;
 constexpr int kBrowserDateGap = 4;
-constexpr int kBrowserIconNameGap = 1;
-constexpr int kBrowserScoreGap = 3;
+constexpr int kBrowserIconNameGap = 3;
+constexpr int kBrowserScoreGap = 4;
 constexpr int kDetailLabelGap = 3;
 constexpr int kDetailIconNameGap = 1;
 constexpr int kDetailScoreGap = 2;
@@ -1133,8 +1210,8 @@ void SubmitMenuRtText(
     uint8_t paletteColor)
 {
     netplay::debug_overlay::RtTextItem item;
-    item.x0 = static_cast<int16_t>(x0);
-    item.x1 = static_cast<int16_t>(x1);
+    item.x0 = static_cast<int16_t>(x0 + g_viewTextOffsetX);
+    item.x1 = static_cast<int16_t>(x1 + g_viewTextOffsetX);
     item.y = static_cast<int16_t>(y);
     item.align = align;
     item.profile = profile;
@@ -1369,59 +1446,27 @@ BrowserRowLayout ComputeBrowserRowLayout(
             ? static_cast<int>(p2IconCount) * kBrowserIconSlotSize
                 + (static_cast<int>(p2IconCount) - 1) * kBrowserIconGap
             : 0;
+    // The score sits on a fixed column; names and their icons grow outward from it.
     const int scoreWidth = MeasureMenuTextWidth(layout.scoreText);
     const int availableLeft = layout.dateRight + kBrowserDateGap;
     const int availableWidth = (std::max)(0, rowRight - availableLeft + 1);
-    const int fixedWidth =
-        p1IconsWidth
-        + (p1IconsWidth > 0 ? kBrowserIconNameGap : 0)
-        + kBrowserScoreGap
-        + scoreWidth
-        + kBrowserScoreGap
-        + (p2IconsWidth > 0 ? kBrowserIconNameGap : 0)
-        + p2IconsWidth;
-    const int maxNamesWidth = (std::max)(0, availableWidth - fixedWidth);
-
-    FitTwoTextsToPixelWidth(session.p1Name, session.p2Name, maxNamesWidth, &layout.leftNameText, &layout.rightNameText);
-
+    const int sideWidth = (std::max)(0, (availableWidth - scoreWidth) / 2 - kBrowserScoreGap);
+    const int p1IconsBlock = p1IconsWidth > 0 ? p1IconsWidth + kBrowserIconNameGap : 0;
+    const int p2IconsBlock = p2IconsWidth > 0 ? p2IconsWidth + kBrowserIconNameGap : 0;
+    layout.leftNameText = FitTextToPixelWidth(session.p1Name, (std::max)(0, sideWidth - p1IconsBlock));
+    layout.rightNameText = FitTextToPixelWidth(session.p2Name, (std::max)(0, sideWidth - p2IconsBlock));
     const int leftNameWidth = MeasureMenuTextWidth(layout.leftNameText);
     const int rightNameWidth = MeasureMenuTextWidth(layout.rightNameText);
-    const int blockWidth =
-        p1IconsWidth
-        + (p1IconsWidth > 0 ? kBrowserIconNameGap : 0)
-        + leftNameWidth
-        + kBrowserScoreGap
-        + scoreWidth
-        + kBrowserScoreGap
-        + rightNameWidth
-        + (p2IconsWidth > 0 ? kBrowserIconNameGap : 0)
-        + p2IconsWidth;
-    int x = availableLeft + (std::max)(0, availableWidth - blockWidth) / 2;
 
-    layout.p1IconsX = x;
+    layout.scoreLeft = availableLeft + (availableWidth - scoreWidth) / 2;
+    layout.scoreRight = layout.scoreLeft + scoreWidth;
+    layout.p1NameRight = layout.scoreLeft - kBrowserScoreGap;
+    layout.p1NameLeft = layout.p1NameRight - leftNameWidth;
+    layout.p1IconsX = layout.p1NameLeft - p1IconsBlock;
     layout.p1IconCount = static_cast<int>(p1IconCount);
-    x += p1IconsWidth;
-    if (p1IconsWidth > 0)
-    {
-        x += kBrowserIconNameGap;
-    }
-
-    layout.p1NameLeft = x;
-    layout.p1NameRight = x + leftNameWidth;
-    x += leftNameWidth + kBrowserScoreGap;
-
-    layout.scoreLeft = x;
-    layout.scoreRight = x + scoreWidth;
-    x += scoreWidth + kBrowserScoreGap;
-
-    layout.p2NameLeft = x;
-    layout.p2NameRight = x + rightNameWidth;
-    x += rightNameWidth;
-    if (p2IconsWidth > 0)
-    {
-        x += kBrowserIconNameGap;
-    }
-    layout.p2IconsX = x;
+    layout.p2NameLeft = layout.scoreRight + kBrowserScoreGap;
+    layout.p2NameRight = layout.p2NameLeft + rightNameWidth;
+    layout.p2IconsX = layout.p2NameRight + p2IconsBlock - p2IconsWidth;
     layout.p2IconCount = static_cast<int>(p2IconCount);
     return layout;
 }
@@ -1809,12 +1854,13 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
 
     const bool isBrowserView = g_state.view == View::Browser;
     const bool isDetailView = g_state.view == View::SetDetail;
-    if (!isBrowserView && !isDetailView)
+    const bool isSummaryView = g_state.view == View::Summary;
+    if (!isBrowserView && !isDetailView && !isSummaryView)
     {
         if (!g_d3dOverlay.firstWrongViewSkipLogged)
         {
             mod::Log(
-                "BattleLog::RenderBrowserIconsD3d9: skipped because view=%d not Browser/SetDetail",
+                "BattleLog::RenderBrowserIconsD3d9: skipped because view=%d has no icons",
                 static_cast<int>(g_state.view));
             g_d3dOverlay.firstWrongViewSkipLogged = true;
         }
@@ -2083,6 +2129,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     const int viewportY = (targetH - viewportH) / 2;
 
     const int slidePageOffsetX = GetPageSlideOffsetX(g_state.view);
+    const int viewSlideOffsetX = GetViewSlideOffsetX();
 
     struct TexturedVertex
     {
@@ -2110,7 +2157,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
     device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
     device->SetFVF(kTexturedFvf);
 
@@ -2218,7 +2265,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int logicalX = icon.logicalX + slidePageOffsetX + g_iconAdjust.offsetX;
+                const int logicalX = icon.logicalX + slidePageOffsetX + viewSlideOffsetX + g_iconAdjust.offsetX;
                 const int logicalY = icon.logicalY + g_iconAdjust.offsetY;
                 const int logicalSize =
                     (std::max)(1, static_cast<int>(icon.logicalSize * g_iconAdjust.scale + 0.5f));
@@ -2352,7 +2399,7 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
             for (const IconDrawRequest& icon : icons)
             {
                 const SpriteBitmap* sprite = icon.sprite;
-                const int logicalX = icon.logicalX + slidePageOffsetX + g_iconAdjust.offsetX;
+                const int logicalX = icon.logicalX + slidePageOffsetX + viewSlideOffsetX + g_iconAdjust.offsetX;
                 const int logicalY = icon.logicalY + g_iconAdjust.offsetY;
                 const int logicalSize =
                     (std::max)(1, static_cast<int>(icon.logicalSize * g_iconAdjust.scale + 0.5f));
@@ -2414,10 +2461,55 @@ bool RenderBrowserIconsD3d9(LPDIRECT3DDEVICE9 device)
         }
     }
 
+    if (isSummaryView)
+    {
+        for (const SummaryIcon& icon : g_summaryIcons)
+        {
+            const SpriteBitmap* sprite = FindCharacterSprite(icon.character);
+            if (sprite == nullptr || sprite->d3dTexture == nullptr)
+            {
+                continue;
+            }
+            const int logicalX = icon.x + viewSlideOffsetX;
+            const int slotLeft = viewportX + (logicalX * viewportW) / 320;
+            const int slotTop = viewportY + (icon.y * viewportH) / 240;
+            const int slotRight = viewportX + ((logicalX + kSummaryTopCharIconSize) * viewportW) / 320;
+            const int slotBottom = viewportY + ((icon.y + kSummaryTopCharIconSize) * viewportH) / 240;
+            int drawX = 0;
+            int drawY = 0;
+            int drawW = 0;
+            int drawH = 0;
+            ComputeScaledSpriteRect(
+                *sprite,
+                slotLeft,
+                slotTop,
+                (std::max)(1, slotRight - slotLeft),
+                (std::max)(1, slotBottom - slotTop),
+                SpriteSlotAlignment::Center,
+                &drawX,
+                &drawY,
+                &drawW,
+                &drawH);
+            const float left = static_cast<float>(drawX) - 0.5f;
+            const float top = static_cast<float>(drawY) - 0.5f;
+            const float right = static_cast<float>(drawX + drawW) - 0.5f;
+            const float bottom = static_cast<float>(drawY + drawH) - 0.5f;
+            const TexturedVertex vertices[4] = {
+                {left,  top,    0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f},
+                {right, top,    0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 0.0f},
+                {left,  bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 1.0f},
+                {right, bottom, 0.0f, 1.0f, 0xFFFFFFFFu, 1.0f, 1.0f},
+            };
+            device->SetTexture(0, sprite->d3dTexture);
+            (void)device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(TexturedVertex));
+            ++drawnIconCount;
+        }
+    }
+
     device->SetTexture(0, nullptr);
     stateBlock->Apply();
     stateBlock->Release();
-    if (drawnIconCount == 0 && !g_d3dOverlay.firstNoDrawableIconsLogged)
+    if (!isSummaryView && drawnIconCount == 0 && !g_d3dOverlay.firstNoDrawableIconsLogged)
     {
         if (isBrowserView)
         {
@@ -3792,6 +3884,36 @@ void FinalizeSummaryUsageCounts(
         }
     }
 
+    summary->topCharacters.assign(characterCounts.begin(), characterCounts.end());
+    std::stable_sort(
+        summary->topCharacters.begin(),
+        summary->topCharacters.end(),
+        [](const auto& left, const auto& right) { return left.second > right.second; });
+    if (summary->topCharacters.size() > 3)
+    {
+        summary->topCharacters.resize(3);
+    }
+
+    for (const auto& [name, count] : summary->nameSetCounts)
+    {
+        if (count > summary->topNameSets)
+        {
+            summary->topNameSets = count;
+            summary->topName = name;
+        }
+    }
+    summary->nameSetCounts.clear();
+    int bestNameCharacterCount = 0;
+    for (const auto& [character, count] : summary->nameCharacterCounts[summary->topName])
+    {
+        if (count > bestNameCharacterCount)
+        {
+            bestNameCharacterCount = count;
+            summary->topNameCharacter = character;
+        }
+    }
+    summary->nameCharacterCounts.clear();
+
     bestCount = 0;
     for (const auto& [matchup, count] : matchupCounts)
     {
@@ -3829,6 +3951,12 @@ void AccumulatePerspectiveSummary(
     }
 
     ++summary->completedSessions;
+    ++summary->nameSetCounts[focusIsP1 ? session.p2Name : session.p1Name];
+    if (session.sortKey > 0 && (summary->firstSortKey == 0 || session.sortKey < summary->firstSortKey))
+    {
+        summary->firstSortKey = session.sortKey;
+        summary->firstTimestamp = FormatDateTime(session.date, session.time);
+    }
     UpdateDerivedSummaryStats(summary, session);
     const int playerSetScore = focusIsP1 ? GetSessionFinalScoreLeft(session) : GetSessionFinalScoreRight(session);
     const int opponentSetScore = focusIsP1 ? GetSessionFinalScoreRight(session) : GetSessionFinalScoreLeft(session);
@@ -3860,6 +3988,11 @@ void AccumulatePerspectiveSummary(
         if (!character.empty())
         {
             ++(*characterCounts)[character];
+        }
+        const std::string& rivalCharacter = focusIsP1 ? match.p2CharacterDisplay : match.p1CharacterDisplay;
+        if (!rivalCharacter.empty())
+        {
+            ++summary->nameCharacterCounts[focusIsP1 ? session.p2Name : session.p1Name][rivalCharacter];
         }
 
         if (matchupCounts != nullptr)
@@ -3895,6 +4028,13 @@ void AccumulateAggregateSummary(
     }
 
     ++summary->completedSessions;
+    ++summary->nameSetCounts[session.p1Name];
+    ++summary->nameSetCounts[session.p2Name];
+    if (session.sortKey > 0 && (summary->firstSortKey == 0 || session.sortKey < summary->firstSortKey))
+    {
+        summary->firstSortKey = session.sortKey;
+        summary->firstTimestamp = FormatDateTime(session.date, session.time);
+    }
     UpdateDerivedSummaryStats(summary, session);
     summary->totalGames += static_cast<int>(session.matches.size());
     for (const BattleLogMatch& match : session.matches)
@@ -3903,10 +4043,12 @@ void AccumulateAggregateSummary(
         if (!match.p1CharacterDisplay.empty())
         {
             ++(*characterCounts)[match.p1CharacterDisplay];
+            ++summary->nameCharacterCounts[session.p1Name][match.p1CharacterDisplay];
         }
         if (!match.p2CharacterDisplay.empty())
         {
             ++(*characterCounts)[match.p2CharacterDisplay];
+            ++summary->nameCharacterCounts[session.p2Name][match.p2CharacterDisplay];
         }
     }
 }
@@ -4756,6 +4898,11 @@ void SwitchView(uint32_t screenContext, View nextView, int selection)
         CancelEdit();
     }
 
+    if (nextView != g_state.view)
+    {
+        g_viewSlideDirection = ViewDepth(nextView) >= ViewDepth(g_state.view) ? 1 : -1;
+        g_viewSlideStartTick = GetTickCount();
+    }
     g_state.view = nextView;
     RebuildMenuEntries();
 
@@ -5739,7 +5886,7 @@ void DrawSummaryPanel(
         panelFill,
         panelFrame);
     DrawPanelBox(surface, kSummaryCardX, kSummaryCardY, kSummaryCardW, kSummaryCardH, panelFill, panelFrame);
-    MenuTitleCentered(surface, BuildSummaryTitleText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 4, titleColor);
+    MenuTitleCentered(surface, BuildSummaryTitleText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 6, titleColor);
     MenuTextCentered(
         surface,
         Tr("ACTIONS"),
@@ -5747,69 +5894,149 @@ void DrawSummaryPanel(
         kSummaryActionPanelX + kSummaryActionPanelW - 2,
         kSummaryActionPanelY + 3,
         titleColor);
-    MenuTextCentered(surface, BuildSummaryIdentityText(), kSummaryCardX + 2, kSummaryCardX + kSummaryCardW - 2, kSummaryCardY + 18, textColor);
-    MenuTextCentered(surface, BuildSummaryLoadText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 30, dimColor);
-
     const BattleLogSummary& summary = GetDisplayedSummary();
-    const int halfSplitLeft = kSummaryCardX + (kSummaryCardW / 2) - 4;
-    const int halfSplitRight = kSummaryCardX + (kSummaryCardW / 2) + 4;
-    const int wideRightLeft = kSummaryCardX + 122;
-    const std::string setsText = summary.hasPerspective
-        ? (Tr("Sets ") + std::to_string(summary.setWins) + "-" + std::to_string(summary.setLosses))
-        : (Tr("Sessions ") + std::to_string(summary.totalSessions));
-    const std::string gamesText = summary.hasPerspective
-        ? (Tr("Games ") + std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses))
-        : (Tr("Games ") + std::to_string(summary.totalGames));
-    MenuTextLeft(surface, setsText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 42, textColor);
-    MenuTextRight(surface, gamesText, halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 42, textColor);
-
-    MenuTextLeft(
-        surface,
-        BuildSummarySetRateText(),
-        kSummaryCardX + 8,
-        halfSplitLeft,
-        kSummaryCardY + 53,
-        dimColor);
-    MenuTextRight(
-        surface,
-        BuildSummaryGameRateText(),
-        halfSplitRight,
-        kSummaryCardX + kSummaryCardW - 8,
-        kSummaryCardY + 53,
-        dimColor);
-
-    const std::string playTimeText = Tr("Playtime: ") + FormatDurationShort(summary.totalDurationSeconds);
-    const std::string mostPlayedText =
-        summary.isHeadToHead
-            ? (Tr("Most played matchup: ")
-                + AbbreviateForDisplay(
-                    summary.mostUsedMatchup.empty() ? std::string(Tr("N/A")) : TranslateMatchupLabel(summary.mostUsedMatchup),
-                    18))
-            : (Tr("Most played character: ")
-                + AbbreviateForDisplay(
-                    summary.mostUsedCharacter.empty() ? std::string(Tr("N/A")) : Tr(summary.mostUsedCharacter),
-                    18));
-    MenuTextLeft(surface, BuildSummaryAverageGamesText(), kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 64, dimColor);
-    if (summary.hasPerspective)
+    const int left = kSummaryCardX + 8;
+    const int right = kSummaryCardX + kSummaryCardW - 8;
+    const auto divider = [&](int y)
     {
-        MenuTextRight(surface, BuildSummaryAverageSetDurationText(), halfSplitRight, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, dimColor);
+        netplay::font::FillIndexedSurfaceRect(surface, left, y, right - left, 1, panelFrame);
+    };
+    const auto percentWon = [](int wins, int losses) -> std::string
+    {
+        if (wins + losses <= 0)
+        {
+            return {};
+        }
+        char buffer[48] = {};
+        std::snprintf(buffer, sizeof(buffer), Tr("%.1f%% won"), 100.0 * wins / (wins + losses));
+        return buffer;
+    };
+    const auto formatted = [](const char* format, auto value) -> std::string
+    {
+        char buffer[64] = {};
+        std::snprintf(buffer, sizeof(buffer), format, value);
+        return buffer;
+    };
+
+    MenuTextCentered(surface, BuildSummaryIdentityText(), left, right, kSummaryCardY + 21, textColor);
+    divider(kSummaryCardY + 36);
+
+    // Four tiles: label, value, detail.
+    struct Tile
+    {
+        std::string label;
+        std::string value;
+        std::string detail;
+    };
+    const bool hasCompleted = summary.completedSessions > 0;
+    const Tile tiles[4] = {
+        {
+            Tr("SETS"),
+            summary.hasPerspective
+                ? std::to_string(summary.setWins) + "-" + std::to_string(summary.setLosses)
+                : std::to_string(summary.totalSessions),
+            summary.hasPerspective
+                ? percentWon(summary.setWins, summary.setLosses)
+                : formatted(Tr("%d played"), summary.completedSessions),
+        },
+        {
+            Tr("GAMES"),
+            summary.hasPerspective
+                ? std::to_string(summary.gameWins) + "-" + std::to_string(summary.gameLosses)
+                : std::to_string(summary.totalGames),
+            summary.hasPerspective
+                ? percentWon(summary.gameWins, summary.gameLosses)
+                : (hasCompleted ? formatted(Tr("%.1f per set"), summary.averageGamesPerCompletedSet) : std::string()),
+        },
+        {
+            Tr("PLAYTIME"),
+            FormatDurationShort(summary.totalDurationSeconds),
+            hasCompleted
+                ? formatted(Tr("%s per set"), FormatDurationShort(summary.averageSetDurationSeconds).c_str())
+                : std::string(),
+        },
+        {
+            Tr("LONGEST SET"),
+            hasCompleted ? FormatDurationShort(summary.longestSetByDurationSeconds) : std::string(Tr("N/A")),
+            hasCompleted ? formatted(Tr("%d games"), summary.longestSetByGamesCount) : std::string(),
+        },
+    };
+    const int tileW = (right - left) / 4;
+    for (int index = 0; index < 4; ++index)
+    {
+        const int x0 = left + index * tileW;
+        MenuTextCentered(surface, tiles[index].label, x0, x0 + tileW, kSummaryCardY + 43, dimColor);
+        MenuTextCentered(surface, tiles[index].value, x0, x0 + tileW, kSummaryCardY + 56, textColor);
+        MenuTextCentered(surface, tiles[index].detail, x0, x0 + tileW, kSummaryCardY + 69, dimColor);
+    }
+    divider(kSummaryCardY + 84);
+
+    g_summaryIcons.clear();
+    if (summary.isHeadToHead)
+    {
+        MenuTextCentered(surface, Tr("MOST PLAYED MATCHUP"), left, right, kSummaryCardY + 90, dimColor);
+        MenuTextCentered(
+            surface,
+            summary.mostUsedMatchup.empty() ? std::string(Tr("N/A")) : TranslateMatchupLabel(summary.mostUsedMatchup),
+            left,
+            right,
+            kSummaryTopCharY + 3,
+            textColor);
     }
     else
     {
-        MenuTextRight(surface, BuildSummaryLongestSetText(), wideRightLeft, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 64, dimColor);
+        MenuTextCentered(surface, Tr("TOP CHARACTERS"), left, right, kSummaryCardY + 90, dimColor);
+        if (summary.topCharacters.empty())
+        {
+            MenuTextCentered(surface, Tr("N/A"), left, right, kSummaryTopCharY + 3, textColor);
+        }
+        // Each icon + label pair is centered in its column; the icon itself comes from the D3D pass.
+        const int columnW = (right - left) / 3;
+        for (size_t index = 0; index < summary.topCharacters.size() && index < 3; ++index)
+        {
+            const std::string label =
+                ShortCharacterLabel(Tr(summary.topCharacters[index].first))
+                + " " + std::to_string(summary.topCharacters[index].second);
+            const int labelW = MeasureMenuTextWidth(label);
+            const int groupW = kSummaryTopCharIconSize + 3 + labelW;
+            const int groupX = left + static_cast<int>(index) * columnW + (std::max)(0, (columnW - groupW) / 2);
+            g_summaryIcons.push_back({groupX, kSummaryTopCharY, summary.topCharacters[index].first});
+            MenuTextLeft(
+                surface,
+                label,
+                groupX + kSummaryTopCharIconSize + 3,
+                groupX + groupW + 2,
+                kSummaryTopCharY + 3,
+                textColor);
+        }
     }
-    MenuTextLeft(surface, playTimeText, kSummaryCardX + 8, halfSplitLeft, kSummaryCardY + 75, textColor);
-    MenuTextRight(
-        surface,
-        summary.hasPerspective ? BuildSummaryLongestSetText() : BuildSummaryCompletionRatioText(),
-        wideRightLeft,
-        kSummaryCardX + kSummaryCardW - 8,
-        kSummaryCardY + 75,
-        dimColor);
+    divider(kSummaryCardY + 123);
 
-    const uint8_t recentColor = summary.hasSessions ? textColor : alertColor;
-    MenuTextLeft(surface, mostPlayedText, kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 86, textColor);
-    MenuTextLeft(surface, BuildSummaryRecentText(), kSummaryCardX + 8, kSummaryCardX + kSummaryCardW - 8, kSummaryCardY + 97, recentColor);
+    if (!summary.isHeadToHead && summary.topNameSets > 0)
+    {
+        char buffer[192] = {};
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            summary.hasPerspective ? Tr("Most played opponent: %s (%d sets)") : Tr("Most active player: %s (%d sets)"),
+            AbbreviateForDisplay(summary.topName, 20).c_str(),
+            summary.topNameSets);
+        const int textW = MeasureMenuTextWidth(buffer);
+        const int iconW = summary.topNameCharacter.empty() ? 0 : kSummaryTopCharIconSize + 3;
+        const int groupX = left + (std::max)(0, (right - left - iconW - textW) / 2);
+        if (iconW > 0)
+        {
+            g_summaryIcons.push_back({groupX, kSummaryCardY + 127, summary.topNameCharacter});
+        }
+        MenuTextLeft(surface, buffer, groupX + iconW, right, kSummaryCardY + 130, dimColor);
+    }
+    MenuTextCentered(
+        surface,
+        BuildSummaryRecentText(),
+        left,
+        right,
+        kSummaryCardY + 145,
+        summary.hasSessions ? textColor : alertColor);
 }
 
 void DrawBrowserPanel(
@@ -5822,16 +6049,31 @@ void DrawBrowserPanel(
     uint8_t /*alertColor*/)
 {
     DrawPanelBox(surface, kBrowserHeaderPanelX, kBrowserHeaderPanelY, kBrowserHeaderPanelW, kBrowserHeaderPanelH, panelFill, panelFrame);
-    DrawPanelBox(surface, kContentColumnX - 2, kBrowserContentPanelY, kContentColumnW + 4, 84, panelFill, panelFrame);
+    DrawPanelBox(surface, kPanelX, kBrowserContentPanelY, kPanelW, kBrowserContentPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kBrowserActionPanelX, kBrowserActionPanelY, kBrowserActionPanelW, kBrowserActionPanelH, panelFill, panelFrame);
     MenuTitleCentered(surface, Tr("SET BROWSER"), kBrowserHeaderPanelX + 2, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 2, kBrowserHeaderPanelY + 4, titleColor);
-    MenuTextLeft(surface, BuildFilterSummary(g_state.activeFilter), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 18, textColor);
-    MenuTextLeft(surface, BuildBrowserPageText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
-    MenuTextRight(surface, BuildBrowserLongestSetText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 31, dimColor);
-    MenuTextLeft(surface, BuildBrowserRecordLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 44, textColor);
-    MenuTextRight(surface, BuildBrowserRecordRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 44, textColor);
-    MenuTextLeft(surface, BuildBrowserUsageLeftText(), kBrowserHeaderPanelX + 8, kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) - 4, kBrowserHeaderPanelY + 57, dimColor);
-    MenuTextRight(surface, BuildBrowserUsageRightText(), kBrowserHeaderPanelX + (kBrowserHeaderPanelW / 2) + 4, kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8, kBrowserHeaderPanelY + 57, dimColor);
+    const int headerLeft = kBrowserHeaderPanelX + 8;
+    const int headerRight = kBrowserHeaderPanelX + kBrowserHeaderPanelW - 8;
+    MenuTextCentered(surface, BuildFilterSummary(g_state.activeFilter), headerLeft, headerRight, kBrowserHeaderPanelY + 18, dimColor);
+    const BattleLogSummary& browser = g_state.browserSummary;
+    char pageText[64] = {};
+    std::snprintf(pageText, sizeof(pageText), Tr("Page %d/%d"), g_state.browserPage + 1, GetBrowserPageCount());
+    const std::string columns[4] = {
+        pageText,
+        Tr("Sets ") + (browser.hasPerspective
+            ? std::to_string(browser.setWins) + "-" + std::to_string(browser.setLosses)
+            : std::to_string(GetBrowserResultCount())),
+        Tr("Games ") + (browser.hasPerspective
+            ? std::to_string(browser.gameWins) + "-" + std::to_string(browser.gameLosses)
+            : std::to_string(browser.totalGames)),
+        FormatDurationShort(browser.totalDurationSeconds),
+    };
+    const int columnW = (headerRight - headerLeft) / 4;
+    for (int index = 0; index < 4; ++index)
+    {
+        const int x0 = headerLeft + index * columnW;
+        MenuTextCentered(surface, columns[index], x0, x0 + columnW, kBrowserHeaderPanelY + 31, textColor);
+    }
     MenuTextCentered(
         surface,
         Tr("ACTIONS"),
@@ -5849,13 +6091,20 @@ void DrawFiltersPanel(
     uint8_t textColor,
     uint8_t dimColor)
 {
-    DrawPanelBox(surface, kPanelX, kPanelY, kPanelW, 46, panelFill, panelFrame);
-    DrawPanelBox(surface, kContentColumnX - 2, 72, kContentColumnW + 4, 96, panelFill, panelFrame);
-    DrawPanelBox(surface, kActionStackX, 164, kActionStackW, 44, panelFill, panelFrame);
-    MenuTitleCentered(surface, Tr("SEARCH"), kPanelX + 2, kPanelX + kPanelW - 2, kPanelY + 4, titleColor);
-    MenuTextLeft(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 18, textColor);
-    MenuTextLeft(surface, Tr("Exact names. Character, set type, and game count filters."), kPanelX + 8, kPanelX + kPanelW - 8, kPanelY + 31, dimColor);
-    MenuTextCentered(surface, Tr("ACTIONS"), kActionStackX + 2, kActionStackX + kActionStackW - 2, 158, titleColor);
+    // Same three-panel layout as the set browser: header, content, action bar.
+    DrawPanelBox(surface, kPanelX, kFilterHeaderPanelY, kPanelW, kFilterHeaderPanelH, panelFill, panelFrame);
+    DrawPanelBox(surface, kPanelX, kFilterFieldPanelY, kPanelW, kFilterFieldPanelH, panelFill, panelFrame);
+    DrawPanelBox(surface, kBrowserActionPanelX, kBrowserActionPanelY, kBrowserActionPanelW, kBrowserActionPanelH, panelFill, panelFrame);
+    MenuTitleCentered(surface, Tr("SEARCH"), kPanelX + 2, kPanelX + kPanelW - 2, kFilterHeaderPanelY + 4, titleColor);
+    MenuTextCentered(surface, BuildFilterSummary(g_state.draftFilter), kPanelX + 8, kPanelX + kPanelW - 8, kFilterHeaderPanelY + 18, dimColor);
+    MenuTextCentered(
+        surface,
+        Tr("ACTIONS"),
+        kBrowserActionPanelX + 2,
+        kBrowserActionPanelX + kBrowserActionPanelW - 2,
+        kBrowserActionPanelY + 3,
+        titleColor);
+    (void)textColor;
 }
 
 void DrawDetailPanel(
@@ -5868,7 +6117,7 @@ void DrawDetailPanel(
     uint8_t alertColor)
 {
     DrawPanelBox(surface, kDetailHeaderPanelX, kDetailHeaderPanelY, kDetailHeaderPanelW, kDetailHeaderPanelH, panelFill, panelFrame);
-    DrawPanelBox(surface, kContentColumnX - 2, kDetailContentPanelY, kContentColumnW + 4, kDetailContentPanelH, panelFill, panelFrame);
+    DrawPanelBox(surface, kPanelX, kDetailContentPanelY, kPanelW, kDetailContentPanelH, panelFill, panelFrame);
     DrawPanelBox(surface, kDetailActionPanelX, kDetailActionPanelY, kDetailActionPanelW, kDetailActionPanelH, panelFill, panelFrame);
     MenuTitleCentered(surface, Tr("SET DETAILS"), kDetailHeaderPanelX + 2, kDetailHeaderPanelX + kDetailHeaderPanelW - 2, kDetailHeaderPanelY + 4, titleColor);
     MenuTextCentered(surface, Tr("ACTIONS"), kDetailActionPanelX + 2, kDetailActionPanelX + kDetailActionPanelW - 2, kDetailActionPanelY + 3, titleColor);
@@ -6026,7 +6275,7 @@ void DrawBrowserRows(
                     Tr("<no matching sets>"),
                     kContentColumnX + 4,
                     kContentColumnX + kContentColumnW - 4,
-                    rowY + 2,
+                    rowY + 5,
                     isSelected ? selectedText : alertColor);
             }
             continue;
@@ -6038,10 +6287,10 @@ void DrawBrowserRows(
         const BrowserRowLayout layout =
             ComputeBrowserRowLayout(*session, p1Characters.size(), p2Characters.size());
 
-        textL(layout.dateTimeText, layout.dateLeft, layout.dateRight, rowY + 2, dimText);
-        textL(layout.leftNameText, layout.p1NameLeft, layout.p1NameRight, rowY + 2, isSelected ? selectedText : normalText);
-        textC(layout.scoreText, layout.scoreLeft, layout.scoreRight, rowY + 2, isSelected ? selectedText : normalText);
-        textL(layout.rightNameText, layout.p2NameLeft, layout.p2NameRight, rowY + 2, isSelected ? selectedText : normalText);
+        textL(layout.dateTimeText, layout.dateLeft, layout.dateRight, rowY + 5, dimText);
+        textL(layout.leftNameText, layout.p1NameLeft, layout.p1NameRight, rowY + 5, isSelected ? selectedText : normalText);
+        textC(layout.scoreText, layout.scoreLeft, layout.scoreRight, rowY + 5, isSelected ? selectedText : normalText);
+        textL(layout.rightNameText, layout.p2NameLeft, layout.p2NameRight, rowY + 5, isSelected ? selectedText : normalText);
     }
 
     static const std::array<const char*, 4> kControls = {
@@ -6068,7 +6317,7 @@ void DrawBrowserRows(
             Tr(kControls[static_cast<size_t>(control)]),
             rowX + 2,
             rowX + kBrowserActionButtonW - 2,
-            rowY + 2,
+            rowY + 3,
             isSelected ? selectedText : normalText);
     }
 }
@@ -6105,41 +6354,45 @@ void DrawFilterRows(
     for (size_t index = 0; index < rows.size(); ++index)
     {
         const bool isSelected = static_cast<int>(index) == selection;
-        const int rowY = index < 7
-            ? kFilterFieldRowY[index]
-            : kFilterActionRowY[index - 7];
         const bool isActionRow = index >= 7;
-        const int rowX = isActionRow ? (kActionStackX + 4) : kContentColumnX;
-        const int rowW = isActionRow ? (kActionStackW - 8) : kContentColumnW;
-        DrawRowBoxAt(surface, rowX, rowY, rowW, kFilterRowH, isSelected, rowFill, rowFrame, selectedFill);
         if (isActionRow)
         {
+            // Three buttons side by side in the action bar.
+            constexpr int kButtonsTotalWidth = 3 * kBrowserActionButtonW + 2 * kBrowserActionButtonGap;
+            const int buttonX =
+                kBrowserActionPanelX + (kBrowserActionPanelW - kButtonsTotalWidth) / 2
+                + static_cast<int>(index - 7) * (kBrowserActionButtonW + kBrowserActionButtonGap);
+            const int buttonY = kBrowserActionPanelY + 11;
+            DrawRowBoxAt(surface, buttonX, buttonY, kBrowserActionButtonW, kBrowserActionButtonH, isSelected, rowFill, rowFrame, selectedFill);
             MenuTextCentered(
                 surface,
                 rows[index].label,
-                rowX + 4,
-                rowX + rowW - 4,
-                rowY + 2,
+                buttonX + 2,
+                buttonX + kBrowserActionButtonW - 2,
+                buttonY + 3,
                 isSelected ? selectedText : normalText);
+            continue;
         }
-        else
-        {
-            MenuTextLeft(
-                surface,
-                rows[index].label,
-                rowX + 6,
-                rowX + 118,
-                rowY + 2,
-                isSelected ? selectedText : normalText);
-        }
-        if (!rows[index].value.empty() && !isActionRow)
+
+        const int rowY = kFilterFieldRowY[index];
+        const int rowX = kContentColumnX;
+        const int rowW = kContentColumnW;
+        DrawRowBoxAt(surface, rowX, rowY, rowW, kFilterRowH, isSelected, rowFill, rowFrame, selectedFill);
+        MenuTextLeft(
+            surface,
+            rows[index].label,
+            rowX + 6,
+            rowX + 118,
+            rowY + 4,
+            isSelected ? selectedText : normalText);
+        if (!rows[index].value.empty())
         {
             MenuTextRight(
                 surface,
                 rows[index].value,
                 rowX + 122,
                 rowX + rowW - 6,
-                rowY + 2,
+                rowY + 4,
                 isSelected ? selectedText : dimText);
         }
     }
@@ -7152,7 +7405,7 @@ bool ExecuteAction(uint32_t screenContext, NetplayMenuAction action)
 
 bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 {
-    (void)((g_state.view == View::Browser) && EnsureRenderAssetsLoaded(screenContext));
+    (void)((g_state.view == View::Browser || g_state.view == View::Summary) && EnsureRenderAssetsLoaded(screenContext));
 
     netplay::draw::LockedMenuSurface lockedSurface;
     if (!netplay::draw::AcquireMenuDrawSurfaceLock(screenContext, &lockedSurface))
@@ -7191,6 +7444,16 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
 
     DrawScreenTitleBar(surface, titleFill, panelFrame, titleColor, dimColor);
 
+    const int viewSlideOffsetX = GetViewSlideOffsetX();
+    static std::vector<uint8_t> pixelsBeforeView;
+    if (viewSlideOffsetX != 0)
+    {
+        pixelsBeforeView.assign(
+            surface.pixels,
+            surface.pixels + static_cast<size_t>(surface.pitch) * static_cast<size_t>(surface.height));
+    }
+    g_viewTextOffsetX = viewSlideOffsetX;
+
     switch (g_state.view)
     {
     case View::Summary:
@@ -7211,13 +7474,19 @@ bool DrawOverlayGdi(uint32_t screenContext, bool /*allowWindowDc*/)
         break;
     }
 
+    g_viewTextOffsetX = 0;
+    if (viewSlideOffsetX != 0)
+    {
+        ShiftDrawnPixels(surface, pixelsBeforeView, viewSlideOffsetX);
+    }
+
     netplay::draw::ReleaseMenuDrawSurfaceLock(lockedSurface);
     return true;
 }
 
 bool DrawImageOverlayGdi(uint32_t screenContext, bool allowWindowDc)
 {
-    if (g_state.view != View::Browser && g_state.view != View::SetDetail)
+    if (g_state.view != View::Browser && g_state.view != View::SetDetail && g_state.view != View::Summary)
     {
         return false;
     }

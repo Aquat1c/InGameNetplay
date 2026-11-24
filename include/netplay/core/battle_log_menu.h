@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <utility>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -77,6 +80,15 @@ struct BattleLogSummary
     int longestSetByGamesSessionIndex = -1;
     std::string mostUsedCharacter;
     std::string mostUsedMatchup;
+    std::vector<std::pair<std::string, int>> topCharacters;
+    // Completed sets per name; consumed into topName when the summary is finalized.
+    std::map<std::string, int> nameSetCounts;
+    std::map<std::string, std::map<std::string, int>> nameCharacterCounts;
+    std::string topName;
+    std::string topNameCharacter;
+    int topNameSets = 0;
+    int64_t firstSortKey = 0;
+    std::string firstTimestamp;
     std::string recentOpponent;
     std::string recentTimestamp;
     bool hasSessions = false;
