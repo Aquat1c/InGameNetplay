@@ -31,6 +31,8 @@ bool HasPendingGameplayExitMenuEntry();
 bool WasGameplayExitRecoveryCompleted();
 void ResetGameplayExitRecoveryCompletion();
 const char* CurrentGameplayExitRecoveryOrigin();
+// Player-facing reason for the last recovery, or nullptr when there was none.
+const char* DescribeGameplayExitRecovery();
 const char* CurrentGameplayExitRecoveryStateName();
 bool HasGameplayExitMenuEntryStarted();
 bool HasGameplayExitMenuEntryBeenConsumed();

@@ -77,6 +77,11 @@ inline uint32_t TimerArmTickNonZero()
     const uint32_t now = static_cast<uint32_t>(GetTickCount());
     return now != 0u ? now : 1u;
 }
+const char* SessionEndedText()
+{
+    const char* reason = netplay::bridge::recovery::DescribeGameplayExitRecovery();
+    return reason != nullptr ? reason : I18N_KEY("Session ended");
+}
 constexpr int kSpectateTitleWarmupFrames = 17;
 int g_pendingGlobalStateTransition = -1;
 bool g_charSelectResetPending = false;
@@ -6489,7 +6494,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
         const char* failureText =
             status.errorMsg[0] != '\0'
                 ? status.errorMsg
-                : (phase == NetbridgePhase::SessionEnded ? I18N_KEY("Session ended") : I18N_KEY("Unknown error"));
+                : (phase == NetbridgePhase::SessionEnded ? SessionEndedText() : I18N_KEY("Unknown error"));
 
         ResetDelaySetupOverlayState();
         ResetSpectateConfirmOverlayState();
@@ -7084,7 +7089,7 @@ char UpdateNetplayMenu(uint32_t screenContext)
             else
             {
                 strncpy_s(g_joiningOverlay.errorText, sizeof(g_joiningOverlay.errorText),
-                    bridgePhase == NetbridgePhase::SessionEnded ? I18N_KEY("Session ended") : I18N_KEY("Unknown error"),
+                    bridgePhase == NetbridgePhase::SessionEnded ? SessionEndedText() : I18N_KEY("Unknown error"),
                     _TRUNCATE);
             }
             mod::Log("JoiningOverlay: connection failed - %s", g_joiningOverlay.errorText);

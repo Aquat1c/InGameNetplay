@@ -231,7 +231,7 @@ static const char* FrontendReturnTargetToString(
     return "unknown";
 }
 
-static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
+static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext, bool menuAlreadyActive)
 {
     using namespace netplay::bridge::frontend_return;
 
@@ -277,6 +277,11 @@ static bool HandleFrontendReturnTitleContinuation(uint32_t screenContext)
         "FRONTEND_RETURN_MENU_CONTINUATION_CONSUMED owner=%s target=%s",
         FrontendReturnOwnerToString(owner),
         FrontendReturnTargetToString(target));
+
+    if (menuAlreadyActive)
+    {
+        return false;
+    }
 
     if (target == ReturnTarget::NetplayMenu)
     {
@@ -381,8 +386,15 @@ static char HookedTitleUpdateImplBody(uint32_t screenContext)
             "post_exit_text_clear_loop");
     }
 
-    if (!g_netplayMenuState.active
-        && HandleFrontendReturnTitleContinuation(screenContext))
+    if (g_netplayMenuState.active)
+    {
+        // A peer can quit before the char-select handoff, while this menu is still up; an unconsumed continuation blocks every later teardown.
+        if (netplay::bridge::frontend_return::HasNetplayMenuContinuationPending())
+        {
+            (void)HandleFrontendReturnTitleContinuation(screenContext, true);
+        }
+    }
+    else if (HandleFrontendReturnTitleContinuation(screenContext, false))
     {
         return 0;
     }

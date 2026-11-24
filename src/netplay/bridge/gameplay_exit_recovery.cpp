@@ -12,6 +12,8 @@
 
 #include <windows.h>
 
+#include <cstring>
+
 namespace netplay::bridge::recovery
 {
 namespace
@@ -506,6 +508,33 @@ void ResetGameplayExitRecoveryCompletion()
 const char* CurrentGameplayExitRecoveryOrigin()
 {
     return g_activeOrigin;
+}
+
+const char* DescribeGameplayExitRecovery()
+{
+    static const struct
+    {
+        GameplayExitOrigin origin;
+        const char* text;
+    } kReasons[] = {
+        {GameplayExitOrigin::QuitRing, I18N_KEY("Opponent left the session.")},
+        {GameplayExitOrigin::ConsoleErrorDisconnect, I18N_KEY("Opponent quit or timed out.")},
+        {GameplayExitOrigin::BypassStallConsoleError, I18N_KEY("Opponent quit or timed out.")},
+        {GameplayExitOrigin::BypassStallSyncFrameStalled, I18N_KEY("Connection to opponent stalled.")},
+        {GameplayExitOrigin::BypassStallWallTimeout, I18N_KEY("Connection to opponent stalled.")},
+        {GameplayExitOrigin::HelperDeathWatchdog, I18N_KEY("EfzRevival closed unexpectedly.")},
+        {GameplayExitOrigin::TickExitProcess, I18N_KEY("EfzRevival ended the session.")},
+        {GameplayExitOrigin::FrameExitProcess, I18N_KEY("EfzRevival ended the session.")},
+        {GameplayExitOrigin::SpectatorEsc, I18N_KEY("Stopped spectating.")},
+    };
+    for (const auto& reason : kReasons)
+    {
+        if (std::strcmp(g_activeOrigin, OriginToString(reason.origin)) == 0)
+        {
+            return reason.text;
+        }
+    }
+    return nullptr;
 }
 
 const char* CurrentGameplayExitRecoveryStateName()
